@@ -70,33 +70,69 @@ RETURN p.name
 
 ---
 
-## UC-3: Knowledge Graph — Concept Relationships
+## UC-3: KMS — Replace Neo4j Aura with SparrowDB (PRIMARY TARGET)
 
-**Motivation:** AI/RAG use case. Validates property-heavy nodes, string
-matching, and mixed traversal + filter. Closest to the embedded use case
-(SparrowDB as a local vector-adjacent store).
+**Motivation:** This is the first real production deployment. The Personal
+Knowledge Management System (KMS) at `~/Dev/KMSmcp` currently uses Neo4j
+Aura (cloud) as its graph store. SparrowDB replaces it — same Cypher, local
+on Mac Mini, zero cloud latency, no subscription cost.
 
-**Dataset:** 1,000 Concept nodes with `name` and `description` properties,
-3,000 RELATED_TO edges with `strength: f32` property.
-
-**Queries:**
-```cypher
-// Find concepts related to "graph database"
-MATCH (c:Concept {name: "graph database"})-[:RELATED_TO]->(r:Concept)
-RETURN r.name, r.description
-
-// Strongest relationships
-MATCH (c:Concept)-[r:RELATED_TO]->(t:Concept)
-WHERE r.strength > 0.8
-RETURN c.name, t.name, r.strength
-ORDER BY r.strength DESC
-
-// 2-hop concept expansion
-MATCH (c:Concept {name: "graph database"})-[:RELATED_TO*1..2]->(t:Concept)
-RETURN DISTINCT t.name
+**Current Neo4j schema in KMS:**
+```
+Node labels: Knowledge | Person | Organization | Project |
+             Technology | Concept | Service | Event
+Relationships: ABOUT, MENTIONS, RELATED_TO (typed, created by EntityLinker)
+Fulltext index: 'knowledge_search' on all node types (name, content fields)
 ```
 
-**Integration test:** `tests/integration/uc3_knowledge_graph.rs`
+**Real queries KMS runs today (from Neo4jStorage.ts):**
+```cypher
+// Store a knowledge node
+CREATE (k:Knowledge {
+  id: $id,
+  content: $content,
+  contentType: $contentType,
+  source: $source,
+  confidence: $confidence,
+  timestamp: $timestamp
+})
+
+// Search by property match (replaces fulltext for v0.1)
+MATCH (k:Knowledge)
+WHERE k.content CONTAINS $query OR k.source = $source
+RETURN k ORDER BY k.confidence DESC LIMIT 20
+
+// Entity relationship traversal (EntityLinker output)
+MATCH (k:Knowledge)-[:ABOUT]->(t:Technology {name: $tech})
+RETURN k.content, k.confidence, k.timestamp
+ORDER BY k.confidence DESC
+
+// 2-hop: what knowledge is related to this project?
+MATCH (p:Project {name: $project})<-[:ABOUT]-(k:Knowledge)-[:MENTIONS]->(t:Technology)
+RETURN k.content, t.name
+
+// Get all knowledge for a session
+MATCH (k:Knowledge)
+WHERE k.timestamp > $since
+RETURN k ORDER BY k.timestamp DESC
+```
+
+**Migration path:**
+1. `src/storage/SparrowDBStorage.ts` replaces `Neo4jStorage.ts` (same interface)
+2. Router updated: `neo4j` → `sparrowdb` in routing config
+3. Existing data migrated via export/import script
+4. KMS runs with zero downtime (Mem0 + MongoDB unchanged)
+
+**Gap — fulltext index:** KMS uses `knowledge_search` fulltext index.
+SparrowDB v0.1 does not have fulltext search. Mitigation for v0.1:
+- Property `CONTAINS` matching (already in Cypher spec)
+- Mem0 continues to handle semantic search
+- Fulltext is tracked as a post-v0.1 enhancement
+
+**Integration test:** `tests/integration/uc3_kms_storage.rs`
+
+**Dataset:** Snapshot of real KMS data (anonymized) — ~2,000 Knowledge nodes,
+~500 entity nodes, ~5,000 typed relationships. Generated from a KMS export.
 
 ---
 
