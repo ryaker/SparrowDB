@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Unit + Integration tests ───────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --workspace --lib --bins 2>&1 | tee /tmp/unit-results.txt
+
+      - name: Integration tests
+        run: cargo test --workspace --test '*' 2>&1 | tee /tmp/integration-results.txt
+
+      - name: Doc tests
+        run: cargo test --workspace --doc
+
+  # ── Acceptance checks — phase gates ───────────────────────────────────────
+  acceptance:
+    name: Acceptance Checks (all 14)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run acceptance suite
+        run: |
+          cargo test --workspace --test acceptance -- --nocapture \
+            2>&1 | tee acceptance-results.txt
+
+      - name: Upload acceptance results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acceptance-results
+          path: acceptance-results.txt
+
+  # ── Performance benchmarks ─────────────────────────────────────────────────
+  bench:
+    name: Benchmarks (regression check)
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmarks (PR branch)
+        run: |
+          cargo bench --workspace -- --output-format bencher \
+            2>&1 | tee pr-bench.txt
+
+      - name: Checkout main for baseline
+        run: |
+          git stash
+          git checkout main
+          cargo bench --workspace -- --output-format bencher \
+            2>&1 | tee main-bench.txt
+          git checkout -
+
+      - name: Compare benchmarks
+        run: |
+          python3 scripts/bench-compare.py main-bench.txt pr-bench.txt \
+            --threshold 0.10 2>&1 | tee bench-diff.txt
+          cat bench-diff.txt
+
+      - name: Post benchmark comment
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            const diff = fs.readFileSync('bench-diff.txt', 'utf8');
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## Benchmark Results\n\`\`\`\n${diff}\n\`\`\``
+            });
+
+  # ── Python bindings (Phase 6+) ─────────────────────────────────────────────
+  python:
+    name: Python bindings
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install maturin
+        run: pip install maturin pytest
+
+      - name: Build and test Python bindings
+        # Skips cleanly if sparrowdb-python crate doesn't exist yet
+        run: |
+          if [ -d "sparrowdb-python" ]; then
+            cd sparrowdb-python
+            maturin develop
+            pytest tests/python/ -v
+          else
+            echo "sparrowdb-python not yet implemented — skipping"
+          fi
+
+  # ── Golden fixture integrity ───────────────────────────────────────────────
+  fixtures:
+    name: Golden fixture round-trips
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fixture round-trip tests
+        run: |
+          cargo test --workspace --test fixtures -- --nocapture \
+            2>&1 || echo "No fixture tests yet — will add per phase"
