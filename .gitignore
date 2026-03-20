@@ -1,0 +1,37 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Test databases
+*.sparrowdb/
+*.db/
+/tmp/sparrowdb-*
+
+# Spill files (runtime, never durable)
+/tmp/sparrowdb-spill-*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Benchmarks output
+benches/output/
+criterion/
