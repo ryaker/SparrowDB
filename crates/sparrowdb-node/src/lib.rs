@@ -57,7 +57,8 @@ impl SparrowDB {
     ///
     /// Each row is a plain object mapping column name → value.
     /// Supported value types: `null`, `number`, `boolean`, `string`,
-    /// `{ $type: "node", id: number }`, `{ $type: "edge", id: number }`.
+    /// `{ $type: "node", id: string }`, `{ $type: "edge", id: string }`.
+    /// Note: `Int64` values outside `±(2^53-1)` are also returned as strings.
     #[napi]
     pub fn execute(&self, cypher: String) -> napi::Result<serde_json::Value> {
         let result = self.inner.execute(&cypher).map_err(to_napi)?;

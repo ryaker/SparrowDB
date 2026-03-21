@@ -7,9 +7,12 @@ use crate::types::{QueryResult, Value};
 
 /// Convert a scalar [`Value`] to a [`serde_json::Value`].
 ///
-/// `NodeRef` and `EdgeRef` are serialized as tagged objects:
-/// `{"$type": "node", "id": <u64>}` / `{"$type": "edge", "id": <u64>}`.
-/// This makes them distinguishable from plain integers on the receiving end.
+/// `NodeRef` and `EdgeRef` are serialized as tagged objects with string ids:
+/// `{"$type": "node", "id": "123"}` / `{"$type": "edge", "id": "456"}`.
+/// IDs are strings (not numbers) to preserve u64 precision across the JS boundary.
+///
+/// `Int64` values within `±(2^53-1)` are plain JSON numbers; values outside
+/// that range are serialized as decimal strings to avoid silent precision loss.
 pub fn value_to_json(v: &Value) -> serde_json::Value {
     match v {
         Value::Null => serde_json::Value::Null,
