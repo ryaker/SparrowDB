@@ -11,8 +11,8 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CreateStatement, Expr, Literal, MatchStatement, ReturnItem, SortDir, Statement,
-    UnwindStatement,
+    BinOpKind, CreateStatement, Expr, Literal, MatchCreateStatement, MatchStatement, ReturnItem,
+    SortDir, Statement, UnwindStatement,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
@@ -73,7 +73,7 @@ impl Engine {
             Statement::Match(m) => self.execute_match(&m),
             Statement::Unwind(u) => self.execute_unwind(&u),
             Statement::Create(c) => self.execute_create(&c),
-            Statement::MatchCreate(_) => Ok(QueryResult::empty(vec![])),
+            Statement::MatchCreate(mc) => self.execute_match_create(&mc),
             Statement::Checkpoint | Statement::Optimize => Ok(QueryResult::empty(vec![])),
         }
     }
@@ -169,6 +169,118 @@ impl Engine {
 
             self.store.create_node(label_id, &props)?;
         }
+        Ok(QueryResult::empty(vec![]))
+    }
+
+    // ── MATCH ... CREATE edge execution ────────────────────────────────────────
+
+    /// Execute a `MATCH ... CREATE` statement that creates edges between
+    /// already-existing nodes.
+    ///
+    /// For each combination of matched node bindings:
+    /// 1. Scans the storage layer to resolve each variable to a `NodeId`.
+    /// 2. For each edge in the CREATE clause, registers the relationship type
+    ///    in the catalog via `get_or_create_rel_type_id` (SPA-167) — the step
+    ///    that was missing, causing "unknown relationship type" on subsequent
+    ///    `MATCH (a)-[:REL]->(b)` queries.
+    /// 3. Opens (or creates) the edge-store file for the resolved `RelTableId`
+    ///    and appends the edge record.
+    fn execute_match_create(&mut self, mc: &MatchCreateStatement) -> Result<QueryResult> {
+        use sparrowdb_common::Error;
+
+        // Build a map: variable name → Vec<NodeId> from MATCH patterns.
+        // Each PathPattern node that has a variable name is scanned.
+        let mut var_candidates: HashMap<String, Vec<NodeId>> = HashMap::new();
+
+        for pat in &mc.match_patterns {
+            for node_pat in &pat.nodes {
+                if node_pat.var.is_empty() {
+                    continue;
+                }
+                // Skip if already resolved (same var can appear in multiple patterns).
+                if var_candidates.contains_key(&node_pat.var) {
+                    continue;
+                }
+
+                let label = node_pat.labels.first().cloned().unwrap_or_default();
+                let label_id: u32 = match self.catalog.get_label(&label)? {
+                    Some(id) => id as u32,
+                    None => return Err(Error::NotFound),
+                };
+
+                let hwm = self.store.hwm_for_label(label_id)?;
+
+                // Collect col_ids needed for inline prop filtering.
+                let filter_col_ids: Vec<u32> = node_pat
+                    .props
+                    .iter()
+                    .map(|p| prop_name_to_col_id(&p.key))
+                    .collect();
+
+                let mut matching_ids: Vec<NodeId> = Vec::new();
+                for slot in 0..hwm {
+                    let node_id = NodeId(((label_id as u64) << 32) | slot);
+
+                    // Skip tombstoned nodes (col_0 == u64::MAX).
+                    // If col_0 does not exist on disk the node was never
+                    // deleted, so treat a missing-file error as "not tombstoned".
+                    match self.store.get_node_raw(node_id, &[0u32]) {
+                        Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
+                            continue;
+                        }
+                        Ok(_) | Err(_) => {}
+                    }
+
+                    // Apply inline prop filter if any.
+                    if !node_pat.props.is_empty() {
+                        match self.store.get_node_raw(node_id, &filter_col_ids) {
+                            Ok(props) => {
+                                if !self.matches_prop_filter(&props, &node_pat.props) {
+                                    continue;
+                                }
+                            }
+                            // If a filter column doesn't exist on disk, the node
+                            // cannot satisfy the filter.
+                            Err(_) => continue,
+                        }
+                    }
+
+                    matching_ids.push(node_id);
+                }
+
+                var_candidates.insert(node_pat.var.clone(), matching_ids);
+            }
+        }
+
+        // For each edge in the CREATE clause, iterate all combinations of
+        // matching (src, dst) node pairs and write the edge.
+        for (left_var, rel_pat, right_var) in &mc.create.edges {
+            let src_candidates = var_candidates.get(left_var).ok_or(Error::NotFound)?.clone();
+            let dst_candidates = var_candidates
+                .get(right_var)
+                .ok_or(Error::NotFound)?
+                .clone();
+
+            for &src in &src_candidates {
+                let src_label_id = (src.0 >> 32) as u16;
+                for &dst in &dst_candidates {
+                    let dst_label_id = (dst.0 >> 32) as u16;
+
+                    // Register (or retrieve) the rel type so that subsequent
+                    // MATCH queries with `[:REL_TYPE]` can resolve it (SPA-167).
+                    let rel_table_id = self.catalog.get_or_create_rel_type_id(
+                        src_label_id,
+                        dst_label_id,
+                        &rel_pat.rel_type,
+                    )?;
+                    let storage_rel_id = RelTableId(rel_table_id as u32);
+
+                    let mut es = EdgeStore::open(&self.db_root, storage_rel_id)?;
+                    es.create_edge(src, storage_rel_id, dst)?;
+                }
+            }
+        }
+
         Ok(QueryResult::empty(vec![]))
     }
 
