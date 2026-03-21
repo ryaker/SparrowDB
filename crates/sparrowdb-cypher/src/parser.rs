@@ -188,11 +188,19 @@ impl Parser {
                             mutation: Mutation::Delete { var },
                         }))
                     }
+                    Token::With => {
+                        // MATCH … WHERE … WITH … RETURN
+                        self.parse_with_pipeline(patterns, Some(where_expr))
+                    }
                     _ => {
                         // Fall through to RETURN parsing with the parsed WHERE expr.
                         self.finish_match_return(patterns, Some(where_expr))
                     }
                 }
+            }
+            Token::With => {
+                // MATCH … WITH … RETURN pipeline
+                self.parse_with_pipeline(patterns, None)
             }
             Token::Return | Token::Order | Token::Limit | Token::Eof | Token::Semicolon => {
                 self.finish_match_return(patterns, None)
@@ -272,6 +280,95 @@ impl Parser {
         Ok(Statement::Match(MatchStatement {
             pattern: patterns,
             where_clause,
+            return_clause,
+            order_by,
+            limit,
+            distinct,
+        }))
+    }
+
+    // ── MATCH … WITH … RETURN pipeline ────────────────────────────────────────
+
+    /// Parse `MATCH pattern [WHERE pred] WITH expr AS alias [, …] [WHERE pred] RETURN …`.
+    fn parse_with_pipeline(
+        &mut self,
+        patterns: Vec<PathPattern>,
+        match_where: Option<Expr>,
+    ) -> Result<Statement> {
+        use crate::ast::{MatchWithStatement, WithClause, WithItem};
+
+        // Consume WITH token.
+        self.expect_tok(&Token::With)?;
+
+        // Parse one or more `expr AS alias` items separated by commas.
+        let mut items: Vec<WithItem> = Vec::new();
+        loop {
+            let expr = self.parse_expr()?;
+            self.expect_tok(&Token::As)?;
+            let alias = self.expect_ident()?;
+            items.push(WithItem { expr, alias });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        // Optional WHERE clause on the WITH stage.
+        let with_where = if matches!(self.peek(), Token::Where) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        let with_clause = WithClause { items, where_clause: with_where };
+
+        // RETURN clause.
+        self.expect_tok(&Token::Return)?;
+        let distinct = if matches!(self.peek(), Token::Distinct) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let return_items = self.parse_return_items()?;
+        let return_clause = crate::ast::ReturnClause { items: return_items };
+
+        // ORDER BY
+        let order_by = if matches!(self.peek(), Token::Order) {
+            self.advance();
+            self.expect_tok(&Token::By)?;
+            self.parse_order_by_items()?
+        } else {
+            vec![]
+        };
+
+        // LIMIT
+        let limit = if matches!(self.peek(), Token::Limit) {
+            self.advance();
+            match self.advance().clone() {
+                Token::Integer(n) => {
+                    if n < 0 {
+                        return Err(Error::InvalidArgument("LIMIT must be non-negative".into()));
+                    }
+                    Some(n as u64)
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected integer after LIMIT, got {:?}",
+                        other
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Statement::MatchWith(MatchWithStatement {
+            match_patterns: patterns,
+            match_where,
+            with_clause,
             return_clause,
             order_by,
             limit,
@@ -705,7 +802,7 @@ impl Parser {
                 self.advance();
                 // STARTS WITH — the WITH keyword is mandatory.
                 match self.peek().clone() {
-                    Token::Ident(s) if s.to_uppercase() == "WITH" => {
+                    Token::With | Token::Ident(_) => {
                         self.advance();
                     }
                     other => {
@@ -726,7 +823,7 @@ impl Parser {
                 self.advance();
                 // ENDS WITH — the WITH keyword is mandatory.
                 match self.peek().clone() {
-                    Token::Ident(s) if s.to_uppercase() == "WITH" => {
+                    Token::With | Token::Ident(_) => {
                         self.advance();
                     }
                     other => {

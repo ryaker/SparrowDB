@@ -38,6 +38,7 @@ pub enum Token {
     True,
     False,
     As,
+    With,
     Exists,
 
     // Punctuation
@@ -309,6 +310,7 @@ fn keyword_or_ident(word: String) -> Token {
         "TRUE" => Token::True,
         "FALSE" => Token::False,
         "AS" => Token::As,
+        "WITH" => Token::With,
         "EXISTS" => Token::Exists,
         _ => Token::Ident(word),
     }

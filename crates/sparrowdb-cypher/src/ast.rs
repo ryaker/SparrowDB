@@ -214,12 +214,39 @@ pub struct MatchMutateStatement {
     pub mutation: Mutation,
 }
 
+/// A single projection in a WITH clause: `expr AS alias`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithItem {
+    pub expr: Expr,
+    pub alias: String,
+}
+
+/// WITH clause: materializes intermediate rows and optionally filters them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithClause {
+    pub items: Vec<WithItem>,
+    pub where_clause: Option<Expr>,
+}
+
+/// MATCH … WITH … RETURN statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchWithStatement {
+    pub match_patterns: Vec<PathPattern>,
+    pub match_where: Option<Expr>,
+    pub with_clause: WithClause,
+    pub return_clause: ReturnClause,
+    pub order_by: Vec<(Expr, SortDir)>,
+    pub limit: Option<u64>,
+    pub distinct: bool,
+}
+
 /// Top-level statement variants.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Create(CreateStatement),
     MatchCreate(MatchCreateStatement),
     Match(MatchStatement),
+    MatchWith(MatchWithStatement),
     Unwind(UnwindStatement),
     Merge(MergeStatement),
     MatchMutate(MatchMutateStatement),

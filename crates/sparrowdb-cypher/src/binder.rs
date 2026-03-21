@@ -13,7 +13,7 @@
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{Error, Result};
 
-use crate::ast::{MatchMutateStatement, MatchStatement, PathPattern, Statement};
+use crate::ast::{MatchMutateStatement, MatchStatement, MatchWithStatement, PathPattern, Statement};
 
 /// A bound statement — the AST annotated with resolved catalog IDs.
 ///
@@ -43,6 +43,7 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
             // CREATE patterns: labels auto-registered — skip existence check.
         }
         Statement::Match(m) => bind_match(m, catalog)?,
+        Statement::MatchWith(mw) => bind_match_with(mw, catalog)?,
         // UNWIND does not reference labels or rel types — nothing to bind.
         Statement::Unwind(_) => {}
         // MERGE: validate that the label exists (or will be created at execution
@@ -54,6 +55,13 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
         Statement::Checkpoint | Statement::Optimize => {}
     }
     Ok(BoundStatement { inner: stmt })
+}
+
+fn bind_match_with(mw: &MatchWithStatement, catalog: &Catalog) -> Result<()> {
+    for pat in &mw.match_patterns {
+        bind_path_pattern(pat, catalog)?;
+    }
+    Ok(())
 }
 
 fn bind_match_mutate(mm: &MatchMutateStatement, catalog: &Catalog) -> Result<()> {

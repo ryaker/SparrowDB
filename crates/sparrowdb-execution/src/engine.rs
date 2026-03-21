@@ -12,7 +12,8 @@ use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
     BinOpKind, CreateStatement, Expr, Literal, MatchMutateStatement,
-    MatchStatement, Mutation, ReturnItem, SortDir, Statement, UnwindStatement,
+    MatchStatement, MatchWithStatement, Mutation, PathPattern, ReturnItem,
+    SortDir, Statement, UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
@@ -71,6 +72,7 @@ impl Engine {
     fn execute_bound(&mut self, stmt: Statement) -> Result<QueryResult> {
         match stmt {
             Statement::Match(m) => self.execute_match(&m),
+            Statement::MatchWith(mw) => self.execute_match_with(&mw),
             Statement::Unwind(u) => self.execute_unwind(&u),
             Statement::Create(c) => self.execute_create(&c),
             Statement::MatchCreate(_) => Ok(QueryResult::empty(vec![])),
@@ -270,6 +272,127 @@ impl Engine {
             self.store.create_node(label_id, &props)?;
         }
         Ok(QueryResult::empty(vec![]))
+    }
+
+    // ── WITH clause pipeline ──────────────────────────────────────────────────
+
+    /// Execute `MATCH … WITH expr AS alias [WHERE pred] … RETURN …`.
+    ///
+    /// 1. Scan MATCH patterns → collect intermediate rows as `Vec<HashMap<String, Value>>`.
+    /// 2. Project each row through the WITH items (evaluate expr, bind to alias).
+    /// 3. Apply WITH WHERE predicate on the projected map.
+    /// 4. Evaluate RETURN expressions against the projected map.
+    fn execute_match_with(&self, m: &MatchWithStatement) -> Result<QueryResult> {
+        // Step 1: collect intermediate rows from MATCH scan.
+        let intermediate = self.collect_match_rows_for_with(
+            &m.match_patterns,
+            m.match_where.as_ref(),
+            &m.with_clause,
+        )?;
+
+        // Step 2 & 3: project through WITH + filter.
+        let mut projected: Vec<HashMap<String, Value>> = Vec::new();
+        for row_vals in &intermediate {
+            let mut with_vals: HashMap<String, Value> = HashMap::new();
+            for item in &m.with_clause.items {
+                let val = eval_expr(&item.expr, row_vals);
+                with_vals.insert(item.alias.clone(), val);
+            }
+            if let Some(ref where_expr) = m.with_clause.where_clause {
+                if !eval_where(where_expr, &with_vals) {
+                    continue;
+                }
+            }
+            projected.push(with_vals);
+        }
+
+        // Step 4: project RETURN from the WITH-projected rows.
+        let column_names = extract_return_column_names(&m.return_clause.items);
+        let mut rows: Vec<Vec<Value>> = projected
+            .iter()
+            .map(|with_vals| {
+                m.return_clause
+                    .items
+                    .iter()
+                    .map(|item| eval_expr(&item.expr, with_vals))
+                    .collect()
+            })
+            .collect();
+
+        if m.distinct {
+            deduplicate_rows(&mut rows);
+        }
+        if let Some(lim) = m.limit {
+            rows.truncate(lim as usize);
+        }
+
+        Ok(QueryResult { columns: column_names, rows })
+    }
+
+    /// Scan a MATCH pattern and return one `HashMap<String, Value>` per matching row.
+    ///
+    /// Only simple single-node scans (no relationship hops) are supported for
+    /// the WITH pipeline; complex patterns return `Err(Unimplemented)`.
+    ///
+    /// Keys in the returned map follow the `build_row_vals` convention:
+    /// `"{var}.col_{col_id}"` → `Value::Int64(raw)`, plus any `"{var}.{prop}"` entries
+    /// added for direct lookup in WITH expressions.
+    fn collect_match_rows_for_with(
+        &self,
+        patterns: &[PathPattern],
+        where_clause: Option<&Expr>,
+        with_clause: &WithClause,
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        if patterns.is_empty() || patterns[0].rels.is_empty() {
+            let pat = &patterns[0];
+            let node = &pat.nodes[0];
+            let var_name = node.var.as_str();
+            let label = node.labels.first().cloned().unwrap_or_default();
+            let label_id = self
+                .catalog
+                .get_label(&label)?
+                .ok_or(sparrowdb_common::Error::NotFound)?;
+            let label_id_u32 = label_id as u32;
+            let hwm = self.store.hwm_for_label(label_id_u32)?;
+
+            // Collect col_ids needed by WHERE + WITH projections + inline prop filters.
+            let mut all_col_ids: Vec<u32> = Vec::new();
+            if let Some(ref wexpr) = where_clause {
+                collect_col_ids_from_expr(wexpr, &mut all_col_ids);
+            }
+            for item in &with_clause.items {
+                collect_col_ids_from_expr(&item.expr, &mut all_col_ids);
+            }
+            for p in &node.props {
+                let col_id = prop_name_to_col_id(&p.key);
+                if !all_col_ids.contains(&col_id) {
+                    all_col_ids.push(col_id);
+                }
+            }
+
+            let mut result: Vec<HashMap<String, Value>> = Vec::new();
+            for slot in 0..hwm {
+                let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
+                let col0_check = self.store.get_node_raw(node_id, &[0u32])?;
+                if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                    continue;
+                }
+                let props = self.store.get_node_raw(node_id, &all_col_ids)?;
+                if !self.matches_prop_filter(&props, &node.props) {
+                    continue;
+                }
+                let row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                if let Some(ref wexpr) = where_clause {
+                    if !eval_where(wexpr, &row_vals) {
+                        continue;
+                    }
+                }
+                result.push(row_vals);
+            }
+            Ok(result)
+        } else {
+            Err(sparrowdb_common::Error::Unimplemented)
+        }
     }
 
     fn execute_match(&self, m: &MatchStatement) -> Result<QueryResult> {
