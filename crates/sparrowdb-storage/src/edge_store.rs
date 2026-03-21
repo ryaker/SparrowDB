@@ -92,9 +92,7 @@ pub struct EdgeStore {
 impl EdgeStore {
     /// Open (or create) an edge store for `rel_table_id` under `db_root`.
     pub fn open(db_root: &Path, rel_table_id: RelTableId) -> Result<Self> {
-        let rel_dir = db_root
-            .join("edges")
-            .join(rel_table_id.0.to_string());
+        let rel_dir = db_root.join("edges").join(rel_table_id.0.to_string());
         fs::create_dir_all(&rel_dir).map_err(Error::Io)?;
 
         // Derive next_edge_id from the current delta log size.
@@ -127,12 +125,7 @@ impl EdgeStore {
     /// Append a new directed edge `src → dst` to the delta log.
     ///
     /// Returns the new [`EdgeId`] (monotonic index into the delta log).
-    pub fn create_edge(
-        &mut self,
-        src: NodeId,
-        rel_id: RelTableId,
-        dst: NodeId,
-    ) -> Result<EdgeId> {
+    pub fn create_edge(&mut self, src: NodeId, rel_id: RelTableId, dst: NodeId) -> Result<EdgeId> {
         let record = DeltaRecord { src, dst, rel_id };
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -177,10 +170,7 @@ impl EdgeStore {
         let records = self.read_delta()?;
 
         // Build edge list as raw node IDs (the CSR works over packed u64).
-        let edges: Vec<(u64, u64)> = records
-            .iter()
-            .map(|r| (r.src.0, r.dst.0))
-            .collect();
+        let edges: Vec<(u64, u64)> = records.iter().map(|r| (r.src.0, r.dst.0)).collect();
 
         let fwd = CsrForward::build(n_nodes, &edges);
         let bwd = CsrBackward::build(n_nodes, &edges);

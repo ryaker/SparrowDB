@@ -28,8 +28,8 @@ use sparrowdb_common::{Error, Result};
 /// zero-copy slice access to neighbor lists.
 pub struct CsrForward {
     n_nodes: u64,
-    offsets: Vec<u64>,    // length = n_nodes + 1
-    neighbors: Vec<u64>,  // length = n_edges
+    offsets: Vec<u64>,   // length = n_nodes + 1
+    neighbors: Vec<u64>, // length = n_edges
 }
 
 impl CsrForward {
@@ -439,9 +439,10 @@ mod tests {
     #[test]
     fn test_csr_golden_fixture_forward() {
         // The golden fixture encodes the same 5-node, 8-edge test graph.
-        let fixture_path = std::path::Path::new(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/csr_forward.bin"),
-        );
+        let fixture_path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/csr_forward.bin"
+        ));
         let bytes = std::fs::read(fixture_path).expect("golden fixture csr_forward.bin not found");
         let fwd = CsrForward::decode(&bytes).unwrap();
 
@@ -460,11 +461,11 @@ mod tests {
 
     #[test]
     fn test_csr_golden_fixture_backward() {
-        let fixture_path = std::path::Path::new(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/csr_backward.bin"),
-        );
-        let bytes =
-            std::fs::read(fixture_path).expect("golden fixture csr_backward.bin not found");
+        let fixture_path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/csr_backward.bin"
+        ));
+        let bytes = std::fs::read(fixture_path).expect("golden fixture csr_backward.bin not found");
         let bwd = CsrBackward::decode(&bytes).unwrap();
 
         assert_eq!(bwd.n_nodes(), 5);

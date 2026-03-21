@@ -101,8 +101,7 @@ impl NodeStore {
     }
 
     fn col_path(&self, label_id: u32, col_id: u32) -> PathBuf {
-        self.label_dir(label_id)
-            .join(format!("col_{col_id}.bin"))
+        self.label_dir(label_id).join(format!("col_{col_id}.bin"))
     }
 
     /// Read the high-water mark for `label_id` from disk (or return 0).
@@ -193,11 +192,7 @@ impl NodeStore {
     ///
     /// Returns `(col_id, raw_u64)` pairs in the order the columns were defined.
     /// The caller knows the schema (col IDs) from the catalog.
-    pub fn get_node_raw(
-        &self,
-        node_id: NodeId,
-        col_ids: &[u32],
-    ) -> Result<Vec<(u32, u64)>> {
+    pub fn get_node_raw(&self, node_id: NodeId, col_ids: &[u32]) -> Result<Vec<(u32, u64)>> {
         let label_id = (node_id.0 >> 32) as u32;
         let slot = (node_id.0 & 0xFFFF_FFFF) as u32;
 
@@ -244,10 +239,7 @@ mod tests {
         let mut store = NodeStore::open(dir.path()).unwrap();
 
         let label_id = 1u32;
-        let props = vec![
-            (0u32, Value::Int64(42)),
-            (1u32, Value::Int64(100)),
-        ];
+        let props = vec![(0u32, Value::Int64(42)), (1u32, Value::Int64(100))];
 
         let node_id = store.create_node(label_id, &props).unwrap();
 
@@ -279,18 +271,9 @@ mod tests {
         assert_eq!(s2, 1);
         assert_eq!(s3, 2);
 
-        assert_eq!(
-            store.get_node(n1, &[0]).unwrap()[0].1,
-            Value::Int64(10)
-        );
-        assert_eq!(
-            store.get_node(n2, &[0]).unwrap()[0].1,
-            Value::Int64(20)
-        );
-        assert_eq!(
-            store.get_node(n3, &[0]).unwrap()[0].1,
-            Value::Int64(30)
-        );
+        assert_eq!(store.get_node(n1, &[0]).unwrap()[0].1, Value::Int64(10));
+        assert_eq!(store.get_node(n2, &[0]).unwrap()[0].1, Value::Int64(20));
+        assert_eq!(store.get_node(n3, &[0]).unwrap()[0].1, Value::Int64(30));
     }
 
     #[test]
