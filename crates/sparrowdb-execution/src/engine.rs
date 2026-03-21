@@ -542,10 +542,16 @@ impl Engine {
         // Determine if this is a 2-hop query.
         let is_two_hop = m.pattern.len() == 1 && m.pattern[0].rels.len() == 2;
         let is_one_hop = m.pattern.len() == 1 && m.pattern[0].rels.len() == 1;
+        // Detect variable-length path: single pattern with exactly 1 rel that has min_hops set.
+        let is_var_len = m.pattern.len() == 1
+            && m.pattern[0].rels.len() == 1
+            && m.pattern[0].rels[0].min_hops.is_some();
 
         let column_names = extract_return_column_names(&m.return_clause.items);
 
-        if is_two_hop {
+        if is_var_len {
+            self.execute_variable_length(m, &column_names)
+        } else if is_two_hop {
             self.execute_two_hop(m, &column_names)
         } else if is_one_hop {
             self.execute_one_hop(m, &column_names)
@@ -1237,7 +1243,207 @@ impl Engine {
         })
     }
 
-    // ── Property filter helpers ───────────────────────────────────────────────
+    // ── Variable-length path traversal: (a)-[:R*M..N]->(b) ──────────────────
+
+    /// Collect all neighbor slot-ids reachable from `src_slot` via the delta
+    /// log and CSR adjacency.  src_label_id is used to filter delta records.
+    fn get_node_neighbors_by_slot(
+        &self,
+        src_slot: u64,
+        src_label_id: u32,
+    ) -> Vec<u64> {
+        let csr_neighbors: Vec<u64> = self.csr.neighbors(src_slot).to_vec();
+        let delta_neighbors: Vec<u64> = {
+            let edge_store = sparrowdb_storage::edge_store::EdgeStore::open(
+                &self.db_root,
+                sparrowdb_storage::edge_store::RelTableId(0),
+            );
+            match edge_store.and_then(|s| s.read_delta()) {
+                Ok(records) => records
+                    .into_iter()
+                    .filter(|r| {
+                        let r_src_label = (r.src.0 >> 32) as u32;
+                        let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                        r_src_label == src_label_id && r_src_slot == src_slot
+                    })
+                    .map(|r| r.dst.0 & 0xFFFF_FFFF)
+                    .collect(),
+                Err(_) => vec![],
+            }
+        };
+        let mut all: std::collections::HashSet<u64> = csr_neighbors.into_iter().collect();
+        all.extend(delta_neighbors);
+        all.into_iter().collect()
+    }
+
+    /// BFS traversal for variable-length path patterns `(src)-[:R*min..max]->(dst)`.
+    ///
+    /// Returns the set of destination slot-ids reachable from `src_slot` in
+    /// `[min_hops, max_hops]` hops.  Max is capped at 10 to prevent runaway
+    /// traversals on dense graphs.
+    fn execute_variable_hops(
+        &self,
+        src_slot: u64,
+        src_label_id: u32,
+        min_hops: u32,
+        max_hops: u32,
+    ) -> Vec<u64> {
+        const SAFETY_CAP: u32 = 10;
+        let max_hops = max_hops.min(SAFETY_CAP);
+
+        // BFS: frontier = nodes at the current depth.
+        // visited = all nodes ever enqueued (for cycle-avoidance).
+        // results = nodes at depth >= min_hops.
+        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        visited.insert(src_slot);
+        let mut frontier: Vec<u64> = vec![src_slot];
+        let mut results: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+        for depth in 1..=max_hops {
+            let mut next_frontier: Vec<u64> = Vec::new();
+            for &node_slot in &frontier {
+                let neighbors = self.get_node_neighbors_by_slot(node_slot, src_label_id);
+                for nb in neighbors {
+                    if visited.insert(nb) {
+                        next_frontier.push(nb);
+                    }
+                    if depth >= min_hops {
+                        results.insert(nb);
+                    }
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+
+        results.into_iter().collect()
+    }
+
+    /// Execute a variable-length path query: `MATCH (a:L1)-[:R*M..N]->(b:L2) RETURN …`.
+    fn execute_variable_length(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<QueryResult> {
+        let pat = &m.pattern[0];
+        let src_node_pat = &pat.nodes[0];
+        let dst_node_pat = &pat.nodes[1];
+        let rel_pat = &pat.rels[0];
+
+        if rel_pat.dir != sparrowdb_cypher::ast::EdgeDir::Outgoing {
+            return Err(sparrowdb_common::Error::Unimplemented);
+        }
+
+        let min_hops = rel_pat.min_hops.unwrap_or(1);
+        let max_hops = rel_pat.max_hops.unwrap_or(10); // unbounded → cap at 10
+
+        let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
+        let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
+
+        let src_label_id = self
+            .catalog
+            .get_label(&src_label)?
+            .ok_or(sparrowdb_common::Error::NotFound)? as u32;
+        let dst_label_id = self
+            .catalog
+            .get_label(&dst_label)?
+            .ok_or(sparrowdb_common::Error::NotFound)? as u32;
+
+        let hwm_src = self.store.hwm_for_label(src_label_id)?;
+
+        let col_ids_src = collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
+        let col_ids_dst = collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
+
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut seen_pairs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+
+        for src_slot in 0..hwm_src {
+            let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
+
+            // Fetch source props (for filter + projection).
+            let src_all_col_ids: Vec<u32> = {
+                let mut v = col_ids_src.clone();
+                for p in &src_node_pat.props {
+                    let col_id = prop_name_to_col_id(&p.key);
+                    if !v.contains(&col_id) {
+                        v.push(col_id);
+                    }
+                }
+                v
+            };
+            let src_props = if !src_all_col_ids.is_empty() {
+                self.store.get_node_raw(src_node, &src_all_col_ids)?
+            } else {
+                vec![]
+            };
+
+            if !self.matches_prop_filter(&src_props, &src_node_pat.props) {
+                continue;
+            }
+
+            // BFS to find all reachable dst slots within [min_hops, max_hops].
+            let dst_slots = self.execute_variable_hops(src_slot, src_label_id, min_hops, max_hops);
+
+            for dst_slot in dst_slots {
+                if !seen_pairs.insert((src_slot, dst_slot)) {
+                    continue;
+                }
+
+                let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
+                let dst_props = if !col_ids_dst.is_empty() {
+                    self.store.get_node_raw(dst_node, &col_ids_dst)?
+                } else {
+                    vec![]
+                };
+
+                if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
+                    continue;
+                }
+
+                // Apply WHERE clause.
+                if let Some(ref where_expr) = m.where_clause {
+                    let mut row_vals =
+                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
+                    row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
+                    if !eval_where(where_expr, &row_vals) {
+                        continue;
+                    }
+                }
+
+                let row = project_hop_row(
+                    &src_props,
+                    &dst_props,
+                    column_names,
+                    &src_node_pat.var,
+                    &dst_node_pat.var,
+                );
+                rows.push(row);
+            }
+        }
+
+        // DISTINCT
+        if m.distinct {
+            deduplicate_rows(&mut rows);
+        }
+
+        // ORDER BY
+        apply_order_by(&mut rows, m, column_names);
+
+        // LIMIT
+        if let Some(lim) = m.limit {
+            rows.truncate(lim as usize);
+        }
+
+        tracing::debug!(rows = rows.len(), min_hops, max_hops, "variable-length traversal complete");
+        Ok(QueryResult {
+            columns: column_names.to_vec(),
+            rows,
+        })
+    }
+
+        // ── Property filter helpers ───────────────────────────────────────────────
 
     fn matches_prop_filter(
         &self,
