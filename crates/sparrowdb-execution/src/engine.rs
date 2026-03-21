@@ -15,6 +15,7 @@ use sparrowdb_cypher::ast::{
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
+use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
 use sparrowdb_storage::node_store::NodeStore;
 
 use crate::types::{QueryResult, Value};
@@ -186,6 +187,15 @@ impl Engine {
             if slot < 1024 || slot % 10_000 == 0 {
                 tracing::trace!(slot = slot, node_id = node_id.0, "scan emit");
             }
+
+            // SPA-164: skip tombstoned nodes.  delete_node writes u64::MAX into
+            // col_0 as the deletion sentinel; nodes in that state must not
+            // appear in scan results.
+            let col0_check = self.store.get_node_raw(node_id, &[0u32])?;
+            if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                continue;
+            }
+
             let props = self.store.get_node_raw(node_id, &all_col_ids)?;
 
             // Apply inline prop filter from the pattern.
@@ -277,9 +287,36 @@ impl Engine {
                 continue;
             }
 
+            // SPA-163: read delta log edges for this source node and merge
+            // with CSR neighbors so edges are visible before a checkpoint.
+            let delta_neighbors: Vec<u64> = {
+                let edge_store = EdgeStore::open(&self.db_root, RelTableId(0));
+                match edge_store.and_then(|s| s.read_delta()) {
+                    Ok(records) => records
+                        .into_iter()
+                        .filter(|r| {
+                            let r_src_label = (r.src.0 >> 32) as u32;
+                            let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                            r_src_label == src_label_id && r_src_slot == src_slot
+                        })
+                        .map(|r| r.dst.0 & 0xFFFF_FFFF)
+                        .collect(),
+                    Err(_) => vec![],
+                }
+            };
+
             // Traverse CSR.
-            let neighbors = self.csr.neighbors(src_slot);
-            for &dst_slot in neighbors {
+            let csr_neighbors = self.csr.neighbors(src_slot);
+            let all_neighbors: Vec<u64> = csr_neighbors
+                .iter()
+                .copied()
+                .chain(delta_neighbors.into_iter())
+                .collect();
+            let mut seen_neighbors: HashSet<u64> = HashSet::new();
+            for &dst_slot in &all_neighbors {
+                if !seen_neighbors.insert(dst_slot) {
+                    continue;
+                }
                 let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
                 let dst_props = if !col_ids_dst.is_empty() {
                     self.store.get_node_raw(dst_node, &col_ids_dst)?
@@ -369,6 +406,27 @@ impl Engine {
             ids
         };
 
+        // SPA-163: build a slot-level adjacency map from the delta log so that
+        // edges written since the last checkpoint are visible for 2-hop queries.
+        // Map: src_slot → Vec<dst_slot> (only records whose src label matches).
+        let delta_adj: HashMap<u64, Vec<u64>> = {
+            let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+            if let Ok(store) = EdgeStore::open(&self.db_root, RelTableId(0)) {
+                if let Ok(records) = store.read_delta() {
+                    for r in records {
+                        let r_src_label = (r.src.0 >> 32) as u32;
+                        let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                        if r_src_label == src_label_id {
+                            adj.entry(r_src_slot)
+                                .or_default()
+                                .push(r.dst.0 & 0xFFFF_FFFF);
+                        }
+                    }
+                }
+            }
+            adj
+        };
+
         let join = AspJoin::new(&self.csr);
         let mut rows = Vec::new();
 
@@ -397,8 +455,35 @@ impl Engine {
                 continue;
             }
 
-            // Use ASP-Join to get 2-hop fof.
-            let fof_slots = join.two_hop(src_slot)?;
+            // Use ASP-Join to get 2-hop fof from CSR.
+            let mut fof_slots = join.two_hop(src_slot)?;
+
+            // SPA-163: extend with delta-log 2-hop paths.
+            // First-hop delta neighbors of src_slot:
+            let first_hop_delta = delta_adj
+                .get(&src_slot)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            if !first_hop_delta.is_empty() {
+                let mut delta_fof: HashSet<u64> = HashSet::new();
+                for &mid_slot in first_hop_delta {
+                    // CSR second hop from mid:
+                    for &fof in self.csr.neighbors(mid_slot) {
+                        delta_fof.insert(fof);
+                    }
+                    // Delta second hop from mid:
+                    if let Some(mid_neighbors) = delta_adj.get(&mid_slot) {
+                        for &fof in mid_neighbors {
+                            delta_fof.insert(fof);
+                        }
+                    }
+                }
+                fof_slots.extend(delta_fof);
+                // Re-deduplicate the combined set.
+                let unique: HashSet<u64> = fof_slots.into_iter().collect();
+                fof_slots = unique.into_iter().collect();
+                fof_slots.sort_unstable();
+            }
 
             for fof_slot in fof_slots {
                 let fof_node = NodeId(((fof_label_id as u64) << 32) | fof_slot);
