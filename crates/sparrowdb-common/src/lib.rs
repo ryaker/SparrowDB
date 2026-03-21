@@ -33,6 +33,8 @@ pub enum Error {
     Unimplemented,
     /// AEAD authentication tag verification failed — wrong key or corrupted ciphertext.
     DecryptionFailed,
+    /// A write transaction is already active; only one writer is allowed at a time.
+    WriterBusy,
 }
 
 impl std::fmt::Display for Error {
@@ -49,6 +51,7 @@ impl std::fmt::Display for Error {
             Error::OutOfMemory => write!(f, "out of memory"),
             Error::Unimplemented => write!(f, "not yet implemented"),
             Error::DecryptionFailed => write!(f, "decryption failed: wrong key or corrupted data"),
+            Error::WriterBusy => write!(f, "writer busy: a write transaction is already active"),
         }
     }
 }

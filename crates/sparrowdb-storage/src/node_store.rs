@@ -229,6 +229,26 @@ impl NodeStore {
         Ok(NodeId(node_id))
     }
 
+    /// Overwrite the value of a single column for an existing node.
+    ///
+    /// Seeks to the slot's offset within `col_{col_id}.bin` and writes the new
+    /// 8-byte little-endian value in-place.  Returns `Err(NotFound)` if the
+    /// slot does not exist yet.
+    pub fn set_node_col(&self, node_id: NodeId, col_id: u32, value: &Value) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let label_id = (node_id.0 >> 32) as u32;
+        let slot = (node_id.0 & 0xFFFF_FFFF) as u32;
+        let path = self.col_path(label_id, col_id);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|_| Error::NotFound)?;
+        let offset = slot as u64 * 8;
+        file.seek(SeekFrom::Start(offset)).map_err(Error::Io)?;
+        file.write_all(&value.to_u64().to_le_bytes())
+            .map_err(Error::Io)
+    }
+
     /// Retrieve all stored properties of a node.
     ///
     /// Returns `(col_id, raw_u64)` pairs in the order the columns were defined.
