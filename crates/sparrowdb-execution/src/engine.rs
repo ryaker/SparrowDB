@@ -1416,6 +1416,12 @@ fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
             collect_col_ids_from_expr(r, out);
         }
         Expr::Not(inner) => collect_col_ids_from_expr(inner, out),
+        Expr::InList { expr, list, .. } => {
+            collect_col_ids_from_expr(expr, out);
+            for item in list {
+                collect_col_ids_from_expr(item, out);
+            }
+        }
         _ => {}
     }
 }
@@ -1597,6 +1603,11 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
         Expr::Not(inner) => !eval_where(inner, vals),
         Expr::Literal(Literal::Bool(b)) => *b,
         Expr::Literal(_) => false,
+        Expr::InList { expr, list, negated } => {
+            let lv = eval_expr(expr, vals);
+            let matched = list.iter().any(|item| values_equal(&lv, &eval_expr(item, vals)));
+            if *negated { !matched } else { matched }
+        }
         _ => false, // unsupported expression — reject row rather than silently pass
     }
 }
@@ -1691,6 +1702,11 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(a || b),
             _ => Value::Null,
         },
+        Expr::InList { expr, list, negated } => {
+            let lv = eval_expr(expr, vals);
+            let matched = list.iter().any(|item| values_equal(&lv, &eval_expr(item, vals)));
+            Value::Bool(if *negated { !matched } else { matched })
+        }
         Expr::List(_) | Expr::NotExists(_) | Expr::CountStar => Value::Null,
     }
 }

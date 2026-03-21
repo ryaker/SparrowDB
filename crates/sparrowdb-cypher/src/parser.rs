@@ -981,6 +981,18 @@ impl Parser {
     fn parse_comparison(&mut self) -> Result<Expr> {
         let left = self.parse_atom()?;
 
+        // Handle `expr IN [...]`
+        if matches!(self.peek(), Token::In) {
+            self.advance(); // consume IN
+            self.expect_tok(&Token::LBracket)?;
+            let list = self.parse_in_list()?;
+            return Ok(Expr::InList {
+                expr: Box::new(left),
+                list,
+                negated: false,
+            });
+        }
+
         let op = match self.peek().clone() {
             Token::Eq => BinOpKind::Eq,
             Token::Neq => BinOpKind::Neq,
@@ -1040,6 +1052,35 @@ impl Parser {
             op,
             right: Box::new(right),
         })
+    }
+
+    /// Parse a comma-separated list of atom expressions up to `]`.
+    /// Assumes `[` has already been consumed.  Returns the list and consumes `]`.
+    fn parse_in_list(&mut self) -> Result<Vec<Expr>> {
+        let mut items = Vec::new();
+        if matches!(self.peek(), Token::RBracket) {
+            self.advance(); // consume `]`
+            return Ok(items); // empty list
+        }
+        loop {
+            items.push(self.parse_atom()?);
+            match self.peek().clone() {
+                Token::Comma => {
+                    self.advance();
+                }
+                Token::RBracket => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected ',' or ']' in IN list, got {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        Ok(items)
     }
 
     fn parse_atom(&mut self) -> Result<Expr> {

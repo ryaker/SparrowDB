@@ -97,6 +97,12 @@ pub enum Expr {
     FnCall { name: String, args: Vec<Expr> },
     /// A list literal: `[expr, expr, ...]`.
     List(Vec<Expr>),
+    /// `expr IN [val, val, ...]` — membership test.
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
 }
 
 /// An existence pattern used in `NOT (a)-[:R]->(b)`.
