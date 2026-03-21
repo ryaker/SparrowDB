@@ -69,9 +69,7 @@ fn spa130_with_where_string_filter() {
     let mut engine = setup_people(dir.path());
 
     let result = engine
-        .execute(
-            "MATCH (n:Person) WITH n.name AS name WHERE name = 'Alice' RETURN name",
-        )
+        .execute("MATCH (n:Person) WITH n.name AS name WHERE name = 'Alice' RETURN name")
         .expect("MATCH … WITH … WHERE … RETURN must succeed");
 
     assert_eq!(result.columns, vec!["name"]);
@@ -151,9 +149,7 @@ fn spa130_with_on_empty_result_set() {
 
     // Filter to a name that doesn't exist → intermediate result is empty.
     let result = engine
-        .execute(
-            "MATCH (n:Person) WITH n.name AS name WHERE name = 'Nobody' RETURN name",
-        )
+        .execute("MATCH (n:Person) WITH n.name AS name WHERE name = 'Nobody' RETURN name")
         .expect("empty result WITH must not error");
 
     assert_eq!(result.rows.len(), 0, "expected 0 rows for 'Nobody'");

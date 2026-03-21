@@ -27,8 +27,10 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 fn type_fn_returns_rel_type() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
     db.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
     )
@@ -59,8 +61,10 @@ fn type_fn_returns_rel_type() {
 fn type_fn_in_where() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
     db.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
     )
@@ -68,9 +72,7 @@ fn type_fn_in_where() {
 
     // Filter that matches — should return 1 row.
     let result = db
-        .execute(
-            "MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE type(r) = 'KNOWS' RETURN a.name",
-        )
+        .execute("MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE type(r) = 'KNOWS' RETURN a.name")
         .expect("MATCH with WHERE type(r) must succeed");
 
     assert_eq!(
@@ -88,9 +90,7 @@ fn type_fn_in_where() {
 
     // Filter that does NOT match — should return 0 rows.
     let result_no_match = db
-        .execute(
-            "MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE type(r) = 'FOLLOWS' RETURN a.name",
-        )
+        .execute("MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE type(r) = 'FOLLOWS' RETURN a.name")
         .expect("MATCH with WHERE type(r) = 'FOLLOWS' must succeed");
 
     assert_eq!(
@@ -109,8 +109,10 @@ fn type_fn_in_where() {
 fn labels_fn_returns_label() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
 
     let result = db
         .execute("MATCH (n:Person) RETURN labels(n)")
@@ -145,9 +147,12 @@ fn labels_fn_returns_label() {
 fn type_fn_variable_path() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
-    db.execute("CREATE (n:Person {name: 'Charlie'})").expect("CREATE Charlie");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Charlie'})")
+        .expect("CREATE Charlie");
 
     // Alice→Bob, Bob→Charlie
     db.execute(

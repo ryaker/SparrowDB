@@ -18,9 +18,12 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 fn count_star() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
-    db.execute("CREATE (n:Person {name: 'Charlie'})").expect("CREATE Charlie");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Charlie'})")
+        .expect("CREATE Charlie");
 
     let result = db
         .execute("MATCH (n:Person) RETURN COUNT(*) AS total")
@@ -47,9 +50,12 @@ fn count_star() {
 fn count_grouped() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
-    db.execute("CREATE (n:Person {name: 'Carol'})").expect("CREATE Carol");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Carol'})")
+        .expect("CREATE Carol");
 
     // Alice knows Bob and Carol; Bob knows Carol.
     db.execute(
@@ -108,7 +114,11 @@ fn sum_property() {
         .execute("MATCH (n:Person) RETURN SUM(n.age) AS total_age")
         .expect("SUM must succeed");
 
-    assert_eq!(result.rows.len(), 1, "SUM with no grouping key must return 1 row");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "SUM with no grouping key must return 1 row"
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Int64(100),
@@ -132,14 +142,15 @@ fn avg_property() {
         .execute("MATCH (n:Person) RETURN AVG(n.age) AS avg")
         .expect("AVG must succeed");
 
-    assert_eq!(result.rows.len(), 1, "AVG with no grouping key must return 1 row");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "AVG with no grouping key must return 1 row"
+    );
     match &result.rows[0][0] {
         Value::Float64(f) => {
             let diff = (f - 20.0_f64).abs();
-            assert!(
-                diff < 1e-9,
-                "AVG(age) should be 20.0; got: {f}"
-            );
+            assert!(diff < 1e-9, "AVG(age) should be 20.0; got: {f}");
         }
         other => panic!("expected Float64 for AVG, got {:?}", other),
     }
@@ -184,7 +195,8 @@ fn count_star_no_rows() {
     let (_dir, db) = make_db();
 
     // Register the label by creating one node that won't match the filter.
-    db.execute("CREATE (n:Person {name: 'Sentinel'})").expect("CREATE sentinel");
+    db.execute("CREATE (n:Person {name: 'Sentinel'})")
+        .expect("CREATE sentinel");
 
     // Use a filter that matches nobody — label exists but zero rows match.
     let result = db

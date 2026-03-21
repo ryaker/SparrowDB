@@ -44,9 +44,7 @@ fn spa140_tostring_in_return() {
     let csr = CsrForward::build(0, &[]);
     let mut engine = Engine::new(store, cat, csr, dir.path());
 
-    let result = engine
-        .execute("RETURN toString(42)")
-        .expect("toString(42)");
+    let result = engine.execute("RETURN toString(42)").expect("toString(42)");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
         result.rows[0][0],
@@ -62,9 +60,7 @@ fn spa140_toupper_in_return() {
     let csr = CsrForward::build(0, &[]);
     let mut engine = Engine::new(store, cat, csr, dir.path());
 
-    let result = engine
-        .execute("RETURN toUpper('hello')")
-        .expect("toUpper");
+    let result = engine.execute("RETURN toUpper('hello')").expect("toUpper");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
         result.rows[0][0],
@@ -80,9 +76,7 @@ fn spa140_tolower_in_return() {
     let csr = CsrForward::build(0, &[]);
     let mut engine = Engine::new(store, cat, csr, dir.path());
 
-    let result = engine
-        .execute("RETURN toLower('WORLD')")
-        .expect("toLower");
+    let result = engine.execute("RETURN toLower('WORLD')").expect("toLower");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
         result.rows[0][0],
@@ -98,9 +92,7 @@ fn spa140_trim_in_return() {
     let csr = CsrForward::build(0, &[]);
     let mut engine = Engine::new(store, cat, csr, dir.path());
 
-    let result = engine
-        .execute("RETURN trim('  hello  ')")
-        .expect("trim");
+    let result = engine.execute("RETURN trim('  hello  ')").expect("trim");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
         result.rows[0][0],
@@ -116,9 +108,7 @@ fn spa140_size_in_return() {
     let csr = CsrForward::build(0, &[]);
     let mut engine = Engine::new(store, cat, csr, dir.path());
 
-    let result = engine
-        .execute("RETURN size('hello')")
-        .expect("size");
+    let result = engine.execute("RETURN size('hello')").expect("size");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], sparrowdb_execution::Value::Int64(5));
 }
@@ -284,9 +274,7 @@ fn spa142_reverse_string_in_return() {
     let csr = CsrForward::build(0, &[]);
     let mut engine = Engine::new(store, cat, csr, dir.path());
 
-    let result = engine
-        .execute("RETURN reverse('abc')")
-        .expect("reverse");
+    let result = engine.execute("RETURN reverse('abc')").expect("reverse");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
         result.rows[0][0],
@@ -304,9 +292,7 @@ fn spa143_tostring_int() {
     let csr = CsrForward::build(0, &[]);
     let mut engine = Engine::new(store, cat, csr, dir.path());
 
-    let result = engine
-        .execute("RETURN toString(42)")
-        .expect("toString(42)");
+    let result = engine.execute("RETURN toString(42)").expect("toString(42)");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
         result.rows[0][0],
@@ -337,9 +323,7 @@ fn spa143_tofloat_int() {
     let csr = CsrForward::build(0, &[]);
     let mut engine = Engine::new(store, cat, csr, dir.path());
 
-    let result = engine
-        .execute("RETURN toFloat(7)")
-        .expect("toFloat");
+    let result = engine.execute("RETURN toFloat(7)").expect("toFloat");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], sparrowdb_execution::Value::Float64(7.0));
 }
@@ -400,9 +384,7 @@ fn spa143_isnull_true() {
     let csr = CsrForward::build(0, &[]);
     let mut engine = Engine::new(store, cat, csr, dir.path());
 
-    let result = engine
-        .execute("RETURN isNull(null)")
-        .expect("isNull(null)");
+    let result = engine.execute("RETURN isNull(null)").expect("isNull(null)");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], sparrowdb_execution::Value::Bool(true));
 }
@@ -463,9 +445,7 @@ fn spa141_abs_in_standalone_return() {
     let csr = CsrForward::build(0, &[]);
     let mut engine = Engine::new(store, cat, csr, dir.path());
 
-    let result = engine
-        .execute("RETURN abs(-10)")
-        .expect("abs(-10)");
+    let result = engine.execute("RETURN abs(-10)").expect("abs(-10)");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], sparrowdb_execution::Value::Int64(10));
 }
@@ -476,8 +456,6 @@ fn spa143_id_function_in_match_return() {
     let dir = tempfile::tempdir().unwrap();
     let _engine = engine_with_person(dir.path());
     let mut engine2 = reopen_engine(dir.path());
-    let result = engine2
-        .execute("RETURN isNull(null)")
-        .expect("isNull");
+    let result = engine2.execute("RETURN isNull(null)").expect("isNull");
     assert_eq!(result.rows[0][0], sparrowdb_execution::Value::Bool(true));
 }

@@ -39,12 +39,7 @@ fn optional_match_existing_label_returns_rows() {
     );
     // All rows should be non-null (actual values).
     for row in &result.rows {
-        assert_ne!(
-            row[0],
-            Value::Null,
-            "expected non-null name, got {:?}",
-            row
-        );
+        assert_ne!(row[0], Value::Null, "expected non-null name, got {:?}", row);
     }
 }
 
@@ -133,9 +128,7 @@ fn setup_person_graph_with_edge(dir: &std::path::Path) -> (GraphDb, NodeId, Node
     db.execute("CREATE (:Person {name: 'Carol'})").unwrap();
 
     // Read back the node IDs from the MATCH result to get the packed NodeIds.
-    let res = db
-        .execute("MATCH (n:Person) RETURN n.name")
-        .unwrap();
+    let res = db.execute("MATCH (n:Person) RETURN n.name").unwrap();
     // We have 3 rows but need the NodeIds to create an edge.
     // Use a WriteTx to create the edge using known slot positions.
     // Slots are 0=Alice, 1=Bob, 2=Carol (creation order).
@@ -145,7 +138,7 @@ fn setup_person_graph_with_edge(dir: &std::path::Path) -> (GraphDb, NodeId, Node
     let cat = Catalog::open(dir).expect("catalog");
     let person_label_id = cat.get_label("Person").unwrap().expect("Person label") as u32;
 
-    let alice_id = NodeId(((person_label_id as u64) << 32) | 0);
+    let alice_id = NodeId((person_label_id as u64) << 32);
     let bob_id = NodeId(((person_label_id as u64) << 32) | 1);
     let carol_id = NodeId(((person_label_id as u64) << 32) | 2);
 

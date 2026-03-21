@@ -11,14 +11,15 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CreateStatement, Expr, ListPredicateKind, Literal, MatchCreateStatement,
-    MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement, MatchWithStatement, Mutation,
-    OptionalMatchStatement, PathPattern, ReturnItem, SortDir, Statement, UnionStatement,
-    UnwindStatement, WithClause,
+    BinOpKind, CallStatement, CreateStatement, Expr, ListPredicateKind, Literal,
+    MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement,
+    MatchWithStatement, Mutation, OptionalMatchStatement, PathPattern, ReturnItem, SortDir,
+    Statement, UnionStatement, UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
+use sparrowdb_storage::fulltext_index::FulltextIndex;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
 
 use crate::types::{QueryResult, Value};
@@ -88,7 +89,128 @@ impl Engine {
             Statement::MatchOptionalMatch(mom) => self.execute_match_optional_match(&mom),
             Statement::Union(u) => self.execute_union(u),
             Statement::Checkpoint | Statement::Optimize => Ok(QueryResult::empty(vec![])),
+            Statement::Call(c) => self.execute_call(&c),
         }
+    }
+
+    // ── CALL procedure dispatch ──────────────────────────────────────────────
+
+    /// Dispatch a `CALL` statement to the appropriate built-in procedure.
+    ///
+    /// Currently implemented procedures:
+    /// - `db.index.fulltext.queryNodes(indexName, query)` — full-text search
+    fn execute_call(&self, c: &CallStatement) -> Result<QueryResult> {
+        match c.procedure.as_str() {
+            "db.index.fulltext.queryNodes" => self.call_fulltext_query_nodes(c),
+            other => Err(sparrowdb_common::Error::InvalidArgument(format!(
+                "unknown procedure: {other}"
+            ))),
+        }
+    }
+
+    /// Implementation of `CALL db.index.fulltext.queryNodes(indexName, query)`.
+    ///
+    /// Args:
+    ///   0 — index name (string literal or param)
+    ///   1 — query string (string literal or param)
+    ///
+    /// Returns one row per matching node with columns declared in YIELD
+    /// (typically `node`).  Each `node` value is a `NodeRef`.
+    fn call_fulltext_query_nodes(&self, c: &CallStatement) -> Result<QueryResult> {
+        // Validate argument count — must be exactly 2.
+        if c.args.len() != 2 {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "db.index.fulltext.queryNodes requires exactly 2 arguments: (indexName, query)"
+                    .into(),
+            ));
+        }
+
+        // Evaluate arg 0 → index name.
+        let index_name = eval_expr_to_string(&c.args[0])?;
+        // Evaluate arg 1 → query string.
+        let query = eval_expr_to_string(&c.args[1])?;
+
+        // Open the fulltext index (read-only; no flush on this path).
+        // `FulltextIndex::open` validates the name for path traversal.
+        let index = FulltextIndex::open(&self.db_root, &index_name)?;
+        let node_ids = index.search(&query);
+
+        // Determine which column names to project.
+        // Default to ["node"] when no YIELD clause was specified.
+        let yield_cols: Vec<String> = if c.yield_columns.is_empty() {
+            vec!["node".to_owned()]
+        } else {
+            c.yield_columns.clone()
+        };
+
+        // Validate YIELD columns — only "node" is defined for this procedure.
+        if let Some(bad_col) = yield_cols.iter().find(|c| c.as_str() != "node") {
+            return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                "unsupported YIELD column for db.index.fulltext.queryNodes: {bad_col}"
+            )));
+        }
+
+        // Build result rows: one per matching node.
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for raw_id in node_ids {
+            let node_id = sparrowdb_common::NodeId(raw_id);
+            let row: Vec<Value> = yield_cols.iter().map(|_| Value::NodeRef(node_id)).collect();
+            rows.push(row);
+        }
+
+        // If a RETURN clause follows, project its items over the YIELD rows.
+        let (columns, rows) = if let Some(ref ret) = c.return_clause {
+            self.project_call_return(ret, &yield_cols, rows)?
+        } else {
+            (yield_cols, rows)
+        };
+
+        Ok(QueryResult { columns, rows })
+    }
+
+    /// Project a RETURN clause over rows produced by a CALL statement.
+    ///
+    /// The YIELD columns from the CALL become the row environment.  Each
+    /// return item is evaluated against those columns:
+    ///   - `Var(name)` — returns the raw yield-column value
+    ///   - `PropAccess { var, prop }` — reads a property from the NodeRef
+    ///
+    /// This covers the primary KMS pattern:
+    /// `CALL … YIELD node RETURN node.content, node.title`
+    fn project_call_return(
+        &self,
+        ret: &sparrowdb_cypher::ast::ReturnClause,
+        yield_cols: &[String],
+        rows: Vec<Vec<Value>>,
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        // Column names from return items.
+        let out_cols: Vec<String> = ret
+            .items
+            .iter()
+            .map(|item| {
+                item.alias
+                    .clone()
+                    .unwrap_or_else(|| expr_to_col_name(&item.expr))
+            })
+            .collect();
+
+        let mut out_rows = Vec::new();
+        for row in rows {
+            // Build a name → Value map for this row.
+            let env: HashMap<String, Value> = yield_cols
+                .iter()
+                .zip(row.iter())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            let projected: Vec<Value> = ret
+                .items
+                .iter()
+                .map(|item| eval_call_expr(&item.expr, &env, &self.store))
+                .collect();
+            out_rows.push(projected);
+        }
+        Ok((out_cols, out_rows))
     }
 
     /// Returns `true` if `stmt` is a mutation (MERGE, MATCH+SET, MATCH+DELETE,
@@ -364,7 +486,6 @@ impl Engine {
         Ok(QueryResult::empty(vec![]))
     }
 
-
     // ── UNION ─────────────────────────────────────────────────────────────────
 
     /// Execute `stmt1 UNION [ALL] stmt2`.
@@ -457,7 +578,10 @@ impl Engine {
             rows.truncate(lim as usize);
         }
 
-        Ok(QueryResult { columns: column_names, rows })
+        Ok(QueryResult {
+            columns: column_names,
+            rows,
+        })
     }
 
     /// Scan a MATCH pattern and return one `HashMap<String, Value>` per matching row.
@@ -488,7 +612,7 @@ impl Engine {
 
             // Collect col_ids needed by WHERE + WITH projections + inline prop filters.
             let mut all_col_ids: Vec<u32> = Vec::new();
-            if let Some(ref wexpr) = where_clause {
+            if let Some(wexpr) = &where_clause {
                 collect_col_ids_from_expr(wexpr, &mut all_col_ids);
             }
             for item in &with_clause.items {
@@ -513,7 +637,7 @@ impl Engine {
                     continue;
                 }
                 let row_vals = build_row_vals(&props, var_name, &all_col_ids);
-                if let Some(ref wexpr) = where_clause {
+                if let Some(wexpr) = &where_clause {
                     if !eval_where(wexpr, &row_vals) {
                         continue;
                     }
@@ -646,7 +770,10 @@ impl Engine {
         // Check that the leading MATCH label exists.
         if mom.match_patterns.is_empty() || mom.match_patterns[0].nodes.is_empty() {
             let null_row = vec![Value::Null; column_names.len()];
-            return Ok(QueryResult { columns: column_names, rows: vec![null_row] });
+            return Ok(QueryResult {
+                columns: column_names,
+                rows: vec![null_row],
+            });
         }
         let lead_node_pat = &mom.match_patterns[0].nodes[0];
         let lead_label = lead_node_pat.labels.first().cloned().unwrap_or_default();
@@ -654,7 +781,10 @@ impl Engine {
             Some(id) => id as u32,
             None => {
                 let null_row = vec![Value::Null; column_names.len()];
-                return Ok(QueryResult { columns: column_names, rows: vec![null_row] });
+                return Ok(QueryResult {
+                    columns: column_names,
+                    rows: vec![null_row],
+                });
             }
         };
 
@@ -800,11 +930,15 @@ impl Engine {
             result_rows.truncate(lim as usize);
         }
 
-        Ok(QueryResult { columns: column_names, rows: result_rows })
+        Ok(QueryResult {
+            columns: column_names,
+            rows: result_rows,
+        })
     }
 
     /// Scan neighbors of `src_slot` via delta log + CSR for the optional 1-hop,
     /// returning one `HashMap<String,Value>` per matching destination node.
+    #[allow(clippy::too_many_arguments)]
     fn optional_one_hop_sub_rows(
         &self,
         src_slot: u64,
@@ -931,7 +1065,15 @@ impl Engine {
                 continue;
             }
 
-            let props = self.store.get_node_raw(node_id, &all_col_ids)?;
+            // Use nullable reads so that absent columns (property never written
+            // for this node) are omitted from the row map rather than surfacing
+            // as Err(NotFound).  Absent columns will evaluate to Value::Null in
+            // eval_expr, enabling correct IS NULL / IS NOT NULL semantics.
+            let nullable_props = self.store.get_node_raw_nullable(node_id, &all_col_ids)?;
+            let props: Vec<(u32, u64)> = nullable_props
+                .iter()
+                .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
+                .collect();
 
             // Apply inline prop filter from the pattern.
             if !self.matches_prop_filter(&props, &node.props) {
@@ -1129,10 +1271,8 @@ impl Engine {
                 }
 
                 if use_agg {
-                    let mut row_vals =
-                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
-                    row_vals
-                        .extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
+                    let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
+                    row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
                     // Inject relationship and label metadata for aggregate path.
                     if !rel_pat.var.is_empty() {
                         row_vals.insert(
@@ -1368,11 +1508,7 @@ impl Engine {
 
     /// Collect all neighbor slot-ids reachable from `src_slot` via the delta
     /// log and CSR adjacency.  src_label_id is used to filter delta records.
-    fn get_node_neighbors_by_slot(
-        &self,
-        src_slot: u64,
-        src_label_id: u32,
-    ) -> Vec<u64> {
+    fn get_node_neighbors_by_slot(&self, src_slot: u64, src_label_id: u32) -> Vec<u64> {
         let csr_neighbors: Vec<u64> = self.csr.neighbors(src_slot).to_vec();
         let delta_neighbors: Vec<u64> = {
             let edge_store = sparrowdb_storage::edge_store::EdgeStore::open(
@@ -1478,7 +1614,8 @@ impl Engine {
         let col_ids_dst = collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
 
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        let mut seen_pairs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+        let mut seen_pairs: std::collections::HashSet<(u64, u64)> =
+            std::collections::HashSet::new();
 
         for src_slot in 0..hwm_src {
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
@@ -1525,8 +1662,7 @@ impl Engine {
 
                 // Apply WHERE clause.
                 if let Some(ref where_expr) = m.where_clause {
-                    let mut row_vals =
-                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
+                    let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
                     row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
                     // Inject relationship metadata so type(r) works in WHERE.
                     if !rel_pat.var.is_empty() {
@@ -1595,14 +1731,19 @@ impl Engine {
             rows.truncate(lim as usize);
         }
 
-        tracing::debug!(rows = rows.len(), min_hops, max_hops, "variable-length traversal complete");
+        tracing::debug!(
+            rows = rows.len(),
+            min_hops,
+            max_hops,
+            "variable-length traversal complete"
+        );
         Ok(QueryResult {
             columns: column_names.to_vec(),
             rows,
         })
     }
 
-        // ── Property filter helpers ───────────────────────────────────────────────
+    // ── Property filter helpers ───────────────────────────────────────────────
 
     fn matches_prop_filter(
         &self,
@@ -1808,7 +1949,11 @@ fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
                 collect_col_ids_from_expr(arg, out);
             }
         }
-        Expr::ListPredicate { list_expr, predicate, .. } => {
+        Expr::ListPredicate {
+            list_expr,
+            predicate,
+            ..
+        } => {
             collect_col_ids_from_expr(list_expr, out);
             collect_col_ids_from_expr(predicate, out);
         }
@@ -1818,6 +1963,9 @@ fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
                 collect_col_ids_from_expr(item, out);
             }
         }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_col_ids_from_expr(inner, out);
+        }
         _ => {}
     }
 }
@@ -1826,6 +1974,7 @@ fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
 ///
 /// Integers are stored as `Int64`; strings are stored as `Bytes` (up to 8 bytes
 /// inline, matching the storage layer's encoding in `Value::to_u64`).
+#[allow(dead_code)]
 fn literal_to_store_value(lit: &Literal) -> StoreValue {
     match lit {
         Literal::Int(n) => StoreValue::Int64(*n),
@@ -2016,10 +2165,20 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
         Expr::Not(inner) => !eval_where(inner, vals),
         Expr::Literal(Literal::Bool(b)) => *b,
         Expr::Literal(_) => false,
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let lv = eval_expr(expr, vals);
-            let matched = list.iter().any(|item| values_equal(&lv, &eval_expr(item, vals)));
-            if *negated { !matched } else { matched }
+            let matched = list
+                .iter()
+                .any(|item| values_equal(&lv, &eval_expr(item, vals)));
+            if *negated {
+                !matched
+            } else {
+                matched
+            }
         }
         Expr::ListPredicate { .. } => {
             // Delegate to eval_expr which handles ListPredicate and returns Value::Bool.
@@ -2028,6 +2187,8 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
                 _ => false,
             }
         }
+        Expr::IsNull(inner) => matches!(eval_expr(inner, vals), Value::Null),
+        Expr::IsNotNull(inner) => !matches!(eval_expr(inner, vals), Value::Null),
         _ => false, // unsupported expression — reject row rather than silently pass
     }
 }
@@ -2138,16 +2299,27 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(a || b),
             _ => Value::Null,
         },
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let lv = eval_expr(expr, vals);
-            let matched = list.iter().any(|item| values_equal(&lv, &eval_expr(item, vals)));
+            let matched = list
+                .iter()
+                .any(|item| values_equal(&lv, &eval_expr(item, vals)));
             Value::Bool(if *negated { !matched } else { matched })
         }
         Expr::List(items) => {
             let evaluated: Vec<Value> = items.iter().map(|e| eval_expr(e, vals)).collect();
             Value::List(evaluated)
         }
-        Expr::ListPredicate { kind, variable, list_expr, predicate } => {
+        Expr::ListPredicate {
+            kind,
+            variable,
+            list_expr,
+            predicate,
+        } => {
             let list_val = eval_expr(list_expr, vals);
             let items = match list_val {
                 Value::List(v) => v,
@@ -2173,6 +2345,8 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             Value::Bool(result)
         }
         Expr::NotExists(_) | Expr::CountStar => Value::Null,
+        Expr::IsNull(inner) => Value::Bool(matches!(eval_expr(inner, vals), Value::Null)),
+        Expr::IsNotNull(inner) => Value::Bool(!matches!(eval_expr(inner, vals), Value::Null)),
     }
 }
 
@@ -2189,7 +2363,10 @@ fn project_row(
         .iter()
         .map(|col_name| {
             // Handle labels(var) column.
-            if let Some(inner) = col_name.strip_prefix("labels(").and_then(|s| s.strip_suffix(')')) {
+            if let Some(inner) = col_name
+                .strip_prefix("labels(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 if inner == var_name && !node_label.is_empty() {
                     return Value::List(vec![Value::String(node_label.to_string())]);
                 }
@@ -2206,6 +2383,7 @@ fn project_row(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn project_hop_row(
     src_props: &[(u32, u64)],
     dst_props: &[(u32, u64)],
@@ -2223,7 +2401,10 @@ fn project_hop_row(
         .iter()
         .map(|col_name| {
             // Handle metadata function calls: type(r) → "type(r)" column name.
-            if let Some(inner) = col_name.strip_prefix("type(").and_then(|s| s.strip_suffix(')')) {
+            if let Some(inner) = col_name
+                .strip_prefix("type(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 // inner is the variable name, e.g. "r"
                 if let Some((rel_var, rel_type)) = rel_var_type {
                     if inner == rel_var {
@@ -2233,7 +2414,10 @@ fn project_hop_row(
                 return Value::Null;
             }
             // Handle labels(n) → "labels(n)" column name.
-            if let Some(inner) = col_name.strip_prefix("labels(").and_then(|s| s.strip_suffix(')')) {
+            if let Some(inner) = col_name
+                .strip_prefix("labels(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 if let Some((meta_var, label)) = src_label_meta {
                     if inner == meta_var {
                         return Value::List(vec![Value::String(label.to_string())]);
@@ -2383,10 +2567,19 @@ fn extract_collect_arg(expr: &Expr, row_vals: &HashMap<String, Value>) -> Value 
 /// For a bare `collect(...)`, returns the list itself.
 /// For `ANY/ALL/NONE/SINGLE(x IN collect(...) WHERE pred)`, substitutes the
 /// accumulated list and evaluates the predicate.
-fn evaluate_aggregate_expr(expr: &Expr, accumulated_list: &Value, outer_vals: &HashMap<String, Value>) -> Value {
+fn evaluate_aggregate_expr(
+    expr: &Expr,
+    accumulated_list: &Value,
+    outer_vals: &HashMap<String, Value>,
+) -> Value {
     match expr {
         Expr::FnCall { name, .. } if name.to_lowercase() == "collect" => accumulated_list.clone(),
-        Expr::ListPredicate { kind, variable, predicate, .. } => {
+        Expr::ListPredicate {
+            kind,
+            variable,
+            predicate,
+            ..
+        } => {
             let items = match accumulated_list {
                 Value::List(v) => v,
                 _ => return Value::Null,
@@ -2454,12 +2647,12 @@ fn agg_kind(expr: &Expr) -> AggKind {
 ///
 /// Non-aggregate RETURN items become the group key.  Returns one output
 /// `Vec<Value>` per unique key in the same column order as `return_items`.
-fn aggregate_rows(
-    rows: &[HashMap<String, Value>],
-    return_items: &[ReturnItem],
-) -> Vec<Vec<Value>> {
+fn aggregate_rows(rows: &[HashMap<String, Value>], return_items: &[ReturnItem]) -> Vec<Vec<Value>> {
     // Classify each return item.
-    let kinds: Vec<AggKind> = return_items.iter().map(|item| agg_kind(&item.expr)).collect();
+    let kinds: Vec<AggKind> = return_items
+        .iter()
+        .map(|item| agg_kind(&item.expr))
+        .collect();
 
     let key_indices: Vec<usize> = kinds
         .iter()
@@ -2573,7 +2766,10 @@ fn aggregate_rows(
             .iter()
             .enumerate()
             .map(|(pos, &i)| {
-                let name = return_items[i].alias.clone().unwrap_or_else(|| format!("_k{i}"));
+                let name = return_items[i]
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| format!("_k{i}"));
                 (name, key_vals[pos].clone())
             })
             .collect();
@@ -2651,9 +2847,7 @@ fn finalize_aggregate(kind: &AggKind, vals: &[Value]) -> Value {
             .fold(None::<Value>, |acc, v| match (acc, v) {
                 (None, v) => Some(v.clone()),
                 (Some(Value::Int64(a)), Value::Int64(b)) => Some(Value::Int64(a.min(*b))),
-                (Some(Value::Float64(a)), Value::Float64(b)) => {
-                    Some(Value::Float64(a.min(*b)))
-                }
+                (Some(Value::Float64(a)), Value::Float64(b)) => Some(Value::Float64(a.min(*b))),
                 (Some(Value::String(a)), Value::String(b)) => {
                     Some(Value::String(if a <= *b { a } else { b.clone() }))
                 }
@@ -2665,9 +2859,7 @@ fn finalize_aggregate(kind: &AggKind, vals: &[Value]) -> Value {
             .fold(None::<Value>, |acc, v| match (acc, v) {
                 (None, v) => Some(v.clone()),
                 (Some(Value::Int64(a)), Value::Int64(b)) => Some(Value::Int64(a.max(*b))),
-                (Some(Value::Float64(a)), Value::Float64(b)) => {
-                    Some(Value::Float64(a.max(*b)))
-                }
+                (Some(Value::Float64(a)), Value::Float64(b)) => Some(Value::Float64(a.max(*b))),
                 (Some(Value::String(a)), Value::String(b)) => {
                     Some(Value::String(if a >= *b { a } else { b.clone() }))
                 }
@@ -2676,5 +2868,65 @@ fn finalize_aggregate(kind: &AggKind, vals: &[Value]) -> Value {
             .unwrap_or(Value::Null),
         AggKind::Collect => Value::List(vals.to_vec()),
         AggKind::Key => Value::Null,
+    }
+}
+
+// ── CALL helpers ─────────────────────────────────────────────────────────────
+
+/// Evaluate an expression to a string value for use as a procedure argument.
+///
+/// Supports `Literal::String(s)` only for v1.  Parameter binding would require
+/// a runtime `params` map that is not yet threaded through the CALL path.
+fn eval_expr_to_string(expr: &Expr) -> Result<String> {
+    match expr {
+        Expr::Literal(Literal::String(s)) => Ok(s.clone()),
+        Expr::Literal(Literal::Param(p)) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "parameter ${p} requires runtime binding; pass a literal string instead"
+        ))),
+        other => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "procedure argument must be a string literal, got: {other:?}"
+        ))),
+    }
+}
+
+/// Derive a display column name from a return expression (used when no AS alias
+/// is provided).
+fn expr_to_col_name(expr: &Expr) -> String {
+    match expr {
+        Expr::PropAccess { var, prop } => format!("{var}.{prop}"),
+        Expr::Var(v) => v.clone(),
+        _ => "value".to_owned(),
+    }
+}
+
+/// Evaluate a RETURN expression against a CALL row environment.
+///
+/// The environment maps YIELD column names → values (e.g. `"node"` →
+/// `Value::NodeRef`).  For `PropAccess` on a NodeRef the property is looked up
+/// from the node store.
+fn eval_call_expr(expr: &Expr, env: &HashMap<String, Value>, store: &NodeStore) -> Value {
+    match expr {
+        Expr::Var(v) => env.get(v.as_str()).cloned().unwrap_or(Value::Null),
+        Expr::PropAccess { var, prop } => match env.get(var.as_str()) {
+            Some(Value::NodeRef(node_id)) => {
+                let col_id = prop_name_to_col_id(prop);
+                store
+                    .get_node_raw(*node_id, &[col_id])
+                    .ok()
+                    .and_then(|pairs| pairs.into_iter().find(|(c, _)| *c == col_id))
+                    .map(|(_, raw)| decode_raw_val(raw))
+                    .unwrap_or(Value::Null)
+            }
+            Some(other) => other.clone(),
+            None => Value::Null,
+        },
+        Expr::Literal(lit) => match lit {
+            Literal::Int(n) => Value::Int64(*n),
+            Literal::Float(f) => Value::Float64(*f),
+            Literal::Bool(b) => Value::Bool(*b),
+            Literal::String(s) => Value::String(s.clone()),
+            _ => Value::Null,
+        },
+        _ => Value::Null,
     }
 }

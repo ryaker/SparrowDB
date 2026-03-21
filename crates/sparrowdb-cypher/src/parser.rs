@@ -6,10 +6,11 @@
 use sparrowdb_common::{Error, Result};
 
 use crate::ast::{
-    BinOpKind, CreateStatement, EdgeDir, ExistsPattern, Expr, ListPredicateKind, Literal,
-    MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement,
-    MergeStatement, Mutation, NodePattern, OptionalMatchStatement, PathPattern, PropEntry,
-    RelPattern, ReturnClause, ReturnItem, SortDir, Statement, UnionStatement, UnwindStatement,
+    BinOpKind, CallStatement, CreateStatement, EdgeDir, ExistsPattern, Expr, ListPredicateKind,
+    Literal, MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement,
+    MatchStatement, MergeStatement, Mutation, NodePattern, OptionalMatchStatement, PathPattern,
+    PropEntry, RelPattern, ReturnClause, ReturnItem, SortDir, Statement, UnionStatement,
+    UnwindStatement,
 };
 use crate::lexer::{tokenize, Token};
 
@@ -136,6 +137,8 @@ impl Parser {
             Token::Unwind => self.parse_unwind(),
             // Standalone RETURN (no MATCH): `RETURN expr [AS alias], ...`
             Token::Return => self.parse_standalone_return(),
+            // CALL procedure(args) YIELD col [RETURN ...]
+            Token::Call => self.parse_call(),
             other => Err(Error::InvalidArgument(format!(
                 "unexpected token at statement start: {:?}",
                 other
@@ -510,7 +513,10 @@ impl Parser {
             None
         };
 
-        let with_clause = WithClause { items, where_clause: with_where };
+        let with_clause = WithClause {
+            items,
+            where_clause: with_where,
+        };
 
         // RETURN clause.
         self.expect_tok(&Token::Return)?;
@@ -521,7 +527,9 @@ impl Parser {
             false
         };
         let return_items = self.parse_return_items()?;
-        let return_clause = crate::ast::ReturnClause { items: return_items };
+        let return_clause = crate::ast::ReturnClause {
+            items: return_items,
+        };
 
         // ORDER BY
         let order_by = if matches!(self.peek(), Token::Order) {
@@ -868,7 +876,7 @@ impl Parser {
                     if let Token::Integer(m) = self.peek().clone() {
                         let second = m as u32;
                         self.advance(); // consume second integer
-                        // [:R*M..N]
+                                        // [:R*M..N]
                         (Some(first), Some(second))
                     } else {
                         // [:R*M..] -> min=M, max=unbounded
@@ -1028,6 +1036,41 @@ impl Parser {
 
     fn parse_comparison(&mut self) -> Result<Expr> {
         let left = self.parse_atom()?;
+
+        // Handle `expr IS NULL` / `expr IS NOT NULL`
+        if matches!(self.peek(), Token::Is) {
+            self.advance(); // consume IS
+            if matches!(self.peek(), Token::Not) {
+                self.advance(); // consume NOT
+                                // Expect NULL
+                match self.peek().clone() {
+                    Token::Null => {
+                        self.advance();
+                        return Ok(Expr::IsNotNull(Box::new(left)));
+                    }
+                    other => {
+                        return Err(Error::InvalidArgument(format!(
+                            "expected NULL after IS NOT, got {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else {
+                // Expect NULL
+                match self.peek().clone() {
+                    Token::Null => {
+                        self.advance();
+                        return Ok(Expr::IsNull(Box::new(left)));
+                    }
+                    other => {
+                        return Err(Error::InvalidArgument(format!(
+                            "expected NULL after IS, got {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        }
 
         // Handle `expr IN [...]`
         if matches!(self.peek(), Token::In) {
@@ -1308,6 +1351,83 @@ impl Parser {
             }
         }
         Ok(items)
+    }
+
+    // ── CALL procedure(args) YIELD col [RETURN ...] ───────────────────────────
+
+    /// Parse `CALL proc.name(args) YIELD col1, col2 [RETURN ...]`.
+    ///
+    /// The procedure name is a dotted identifier sequence, e.g.
+    /// `db.index.fulltext.queryNodes`.  Arguments are a comma-separated list
+    /// of expressions (string literals, parameters, etc.).  The `YIELD` clause
+    /// names the columns the procedure produces; an optional `RETURN` clause
+    /// projects them further.
+    fn parse_call(&mut self) -> Result<Statement> {
+        self.expect_tok(&Token::Call)?;
+
+        // Parse dotted procedure name: ident (. ident)*
+        let mut proc_name = self.expect_ident()?;
+        while matches!(self.peek(), Token::Dot) {
+            self.advance(); // consume '.'
+            let part = self.expect_ident()?;
+            proc_name.push('.');
+            proc_name.push_str(&part);
+        }
+
+        // Parse argument list: ( expr, expr, ... )
+        self.expect_tok(&Token::LParen)?;
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Token::RParen) {
+            loop {
+                args.push(self.parse_atom()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect_tok(&Token::RParen)?;
+
+        // Parse YIELD col1, col2, ...
+        let yield_columns = if matches!(self.peek(), Token::Yield) {
+            self.advance(); // consume YIELD
+            let mut cols = Vec::new();
+            loop {
+                cols.push(self.expect_ident()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            cols
+        } else {
+            vec![]
+        };
+
+        // Optional trailing RETURN clause.
+        let return_clause = if matches!(self.peek(), Token::Return) {
+            self.advance(); // consume RETURN
+            let distinct = if matches!(self.peek(), Token::Distinct) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            let _ = distinct; // not threaded through CallStatement yet — ignored
+            let items = self.parse_return_items()?;
+            Some(ReturnClause { items })
+        } else {
+            None
+        };
+
+        Ok(Statement::Call(CallStatement {
+            procedure: proc_name,
+            args,
+            yield_columns,
+            return_clause,
+        }))
     }
 }
 
