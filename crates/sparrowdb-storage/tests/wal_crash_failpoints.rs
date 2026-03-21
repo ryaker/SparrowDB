@@ -439,7 +439,15 @@ fn test_wal_segment_golden_fixture() {
     assert_eq!(records[1].kind, WalRecordKind::Write);
     assert_eq!(records[1].lsn, Lsn(2));
     assert_eq!(records[1].txn_id, TxnId(1));
-    match &records[1].payload {
+    // decode() returns Raw for Write records; use decode_plaintext to get structure.
+    let write_payload = match &records[1].payload {
+        WalPayload::Raw(bytes) => {
+            WalPayload::decode_plaintext(records[1].kind, bytes)
+                .expect("decode_plaintext must succeed for unencrypted fixture")
+        }
+        other => other.clone(),
+    };
+    match &write_payload {
         WalPayload::Write { page_id, image } => {
             assert_eq!(*page_id, 0, "golden fixture write must target page 0");
             assert!(

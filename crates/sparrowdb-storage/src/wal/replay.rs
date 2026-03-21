@@ -162,12 +162,16 @@ impl WalReplayer {
                 let _ = lsn_limit;
             }
             if rec.kind == WalRecordKind::Write && committed.contains(&rec.txn_id.0) {
-                // Resolve the payload — decrypt if it came from an encrypted WAL.
+                // Resolve the payload — Raw bytes always need decode_plaintext;
+                // if encryption is active, decrypt first (AAD = lsn).
                 let resolved = match &rec.payload {
-                    WalPayload::Raw(encrypted_bytes) => {
-                        // Decrypt using the record's own LSN as AAD.
-                        let plaintext = enc.decrypt_wal_payload(*lsn, encrypted_bytes)?;
-                        WalPayload::decode_raw(rec.kind, &plaintext)?
+                    WalPayload::Raw(raw_bytes) => {
+                        let plaintext = if enc.is_encrypted() {
+                            enc.decrypt_wal_payload(*lsn, raw_bytes)?
+                        } else {
+                            raw_bytes.clone()
+                        };
+                        WalPayload::decode_plaintext(rec.kind, &plaintext)?
                     }
                     other => other.clone(),
                 };
