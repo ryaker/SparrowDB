@@ -60,7 +60,12 @@ fn cmd_query(db_path: &std::path::Path, cypher: &str) -> Result<(), Box<dyn std:
             let json = serde_json::json!({ "rows": format!("{result:?}") });
             println!("{}", serde_json::to_string_pretty(&json)?);
         }
-        Err(e) if e.to_string().contains("not yet implemented") => {
+        // Execution engine not yet implemented, or empty/newly-created database
+        // with no stored data — both are expected states, not errors for the caller.
+        Err(e)
+            if matches!(e.to_string().as_str(), "not yet implemented" | "not found")
+                || e.to_string().contains("not yet implemented") =>
+        {
             println!("NotImplemented: Cypher query execution not yet available");
         }
         Err(e) => return Err(e.into()),
