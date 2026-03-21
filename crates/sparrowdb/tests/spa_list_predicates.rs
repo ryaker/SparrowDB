@@ -28,17 +28,23 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 fn any_matches() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Tag {name: 'graph'})").expect("CREATE graph");
-    db.execute("CREATE (n:Tag {name: 'database'})").expect("CREATE database");
-    db.execute("CREATE (n:Tag {name: 'rust'})").expect("CREATE rust");
+    db.execute("CREATE (n:Tag {name: 'graph'})")
+        .expect("CREATE graph");
+    db.execute("CREATE (n:Tag {name: 'database'})")
+        .expect("CREATE database");
+    db.execute("CREATE (n:Tag {name: 'rust'})")
+        .expect("CREATE rust");
 
     let result = db
-        .execute(
-            "MATCH (t:Tag) RETURN ANY(x IN collect(t.name) WHERE x = 'graph') AS has_graph",
-        )
+        .execute("MATCH (t:Tag) RETURN ANY(x IN collect(t.name) WHERE x = 'graph') AS has_graph")
         .expect("ANY predicate must succeed");
 
-    assert_eq!(result.rows.len(), 1, "expected 1 row; got: {:?}", result.rows);
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected 1 row; got: {:?}",
+        result.rows
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Bool(true),
@@ -58,7 +64,12 @@ fn any_inline_list() {
         .execute("RETURN ANY(x IN ['a', 'b', 'c'] WHERE x = 'b') AS found")
         .expect("ANY with inline list must succeed");
 
-    assert_eq!(result.rows.len(), 1, "expected 1 row; got: {:?}", result.rows);
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected 1 row; got: {:?}",
+        result.rows
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Bool(true),
@@ -78,7 +89,12 @@ fn all_inline_list() {
         .execute("RETURN ALL(x IN [2, 4, 6] WHERE x > 1) AS all_positive")
         .expect("ALL with inline list must succeed");
 
-    assert_eq!(result.rows.len(), 1, "expected 1 row; got: {:?}", result.rows);
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected 1 row; got: {:?}",
+        result.rows
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Bool(true),
@@ -98,7 +114,12 @@ fn none_inline_list() {
         .execute("RETURN NONE(x IN [1, 2, 3] WHERE x = 99) AS none_99")
         .expect("NONE with inline list must succeed");
 
-    assert_eq!(result.rows.len(), 1, "expected 1 row; got: {:?}", result.rows);
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected 1 row; got: {:?}",
+        result.rows
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Bool(true),
@@ -118,7 +139,12 @@ fn single_inline_list() {
         .execute("RETURN SINGLE(x IN [1, 2, 3] WHERE x = 2) AS exactly_one")
         .expect("SINGLE with inline list must succeed");
 
-    assert_eq!(result.rows.len(), 1, "expected 1 row; got: {:?}", result.rows);
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected 1 row; got: {:?}",
+        result.rows
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Bool(true),
@@ -134,13 +160,13 @@ fn single_inline_list() {
 fn any_no_match() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Tag {name: 'graph'})").expect("CREATE graph");
-    db.execute("CREATE (n:Tag {name: 'database'})").expect("CREATE database");
+    db.execute("CREATE (n:Tag {name: 'graph'})")
+        .expect("CREATE graph");
+    db.execute("CREATE (n:Tag {name: 'database'})")
+        .expect("CREATE database");
 
     let result = db
-        .execute(
-            "MATCH (t:Tag) RETURN ANY(x IN collect(t.name) WHERE x = 'missing') AS found",
-        )
+        .execute("MATCH (t:Tag) RETURN ANY(x IN collect(t.name) WHERE x = 'missing') AS found")
         .expect("ANY predicate (no match) must succeed");
 
     assert_eq!(result.rows.len(), 1, "expected 1 row");
@@ -159,14 +185,15 @@ fn any_no_match() {
 fn all_matches() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Score {value: 90})").expect("CREATE 90");
-    db.execute("CREATE (n:Score {value: 85})").expect("CREATE 85");
-    db.execute("CREATE (n:Score {value: 95})").expect("CREATE 95");
+    db.execute("CREATE (n:Score {value: 90})")
+        .expect("CREATE 90");
+    db.execute("CREATE (n:Score {value: 85})")
+        .expect("CREATE 85");
+    db.execute("CREATE (n:Score {value: 95})")
+        .expect("CREATE 95");
 
     let result = db
-        .execute(
-            "MATCH (s:Score) RETURN ALL(x IN collect(s.value) WHERE x > 80) AS all_above_80",
-        )
+        .execute("MATCH (s:Score) RETURN ALL(x IN collect(s.value) WHERE x > 80) AS all_above_80")
         .expect("ALL predicate must succeed");
 
     assert_eq!(result.rows.len(), 1, "expected 1 row");
@@ -185,14 +212,15 @@ fn all_matches() {
 fn all_fails() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Score {value: 90})").expect("CREATE 90");
-    db.execute("CREATE (n:Score {value: 70})").expect("CREATE 70 (below threshold)");
-    db.execute("CREATE (n:Score {value: 95})").expect("CREATE 95");
+    db.execute("CREATE (n:Score {value: 90})")
+        .expect("CREATE 90");
+    db.execute("CREATE (n:Score {value: 70})")
+        .expect("CREATE 70 (below threshold)");
+    db.execute("CREATE (n:Score {value: 95})")
+        .expect("CREATE 95");
 
     let result = db
-        .execute(
-            "MATCH (s:Score) RETURN ALL(x IN collect(s.value) WHERE x > 80) AS all_above_80",
-        )
+        .execute("MATCH (s:Score) RETURN ALL(x IN collect(s.value) WHERE x > 80) AS all_above_80")
         .expect("ALL predicate (fail case) must succeed");
 
     assert_eq!(result.rows.len(), 1, "expected 1 row");
@@ -211,9 +239,12 @@ fn all_fails() {
 fn none_matches() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Item {name: 'alpha'})").expect("CREATE alpha");
-    db.execute("CREATE (n:Item {name: 'beta'})").expect("CREATE beta");
-    db.execute("CREATE (n:Item {name: 'gamma'})").expect("CREATE gamma");
+    db.execute("CREATE (n:Item {name: 'alpha'})")
+        .expect("CREATE alpha");
+    db.execute("CREATE (n:Item {name: 'beta'})")
+        .expect("CREATE beta");
+    db.execute("CREATE (n:Item {name: 'gamma'})")
+        .expect("CREATE gamma");
 
     let result = db
         .execute(
@@ -237,8 +268,10 @@ fn none_matches() {
 fn none_fails() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Item {name: 'alpha'})").expect("CREATE alpha");
-    db.execute("CREATE (n:Item {name: 'deleted'})").expect("CREATE deleted");
+    db.execute("CREATE (n:Item {name: 'alpha'})")
+        .expect("CREATE alpha");
+    db.execute("CREATE (n:Item {name: 'deleted'})")
+        .expect("CREATE deleted");
 
     let result = db
         .execute(
@@ -265,17 +298,21 @@ fn any_on_empty_list() {
     let (_dir, db) = make_db();
 
     // Create a node so the label exists, but use a prop filter that matches nothing.
-    db.execute("CREATE (n:Empty {val: 999})").expect("CREATE dummy");
+    db.execute("CREATE (n:Empty {val: 999})")
+        .expect("CREATE dummy");
 
     // Prop filter {val: 0} matches nothing → collect() produces [] → ANY = false.
     let result = db
-        .execute(
-            "MATCH (e:Empty {val: 0}) RETURN ANY(x IN collect(e.val) WHERE x = 0) AS found",
-        )
+        .execute("MATCH (e:Empty {val: 0}) RETURN ANY(x IN collect(e.val) WHERE x = 0) AS found")
         .expect("ANY on empty list must succeed");
 
     // With no rows matching the prop filter, aggregate_rows returns one row with empty list.
-    assert_eq!(result.rows.len(), 1, "expected 1 row; got: {:?}", result.rows);
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected 1 row; got: {:?}",
+        result.rows
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Bool(false),
@@ -291,7 +328,8 @@ fn any_on_empty_list() {
 fn all_on_empty_list() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Empty {val: 999})").expect("CREATE dummy");
+    db.execute("CREATE (n:Empty {val: 999})")
+        .expect("CREATE dummy");
 
     let result = db
         .execute(
@@ -299,7 +337,12 @@ fn all_on_empty_list() {
         )
         .expect("ALL on empty list must succeed");
 
-    assert_eq!(result.rows.len(), 1, "expected 1 row; got: {:?}", result.rows);
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected 1 row; got: {:?}",
+        result.rows
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Bool(true),
@@ -315,9 +358,12 @@ fn all_on_empty_list() {
 fn single_matches() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
-    db.execute("CREATE (n:Person {name: 'Charlie'})").expect("CREATE Charlie");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Charlie'})")
+        .expect("CREATE Charlie");
 
     let result = db
         .execute(
@@ -341,9 +387,12 @@ fn single_matches() {
 fn single_fails_multiple() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice 1");
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice 2");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice 1");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice 2");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
 
     let result = db
         .execute(

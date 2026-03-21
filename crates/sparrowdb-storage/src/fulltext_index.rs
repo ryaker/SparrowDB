@@ -149,11 +149,7 @@ impl FulltextIndex {
 /// Rejects empty names and names containing path separators or `..` sequences
 /// to prevent directory traversal attacks.
 fn validate_index_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains("..")
-    {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
         return Err(Error::InvalidArgument(format!(
             "invalid fulltext index name: {name:?} — must not be empty or contain path separators"
         )));

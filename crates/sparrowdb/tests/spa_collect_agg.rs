@@ -27,9 +27,12 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 fn collect_basic() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
-    db.execute("CREATE (n:Person {name: 'Charlie'})").expect("CREATE Charlie");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Charlie'})")
+        .expect("CREATE Charlie");
 
     let result = db
         .execute("MATCH (p:Person) RETURN collect(p.name) AS names")
@@ -79,9 +82,12 @@ fn collect_grouped() {
     let (_dir, db) = make_db();
 
     // Create three Person nodes.
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
-    db.execute("CREATE (n:Person {name: 'Carol'})").expect("CREATE Carol");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Carol'})")
+        .expect("CREATE Carol");
 
     // Alice knows Bob and Carol.
     db.execute(
@@ -109,7 +115,11 @@ fn collect_grouped() {
     assert_eq!(row.len(), 2, "expected 2 columns per row");
 
     // First column: p.name = "Alice"
-    assert_eq!(row[0], Value::String("Alice".to_string()), "group key mismatch");
+    assert_eq!(
+        row[0],
+        Value::String("Alice".to_string()),
+        "group key mismatch"
+    );
 
     // Second column: collect(f.name) = [Bob, Carol]
     match &row[1] {
@@ -155,13 +165,18 @@ fn collect_empty() {
     // from the result via WHERE false - but we don't have that.
     // Instead, test the case where the label exists with zero matching nodes
     // by using an inline prop filter that matches nothing.
-    db.execute("CREATE (n:Person {name: 'ZZZ'})").expect("CREATE Person");
+    db.execute("CREATE (n:Person {name: 'ZZZ'})")
+        .expect("CREATE Person");
     let result = db
         .execute("MATCH (p:Person {name: 'NOBODY'}) RETURN collect(p.name) AS names")
         .expect("collect() over zero-matching-nodes must succeed");
 
     // With no rows matching, aggregate_rows emits one row with an empty list.
-    assert_eq!(result.rows.len(), 1, "must return 1 row even with zero matches");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "must return 1 row even with zero matches"
+    );
     match &result.rows[0][0] {
         Value::List(items) => assert!(
             items.is_empty(),
@@ -179,9 +194,12 @@ fn collect_empty() {
 fn collect_integers() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {age: 30})").expect("CREATE age 30");
-    db.execute("CREATE (n:Person {age: 25})").expect("CREATE age 25");
-    db.execute("CREATE (n:Person {age: 40})").expect("CREATE age 40");
+    db.execute("CREATE (n:Person {age: 30})")
+        .expect("CREATE age 30");
+    db.execute("CREATE (n:Person {age: 25})")
+        .expect("CREATE age 25");
+    db.execute("CREATE (n:Person {age: 40})")
+        .expect("CREATE age 40");
 
     let result = db
         .execute("MATCH (p:Person) RETURN collect(p.age) AS ages")

@@ -33,9 +33,9 @@ use std::collections::HashMap;
 fn fixture_path(name: &str) -> std::path::PathBuf {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest
-        .parent()   // crates/
+        .parent() // crates/
         .unwrap()
-        .parent()   // repo root
+        .parent() // repo root
         .unwrap()
         .join("fixtures")
         .join("real_world")
@@ -49,8 +49,7 @@ fn fixture_path(name: &str) -> std::path::PathBuf {
 /// Lines starting with `//` are skipped.  Trailing `;` is stripped before
 /// calling `db.execute()`.
 fn load_fixture(db: &sparrowdb::GraphDb, fixture_path: &std::path::Path) {
-    let content =
-        std::fs::read_to_string(fixture_path).expect("read fixture file");
+    let content = std::fs::read_to_string(fixture_path).expect("read fixture file");
     for raw_line in content.lines() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with("//") {
@@ -91,8 +90,7 @@ fn xorshift64(state: &mut u64) -> u64 {
 /// Generate `count` unique directed (a, b) pairs from `[0, n)` with a != b.
 fn gen_unique_pairs(n: usize, count: usize, seed: u64) -> Vec<(usize, usize)> {
     let mut state = seed;
-    let mut pairs: std::collections::HashSet<(usize, usize)> =
-        std::collections::HashSet::new();
+    let mut pairs: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
     let mut attempts = 0usize;
     while pairs.len() < count && attempts < count * 20 {
         attempts += 1;
@@ -108,12 +106,7 @@ fn gen_unique_pairs(n: usize, count: usize, seed: u64) -> Vec<(usize, usize)> {
 }
 
 /// Create KNOWS edges (Person → Person) in batches.
-fn create_knows_edges(
-    db: &sparrowdb::GraphDb,
-    person_label: u16,
-    n_persons: usize,
-    count: usize,
-) {
+fn create_knows_edges(db: &sparrowdb::GraphDb, person_label: u16, n_persons: usize, count: usize) {
     let pairs = gen_unique_pairs(n_persons, count, 0xDEAD_BEEF_1111_1111);
     let chunk_size = 200;
     for chunk in pairs.chunks(chunk_size) {
@@ -138,13 +131,7 @@ const N_KNOWS: usize = 3000;
 /// Load the social graph fixture and create KNOWS edge topology.
 ///
 /// Returns `(dir, db, person_label, company_label, post_label)`.
-fn setup_social_graph() -> (
-    tempfile::TempDir,
-    sparrowdb::GraphDb,
-    u16,
-    u16,
-    u16,
-) {
+fn setup_social_graph() -> (tempfile::TempDir, sparrowdb::GraphDb, u16, u16, u16) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = open(dir.path()).expect("open db");
 
@@ -168,12 +155,7 @@ const N_ENTITIES: usize = 80;
 const N_RELATES_TO: usize = 150;
 
 /// Load the knowledge graph fixture and create RELATES_TO edge topology.
-fn setup_knowledge_graph() -> (
-    tempfile::TempDir,
-    sparrowdb::GraphDb,
-    u16,
-    u16,
-) {
+fn setup_knowledge_graph() -> (tempfile::TempDir, sparrowdb::GraphDb, u16, u16) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = open(dir.path()).expect("open db");
 
@@ -253,11 +235,7 @@ fn social_graph_post_count() {
         .execute("MATCH (n:Post) RETURN n.content")
         .expect("MATCH Post");
 
-    assert_eq!(
-        r.rows.len(),
-        N_POSTS,
-        "expected {N_POSTS} Post nodes"
-    );
+    assert_eq!(r.rows.len(), N_POSTS, "expected {N_POSTS} Post nodes");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -304,21 +282,29 @@ fn social_graph_works_at_cross_label_traversal() {
 
     // Create 10 workers via Cypher CREATE.
     for i in 0..10u32 {
-        db.execute(&format!("CREATE (n:Worker {{name: 'Worker{i}', slot: {i}}})"))
-            .expect("CREATE Worker");
+        db.execute(&format!(
+            "CREATE (n:Worker {{name: 'Worker{i}', slot: {i}}})"
+        ))
+        .expect("CREATE Worker");
     }
 
     // Create 3 employers via Cypher CREATE.
     for j in 0..3u32 {
-        db.execute(&format!("CREATE (n:Employer {{name: 'Employer{j}', slot: {j}}})"))
-            .expect("CREATE Employer");
+        db.execute(&format!(
+            "CREATE (n:Employer {{name: 'Employer{j}', slot: {j}}})"
+        ))
+        .expect("CREATE Employer");
     }
 
     // Verify node counts before creating edges.
-    let workers = db.execute("MATCH (n:Worker) RETURN n.name").expect("MATCH Worker");
+    let workers = db
+        .execute("MATCH (n:Worker) RETURN n.name")
+        .expect("MATCH Worker");
     assert_eq!(workers.rows.len(), 10, "10 Worker nodes must be visible");
 
-    let employers = db.execute("MATCH (n:Employer) RETURN n.name").expect("MATCH Employer");
+    let employers = db
+        .execute("MATCH (n:Employer) RETURN n.name")
+        .expect("MATCH Employer");
     assert_eq!(employers.rows.len(), 3, "3 Employer nodes must be visible");
 
     // Create WORKS_AT edges as the FIRST rel type (RelTableId=0).
@@ -388,7 +374,11 @@ fn social_graph_where_filter_integer_founded() {
     let all = db
         .execute("MATCH (n:Company) RETURN n.founded")
         .expect("MATCH Company founded");
-    assert_eq!(all.rows.len(), N_COMPANIES, "all {N_COMPANIES} companies visible");
+    assert_eq!(
+        all.rows.len(),
+        N_COMPANIES,
+        "all {N_COMPANIES} companies visible"
+    );
 
     let filtered = db
         .execute("MATCH (n:Company) WHERE n.founded = 1990 RETURN n.name")
@@ -432,21 +422,26 @@ fn social_graph_merge_idempotency() {
         .expect("count before idempotency check")
         .rows
         .len();
-    assert_eq!(before, 5, "5 Gadget nodes must exist before idempotency check");
+    assert_eq!(
+        before, 5,
+        "5 Gadget nodes must exist before idempotency check"
+    );
 
     // Merge id=3 twice — must not create a duplicate.
     {
         let mut props = HashMap::new();
         props.insert("id".to_string(), Value::Int64(3));
         let mut tx = db.begin_write().expect("begin_write 1");
-        tx.merge_node("Gadget", props).expect("first merge_node id=3");
+        tx.merge_node("Gadget", props)
+            .expect("first merge_node id=3");
         tx.commit().expect("commit 1");
     }
     {
         let mut props = HashMap::new();
         props.insert("id".to_string(), Value::Int64(3));
         let mut tx = db.begin_write().expect("begin_write 2");
-        tx.merge_node("Gadget", props).expect("second merge_node id=3");
+        tx.merge_node("Gadget", props)
+            .expect("second merge_node id=3");
         tx.commit().expect("commit 2");
     }
 
@@ -457,8 +452,7 @@ fn social_graph_merge_idempotency() {
         .len();
 
     assert_eq!(
-        after,
-        before,
+        after, before,
         "double merge_node on existing id=3 must not create a duplicate \
          (before={before} after={after})"
     );
@@ -482,22 +476,31 @@ fn social_graph_delete_then_match_verifies_removal() {
 
     let label_id: u32 = {
         let mut cat = Catalog::open(dir.path()).expect("catalog");
-        cat.create_label("Widget")
-            .expect("create Widget label") as u32
+        cat.create_label("Widget").expect("create Widget label") as u32
     };
 
     // Create two Widget nodes.
     let (keeper, goner);
     {
         let mut tx = db.begin_write().expect("begin_write");
-        keeper = tx.create_node(label_id, &[(0u32, Value::Int64(1))]).expect("Widget keeper");
-        goner  = tx.create_node(label_id, &[(0u32, Value::Int64(99))]).expect("Widget goner");
+        keeper = tx
+            .create_node(label_id, &[(0u32, Value::Int64(1))])
+            .expect("Widget keeper");
+        goner = tx
+            .create_node(label_id, &[(0u32, Value::Int64(99))])
+            .expect("Widget goner");
         tx.commit().expect("commit create");
     }
 
     // Verify both are visible.
-    let before = db.execute("MATCH (n:Widget) RETURN n.col_0").expect("before delete");
-    assert_eq!(before.rows.len(), 2, "both Widgets must be visible before delete");
+    let before = db
+        .execute("MATCH (n:Widget) RETURN n.col_0")
+        .expect("before delete");
+    assert_eq!(
+        before.rows.len(),
+        2,
+        "both Widgets must be visible before delete"
+    );
 
     // Delete one.
     {
@@ -507,7 +510,9 @@ fn social_graph_delete_then_match_verifies_removal() {
     }
 
     // Only the keeper remains.
-    let after = db.execute("MATCH (n:Widget) RETURN n.col_0").expect("after delete");
+    let after = db
+        .execute("MATCH (n:Widget) RETURN n.col_0")
+        .expect("after delete");
     assert_eq!(
         after.rows.len(),
         1,

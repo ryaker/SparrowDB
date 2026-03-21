@@ -11,10 +11,10 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CallStatement, CreateStatement, Expr, ListPredicateKind, Literal, MatchCreateStatement,
-    MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement, MatchWithStatement, Mutation,
-    OptionalMatchStatement, PathPattern, ReturnItem, SortDir, Statement, UnionStatement,
-    UnwindStatement, WithClause,
+    BinOpKind, CallStatement, CreateStatement, Expr, ListPredicateKind, Literal,
+    MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement,
+    MatchWithStatement, Mutation, OptionalMatchStatement, PathPattern, ReturnItem, SortDir,
+    Statement, UnionStatement, UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
@@ -154,10 +154,7 @@ impl Engine {
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for raw_id in node_ids {
             let node_id = sparrowdb_common::NodeId(raw_id);
-            let row: Vec<Value> = yield_cols
-                .iter()
-                .map(|_| Value::NodeRef(node_id))
-                .collect();
+            let row: Vec<Value> = yield_cols.iter().map(|_| Value::NodeRef(node_id)).collect();
             rows.push(row);
         }
 
@@ -489,7 +486,6 @@ impl Engine {
         Ok(QueryResult::empty(vec![]))
     }
 
-
     // ── UNION ─────────────────────────────────────────────────────────────────
 
     /// Execute `stmt1 UNION [ALL] stmt2`.
@@ -582,7 +578,10 @@ impl Engine {
             rows.truncate(lim as usize);
         }
 
-        Ok(QueryResult { columns: column_names, rows })
+        Ok(QueryResult {
+            columns: column_names,
+            rows,
+        })
     }
 
     /// Scan a MATCH pattern and return one `HashMap<String, Value>` per matching row.
@@ -771,7 +770,10 @@ impl Engine {
         // Check that the leading MATCH label exists.
         if mom.match_patterns.is_empty() || mom.match_patterns[0].nodes.is_empty() {
             let null_row = vec![Value::Null; column_names.len()];
-            return Ok(QueryResult { columns: column_names, rows: vec![null_row] });
+            return Ok(QueryResult {
+                columns: column_names,
+                rows: vec![null_row],
+            });
         }
         let lead_node_pat = &mom.match_patterns[0].nodes[0];
         let lead_label = lead_node_pat.labels.first().cloned().unwrap_or_default();
@@ -779,7 +781,10 @@ impl Engine {
             Some(id) => id as u32,
             None => {
                 let null_row = vec![Value::Null; column_names.len()];
-                return Ok(QueryResult { columns: column_names, rows: vec![null_row] });
+                return Ok(QueryResult {
+                    columns: column_names,
+                    rows: vec![null_row],
+                });
             }
         };
 
@@ -925,7 +930,10 @@ impl Engine {
             result_rows.truncate(lim as usize);
         }
 
-        Ok(QueryResult { columns: column_names, rows: result_rows })
+        Ok(QueryResult {
+            columns: column_names,
+            rows: result_rows,
+        })
     }
 
     /// Scan neighbors of `src_slot` via delta log + CSR for the optional 1-hop,
@@ -1254,10 +1262,8 @@ impl Engine {
                 }
 
                 if use_agg {
-                    let mut row_vals =
-                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
-                    row_vals
-                        .extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
+                    let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
+                    row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
                     // Inject relationship and label metadata for aggregate path.
                     if !rel_pat.var.is_empty() {
                         row_vals.insert(
@@ -1493,11 +1499,7 @@ impl Engine {
 
     /// Collect all neighbor slot-ids reachable from `src_slot` via the delta
     /// log and CSR adjacency.  src_label_id is used to filter delta records.
-    fn get_node_neighbors_by_slot(
-        &self,
-        src_slot: u64,
-        src_label_id: u32,
-    ) -> Vec<u64> {
+    fn get_node_neighbors_by_slot(&self, src_slot: u64, src_label_id: u32) -> Vec<u64> {
         let csr_neighbors: Vec<u64> = self.csr.neighbors(src_slot).to_vec();
         let delta_neighbors: Vec<u64> = {
             let edge_store = sparrowdb_storage::edge_store::EdgeStore::open(
@@ -1603,7 +1605,8 @@ impl Engine {
         let col_ids_dst = collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
 
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        let mut seen_pairs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+        let mut seen_pairs: std::collections::HashSet<(u64, u64)> =
+            std::collections::HashSet::new();
 
         for src_slot in 0..hwm_src {
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
@@ -1650,8 +1653,7 @@ impl Engine {
 
                 // Apply WHERE clause.
                 if let Some(ref where_expr) = m.where_clause {
-                    let mut row_vals =
-                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
+                    let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
                     row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
                     // Inject relationship metadata so type(r) works in WHERE.
                     if !rel_pat.var.is_empty() {
@@ -1720,14 +1722,19 @@ impl Engine {
             rows.truncate(lim as usize);
         }
 
-        tracing::debug!(rows = rows.len(), min_hops, max_hops, "variable-length traversal complete");
+        tracing::debug!(
+            rows = rows.len(),
+            min_hops,
+            max_hops,
+            "variable-length traversal complete"
+        );
         Ok(QueryResult {
             columns: column_names.to_vec(),
             rows,
         })
     }
 
-        // ── Property filter helpers ───────────────────────────────────────────────
+    // ── Property filter helpers ───────────────────────────────────────────────
 
     fn matches_prop_filter(
         &self,
@@ -1933,7 +1940,11 @@ fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
                 collect_col_ids_from_expr(arg, out);
             }
         }
-        Expr::ListPredicate { list_expr, predicate, .. } => {
+        Expr::ListPredicate {
+            list_expr,
+            predicate,
+            ..
+        } => {
             collect_col_ids_from_expr(list_expr, out);
             collect_col_ids_from_expr(predicate, out);
         }
@@ -2144,10 +2155,20 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
         Expr::Not(inner) => !eval_where(inner, vals),
         Expr::Literal(Literal::Bool(b)) => *b,
         Expr::Literal(_) => false,
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let lv = eval_expr(expr, vals);
-            let matched = list.iter().any(|item| values_equal(&lv, &eval_expr(item, vals)));
-            if *negated { !matched } else { matched }
+            let matched = list
+                .iter()
+                .any(|item| values_equal(&lv, &eval_expr(item, vals)));
+            if *negated {
+                !matched
+            } else {
+                matched
+            }
         }
         Expr::ListPredicate { .. } => {
             // Delegate to eval_expr which handles ListPredicate and returns Value::Bool.
@@ -2268,16 +2289,27 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(a || b),
             _ => Value::Null,
         },
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let lv = eval_expr(expr, vals);
-            let matched = list.iter().any(|item| values_equal(&lv, &eval_expr(item, vals)));
+            let matched = list
+                .iter()
+                .any(|item| values_equal(&lv, &eval_expr(item, vals)));
             Value::Bool(if *negated { !matched } else { matched })
         }
         Expr::List(items) => {
             let evaluated: Vec<Value> = items.iter().map(|e| eval_expr(e, vals)).collect();
             Value::List(evaluated)
         }
-        Expr::ListPredicate { kind, variable, list_expr, predicate } => {
+        Expr::ListPredicate {
+            kind,
+            variable,
+            list_expr,
+            predicate,
+        } => {
             let list_val = eval_expr(list_expr, vals);
             let items = match list_val {
                 Value::List(v) => v,
@@ -2321,7 +2353,10 @@ fn project_row(
         .iter()
         .map(|col_name| {
             // Handle labels(var) column.
-            if let Some(inner) = col_name.strip_prefix("labels(").and_then(|s| s.strip_suffix(')')) {
+            if let Some(inner) = col_name
+                .strip_prefix("labels(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 if inner == var_name && !node_label.is_empty() {
                     return Value::List(vec![Value::String(node_label.to_string())]);
                 }
@@ -2355,7 +2390,10 @@ fn project_hop_row(
         .iter()
         .map(|col_name| {
             // Handle metadata function calls: type(r) → "type(r)" column name.
-            if let Some(inner) = col_name.strip_prefix("type(").and_then(|s| s.strip_suffix(')')) {
+            if let Some(inner) = col_name
+                .strip_prefix("type(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 // inner is the variable name, e.g. "r"
                 if let Some((rel_var, rel_type)) = rel_var_type {
                     if inner == rel_var {
@@ -2365,7 +2403,10 @@ fn project_hop_row(
                 return Value::Null;
             }
             // Handle labels(n) → "labels(n)" column name.
-            if let Some(inner) = col_name.strip_prefix("labels(").and_then(|s| s.strip_suffix(')')) {
+            if let Some(inner) = col_name
+                .strip_prefix("labels(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 if let Some((meta_var, label)) = src_label_meta {
                     if inner == meta_var {
                         return Value::List(vec![Value::String(label.to_string())]);
@@ -2515,10 +2556,19 @@ fn extract_collect_arg(expr: &Expr, row_vals: &HashMap<String, Value>) -> Value 
 /// For a bare `collect(...)`, returns the list itself.
 /// For `ANY/ALL/NONE/SINGLE(x IN collect(...) WHERE pred)`, substitutes the
 /// accumulated list and evaluates the predicate.
-fn evaluate_aggregate_expr(expr: &Expr, accumulated_list: &Value, outer_vals: &HashMap<String, Value>) -> Value {
+fn evaluate_aggregate_expr(
+    expr: &Expr,
+    accumulated_list: &Value,
+    outer_vals: &HashMap<String, Value>,
+) -> Value {
     match expr {
         Expr::FnCall { name, .. } if name.to_lowercase() == "collect" => accumulated_list.clone(),
-        Expr::ListPredicate { kind, variable, predicate, .. } => {
+        Expr::ListPredicate {
+            kind,
+            variable,
+            predicate,
+            ..
+        } => {
             let items = match accumulated_list {
                 Value::List(v) => v,
                 _ => return Value::Null,
@@ -2586,12 +2636,12 @@ fn agg_kind(expr: &Expr) -> AggKind {
 ///
 /// Non-aggregate RETURN items become the group key.  Returns one output
 /// `Vec<Value>` per unique key in the same column order as `return_items`.
-fn aggregate_rows(
-    rows: &[HashMap<String, Value>],
-    return_items: &[ReturnItem],
-) -> Vec<Vec<Value>> {
+fn aggregate_rows(rows: &[HashMap<String, Value>], return_items: &[ReturnItem]) -> Vec<Vec<Value>> {
     // Classify each return item.
-    let kinds: Vec<AggKind> = return_items.iter().map(|item| agg_kind(&item.expr)).collect();
+    let kinds: Vec<AggKind> = return_items
+        .iter()
+        .map(|item| agg_kind(&item.expr))
+        .collect();
 
     let key_indices: Vec<usize> = kinds
         .iter()
@@ -2705,7 +2755,10 @@ fn aggregate_rows(
             .iter()
             .enumerate()
             .map(|(pos, &i)| {
-                let name = return_items[i].alias.clone().unwrap_or_else(|| format!("_k{i}"));
+                let name = return_items[i]
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| format!("_k{i}"));
                 (name, key_vals[pos].clone())
             })
             .collect();
@@ -2783,9 +2836,7 @@ fn finalize_aggregate(kind: &AggKind, vals: &[Value]) -> Value {
             .fold(None::<Value>, |acc, v| match (acc, v) {
                 (None, v) => Some(v.clone()),
                 (Some(Value::Int64(a)), Value::Int64(b)) => Some(Value::Int64(a.min(*b))),
-                (Some(Value::Float64(a)), Value::Float64(b)) => {
-                    Some(Value::Float64(a.min(*b)))
-                }
+                (Some(Value::Float64(a)), Value::Float64(b)) => Some(Value::Float64(a.min(*b))),
                 (Some(Value::String(a)), Value::String(b)) => {
                     Some(Value::String(if a <= *b { a } else { b.clone() }))
                 }
@@ -2797,9 +2848,7 @@ fn finalize_aggregate(kind: &AggKind, vals: &[Value]) -> Value {
             .fold(None::<Value>, |acc, v| match (acc, v) {
                 (None, v) => Some(v.clone()),
                 (Some(Value::Int64(a)), Value::Int64(b)) => Some(Value::Int64(a.max(*b))),
-                (Some(Value::Float64(a)), Value::Float64(b)) => {
-                    Some(Value::Float64(a.max(*b)))
-                }
+                (Some(Value::Float64(a)), Value::Float64(b)) => Some(Value::Float64(a.max(*b))),
                 (Some(Value::String(a)), Value::String(b)) => {
                     Some(Value::String(if a >= *b { a } else { b.clone() }))
                 }
@@ -2820,9 +2869,9 @@ fn finalize_aggregate(kind: &AggKind, vals: &[Value]) -> Value {
 fn eval_expr_to_string(expr: &Expr) -> Result<String> {
     match expr {
         Expr::Literal(Literal::String(s)) => Ok(s.clone()),
-        Expr::Literal(Literal::Param(p)) => Err(sparrowdb_common::Error::InvalidArgument(
-            format!("parameter ${p} requires runtime binding; pass a literal string instead"),
-        )),
+        Expr::Literal(Literal::Param(p)) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "parameter ${p} requires runtime binding; pass a literal string instead"
+        ))),
         other => Err(sparrowdb_common::Error::InvalidArgument(format!(
             "procedure argument must be a string literal, got: {other:?}"
         ))),

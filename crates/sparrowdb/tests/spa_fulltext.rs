@@ -36,7 +36,10 @@ fn create_index_and_search() {
         let text = "machine learning fundamentals";
         // Store the text as a Bytes property (col_0).
         let node_id = tx
-            .create_node(label_id, &[(0, StoreValue::Bytes(text.as_bytes().to_vec()))])
+            .create_node(
+                label_id,
+                &[(0, StoreValue::Bytes(text.as_bytes().to_vec()))],
+            )
             .expect("create_node");
         tx.add_to_fulltext_index("searchIndex", node_id, text)
             .expect("index node A");
@@ -50,7 +53,10 @@ fn create_index_and_search() {
         let label_id = catalog.get_label("Fact").unwrap().unwrap() as u32;
         let text = "deep learning neural networks";
         let node_id = tx
-            .create_node(label_id, &[(0, StoreValue::Bytes(text.as_bytes().to_vec()))])
+            .create_node(
+                label_id,
+                &[(0, StoreValue::Bytes(text.as_bytes().to_vec()))],
+            )
             .expect("create_node");
         tx.add_to_fulltext_index("searchIndex", node_id, text)
             .expect("index node B");
@@ -63,7 +69,11 @@ fn create_index_and_search() {
         .execute("CALL db.index.fulltext.queryNodes('searchIndex', 'learning') YIELD node")
         .expect("CALL must succeed");
 
-    assert_eq!(result.columns, vec!["node"], "yield column should be 'node'");
+    assert_eq!(
+        result.columns,
+        vec!["node"],
+        "yield column should be 'node'"
+    );
     assert_eq!(result.rows.len(), 2, "both nodes should match 'learning'");
 
     // Verify the NodeRef values match the inserted nodes.
@@ -126,12 +136,14 @@ fn search_partial_match() {
     };
 
     let result = db
-        .execute(
-            "CALL db.index.fulltext.queryNodes('kmsIndex', 'economics biology') YIELD node",
-        )
+        .execute("CALL db.index.fulltext.queryNodes('kmsIndex', 'economics biology') YIELD node")
         .expect("CALL");
 
-    assert_eq!(result.rows.len(), 2, "OR semantics: both nodes should match");
+    assert_eq!(
+        result.rows.len(),
+        2,
+        "OR semantics: both nodes should match"
+    );
 
     let ids: Vec<u64> = result
         .rows
@@ -141,7 +153,10 @@ fn search_partial_match() {
             other => panic!("expected NodeRef, got {other:?}"),
         })
         .collect();
-    assert!(ids.contains(&node_a.0), "node A (economics) must be returned");
+    assert!(
+        ids.contains(&node_a.0),
+        "node A (economics) must be returned"
+    );
     assert!(ids.contains(&node_b.0), "node B (biology) must be returned");
 
     // A query with only one matching term should return exactly one node.
@@ -243,9 +258,7 @@ fn call_missing_index_returns_empty() {
 
     // The index was never created — FulltextIndex::open returns an empty index.
     let result = db
-        .execute(
-            "CALL db.index.fulltext.queryNodes('nonExistentIndex', 'hello') YIELD node",
-        )
+        .execute("CALL db.index.fulltext.queryNodes('nonExistentIndex', 'hello') YIELD node")
         .expect("CALL on missing index should succeed with empty results");
 
     assert_eq!(

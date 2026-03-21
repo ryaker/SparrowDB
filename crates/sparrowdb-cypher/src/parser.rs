@@ -7,10 +7,10 @@ use sparrowdb_common::{Error, Result};
 
 use crate::ast::{
     BinOpKind, CallStatement, CreateStatement, EdgeDir, ExistsPattern, Expr, ListPredicateKind,
-    Literal,
-    MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement,
-    MergeStatement, Mutation, NodePattern, OptionalMatchStatement, PathPattern, PropEntry,
-    RelPattern, ReturnClause, ReturnItem, SortDir, Statement, UnionStatement, UnwindStatement,
+    Literal, MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement,
+    MatchStatement, MergeStatement, Mutation, NodePattern, OptionalMatchStatement, PathPattern,
+    PropEntry, RelPattern, ReturnClause, ReturnItem, SortDir, Statement, UnionStatement,
+    UnwindStatement,
 };
 use crate::lexer::{tokenize, Token};
 
@@ -513,7 +513,10 @@ impl Parser {
             None
         };
 
-        let with_clause = WithClause { items, where_clause: with_where };
+        let with_clause = WithClause {
+            items,
+            where_clause: with_where,
+        };
 
         // RETURN clause.
         self.expect_tok(&Token::Return)?;
@@ -524,7 +527,9 @@ impl Parser {
             false
         };
         let return_items = self.parse_return_items()?;
-        let return_clause = crate::ast::ReturnClause { items: return_items };
+        let return_clause = crate::ast::ReturnClause {
+            items: return_items,
+        };
 
         // ORDER BY
         let order_by = if matches!(self.peek(), Token::Order) {
@@ -871,7 +876,7 @@ impl Parser {
                     if let Token::Integer(m) = self.peek().clone() {
                         let second = m as u32;
                         self.advance(); // consume second integer
-                        // [:R*M..N]
+                                        // [:R*M..N]
                         (Some(first), Some(second))
                     } else {
                         // [:R*M..] -> min=M, max=unbounded

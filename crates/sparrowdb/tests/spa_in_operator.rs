@@ -160,9 +160,5 @@ fn in_operator_empty_list() {
         .execute("MATCH (n:Person) WHERE n.name IN [] RETURN n.name")
         .expect("MATCH WHERE IN empty list — must not error");
 
-    assert_eq!(
-        result.rows.len(),
-        0,
-        "empty IN list should match nothing"
-    );
+    assert_eq!(result.rows.len(), 0, "empty IN list should match nothing");
 }
