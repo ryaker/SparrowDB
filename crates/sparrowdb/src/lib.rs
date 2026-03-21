@@ -311,6 +311,7 @@ impl GraphDb {
             match bound.inner {
                 Statement::Merge(ref m) => self.execute_merge(m),
                 Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
+                Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
                 _ => unreachable!(),
             }
         } else {
@@ -392,6 +393,60 @@ impl GraphDb {
             sparrowdb_cypher::ast::Mutation::Delete { .. } => {
                 for node_id in matching_ids {
                     tx.delete_node(node_id)?;
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(QueryResult::empty(vec![]))
+    }
+
+    /// Internal: execute a `MATCH … CREATE (a)-[:R]->(b)` statement.
+    ///
+    /// 1. Acquires the write lock (preventing concurrent writes).
+    /// 2. Opens a read-capable Engine to scan MATCH patterns and resolve
+    ///    variable bindings (`var → Vec<NodeId>`).
+    /// 3. For each `(src, dst)` combination, calls `WriteTx::create_edge`
+    ///    which registers the rel type in the catalog and appends to the WAL.
+    /// 4. Commits the write transaction.
+    ///
+    /// If the MATCH finds no nodes for any variable the CREATE is a no-op
+    /// (no edges created, no error — SPA-168).
+    fn execute_match_create(
+        &self,
+        mc: &sparrowdb_cypher::ast::MatchCreateStatement,
+    ) -> Result<QueryResult> {
+        // Acquire the write lock first so no concurrent writer can commit
+        // between the scan and the edge creation.
+        let mut tx = self.begin_write()?;
+
+        // Build an Engine for the read-scan phase.
+        let csr = open_csr_forward(&self.inner.path);
+        let engine = Engine::new(
+            NodeStore::open(&self.inner.path)?,
+            Catalog::open(&self.inner.path)?,
+            csr,
+            &self.inner.path,
+        );
+
+        // Resolve MATCH variable bindings.
+        let var_candidates = engine.scan_match_create(mc)?;
+
+        // For each edge in the CREATE clause, create it for every matching
+        // (src, dst) pair.
+        for (left_var, rel_pat, right_var) in &mc.create.edges {
+            let src_candidates = match var_candidates.get(left_var) {
+                Some(v) if !v.is_empty() => v.clone(),
+                _ => return Ok(QueryResult::empty(vec![])),
+            };
+            let dst_candidates = match var_candidates.get(right_var) {
+                Some(v) if !v.is_empty() => v.clone(),
+                _ => return Ok(QueryResult::empty(vec![])),
+            };
+
+            for &src in &src_candidates {
+                for &dst in &dst_candidates {
+                    tx.create_edge(src, dst, &rel_pat.rel_type, HashMap::new())?;
                 }
             }
         }

@@ -147,13 +147,23 @@ fn parse_optimize() {
 // ── Must-fail cases ───────────────────────────────────────────────────────────
 
 #[test]
-fn parse_optional_match_rejected() {
-    assert!(parse("OPTIONAL MATCH (n:Person) RETURN n").is_err());
+fn parse_optional_match_ok() {
+    // OPTIONAL MATCH standalone is now supported (SPA-131).
+    let stmt = parse("OPTIONAL MATCH (n:Person) RETURN n").expect("OPTIONAL MATCH must parse");
+    assert!(matches!(stmt, sparrowdb_cypher::ast::Statement::OptionalMatch(_)));
 }
 
 #[test]
-fn parse_union_rejected() {
-    assert!(parse("MATCH (n) RETURN n UNION MATCH (m) RETURN m").is_err());
+fn parse_optional_match_missing_return_fails() {
+    assert!(parse("OPTIONAL MATCH (n:Person)").is_err());
+}
+
+#[test]
+fn parse_union_ok() {
+    // UNION is now supported (SPA-132).
+    let stmt = parse("MATCH (n:Person) RETURN n.name UNION MATCH (m:Person) RETURN m.name")
+        .expect("UNION must parse");
+    assert!(matches!(stmt, sparrowdb_cypher::ast::Statement::Union(_)));
 }
 
 #[test]
