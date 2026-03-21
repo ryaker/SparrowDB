@@ -366,3 +366,101 @@ Milestones:
 - `Phase 4 — Query Engine`
 - `Phase 5 — Transactions + Maintenance`
 - `Phase 6 — Encryption + Python + Release`
+  - `Phase 7 — Mutation Cypher`
+  - `Phase 8 — Pipeline Cypher`
+  - `Phase 9 — Paths + Subqueries`
+  - `Phase 10 — Function Library`
+  - `Phase 11 — LDBC SNB + Publication`
+
+---
+
+## Version Milestones
+
+### v0.1 — KMS Production Drop-in (Phases 0–6)
+The first real deployment: replace Neo4j Aura in `~/Dev/KMSmcp`.
+- All 14 acceptance checks pass
+- `sparrowdb-cli` serves KMS queries via NDJSON subprocess
+- KMS query latency: <2ms local vs 50–200ms Neo4j Aura (cloud)
+- Python bindings ship, encrypted storage works
+- **Proof it works. Neo4j Aura subscription cancelled.**
+
+### v0.5 — Full Read-Write Cypher (Phases 7–9)
+- MERGE, SET, DELETE, DETACH DELETE (Phase 7)
+- WITH, OPTIONAL MATCH, UNION, UNWIND (Phase 8)
+- Variable-length paths [:REL*1..N], EXISTS {}, CASE WHEN (Phase 9)
+- Node.js/TypeScript ecosystem can use SparrowDB for any graph workload
+
+### v1.0 — openCypher Compliance + World Stage (Phases 10–11)
+- Full function library: string, math, list, temporal (Phase 10)
+- LDBC SNB Interactive benchmark at SF-1 and SF-10 (Phase 11)
+- Comparative results vs Kuzu and Neo4j Community published
+- arxiv preprint / blog post with benchmark numbers
+- **The paper. The world stage.**
+
+---
+
+## Post-v0.1 Phase Stubs
+
+### Phase 7 — Mutation Cypher (WSJF priority order)
+| Ticket | Description | WSJF |
+|--------|-------------|------|
+| P7-1 | MERGE (upsert: match or create) | 13.0 |
+| P7-2 | SET property values on matched nodes/edges | 11.0 |
+| P7-3 | REMOVE property / label | 8.0 |
+| P7-4 | DELETE node (no edges) | 10.0 |
+| P7-5 | DETACH DELETE (node + all edges) | 12.0 |
+| P7-6 | WAL records for SET/DELETE operations | 14.0 |
+| P7-7 | Integration: `node_update_survive_restart` | 15.0 |
+
+### Phase 8 — Pipeline Cypher
+| Ticket | Description | WSJF |
+|--------|-------------|------|
+| P8-1 | WITH clause — pipe results between clauses | 12.0 |
+| P8-2 | OPTIONAL MATCH — nullable traversal | 10.0 |
+| P8-3 | UNION / UNION ALL | 8.0 |
+| P8-4 | UNWIND list into rows | 9.0 |
+| P8-5 | Integration: complex multi-clause query | 12.0 |
+
+### Phase 9 — Paths and Subqueries
+| Ticket | Description | WSJF |
+|--------|-------------|------|
+| P9-1 | Variable-length paths [:REL*1..N] — BFS engine | 14.0 |
+| P9-2 | Shortest path (allShortestPaths stub) | 10.0 |
+| P9-3 | EXISTS {} subquery predicate | 9.0 |
+| P9-4 | CASE WHEN THEN ELSE END | 8.0 |
+| P9-5 | Integration: 3-hop traversal + variable path | 14.0 |
+
+### Phase 10 — Function Library
+| Ticket | Description | WSJF |
+|--------|-------------|------|
+| P10-1 | String: toLower, toUpper, trim, split, replace, size | 9.0 |
+| P10-2 | Math: abs, ceil, floor, round, sqrt, log | 7.0 |
+| P10-3 | List: collect, head, tail, range, reverse, size | 10.0 |
+| P10-4 | Type conversion: toInteger, toFloat, toString, coalesce | 8.0 |
+| P10-5 | openCypher compliance test suite (TCK subset) | 13.0 |
+
+### Phase 11 — LDBC SNB Benchmark + Publication
+| Ticket | Description | WSJF |
+|--------|-------------|------|
+| P11-1 | LDBC SNB data loader (CSV → SparrowDB bulk import) | 12.0 |
+| P11-2 | SNB Interactive Read queries 1–7 | 14.0 |
+| P11-3 | SNB Interactive Read queries 8–14 | 14.0 |
+| P11-4 | Benchmark harness: criterion + wall-clock at SF-0.1, SF-1 | 13.0 |
+| P11-5 | Comparison run: SparrowDB vs Kuzu vs Neo4j Community | 15.0 |
+| P11-6 | Blog post / arxiv preprint with results | 20.0 |
+
+---
+
+## Competitor Reference
+
+**Direct competitor: Kuzu** (kuzudb.com)
+- Embedded graph DB, C++, Cypher, factorized execution
+- VLDB 2023 paper, ~2k GitHub stars
+- Not ACID-durable by design (OLAP orientation)
+
+**SparrowDB differentiators for publication:**
+- Rust (memory safety, no GC, deterministic latency)
+- WAL-first ACID (durable by default — unique in embedded category)
+- At-rest encryption (XChaCha20-Poly1305, unique in category)
+- SWMR transactions (concurrent readers + single writer)
+- Same factorized execution technique, but with full durability
