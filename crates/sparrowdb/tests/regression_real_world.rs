@@ -252,7 +252,7 @@ fn social_graph_knows_edges_traversable() {
         .expect("MATCH KNOWS traversal");
 
     assert!(
-        r.rows.len() > 0,
+        !r.rows.is_empty(),
         "KNOWS edge traversal must return at least 1 row on a {N_KNOWS}-edge graph"
     );
 }
@@ -328,7 +328,7 @@ fn social_graph_works_at_cross_label_traversal() {
         .expect("MATCH WORKS_AT traversal");
 
     assert!(
-        r.rows.len() > 0,
+        !r.rows.is_empty(),
         "cross-label WORKS_AT traversal must return at least 1 row (got 0)"
     );
     assert_eq!(
@@ -353,7 +353,7 @@ fn social_graph_where_filter_city() {
         .expect("MATCH WHERE city = Dallas");
 
     assert!(
-        r.rows.len() > 0,
+        !r.rows.is_empty(),
         "WHERE n.city = 'Dallas' must match at least one person"
     );
     assert!(
@@ -619,7 +619,7 @@ fn knowledge_graph_relates_to_traversable() {
         .expect("MATCH RELATES_TO");
 
     assert!(
-        r.rows.len() > 0,
+        !r.rows.is_empty(),
         "RELATES_TO traversal must return at least 1 row on a {N_RELATES_TO}-edge graph"
     );
 }
@@ -645,7 +645,7 @@ fn knowledge_graph_where_filter_source() {
         .expect("MATCH WHERE source = wikipedia:en");
 
     assert!(
-        filtered.rows.len() > 0,
+        !filtered.rows.is_empty(),
         "WHERE source = 'wikipedia:en' must match at least one Fact"
     );
     assert!(

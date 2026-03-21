@@ -180,16 +180,41 @@ impl NodeStore {
     }
 
     /// Append a `u64` value to a column file.
-    fn append_col(&self, label_id: u32, col_id: u32, value: u64) -> Result<()> {
-        use std::io::Write;
+    fn append_col(&self, label_id: u32, col_id: u32, slot: u32, value: u64) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
         let path = self.col_path(label_id, col_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(Error::Io)?;
         }
+        // Open without truncation so we can inspect the current length.
         let mut file = fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
             .open(&path)
+            .map_err(Error::Io)?;
+
+        // Pad with zeros for any slots that were skipped (sparse write pattern).
+        // Without padding, a later slot's value would be written at offset 0,
+        // causing earlier slots to incorrectly read that value.
+        let existing_len = file.seek(SeekFrom::End(0)).map_err(Error::Io)?;
+        let expected_offset = slot as u64 * 8;
+        if existing_len < expected_offset {
+            file.seek(SeekFrom::Start(existing_len))
+                .map_err(Error::Io)?;
+            const CHUNK: usize = 65536;
+            let zeros = [0u8; CHUNK];
+            let mut remaining = (expected_offset - existing_len) as usize;
+            while remaining > 0 {
+                let n = remaining.min(CHUNK);
+                file.write_all(&zeros[..n]).map_err(Error::Io)?;
+                remaining -= n;
+            }
+        }
+
+        // Seek to the correct slot position and write the value.
+        file.seek(SeekFrom::Start(expected_offset))
             .map_err(Error::Io)?;
         file.write_all(&value.to_le_bytes()).map_err(Error::Io)
     }
@@ -257,7 +282,7 @@ impl NodeStore {
         // were already written to avoid slot misalignment.
         let write_result = (|| {
             for &(col_id, ref val) in props {
-                self.append_col(label_id, col_id, val.to_u64())?;
+                self.append_col(label_id, col_id, slot, val.to_u64())?;
             }
             Ok::<(), sparrowdb_common::Error>(())
         })();
@@ -377,6 +402,68 @@ impl NodeStore {
             result.push((col_id, val));
         }
         Ok(result)
+    }
+
+    /// Like [`get_node_raw`] but treats absent columns as `None` rather than
+    /// propagating [`Error::NotFound`].
+    ///
+    /// A column is considered absent when:
+    /// - Its column file does not exist (property never written for the label).
+    /// - Its column file is shorter than `slot + 1` entries (sparse write —
+    ///   an earlier node never wrote this column; a later node that did write it
+    ///   padded the file, but this slot's value was never explicitly stored).
+    ///
+    /// This is the correct read path for IS NULL evaluation: absent properties
+    /// must appear as `Value::Null`, not as an error or as integer 0.
+    pub fn get_node_raw_nullable(
+        &self,
+        node_id: NodeId,
+        col_ids: &[u32],
+    ) -> Result<Vec<(u32, Option<u64>)>> {
+        let label_id = (node_id.0 >> 32) as u32;
+        let slot = (node_id.0 & 0xFFFF_FFFF) as u32;
+
+        let mut result = Vec::with_capacity(col_ids.len());
+        for &col_id in col_ids {
+            let opt_val = self.read_col_slot_nullable(label_id, col_id, slot)?;
+            result.push((col_id, opt_val));
+        }
+        Ok(result)
+    }
+
+    /// Read a single column slot, returning `None` when the column was never
+    /// written for this node (file absent or slot out of bounds / zero-padded).
+    ///
+    /// Unlike [`read_col_slot`], this function distinguishes between:
+    /// - Column file does not exist → `None` (property never set on any node).
+    /// - Slot falls within the file but reads as 0 → the slot was zero-padded
+    ///   by `append_col` for a later node's write; treat as `None`.
+    /// - Slot has a non-zero value → `Some(value)`.
+    /// - Slot is beyond the file end → `None` (property not set on this node).
+    ///
+    /// Value 0 is used as the "absent" sentinel: the storage encoding ensures
+    /// that any legitimately stored property (Int64, Bytes, Bool, Float) encodes
+    /// to a non-zero u64.  Specifically, `StoreValue::Int64(0)` stores as 0 and
+    /// would be misidentified as absent — callers that need to store integer 0
+    /// should be aware of this limitation.
+    fn read_col_slot_nullable(&self, label_id: u32, col_id: u32, slot: u32) -> Result<Option<u64>> {
+        let path = self.col_path(label_id, col_id);
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        let offset = slot as usize * 8;
+        if bytes.len() < offset + 8 {
+            return Ok(None);
+        }
+        let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        // Zero means "never written" (absent). Non-zero means a real value.
+        if raw == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(raw))
+        }
     }
 
     /// Retrieve the typed property values for a node.

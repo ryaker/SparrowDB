@@ -45,6 +45,9 @@ pub enum Token {
     All,
     NoneKw,
     Single,
+    Is,
+    Call,
+    Yield,
 
     // Punctuation
     LParen,    // (
@@ -324,6 +327,9 @@ fn keyword_or_ident(word: String) -> Token {
         "ALL" => Token::All,
         "NONE" => Token::NoneKw,
         "SINGLE" => Token::Single,
+        "IS" => Token::Is,
+        "CALL" => Token::Call,
+        "YIELD" => Token::Yield,
         _ => Token::Ident(word),
     }
 }

@@ -124,6 +124,10 @@ pub enum Expr {
         list_expr: Box<Expr>,
         predicate: Box<Expr>,
     },
+    /// `expr IS NULL`
+    IsNull(Box<Expr>),
+    /// `expr IS NOT NULL`
+    IsNotNull(Box<Expr>),
 }
 
 /// An existence pattern used in `NOT (a)-[:R]->(b)`.
@@ -312,6 +316,24 @@ pub struct UnionStatement {
     pub all: bool,
 }
 
+/// A CALL procedure statement.
+///
+/// ```cypher
+/// CALL db.index.fulltext.queryNodes('myIndex', $query) YIELD node
+/// RETURN node
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallStatement {
+    /// Dotted procedure name, e.g. `"db.index.fulltext.queryNodes"`.
+    pub procedure: String,
+    /// Positional arguments.
+    pub args: Vec<Expr>,
+    /// Columns declared in `YIELD col1, col2`.
+    pub yield_columns: Vec<String>,
+    /// Optional trailing `RETURN` clause.
+    pub return_clause: Option<ReturnClause>,
+}
+
 /// Top-level statement variants.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -327,4 +349,6 @@ pub enum Statement {
     Union(UnionStatement),
     Checkpoint,
     Optimize,
+    /// CALL procedure dispatch (SPA-170 — KMS full-text search).
+    Call(CallStatement),
 }

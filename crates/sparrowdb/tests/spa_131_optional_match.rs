@@ -138,7 +138,7 @@ fn setup_person_graph_with_edge(dir: &std::path::Path) -> (GraphDb, NodeId, Node
     let cat = Catalog::open(dir).expect("catalog");
     let person_label_id = cat.get_label("Person").unwrap().expect("Person label") as u32;
 
-    let alice_id = NodeId(((person_label_id as u64) << 32) | 0);
+    let alice_id = NodeId((person_label_id as u64) << 32);
     let bob_id = NodeId(((person_label_id as u64) << 32) | 1);
     let carol_id = NodeId(((person_label_id as u64) << 32) | 2);
 
