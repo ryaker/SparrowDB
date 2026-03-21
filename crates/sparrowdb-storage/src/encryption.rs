@@ -9,13 +9,14 @@
 //!   total on disk: page_size + 40 bytes  ("encrypted stride")
 //! ```
 //!
-//! The nonce is derived deterministically per page:
-//! `nonce[0..8] = page_id.to_le_bytes()`, `nonce[8..24] = 0x00`.
+//! The nonce is generated fresh from the OS CSPRNG on every write.
+//! It is stored inline in the page so decryption is self-contained.
 //!
-//! This is safe because a fresh 32-byte key is generated per database file, so
-//! the (key, nonce) pair is unique across all pages of all databases. The nonce
-//! is still stored inline in the page for forward compatibility (future versions
-//! may use random per-write nonces).
+//! The `page_id` is passed as AEAD Associated Authenticated Data (AAD) on
+//! both encrypt and decrypt.  This cryptographically binds each ciphertext
+//! to its logical page location: swapping the encrypted blob of page A into
+//! slot B will cause the AEAD tag to fail, defeating page-swap / relocation
+//! attacks without any additional nonce comparison.
 //!
 //! # Passthrough mode
 //!
@@ -23,9 +24,10 @@
 //! identity functions — plaintext in, plaintext out.
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
+use rand::{rngs::OsRng, RngCore};
 use sparrowdb_common::{Error, Result};
 
 /// Encryption context — holds the 32-byte master key for an open database.
@@ -50,16 +52,11 @@ impl EncryptionContext {
         }
     }
 
-    /// Derive the 24-byte XChaCha20 nonce for a page.
-    ///
-    /// Layout: `[page_id LE u64 (8 bytes)][zeros (16 bytes)]`
-    fn nonce_for(page_id: u64) -> XNonce {
-        let mut nonce = [0u8; 24];
-        nonce[..8].copy_from_slice(&page_id.to_le_bytes());
-        *XNonce::from_slice(&nonce)
-    }
-
     /// Encrypt a plaintext page and return the on-disk representation.
+    ///
+    /// A fresh 24-byte nonce is generated from the OS CSPRNG on every call.
+    /// `page_id` is passed as AEAD AAD so the ciphertext is cryptographically
+    /// bound to its logical page location.
     ///
     /// Output layout: `[nonce: 24 bytes][ciphertext+tag: plaintext.len()+16 bytes]`
     /// Total length: `plaintext.len() + 40`.
@@ -77,9 +74,14 @@ impl EncryptionContext {
             Some(c) => c,
         };
 
-        let nonce = Self::nonce_for(page_id);
+        // Generate a fresh random nonce for every write.
+        let mut nonce_bytes = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = *XNonce::from_slice(&nonce_bytes);
+
+        let aad = page_id.to_le_bytes();
         let ciphertext = cipher
-            .encrypt(&nonce, plaintext)
+            .encrypt(&nonce, Payload { msg: plaintext, aad: &aad })
             .map_err(|_| Error::Corruption("XChaCha20-Poly1305 encrypt failed".into()))?;
 
         // Prepend the nonce so the on-disk page is self-describing.
@@ -93,16 +95,15 @@ impl EncryptionContext {
     ///
     /// Expects `encrypted` to be at least 40 bytes (`24` nonce + `16` tag).
     ///
-    /// The stored nonce is validated against the nonce derived from `page_id`
-    /// before decryption is attempted. This enforces page-location integrity:
-    /// a ciphertext blob from page A cannot be silently accepted as page B.
+    /// `page_id` is passed as AEAD AAD — the AEAD authentication tag will
+    /// reject ciphertexts encrypted under a different `page_id`, defeating
+    /// page-swap / relocation attacks.
     ///
     /// In passthrough mode the data is returned as-is.
     ///
     /// # Errors
-    /// - [`Error::DecryptionFailed`] — stored nonce does not match the nonce
-    ///   derived from `page_id` (page-swap / relocation attack detected), or
-    ///   the AEAD authentication tag was rejected (wrong key or corrupted data).
+    /// - [`Error::DecryptionFailed`] — the AEAD authentication tag was
+    ///   rejected (wrong key, corrupted data, or page-swap attack detected).
     /// - [`Error::InvalidArgument`] — `encrypted` is shorter than 40 bytes.
     pub fn decrypt_page(&self, page_id: u64, encrypted: &[u8]) -> Result<Vec<u8>> {
         let cipher = match &self.cipher {
@@ -117,14 +118,10 @@ impl EncryptionContext {
             )));
         }
 
-        let expected_nonce = Self::nonce_for(page_id);
-        let stored_nonce = &encrypted[..24];
-        if stored_nonce != expected_nonce.as_slice() {
-            return Err(Error::DecryptionFailed);
-        }
-
+        let nonce = XNonce::from_slice(&encrypted[..24]);
+        let aad = page_id.to_le_bytes();
         let plaintext = cipher
-            .decrypt(&expected_nonce, &encrypted[24..])
+            .decrypt(nonce, Payload { msg: &encrypted[24..], aad: &aad })
             .map_err(|_| Error::DecryptionFailed)?;
 
         Ok(plaintext)
@@ -136,19 +133,17 @@ mod unit_tests {
     use super::*;
 
     #[test]
-    fn nonce_is_deterministic() {
-        let n0a = EncryptionContext::nonce_for(0);
-        let n0b = EncryptionContext::nonce_for(0);
-        assert_eq!(n0a, n0b);
-    }
-
-    #[test]
-    fn nonce_encodes_page_id() {
-        let n = EncryptionContext::nonce_for(0xDEAD_BEEF_CAFE_1234);
-        let expected = 0xDEAD_BEEF_CAFE_1234u64.to_le_bytes();
-        assert_eq!(&n.as_slice()[..8], &expected);
-        // Trailing bytes must be zero.
-        assert!(n.as_slice()[8..].iter().all(|&b| b == 0));
+    fn nonces_are_random() {
+        // Two encryptions of the same page must produce different nonces.
+        let ctx = EncryptionContext::with_key([0x01; 32]);
+        let pt = vec![0u8; 32];
+        let ct0 = ctx.encrypt_page(0, &pt).unwrap();
+        let ct1 = ctx.encrypt_page(0, &pt).unwrap();
+        // The first 24 bytes are the nonces — they must differ.
+        assert_ne!(
+            &ct0[..24], &ct1[..24],
+            "nonces must be random, not deterministic"
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ fn main() {
     path.pop(); // crates
     path.push("tests");
     path.push("fixtures");
+    std::fs::create_dir_all(&path).expect("create fixture directory");
     path.push("encrypted_page.bin");
 
     std::fs::write(&path, &ciphertext).expect("write fixture");
