@@ -11,7 +11,7 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CreateStatement, Expr, ListPredicateKind, Literal, MatchCreateStatement,
+    BinOpKind, CallStatement, CreateStatement, Expr, ListPredicateKind, Literal, MatchCreateStatement,
     MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement, MatchWithStatement, Mutation,
     OptionalMatchStatement, PathPattern, ReturnItem, SortDir, Statement, UnionStatement,
     UnwindStatement, WithClause,
@@ -19,6 +19,7 @@ use sparrowdb_cypher::ast::{
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
+use sparrowdb_storage::fulltext_index::FulltextIndex;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
 
 use crate::types::{QueryResult, Value};
@@ -88,7 +89,128 @@ impl Engine {
             Statement::MatchOptionalMatch(mom) => self.execute_match_optional_match(&mom),
             Statement::Union(u) => self.execute_union(u),
             Statement::Checkpoint | Statement::Optimize => Ok(QueryResult::empty(vec![])),
+            Statement::Call(c) => self.execute_call(&c),
         }
+    }
+
+    // ── CALL procedure dispatch ──────────────────────────────────────────────
+
+    /// Dispatch a `CALL` statement to the appropriate built-in procedure.
+    ///
+    /// Currently implemented procedures:
+    /// - `db.index.fulltext.queryNodes(indexName, query)` — full-text search
+    fn execute_call(&self, c: &CallStatement) -> Result<QueryResult> {
+        match c.procedure.as_str() {
+            "db.index.fulltext.queryNodes" => self.call_fulltext_query_nodes(c),
+            other => Err(sparrowdb_common::Error::InvalidArgument(format!(
+                "unknown procedure: {other}"
+            ))),
+        }
+    }
+
+    /// Implementation of `CALL db.index.fulltext.queryNodes(indexName, query)`.
+    ///
+    /// Args:
+    ///   0 — index name (string literal or param)
+    ///   1 — query string (string literal or param)
+    ///
+    /// Returns one row per matching node with columns declared in YIELD
+    /// (typically `node`).  Each `node` value is a `NodeRef`.
+    fn call_fulltext_query_nodes(&self, c: &CallStatement) -> Result<QueryResult> {
+        // Validate argument count.
+        if c.args.len() < 2 {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "db.index.fulltext.queryNodes requires 2 arguments: (indexName, query)".into(),
+            ));
+        }
+
+        // Evaluate arg 0 → index name.
+        let index_name = eval_expr_to_string(&c.args[0])?;
+        // Evaluate arg 1 → query string.
+        let query = eval_expr_to_string(&c.args[1])?;
+
+        // Open the fulltext index (read-only; no flush on this path).
+        let index = FulltextIndex::open(&self.db_root, &index_name)?;
+        let node_ids = index.search(&query);
+
+        // Determine which column names to project.
+        // Default to ["node"] when no YIELD clause was specified.
+        let yield_cols: Vec<String> = if c.yield_columns.is_empty() {
+            vec!["node".to_owned()]
+        } else {
+            c.yield_columns.clone()
+        };
+
+        // Build result rows: one per matching node.
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for raw_id in node_ids {
+            let node_id = sparrowdb_common::NodeId(raw_id);
+            let row: Vec<Value> = yield_cols
+                .iter()
+                .map(|col| {
+                    if col == "node" {
+                        Value::NodeRef(node_id)
+                    } else {
+                        Value::Null
+                    }
+                })
+                .collect();
+            rows.push(row);
+        }
+
+        // If a RETURN clause follows, project its items over the YIELD rows.
+        let (columns, rows) = if let Some(ref ret) = c.return_clause {
+            self.project_call_return(ret, &yield_cols, rows)?
+        } else {
+            (yield_cols, rows)
+        };
+
+        Ok(QueryResult { columns, rows })
+    }
+
+    /// Project a RETURN clause over rows produced by a CALL statement.
+    ///
+    /// The YIELD columns from the CALL become the row environment.  Each
+    /// return item is evaluated against those columns:
+    ///   - `Var(name)` — returns the raw yield-column value
+    ///   - `PropAccess { var, prop }` — reads a property from the NodeRef
+    ///
+    /// This covers the primary KMS pattern:
+    /// `CALL … YIELD node RETURN node.content, node.title`
+    fn project_call_return(
+        &self,
+        ret: &sparrowdb_cypher::ast::ReturnClause,
+        yield_cols: &[String],
+        rows: Vec<Vec<Value>>,
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        // Column names from return items.
+        let out_cols: Vec<String> = ret
+            .items
+            .iter()
+            .map(|item| {
+                item.alias
+                    .clone()
+                    .unwrap_or_else(|| expr_to_col_name(&item.expr))
+            })
+            .collect();
+
+        let mut out_rows = Vec::new();
+        for row in rows {
+            // Build a name → Value map for this row.
+            let env: HashMap<String, Value> = yield_cols
+                .iter()
+                .zip(row.iter())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            let projected: Vec<Value> = ret
+                .items
+                .iter()
+                .map(|item| eval_call_expr(&item.expr, &env, &self.store))
+                .collect();
+            out_rows.push(projected);
+        }
+        Ok((out_cols, out_rows))
     }
 
     /// Returns `true` if `stmt` is a mutation (MERGE, MATCH+SET, MATCH+DELETE,
@@ -1818,6 +1940,9 @@ fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
                 collect_col_ids_from_expr(item, out);
             }
         }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_col_ids_from_expr(inner, out);
+        }
         _ => {}
     }
 }
@@ -2028,6 +2153,8 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
                 _ => false,
             }
         }
+        Expr::IsNull(inner) => matches!(eval_expr(inner, vals), Value::Null),
+        Expr::IsNotNull(inner) => !matches!(eval_expr(inner, vals), Value::Null),
         _ => false, // unsupported expression — reject row rather than silently pass
     }
 }
@@ -2173,6 +2300,8 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             Value::Bool(result)
         }
         Expr::NotExists(_) | Expr::CountStar => Value::Null,
+        Expr::IsNull(inner) => Value::Bool(matches!(eval_expr(inner, vals), Value::Null)),
+        Expr::IsNotNull(inner) => Value::Bool(!matches!(eval_expr(inner, vals), Value::Null)),
     }
 }
 
@@ -2676,5 +2805,65 @@ fn finalize_aggregate(kind: &AggKind, vals: &[Value]) -> Value {
             .unwrap_or(Value::Null),
         AggKind::Collect => Value::List(vals.to_vec()),
         AggKind::Key => Value::Null,
+    }
+}
+
+// ── CALL helpers ─────────────────────────────────────────────────────────────
+
+/// Evaluate an expression to a string value for use as a procedure argument.
+///
+/// Supports `Literal::String(s)` only for v1.  Parameter binding would require
+/// a runtime `params` map that is not yet threaded through the CALL path.
+fn eval_expr_to_string(expr: &Expr) -> Result<String> {
+    match expr {
+        Expr::Literal(Literal::String(s)) => Ok(s.clone()),
+        Expr::Literal(Literal::Param(p)) => Err(sparrowdb_common::Error::InvalidArgument(
+            format!("parameter ${p} requires runtime binding; pass a literal string instead"),
+        )),
+        other => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "procedure argument must be a string literal, got: {other:?}"
+        ))),
+    }
+}
+
+/// Derive a display column name from a return expression (used when no AS alias
+/// is provided).
+fn expr_to_col_name(expr: &Expr) -> String {
+    match expr {
+        Expr::PropAccess { var, prop } => format!("{var}.{prop}"),
+        Expr::Var(v) => v.clone(),
+        _ => "value".to_owned(),
+    }
+}
+
+/// Evaluate a RETURN expression against a CALL row environment.
+///
+/// The environment maps YIELD column names → values (e.g. `"node"` →
+/// `Value::NodeRef`).  For `PropAccess` on a NodeRef the property is looked up
+/// from the node store.
+fn eval_call_expr(expr: &Expr, env: &HashMap<String, Value>, store: &NodeStore) -> Value {
+    match expr {
+        Expr::Var(v) => env.get(v.as_str()).cloned().unwrap_or(Value::Null),
+        Expr::PropAccess { var, prop } => match env.get(var.as_str()) {
+            Some(Value::NodeRef(node_id)) => {
+                let col_id = prop_name_to_col_id(prop);
+                store
+                    .get_node_raw(*node_id, &[col_id])
+                    .ok()
+                    .and_then(|pairs| pairs.into_iter().find(|(c, _)| *c == col_id))
+                    .map(|(_, raw)| decode_raw_val(raw))
+                    .unwrap_or(Value::Null)
+            }
+            Some(other) => other.clone(),
+            None => Value::Null,
+        },
+        Expr::Literal(lit) => match lit {
+            Literal::Int(n) => Value::Int64(*n),
+            Literal::Float(f) => Value::Float64(*f),
+            Literal::Bool(b) => Value::Bool(*b),
+            Literal::String(s) => Value::String(s.clone()),
+            _ => Value::Null,
+        },
+        _ => Value::Null,
     }
 }

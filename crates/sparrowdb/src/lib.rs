@@ -454,6 +454,29 @@ impl GraphDb {
         tx.commit()?;
         Ok(QueryResult::empty(vec![]))
     }
+
+    /// Create (or overwrite) a named full-text index.
+    ///
+    /// In v1 this creates the on-disk backing file and registers the index
+    /// name so that `CALL db.index.fulltext.queryNodes(name, query)` can find
+    /// it.  The `label` and `props` parameters describe which node
+    /// label/properties to index; actual document ingestion happens via
+    /// [`WriteTx::add_to_fulltext_index`].
+    ///
+    /// # Example
+    /// ```no_run
+    /// db.create_fulltext_index("searchIndex", "Fact", &["content"])?;
+    /// ```
+    pub fn create_fulltext_index(
+        &self,
+        name: &str,
+        _label: &str,
+        _props: &[&str],
+    ) -> Result<()> {
+        use sparrowdb_storage::fulltext_index::FulltextIndex;
+        FulltextIndex::create(&self.inner.path, name)?;
+        Ok(())
+    }
 }
 
 /// Convenience wrapper — equivalent to [`GraphDb::open`].
@@ -784,6 +807,31 @@ impl<'db> WriteTx<'db> {
             }
         }
         Ok(())
+    }
+
+    // ── Full-text index maintenance ──────────────────────────────────────────
+
+    /// Add a node document to a named full-text index.
+    ///
+    /// Call after creating or updating a node to keep the index current.
+    /// The `text` should be the concatenated string value(s) of the indexed
+    /// properties.  Changes are flushed to disk immediately (no WAL for v1).
+    ///
+    /// # Example
+    /// ```no_run
+    /// let node_id = tx.merge_node("Fact", props)?;
+    /// tx.add_to_fulltext_index("searchIndex", node_id, "some searchable text")?;
+    /// ```
+    pub fn add_to_fulltext_index(
+        &mut self,
+        index_name: &str,
+        node_id: NodeId,
+        text: &str,
+    ) -> Result<()> {
+        use sparrowdb_storage::fulltext_index::FulltextIndex;
+        let mut idx = FulltextIndex::open(&self.inner.path, index_name)?;
+        idx.add_document(node_id.0, text);
+        idx.flush()
     }
 
     // ── Commit ───────────────────────────────────────────────────────────────

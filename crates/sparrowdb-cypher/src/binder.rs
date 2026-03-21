@@ -65,6 +65,9 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
             bind((*u.right).clone(), catalog)?;
         }
         Statement::Checkpoint | Statement::Optimize => {}
+        // CALL: procedure name and args are validated at execution time by the
+        // procedure dispatcher.  No catalog lookups are required here.
+        Statement::Call(_) => {}
     }
     Ok(BoundStatement { inner: stmt })
 }
