@@ -153,7 +153,11 @@ impl Catalog {
                     self.labels.push(e);
                 }
                 TlvEntry::RelTable(e) => {
-                    if self.rel_tables.iter().any(|x| x.rel_table_id == e.rel_table_id) {
+                    if self
+                        .rel_tables
+                        .iter()
+                        .any(|x| x.rel_table_id == e.rel_table_id)
+                    {
                         return Err(Error::Corruption(format!(
                             "duplicate rel_table_id {} in catalog file",
                             e.rel_table_id

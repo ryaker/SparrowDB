@@ -15,7 +15,10 @@ pub fn crc32_zeroed_at(buf: &[u8], zeroed_offset: usize, zeroed_len: usize) -> u
     let crc = crc32c::crc32c(&buf[..zeroed_offset]);
     // zeroed_len is always small (4 bytes in all current callers); use a stack buffer.
     const MAX_ZEROED: usize = 64;
-    assert!(zeroed_len <= MAX_ZEROED, "zeroed_len exceeds stack buffer size");
+    assert!(
+        zeroed_len <= MAX_ZEROED,
+        "zeroed_len exceeds stack buffer size"
+    );
     let zeros = [0u8; MAX_ZEROED];
     let crc = crc32c::crc32c_append(crc, &zeros[..zeroed_len]);
     crc32c::crc32c_append(crc, &buf[zeroed_offset + zeroed_len..])
