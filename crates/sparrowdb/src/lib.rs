@@ -394,13 +394,7 @@ impl<'db> WriteTx<'db> {
     }
 
     /// Stage a property update with an explicit human-readable key name for WAL.
-    fn set_node_col_named(
-        &mut self,
-        node_id: NodeId,
-        col_id: u32,
-        key_name: String,
-        value: Value,
-    ) {
+    fn set_node_col_named(&mut self, node_id: NodeId, col_id: u32, key_name: String, value: Value) {
         let key = (node_id.0, col_id);
         self.dirty_nodes.insert(node_id.0);
 
