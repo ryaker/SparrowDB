@@ -35,6 +35,7 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         // Serialize as strings so precision is preserved across the JSON boundary.
         Value::NodeRef(n) => serde_json::json!({"$type": "node", "id": n.0.to_string()}),
         Value::EdgeRef(e) => serde_json::json!({"$type": "edge", "id": e.0.to_string()}),
+        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
     }
 }
 

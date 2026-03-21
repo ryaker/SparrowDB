@@ -73,6 +73,15 @@ pub struct PathPattern {
     pub rels: Vec<RelPattern>,
 }
 
+/// Variants for list predicate expressions: ANY, ALL, NONE, SINGLE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListPredicateKind {
+    Any,
+    All,
+    None,
+    Single,
+}
+
 /// An expression used in WHERE, RETURN, ORDER BY.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -107,6 +116,13 @@ pub enum Expr {
         expr: Box<Expr>,
         list: Vec<Expr>,
         negated: bool,
+    },
+    /// `ANY(x IN list_expr WHERE predicate)` — list predicate.
+    ListPredicate {
+        kind: ListPredicateKind,
+        variable: String,
+        list_expr: Box<Expr>,
+        predicate: Box<Expr>,
     },
 }
 

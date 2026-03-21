@@ -11,8 +11,8 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CreateStatement, Expr, Literal, MatchCreateStatement, MatchMutateStatement,
-    MatchOptionalMatchStatement, MatchStatement, MatchWithStatement, Mutation,
+    BinOpKind, CreateStatement, Expr, ListPredicateKind, Literal, MatchCreateStatement,
+    MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement, MatchWithStatement, Mutation,
     OptionalMatchStatement, PathPattern, ReturnItem, SortDir, Statement, UnionStatement,
     UnwindStatement, WithClause,
 };
@@ -1808,6 +1808,16 @@ fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
                 collect_col_ids_from_expr(arg, out);
             }
         }
+        Expr::ListPredicate { list_expr, predicate, .. } => {
+            collect_col_ids_from_expr(list_expr, out);
+            collect_col_ids_from_expr(predicate, out);
+        }
+        // Inline list literal: recurse into each element so property references are loaded.
+        Expr::List(items) => {
+            for item in items {
+                collect_col_ids_from_expr(item, out);
+            }
+        }
         _ => {}
     }
 }
@@ -2011,6 +2021,13 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
             let matched = list.iter().any(|item| values_equal(&lv, &eval_expr(item, vals)));
             if *negated { !matched } else { matched }
         }
+        Expr::ListPredicate { .. } => {
+            // Delegate to eval_expr which handles ListPredicate and returns Value::Bool.
+            match eval_expr(expr, vals) {
+                Value::Bool(b) => b,
+                _ => false,
+            }
+        }
         _ => false, // unsupported expression — reject row rather than silently pass
     }
 }
@@ -2126,7 +2143,36 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             let matched = list.iter().any(|item| values_equal(&lv, &eval_expr(item, vals)));
             Value::Bool(if *negated { !matched } else { matched })
         }
-        Expr::List(_) | Expr::NotExists(_) | Expr::CountStar => Value::Null,
+        Expr::List(items) => {
+            let evaluated: Vec<Value> = items.iter().map(|e| eval_expr(e, vals)).collect();
+            Value::List(evaluated)
+        }
+        Expr::ListPredicate { kind, variable, list_expr, predicate } => {
+            let list_val = eval_expr(list_expr, vals);
+            let items = match list_val {
+                Value::List(v) => v,
+                _ => return Value::Null,
+            };
+            let mut satisfied_count = 0usize;
+            // Clone vals once and reuse the same scope map each iteration,
+            // updating only the loop variable binding to avoid O(n * |scope|) clones.
+            let mut scope = vals.clone();
+            for item in &items {
+                scope.insert(variable.clone(), item.clone());
+                let result = eval_expr(predicate, &scope);
+                if result == Value::Bool(true) {
+                    satisfied_count += 1;
+                }
+            }
+            let result = match kind {
+                ListPredicateKind::Any => satisfied_count > 0,
+                ListPredicateKind::All => satisfied_count == items.len(),
+                ListPredicateKind::None => satisfied_count == 0,
+                ListPredicateKind::Single => satisfied_count == 1,
+            };
+            Value::Bool(result)
+        }
+        Expr::NotExists(_) | Expr::CountStar => Value::Null,
     }
 }
 
@@ -2304,7 +2350,65 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
             name.to_lowercase().as_str(),
             "count" | "sum" | "avg" | "min" | "max" | "collect"
         ),
+        // ANY/ALL/NONE/SINGLE(x IN collect(...) WHERE pred) is an aggregate.
+        Expr::ListPredicate { list_expr, .. } => expr_has_collect(list_expr),
         _ => false,
+    }
+}
+
+/// Returns `true` if the expression contains a `collect()` call (directly or nested).
+fn expr_has_collect(expr: &Expr) -> bool {
+    match expr {
+        Expr::FnCall { name, .. } => name.to_lowercase() == "collect",
+        Expr::ListPredicate { list_expr, .. } => expr_has_collect(list_expr),
+        _ => false,
+    }
+}
+
+/// Extract the `collect()` argument from an expression that contains `collect()`.
+///
+/// Handles two forms:
+/// - Direct: `collect(expr)` → evaluates `expr` against `row_vals`
+/// - Nested: `ANY(x IN collect(expr) WHERE pred)` → evaluates `expr` against `row_vals`
+fn extract_collect_arg(expr: &Expr, row_vals: &HashMap<String, Value>) -> Value {
+    match expr {
+        Expr::FnCall { args, .. } if !args.is_empty() => eval_expr(&args[0], row_vals),
+        Expr::ListPredicate { list_expr, .. } => extract_collect_arg(list_expr, row_vals),
+        _ => Value::Null,
+    }
+}
+
+/// Evaluate an aggregate expression given the already-accumulated list.
+///
+/// For a bare `collect(...)`, returns the list itself.
+/// For `ANY/ALL/NONE/SINGLE(x IN collect(...) WHERE pred)`, substitutes the
+/// accumulated list and evaluates the predicate.
+fn evaluate_aggregate_expr(expr: &Expr, accumulated_list: &Value, outer_vals: &HashMap<String, Value>) -> Value {
+    match expr {
+        Expr::FnCall { name, .. } if name.to_lowercase() == "collect" => accumulated_list.clone(),
+        Expr::ListPredicate { kind, variable, predicate, .. } => {
+            let items = match accumulated_list {
+                Value::List(v) => v,
+                _ => return Value::Null,
+            };
+            let mut satisfied_count = 0usize;
+            for item in items {
+                let mut scope = outer_vals.clone();
+                scope.insert(variable.clone(), item.clone());
+                let result = eval_expr(predicate, &scope);
+                if result == Value::Bool(true) {
+                    satisfied_count += 1;
+                }
+            }
+            let result = match kind {
+                ListPredicateKind::Any => satisfied_count > 0,
+                ListPredicateKind::All => satisfied_count == items.len(),
+                ListPredicateKind::None => satisfied_count == 0,
+                ListPredicateKind::Single => satisfied_count == 1,
+            };
+            Value::Bool(result)
+        }
+        _ => Value::Null,
     }
 }
 
@@ -2339,6 +2443,8 @@ fn agg_kind(expr: &Expr) -> AggKind {
             "collect" => AggKind::Collect,
             _ => AggKind::Key,
         },
+        // ANY/ALL/NONE/SINGLE(x IN collect(...) WHERE pred) treated as Collect-kind aggregate.
+        Expr::ListPredicate { list_expr, .. } if expr_has_collect(list_expr) => AggKind::Collect,
         _ => AggKind::Key,
     }
 }
@@ -2407,8 +2513,7 @@ fn aggregate_rows(
                     // Sentinel: count the number of sentinels after grouping.
                     group_accum[group_idx][ai].push(Value::Int64(1));
                 }
-                AggKind::Count | AggKind::Sum | AggKind::Avg | AggKind::Min | AggKind::Max
-                | AggKind::Collect => {
+                AggKind::Count | AggKind::Sum | AggKind::Avg | AggKind::Min | AggKind::Max => {
                     let arg_val = match &return_items[ri].expr {
                         Expr::FnCall { args, .. } if !args.is_empty() => {
                             eval_expr(&args[0], row_vals)
@@ -2420,6 +2525,15 @@ fn aggregate_rows(
                         group_accum[group_idx][ai].push(arg_val);
                     }
                 }
+                AggKind::Collect => {
+                    // For collect() or ListPredicate(x IN collect(...) WHERE ...), extract the
+                    // collect() argument (handles both direct and nested forms).
+                    let arg_val = extract_collect_arg(&return_items[ri].expr, row_vals);
+                    // Standard Cypher: collect() ignores nulls.
+                    if !matches!(arg_val, Value::Null) {
+                        group_accum[group_idx][ai].push(arg_val);
+                    }
+                }
                 AggKind::Key => unreachable!(),
             }
         }
@@ -2427,12 +2541,16 @@ fn aggregate_rows(
 
     // No grouping keys and no rows → one result row of zero/empty aggregates.
     if group_keys.is_empty() && key_indices.is_empty() {
-        let row: Vec<Value> = kinds
+        let empty_vals: HashMap<String, Value> = HashMap::new();
+        let row: Vec<Value> = return_items
             .iter()
-            .map(|k| match k {
+            .zip(kinds.iter())
+            .map(|(item, k)| match k {
                 AggKind::CountStar | AggKind::Count | AggKind::Sum => Value::Int64(0),
                 AggKind::Avg | AggKind::Min | AggKind::Max => Value::Null,
-                AggKind::Collect => Value::List(vec![]),
+                AggKind::Collect => {
+                    evaluate_aggregate_expr(&item.expr, &Value::List(vec![]), &empty_vals)
+                }
                 AggKind::Key => Value::Null,
             })
             .collect();
@@ -2450,12 +2568,26 @@ fn aggregate_rows(
         let mut output_row: Vec<Value> = Vec::with_capacity(return_items.len());
         let mut ki = 0usize;
         let mut ai = 0usize;
+        // Build outer scope from key columns for ListPredicate predicate evaluation.
+        let outer_vals: HashMap<String, Value> = key_indices
+            .iter()
+            .enumerate()
+            .map(|(pos, &i)| {
+                let name = return_items[i].alias.clone().unwrap_or_else(|| format!("_k{i}"));
+                (name, key_vals[pos].clone())
+            })
+            .collect();
         for col_idx in 0..return_items.len() {
             if kinds[col_idx] == AggKind::Key {
                 output_row.push(key_vals[ki].clone());
                 ki += 1;
             } else {
-                let result = finalize_aggregate(&kinds[col_idx], &group_accum[gi][ai]);
+                let accumulated = Value::List(group_accum[gi][ai].clone());
+                let result = if kinds[col_idx] == AggKind::Collect {
+                    evaluate_aggregate_expr(&return_items[col_idx].expr, &accumulated, &outer_vals)
+                } else {
+                    finalize_aggregate(&kinds[col_idx], &group_accum[gi][ai])
+                };
                 output_row.push(result);
                 ai += 1;
             }
