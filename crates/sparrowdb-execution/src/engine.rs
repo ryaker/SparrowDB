@@ -2252,16 +2252,15 @@ fn project_fof_row(
 }
 
 fn deduplicate_rows(rows: &mut Vec<Vec<Value>>) {
-    // Deduplicate by converting to a string key.
-    let mut seen: HashSet<String> = HashSet::new();
-    rows.retain(|row| {
-        let key: String = row
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("|");
-        seen.insert(key)
-    });
+    // Deduplicate using structural row equality to avoid false collisions from
+    // string-key approaches (e.g. ["a|", "b"] vs ["a", "|b"] would hash equal).
+    let mut unique: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        if !unique.iter().any(|existing| existing == &row) {
+            unique.push(row);
+        }
+    }
+    *rows = unique;
 }
 
 fn apply_order_by(rows: &mut [Vec<Value>], m: &MatchStatement, column_names: &[String]) {

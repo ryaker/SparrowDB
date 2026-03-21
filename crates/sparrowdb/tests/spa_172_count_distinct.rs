@@ -86,8 +86,32 @@ fn distinct_deduplicates_node_scan() {
         result.rows
     );
 
-    let mut sorted_ages: Vec<String> = result.rows.iter().map(|r| r[0].to_string()).collect();
-    sorted_ages.sort();
-    sorted_ages.dedup();
-    assert_eq!(sorted_ages.len(), 4, "no duplicate ages in DISTINCT result");
+    // Validate returned values are typed Int64 and contain exactly the 4 unique ages.
+    let mut ages: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Int64(v) => *v,
+            other => panic!("expected Int64 age value, got {:?}", other),
+        })
+        .collect();
+    ages.sort_unstable();
+    ages.dedup();
+    assert_eq!(ages, vec![25, 30, 35, 40], "DISTINCT must return exactly the 4 unique ages");
+}
+
+/// COUNT(*) on an empty result set must return a single row with value 0.
+#[test]
+fn count_star_empty_result_returns_zero() {
+    let (_dir, db) = make_db();
+
+    // Insert a node so the label is registered, then match with a WHERE that matches nothing.
+    db.execute("CREATE (n:Person {name: 'Alice', age: 30})").unwrap();
+
+    let result = db
+        .execute("MATCH (n:Person) WHERE n.age > 9999 RETURN COUNT(*)")
+        .expect("COUNT(*) on empty set must succeed");
+
+    assert_eq!(result.rows.len(), 1, "COUNT(*) should return one row even for empty input");
+    assert_eq!(result.rows[0][0], Value::Int64(0), "COUNT(*) of empty set should be 0");
 }
