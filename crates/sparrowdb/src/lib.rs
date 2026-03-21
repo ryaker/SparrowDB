@@ -458,15 +458,21 @@ impl GraphDb {
 
     /// Create (or overwrite) a named full-text index.
     ///
-    /// In v1 this creates the on-disk backing file and registers the index
-    /// name so that `CALL db.index.fulltext.queryNodes(name, query)` can find
-    /// it.  The `label` and `props` parameters describe which node
-    /// label/properties to index; actual document ingestion happens via
+    /// Creates the on-disk backing file for the named index so that
+    /// `CALL db.index.fulltext.queryNodes(name, query)` can find it.
+    /// If an index with the same name already exists its contents are cleared
+    /// (overwrite semantics).  Document ingestion happens separately via
     /// [`WriteTx::add_to_fulltext_index`].
+    ///
+    /// Acquires the writer lock — returns [`Error::WriterBusy`] if a
+    /// [`WriteTx`] is already active.
     ///
     /// # Example
     /// ```no_run
-    /// db.create_fulltext_index("searchIndex", "Fact", &["content"])?;
+    /// # use sparrowdb::GraphDb;
+    /// # let db = GraphDb::open(std::path::Path::new("/tmp/test")).unwrap();
+    /// db.create_fulltext_index("searchIndex")?;
+    /// # Ok::<(), sparrowdb_common::Error>(())
     /// ```
     pub fn create_fulltext_index(&self, name: &str) -> Result<()> {
         use sparrowdb_storage::fulltext_index::FulltextIndex;
@@ -827,8 +833,13 @@ impl<'db> WriteTx<'db> {
     ///
     /// # Example
     /// ```no_run
-    /// let node_id = tx.merge_node("Fact", props)?;
+    /// # use sparrowdb::GraphDb;
+    /// # use sparrowdb_common::NodeId;
+    /// # let db = GraphDb::open(std::path::Path::new("/tmp/test")).unwrap();
+    /// # let mut tx = db.begin_write().unwrap();
+    /// # let node_id = NodeId(0);
     /// tx.add_to_fulltext_index("searchIndex", node_id, "some searchable text")?;
+    /// # Ok::<(), sparrowdb_common::Error>(())
     /// ```
     pub fn add_to_fulltext_index(
         &mut self,
