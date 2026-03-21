@@ -8,6 +8,8 @@ members = [
     "crates/sparrowdb-execution",
     "crates/sparrowdb",
     "crates/sparrowdb-python",
+    "crates/sparrowdb-cli",
+    "crates/sparrowdb-mcp",
 ]
 
 [workspace.package]
