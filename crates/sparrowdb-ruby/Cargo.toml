@@ -1,0 +1,20 @@
+[package]
+name = "sparrowdb-ruby"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Ruby bindings for SparrowDB embedded graph database"
+
+[lib]
+name = "sparrowdb_ruby"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+ruby = ["dep:magnus", "dep:sparrowdb", "dep:sparrowdb-execution"]
+
+[dependencies]
+magnus = { version = "0.7", optional = true }
+sparrowdb = { workspace = true, optional = true }
+sparrowdb-execution = { workspace = true, optional = true }

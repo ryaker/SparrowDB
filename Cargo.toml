@@ -8,6 +8,7 @@ members = [
     "crates/sparrowdb-execution",
     "crates/sparrowdb",
     "crates/sparrowdb-python",
+    "crates/sparrowdb-ruby",
     "crates/sparrowdb-cli",
     "crates/sparrowdb-mcp",
     "crates/sparrowdb-node",

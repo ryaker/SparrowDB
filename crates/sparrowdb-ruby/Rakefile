@@ -1,0 +1,10 @@
+# frozen_string_literal: true
+
+require "rake/extensiontask"
+require "rb_sys/extensiontask"
+
+RbSys::ExtensionTask.new("sparrowdb_ruby", Gem::Specification.load("sparrowdb.gemspec")) do |ext|
+  ext.lib_dir = "lib/sparrowdb"
+end
+
+task default: :build
