@@ -1,0 +1,9 @@
+[package]
+name = "sparrowdb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sparrowdb-common = { workspace = true }

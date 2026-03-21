@@ -1,0 +1,110 @@
+/// Logical sequence number identifying a WAL record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Lsn(pub u64);
+
+/// Physical page identifier within a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PageId(pub u64);
+
+/// Transaction identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TxnId(pub u64);
+
+/// Node identifier: upper 16 bits = label_id, lower 48 bits = slot_id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId(pub u64);
+
+/// Edge identifier: monotonic u64 sourced from the active metapage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EdgeId(pub u64);
+
+/// All errors that SparrowDB can return.
+#[derive(Debug)]
+pub enum Error {
+    Io(std::io::Error),
+    InvalidMagic,
+    ChecksumMismatch,
+    VersionMismatch,
+    NotFound,
+    AlreadyExists,
+    InvalidArgument(String),
+    Corruption(String),
+    OutOfMemory,
+    Unimplemented,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Io(e) => write!(f, "I/O error: {e}"),
+            Error::InvalidMagic => write!(f, "invalid magic bytes"),
+            Error::ChecksumMismatch => write!(f, "checksum mismatch"),
+            Error::VersionMismatch => write!(f, "version mismatch"),
+            Error::NotFound => write!(f, "not found"),
+            Error::AlreadyExists => write!(f, "already exists"),
+            Error::InvalidArgument(s) => write!(f, "invalid argument: {s}"),
+            Error::Corruption(s) => write!(f, "corruption: {s}"),
+            Error::OutOfMemory => write!(f, "out of memory"),
+            Error::Unimplemented => write!(f, "not yet implemented"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+/// Crate-wide result type.
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_id_roundtrip() {
+        let id = PageId(42);
+        assert_eq!(id.0, 42);
+    }
+
+    #[test]
+    fn lsn_ordering() {
+        assert!(Lsn(1) < Lsn(2));
+    }
+
+    #[test]
+    fn txn_id_copy() {
+        let t = TxnId(99);
+        let t2 = t;
+        assert_eq!(t, t2);
+    }
+
+    #[test]
+    fn node_id_packing_roundtrip() {
+        let label_id: u64 = 3;
+        let slot_id: u64 = 0x0000_BEEF_CAFE;
+        let packed = (label_id << 48) | (slot_id & 0x0000_FFFF_FFFF_FFFF);
+        let node = NodeId(packed);
+        let recovered_label = node.0 >> 48;
+        let recovered_slot = node.0 & 0x0000_FFFF_FFFF_FFFF;
+        assert_eq!(recovered_label, label_id);
+        assert_eq!(recovered_slot, slot_id);
+    }
+
+    #[test]
+    fn error_display() {
+        let e = Error::InvalidMagic;
+        assert!(!e.to_string().is_empty());
+    }
+}

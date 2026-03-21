@@ -1,0 +1,18 @@
+[package]
+name = "sparrowdb-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "sparrowdb_python"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:sparrowdb"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+sparrowdb = { workspace = true, optional = true }
