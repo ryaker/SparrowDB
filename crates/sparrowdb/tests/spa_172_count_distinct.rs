@@ -16,15 +16,22 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 fn count_variable_parses_and_returns_total() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice', age: 30})").unwrap();
-    db.execute("CREATE (n:Person {name: 'Bob',   age: 25})").unwrap();
-    db.execute("CREATE (n:Person {name: 'Carol',  age: 35})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        .unwrap();
+    db.execute("CREATE (n:Person {name: 'Bob',   age: 25})")
+        .unwrap();
+    db.execute("CREATE (n:Person {name: 'Carol',  age: 35})")
+        .unwrap();
 
     let result = db
         .execute("MATCH (n:Person) RETURN COUNT(n)")
         .expect("COUNT(n) must not raise a parse error");
 
-    assert_eq!(result.rows.len(), 1, "COUNT(n) should return exactly one row");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "COUNT(n) should return exactly one row"
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Int64(3),
@@ -49,7 +56,11 @@ fn count_star_returns_scalar_total() {
         .expect("COUNT(*) must succeed");
 
     // Must return exactly one row, not one row per node.
-    assert_eq!(result.rows.len(), 1, "COUNT(*) must aggregate into a single row");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "COUNT(*) must aggregate into a single row"
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Int64(4),
@@ -68,11 +79,16 @@ fn distinct_deduplicates_node_scan() {
     let (_dir, db) = make_db();
 
     // Insert 5 nodes: two share age=30.
-    db.execute("CREATE (n:Person {name: 'Alice', age: 30})").unwrap();
-    db.execute("CREATE (n:Person {name: 'Alice2', age: 30})").unwrap();
-    db.execute("CREATE (n:Person {name: 'Bob',   age: 25})").unwrap();
-    db.execute("CREATE (n:Person {name: 'Carol',  age: 35})").unwrap();
-    db.execute("CREATE (n:Person {name: 'Dave',   age: 40})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        .unwrap();
+    db.execute("CREATE (n:Person {name: 'Alice2', age: 30})")
+        .unwrap();
+    db.execute("CREATE (n:Person {name: 'Bob',   age: 25})")
+        .unwrap();
+    db.execute("CREATE (n:Person {name: 'Carol',  age: 35})")
+        .unwrap();
+    db.execute("CREATE (n:Person {name: 'Dave',   age: 40})")
+        .unwrap();
 
     let result = db
         .execute("MATCH (n:Person) RETURN DISTINCT n.age")
@@ -97,7 +113,11 @@ fn distinct_deduplicates_node_scan() {
         .collect();
     ages.sort_unstable();
     ages.dedup();
-    assert_eq!(ages, vec![25, 30, 35, 40], "DISTINCT must return exactly the 4 unique ages");
+    assert_eq!(
+        ages,
+        vec![25, 30, 35, 40],
+        "DISTINCT must return exactly the 4 unique ages"
+    );
 }
 
 /// COUNT(*) on an empty result set must return a single row with value 0.
@@ -106,12 +126,21 @@ fn count_star_empty_result_returns_zero() {
     let (_dir, db) = make_db();
 
     // Insert a node so the label is registered, then match with a WHERE that matches nothing.
-    db.execute("CREATE (n:Person {name: 'Alice', age: 30})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        .unwrap();
 
     let result = db
         .execute("MATCH (n:Person) WHERE n.age > 9999 RETURN COUNT(*)")
         .expect("COUNT(*) on empty set must succeed");
 
-    assert_eq!(result.rows.len(), 1, "COUNT(*) should return one row even for empty input");
-    assert_eq!(result.rows[0][0], Value::Int64(0), "COUNT(*) of empty set should be 0");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "COUNT(*) should return one row even for empty input"
+    );
+    assert_eq!(
+        result.rows[0][0],
+        Value::Int64(0),
+        "COUNT(*) of empty set should be 0"
+    );
 }

@@ -23,9 +23,12 @@ fn union_combines_results() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_db(dir.path());
 
-    db.execute("CREATE (:Person {name: 'Alice', age: 30})").unwrap();
-    db.execute("CREATE (:Person {name: 'Bob', age: 25})").unwrap();
-    db.execute("CREATE (:Person {name: 'Carol', age: 35})").unwrap();
+    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        .unwrap();
+    db.execute("CREATE (:Person {name: 'Bob', age: 25})")
+        .unwrap();
+    db.execute("CREATE (:Person {name: 'Carol', age: 35})")
+        .unwrap();
 
     // UNION ALL of two disjoint WHERE-filtered sides — combined they cover all 3 rows.
     let result = db
@@ -53,8 +56,10 @@ fn union_deduplicates() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_db(dir.path());
 
-    db.execute("CREATE (:Person {name: 'Alice', age: 30})").unwrap();
-    db.execute("CREATE (:Person {name: 'Bob', age: 25})").unwrap();
+    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        .unwrap();
+    db.execute("CREATE (:Person {name: 'Bob', age: 25})")
+        .unwrap();
 
     // Both sides return all Person ages — UNION must deduplicate so we get 2 unique rows.
     let result = db
@@ -81,8 +86,10 @@ fn union_all_keeps_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_db(dir.path());
 
-    db.execute("CREATE (:Person {name: 'Alice', age: 30})").unwrap();
-    db.execute("CREATE (:Person {name: 'Bob', age: 25})").unwrap();
+    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        .unwrap();
+    db.execute("CREATE (:Person {name: 'Bob', age: 25})")
+        .unwrap();
 
     // Both sides return all Person ages — UNION ALL must keep all 4 rows (2+2).
     let result = db
@@ -151,8 +158,10 @@ fn union_empty_left() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_db(dir.path());
 
-    db.execute("CREATE (:Person {name: 'Alice', age: 30})").unwrap();
-    db.execute("CREATE (:Person {name: 'Bob', age: 25})").unwrap();
+    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        .unwrap();
+    db.execute("CREATE (:Person {name: 'Bob', age: 25})")
+        .unwrap();
 
     // Left side: WHERE age > 100 → matches nobody (0 rows).
     // Right side: no predicate → 2 rows.
@@ -191,8 +200,10 @@ fn union_empty_right() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_db(dir.path());
 
-    db.execute("CREATE (:Person {name: 'Alice', age: 30})").unwrap();
-    db.execute("CREATE (:Person {name: 'Bob', age: 25})").unwrap();
+    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        .unwrap();
+    db.execute("CREATE (:Person {name: 'Bob', age: 25})")
+        .unwrap();
 
     // Left side: no predicate → 2 rows.
     // Right side: WHERE age > 100 → matches nobody (0 rows).

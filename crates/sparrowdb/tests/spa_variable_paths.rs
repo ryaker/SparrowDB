@@ -52,7 +52,10 @@ fn var_path_star_one_hop() {
 
     let src_names = col_strings(&result, 0);
     let dst_names = col_strings(&result, 1);
-    assert!(src_names.contains(&"Alice".to_string()), "src should be Alice");
+    assert!(
+        src_names.contains(&"Alice".to_string()),
+        "src should be Alice"
+    );
     assert!(dst_names.contains(&"Bob".to_string()), "dst should be Bob");
 }
 

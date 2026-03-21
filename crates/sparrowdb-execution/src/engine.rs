@@ -364,7 +364,6 @@ impl Engine {
         Ok(QueryResult::empty(vec![]))
     }
 
-
     // ── UNION ─────────────────────────────────────────────────────────────────
 
     /// Execute `stmt1 UNION [ALL] stmt2`.
@@ -457,7 +456,10 @@ impl Engine {
             rows.truncate(lim as usize);
         }
 
-        Ok(QueryResult { columns: column_names, rows })
+        Ok(QueryResult {
+            columns: column_names,
+            rows,
+        })
     }
 
     /// Scan a MATCH pattern and return one `HashMap<String, Value>` per matching row.
@@ -646,7 +648,10 @@ impl Engine {
         // Check that the leading MATCH label exists.
         if mom.match_patterns.is_empty() || mom.match_patterns[0].nodes.is_empty() {
             let null_row = vec![Value::Null; column_names.len()];
-            return Ok(QueryResult { columns: column_names, rows: vec![null_row] });
+            return Ok(QueryResult {
+                columns: column_names,
+                rows: vec![null_row],
+            });
         }
         let lead_node_pat = &mom.match_patterns[0].nodes[0];
         let lead_label = lead_node_pat.labels.first().cloned().unwrap_or_default();
@@ -654,7 +659,10 @@ impl Engine {
             Some(id) => id as u32,
             None => {
                 let null_row = vec![Value::Null; column_names.len()];
-                return Ok(QueryResult { columns: column_names, rows: vec![null_row] });
+                return Ok(QueryResult {
+                    columns: column_names,
+                    rows: vec![null_row],
+                });
             }
         };
 
@@ -800,7 +808,10 @@ impl Engine {
             result_rows.truncate(lim as usize);
         }
 
-        Ok(QueryResult { columns: column_names, rows: result_rows })
+        Ok(QueryResult {
+            columns: column_names,
+            rows: result_rows,
+        })
     }
 
     /// Scan neighbors of `src_slot` via delta log + CSR for the optional 1-hop,
@@ -1136,10 +1147,8 @@ impl Engine {
                 }
 
                 if use_agg {
-                    let mut row_vals =
-                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
-                    row_vals
-                        .extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
+                    let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
+                    row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
                     // Inject relationship and label metadata for aggregate path.
                     if !rel_pat.var.is_empty() {
                         row_vals.insert(
@@ -1381,11 +1390,7 @@ impl Engine {
 
     /// Collect all neighbor slot-ids reachable from `src_slot` via the delta
     /// log and CSR adjacency.  src_label_id is used to filter delta records.
-    fn get_node_neighbors_by_slot(
-        &self,
-        src_slot: u64,
-        src_label_id: u32,
-    ) -> Vec<u64> {
+    fn get_node_neighbors_by_slot(&self, src_slot: u64, src_label_id: u32) -> Vec<u64> {
         let csr_neighbors: Vec<u64> = self.csr.neighbors(src_slot).to_vec();
         let delta_neighbors: Vec<u64> = {
             let edge_store = sparrowdb_storage::edge_store::EdgeStore::open(
@@ -1491,7 +1496,8 @@ impl Engine {
         let col_ids_dst = collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
 
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        let mut seen_pairs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+        let mut seen_pairs: std::collections::HashSet<(u64, u64)> =
+            std::collections::HashSet::new();
 
         for src_slot in 0..hwm_src {
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
@@ -1538,8 +1544,7 @@ impl Engine {
 
                 // Apply WHERE clause.
                 if let Some(ref where_expr) = m.where_clause {
-                    let mut row_vals =
-                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
+                    let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
                     row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
                     // Inject relationship metadata so type(r) works in WHERE.
                     if !rel_pat.var.is_empty() {
@@ -1608,14 +1613,19 @@ impl Engine {
             rows.truncate(lim as usize);
         }
 
-        tracing::debug!(rows = rows.len(), min_hops, max_hops, "variable-length traversal complete");
+        tracing::debug!(
+            rows = rows.len(),
+            min_hops,
+            max_hops,
+            "variable-length traversal complete"
+        );
         Ok(QueryResult {
             columns: column_names.to_vec(),
             rows,
         })
     }
 
-        // ── Property filter helpers ───────────────────────────────────────────────
+    // ── Property filter helpers ───────────────────────────────────────────────
 
     fn matches_prop_filter(
         &self,
@@ -2019,10 +2029,20 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
         Expr::Not(inner) => !eval_where(inner, vals),
         Expr::Literal(Literal::Bool(b)) => *b,
         Expr::Literal(_) => false,
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let lv = eval_expr(expr, vals);
-            let matched = list.iter().any(|item| values_equal(&lv, &eval_expr(item, vals)));
-            if *negated { !matched } else { matched }
+            let matched = list
+                .iter()
+                .any(|item| values_equal(&lv, &eval_expr(item, vals)));
+            if *negated {
+                !matched
+            } else {
+                matched
+            }
         }
         _ => false, // unsupported expression — reject row rather than silently pass
     }
@@ -2134,9 +2154,15 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(a || b),
             _ => Value::Null,
         },
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let lv = eval_expr(expr, vals);
-            let matched = list.iter().any(|item| values_equal(&lv, &eval_expr(item, vals)));
+            let matched = list
+                .iter()
+                .any(|item| values_equal(&lv, &eval_expr(item, vals)));
             Value::Bool(if *negated { !matched } else { matched })
         }
         Expr::List(_) | Expr::NotExists(_) | Expr::CountStar => Value::Null,
@@ -2156,7 +2182,10 @@ fn project_row(
         .iter()
         .map(|col_name| {
             // Handle labels(var) column.
-            if let Some(inner) = col_name.strip_prefix("labels(").and_then(|s| s.strip_suffix(')')) {
+            if let Some(inner) = col_name
+                .strip_prefix("labels(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 if inner == var_name && !node_label.is_empty() {
                     return Value::List(vec![Value::String(node_label.to_string())]);
                 }
@@ -2190,7 +2219,10 @@ fn project_hop_row(
         .iter()
         .map(|col_name| {
             // Handle metadata function calls: type(r) → "type(r)" column name.
-            if let Some(inner) = col_name.strip_prefix("type(").and_then(|s| s.strip_suffix(')')) {
+            if let Some(inner) = col_name
+                .strip_prefix("type(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 // inner is the variable name, e.g. "r"
                 if let Some((rel_var, rel_type)) = rel_var_type {
                     if inner == rel_var {
@@ -2200,7 +2232,10 @@ fn project_hop_row(
                 return Value::Null;
             }
             // Handle labels(n) → "labels(n)" column name.
-            if let Some(inner) = col_name.strip_prefix("labels(").and_then(|s| s.strip_suffix(')')) {
+            if let Some(inner) = col_name
+                .strip_prefix("labels(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 if let Some((meta_var, label)) = src_label_meta {
                     if inner == meta_var {
                         return Value::List(vec![Value::String(label.to_string())]);
@@ -2360,12 +2395,12 @@ fn agg_kind(expr: &Expr) -> AggKind {
 ///
 /// Non-aggregate RETURN items become the group key.  Returns one output
 /// `Vec<Value>` per unique key in the same column order as `return_items`.
-fn aggregate_rows(
-    rows: &[HashMap<String, Value>],
-    return_items: &[ReturnItem],
-) -> Vec<Vec<Value>> {
+fn aggregate_rows(rows: &[HashMap<String, Value>], return_items: &[ReturnItem]) -> Vec<Vec<Value>> {
     // Classify each return item.
-    let kinds: Vec<AggKind> = return_items.iter().map(|item| agg_kind(&item.expr)).collect();
+    let kinds: Vec<AggKind> = return_items
+        .iter()
+        .map(|item| agg_kind(&item.expr))
+        .collect();
 
     let key_indices: Vec<usize> = kinds
         .iter()
@@ -2419,7 +2454,11 @@ fn aggregate_rows(
                     // Sentinel: count the number of sentinels after grouping.
                     group_accum[group_idx][ai].push(Value::Int64(1));
                 }
-                AggKind::Count | AggKind::Sum | AggKind::Avg | AggKind::Min | AggKind::Max
+                AggKind::Count
+                | AggKind::Sum
+                | AggKind::Avg
+                | AggKind::Min
+                | AggKind::Max
                 | AggKind::Collect => {
                     let arg_val = match &return_items[ri].expr {
                         Expr::FnCall { args, .. } if !args.is_empty() => {
@@ -2531,9 +2570,7 @@ fn finalize_aggregate(kind: &AggKind, vals: &[Value]) -> Value {
             .fold(None::<Value>, |acc, v| match (acc, v) {
                 (None, v) => Some(v.clone()),
                 (Some(Value::Int64(a)), Value::Int64(b)) => Some(Value::Int64(a.min(*b))),
-                (Some(Value::Float64(a)), Value::Float64(b)) => {
-                    Some(Value::Float64(a.min(*b)))
-                }
+                (Some(Value::Float64(a)), Value::Float64(b)) => Some(Value::Float64(a.min(*b))),
                 (Some(Value::String(a)), Value::String(b)) => {
                     Some(Value::String(if a <= *b { a } else { b.clone() }))
                 }
@@ -2545,9 +2582,7 @@ fn finalize_aggregate(kind: &AggKind, vals: &[Value]) -> Value {
             .fold(None::<Value>, |acc, v| match (acc, v) {
                 (None, v) => Some(v.clone()),
                 (Some(Value::Int64(a)), Value::Int64(b)) => Some(Value::Int64(a.max(*b))),
-                (Some(Value::Float64(a)), Value::Float64(b)) => {
-                    Some(Value::Float64(a.max(*b)))
-                }
+                (Some(Value::Float64(a)), Value::Float64(b)) => Some(Value::Float64(a.max(*b))),
                 (Some(Value::String(a)), Value::String(b)) => {
                     Some(Value::String(if a >= *b { a } else { b.clone() }))
                 }
