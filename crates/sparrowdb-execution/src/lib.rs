@@ -1,6 +1,7 @@
 //! sparrowdb-execution: factorized execution engine.
 
 pub mod engine;
+pub mod functions;
 pub mod join;
 pub mod join_spill;
 pub mod operators;
