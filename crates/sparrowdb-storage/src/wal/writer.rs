@@ -30,6 +30,7 @@ use std::{
 use sparrowdb_common::{Lsn, Result, TxnId};
 
 use super::codec::{WalPayload, WalRecord, WalRecordKind};
+use crate::encryption::EncryptionContext;
 
 /// 64 MiB per segment.
 pub const SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
@@ -50,14 +51,30 @@ pub struct WalWriter {
     seg_offset: u64,
     /// Next LSN to assign (monotonically increasing).
     next_lsn: AtomicU64,
+    /// Optional payload encryption context.
+    enc: EncryptionContext,
 }
 
 impl WalWriter {
-    /// Open or create the WAL writer rooted at `wal_dir`.
+    /// Open or create the WAL writer rooted at `wal_dir` without encryption.
     ///
     /// Scans existing segments to find the highest segment number and the
     /// highest LSN in use, then continues from there.
     pub fn open(wal_dir: &std::path::Path) -> Result<Self> {
+        Self::open_inner(wal_dir, EncryptionContext::none())
+    }
+
+    /// Open or create an encrypted WAL writer.
+    ///
+    /// Each WAL record's payload bytes are encrypted with XChaCha20-Poly1305;
+    /// the framing header (lsn, txn_id, kind, crc32c) remains plaintext.
+    /// The record's LSN is used as AEAD AAD to bind the ciphertext to its
+    /// log position.
+    pub fn open_encrypted(wal_dir: &std::path::Path, key: [u8; 32]) -> Result<Self> {
+        Self::open_inner(wal_dir, EncryptionContext::with_key(key))
+    }
+
+    fn open_inner(wal_dir: &std::path::Path, enc: EncryptionContext) -> Result<Self> {
         std::fs::create_dir_all(wal_dir)?;
 
         // Find highest existing segment number and last LSN.
@@ -82,6 +99,7 @@ impl WalWriter {
             seg_no,
             seg_offset,
             next_lsn: AtomicU64::new(next_lsn),
+            enc,
         })
     }
 
@@ -135,6 +153,10 @@ impl WalWriter {
 
     /// Append a WAL record and return its assigned LSN.
     ///
+    /// If the writer was opened with an encryption key, the payload portion of
+    /// the record is encrypted with XChaCha20-Poly1305 before being written.
+    /// The framing header (kind, lsn, txn_id, crc32c) is always plaintext.
+    ///
     /// Rotates to a new segment if this record would overflow the current one.
     pub fn append(
         &mut self,
@@ -143,11 +165,26 @@ impl WalWriter {
         payload: WalPayload,
     ) -> Result<Lsn> {
         let lsn = self.alloc_lsn();
+
+        // Optionally encrypt the payload before encoding.
+        let final_payload = if self.enc.is_encrypted() {
+            let raw_payload_bytes = payload.encode();
+            // Only encrypt non-empty payloads (Empty → no bytes to encrypt).
+            if raw_payload_bytes.is_empty() {
+                payload
+            } else {
+                let encrypted = self.enc.encrypt_wal_payload(lsn.0, &raw_payload_bytes)?;
+                WalPayload::Raw(encrypted)
+            }
+        } else {
+            payload
+        };
+
         let record = WalRecord {
             lsn,
             txn_id,
             kind,
-            payload,
+            payload: final_payload,
         };
         let encoded = record.encode();
         let record_len = encoded.len() as u64;

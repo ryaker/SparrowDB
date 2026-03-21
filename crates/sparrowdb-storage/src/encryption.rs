@@ -52,6 +52,85 @@ impl EncryptionContext {
         }
     }
 
+    /// Returns `true` if this context has an encryption key (non-passthrough).
+    pub fn is_encrypted(&self) -> bool {
+        self.cipher.is_some()
+    }
+
+    /// Encrypt a WAL record payload.
+    ///
+    /// `lsn` is used as the AEAD AAD, binding the ciphertext to its log position.
+    ///
+    /// Output layout: `[nonce: 24 bytes][ciphertext+tag: plaintext.len()+16 bytes]`
+    ///
+    /// In passthrough mode the plaintext is returned as-is.
+    ///
+    /// # Errors
+    /// Returns [`Error::Corruption`] if the underlying AEAD encrypt fails.
+    pub fn encrypt_wal_payload(&self, lsn: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let cipher = match &self.cipher {
+            None => return Ok(plaintext.to_vec()),
+            Some(c) => c,
+        };
+
+        let mut nonce_bytes = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = *XNonce::from_slice(&nonce_bytes);
+        let aad = lsn.to_le_bytes();
+
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::Corruption("XChaCha20-Poly1305 WAL encrypt failed".into()))?;
+
+        let mut output = Vec::with_capacity(24 + ciphertext.len());
+        output.extend_from_slice(nonce.as_slice());
+        output.extend_from_slice(&ciphertext);
+        Ok(output)
+    }
+
+    /// Decrypt a WAL record payload encrypted with [`encrypt_wal_payload`].
+    ///
+    /// `lsn` is used as AEAD AAD — must match the value used during encryption.
+    ///
+    /// In passthrough mode the data is returned as-is.
+    ///
+    /// # Errors
+    /// - [`Error::EncryptionAuthFailed`] — wrong key or the LSN does not match.
+    /// - [`Error::InvalidArgument`] — `encrypted` is shorter than 40 bytes.
+    pub fn decrypt_wal_payload(&self, lsn: u64, encrypted: &[u8]) -> Result<Vec<u8>> {
+        let cipher = match &self.cipher {
+            None => return Ok(encrypted.to_vec()),
+            Some(c) => c,
+        };
+
+        if encrypted.len() < 40 {
+            return Err(Error::InvalidArgument(format!(
+                "encrypted WAL payload is {} bytes; minimum is 40 (24-byte nonce + 16-byte tag)",
+                encrypted.len()
+            )));
+        }
+
+        let nonce = XNonce::from_slice(&encrypted[..24]);
+        let aad = lsn.to_le_bytes();
+        let plaintext = cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &encrypted[24..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::EncryptionAuthFailed)?;
+
+        Ok(plaintext)
+    }
+
     /// Encrypt a plaintext page and return the on-disk representation.
     ///
     /// A fresh 24-byte nonce is generated from the OS CSPRNG on every call.
@@ -108,7 +187,7 @@ impl EncryptionContext {
     /// In passthrough mode the data is returned as-is.
     ///
     /// # Errors
-    /// - [`Error::DecryptionFailed`] — the AEAD authentication tag was
+    /// - [`Error::EncryptionAuthFailed`] — the AEAD authentication tag was
     ///   rejected (wrong key, corrupted data, or page-swap attack detected).
     /// - [`Error::InvalidArgument`] — `encrypted` is shorter than 40 bytes.
     pub fn decrypt_page(&self, page_id: u64, encrypted: &[u8]) -> Result<Vec<u8>> {
@@ -134,7 +213,7 @@ impl EncryptionContext {
                     aad: &aad,
                 },
             )
-            .map_err(|_| Error::DecryptionFailed)?;
+            .map_err(|_| Error::EncryptionAuthFailed)?;
 
         Ok(plaintext)
     }

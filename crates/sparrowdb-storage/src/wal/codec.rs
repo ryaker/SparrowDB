@@ -73,9 +73,17 @@ pub enum WalPayload {
         /// Raw page image bytes.
         image: Vec<u8>,
     },
+    /// Opaque pre-encoded (possibly encrypted) payload bytes.
+    ///
+    /// Used internally by the WAL writer when encryption is enabled: the
+    /// plaintext `WalPayload::encode()` bytes are encrypted and stored here
+    /// so the codec writes them verbatim.  The replayer decrypts them and
+    /// calls `WalPayload::decode_raw()` to recover the structured payload.
+    Raw(Vec<u8>),
 }
 
 impl WalPayload {
+    /// Encode to on-disk bytes (plaintext structured form).
     pub fn encode(&self) -> Vec<u8> {
         match self {
             WalPayload::Empty => vec![],
@@ -86,10 +94,47 @@ impl WalPayload {
                 buf.extend_from_slice(image);
                 buf
             }
+            // Raw bytes are already in their final on-disk form.
+            WalPayload::Raw(bytes) => bytes.clone(),
         }
     }
 
+    /// Decode from the raw byte slice in a WAL record.
+    ///
+    /// This is used during WAL replay to reconstruct the payload.  For records
+    /// without a payload (Begin, Commit, Abort, CheckpointBegin, CheckpointEnd)
+    /// it returns `Empty`.  For Write records it returns `Raw(bytes)` so that
+    /// the replayer can optionally decrypt the bytes first (P6-3) and then call
+    /// [`decode_plaintext`] to get the structured `Write { page_id, image }`.
     pub fn decode(kind: WalRecordKind, bytes: &[u8]) -> Result<Self> {
+        match kind {
+            WalRecordKind::Begin
+            | WalRecordKind::Commit
+            | WalRecordKind::Abort
+            | WalRecordKind::CheckpointBegin
+            | WalRecordKind::CheckpointEnd => {
+                if !bytes.is_empty() {
+                    return Err(Error::Corruption(format!(
+                        "expected empty payload for {:?} but got {} bytes",
+                        kind,
+                        bytes.len()
+                    )));
+                }
+                Ok(WalPayload::Empty)
+            }
+            WalRecordKind::Write => {
+                // Return the raw bytes; the replayer will decrypt if needed,
+                // then call decode_plaintext to get the Write variant.
+                Ok(WalPayload::Raw(bytes.to_vec()))
+            }
+        }
+    }
+
+    /// Decode a plaintext Write payload from raw bytes.
+    ///
+    /// Called by the replayer after optional decryption.
+    /// Returns `Err(Corruption)` if the bytes do not match the expected layout.
+    pub fn decode_plaintext(kind: WalRecordKind, bytes: &[u8]) -> Result<Self> {
         match kind {
             WalRecordKind::Begin
             | WalRecordKind::Commit
@@ -121,6 +166,11 @@ impl WalPayload {
                 Ok(WalPayload::Write { page_id, image })
             }
         }
+    }
+
+    /// Alias for [`decode_plaintext`] — used at the decryption path in the replayer.
+    pub fn decode_raw(kind: WalRecordKind, plaintext_bytes: &[u8]) -> Result<Self> {
+        Self::decode_plaintext(kind, plaintext_bytes)
     }
 }
 
@@ -330,10 +380,18 @@ mod tests {
             },
         );
         let encoded = rec.encode();
-        let (decoded, consumed) = WalRecord::decode(&encoded).unwrap();
-        assert_eq!(decoded, rec);
+        // decode() returns Raw for Write records; decode_plaintext() gives Write.
+        let (decoded_raw, consumed) = WalRecord::decode(&encoded).unwrap();
         assert_eq!(consumed, encoded.len());
-        match &decoded.payload {
+        assert_eq!(decoded_raw.lsn.0, 2);
+        assert_eq!(decoded_raw.txn_id.0, 100);
+        let structured = match &decoded_raw.payload {
+            WalPayload::Raw(bytes) => {
+                WalPayload::decode_plaintext(decoded_raw.kind, bytes).unwrap()
+            }
+            other => other.clone(),
+        };
+        match &structured {
             WalPayload::Write {
                 page_id,
                 image: img,
@@ -400,11 +458,18 @@ mod tests {
             },
         );
         let encoded = rec.encode();
-        let (decoded, consumed) = WalRecord::decode(&encoded).unwrap();
-        assert_eq!(decoded.lsn.0, 5);
-        assert_eq!(decoded.txn_id.0, 200);
+        // decode() returns Raw for Write records; decode_plaintext() gives Write.
+        let (decoded_raw, consumed) = WalRecord::decode(&encoded).unwrap();
+        assert_eq!(decoded_raw.lsn.0, 5);
+        assert_eq!(decoded_raw.txn_id.0, 200);
         assert_eq!(consumed, encoded.len());
-        match &decoded.payload {
+        let structured = match &decoded_raw.payload {
+            WalPayload::Raw(bytes) => {
+                WalPayload::decode_plaintext(decoded_raw.kind, bytes).unwrap()
+            }
+            other => other.clone(),
+        };
+        match &structured {
             WalPayload::Write { page_id, image } => {
                 assert_eq!(*page_id, 999);
                 assert_eq!(image.len(), 4096);
