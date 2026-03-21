@@ -24,7 +24,8 @@ sparrowdb-catalog = { path = "crates/sparrowdb-catalog" }
 sparrowdb-cypher  = { path = "crates/sparrowdb-cypher" }
 sparrowdb-execution = { path = "crates/sparrowdb-execution" }
 sparrowdb = { path = "crates/sparrowdb" }
-tempfile = "3"
+tempfile  = "3"
+crc32fast = "1"
 
 [profile.dev]
 opt-level = 0

@@ -7,3 +7,7 @@ authors.workspace = true
 
 [dependencies]
 sparrowdb-common = { workspace = true }
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
