@@ -40,16 +40,22 @@ impl<'a> AspJoin<'a> {
         }
 
         // Step 2: build semijoin filter from direct neighbors.
+        // RoaringBitmap only supports u32 keys — return an error rather than
+        // silently dropping nodes whose slot exceeds u32::MAX.
         let mut filter = RoaringBitmap::new();
         for &mid in direct {
-            if mid <= u32::MAX as u64 {
-                filter.insert(mid as u32);
-            }
+            let mid32 = u32::try_from(mid).map_err(|_| {
+                sparrowdb_common::Error::InvalidArgument(format!(
+                    "node slot {mid} exceeds u32::MAX; cannot use RoaringBitmap semijoin filter"
+                ))
+            })?;
+            filter.insert(mid32);
         }
 
         // Step 3 & 4: for each mid node admitted by the filter, collect fof.
         let mut hash: HashMap<u32, Vec<u64>> = HashMap::new();
         for &mid in direct {
+            // Safety: all mids were validated as u32 in the filter step above.
             if !filter.contains(mid as u32) {
                 continue;
             }
