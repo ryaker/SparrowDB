@@ -11,9 +11,10 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CreateStatement, Expr, Literal, MatchMutateStatement, MatchOptionalMatchStatement,
-    MatchStatement, MatchWithStatement, Mutation, OptionalMatchStatement, PathPattern, ReturnItem,
-    SortDir, Statement, UnionStatement, UnwindStatement, WithClause,
+    BinOpKind, CreateStatement, Expr, Literal, MatchCreateStatement, MatchMutateStatement,
+    MatchOptionalMatchStatement, MatchStatement, MatchWithStatement, Mutation,
+    OptionalMatchStatement, PathPattern, ReturnItem, SortDir, Statement, UnionStatement,
+    UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
@@ -75,11 +76,10 @@ impl Engine {
             Statement::MatchWith(mw) => self.execute_match_with(&mw),
             Statement::Unwind(u) => self.execute_unwind(&u),
             Statement::Create(c) => self.execute_create(&c),
-            Statement::MatchCreate(_) => Ok(QueryResult::empty(vec![])),
             // Mutation statements require a write transaction owned by the
             // caller (GraphDb). They are dispatched via the public helpers
             // below and should not reach execute_bound in normal use.
-            Statement::Merge(_) | Statement::MatchMutate(_) => {
+            Statement::Merge(_) | Statement::MatchMutate(_) | Statement::MatchCreate(_) => {
                 Err(sparrowdb_common::Error::InvalidArgument(
                     "mutation statements must be executed via execute_mutation".into(),
                 ))
@@ -91,11 +91,15 @@ impl Engine {
         }
     }
 
-    /// Returns `true` if `stmt` is a mutation (MERGE, MATCH+SET, MATCH+DELETE).
+    /// Returns `true` if `stmt` is a mutation (MERGE, MATCH+SET, MATCH+DELETE,
+    /// MATCH+CREATE edge).
     ///
     /// Used by `GraphDb::execute` to route the statement to the write path.
     pub fn is_mutation(stmt: &Statement) -> bool {
-        matches!(stmt, Statement::Merge(_) | Statement::MatchMutate(_))
+        matches!(
+            stmt,
+            Statement::Merge(_) | Statement::MatchMutate(_) | Statement::MatchCreate(_)
+        )
     }
 
     // ── Mutation execution (called by GraphDb with a write transaction) ────────
@@ -181,6 +185,85 @@ impl Engine {
     /// to the caller (GraphDb) so it can apply it inside a write transaction.
     pub fn mutation_from_match_mutate(mm: &MatchMutateStatement) -> &Mutation {
         &mm.mutation
+    }
+
+    // ── Scan for MATCH…CREATE (called by GraphDb with a write transaction) ──────
+
+    /// Scan nodes matching the MATCH patterns in a `MatchCreateStatement` and
+    /// return a map of variable name → Vec<NodeId> for each named node pattern.
+    ///
+    /// The caller (GraphDb) uses this to resolve variable bindings before
+    /// calling `WriteTx::create_edge` for each edge in the CREATE clause.
+    pub fn scan_match_create(
+        &self,
+        mc: &MatchCreateStatement,
+    ) -> Result<HashMap<String, Vec<NodeId>>> {
+        let mut var_candidates: HashMap<String, Vec<NodeId>> = HashMap::new();
+
+        for pat in &mc.match_patterns {
+            for node_pat in &pat.nodes {
+                if node_pat.var.is_empty() {
+                    continue;
+                }
+                // Skip if already resolved (same var can appear in multiple patterns).
+                if var_candidates.contains_key(&node_pat.var) {
+                    continue;
+                }
+
+                let label = node_pat.labels.first().cloned().unwrap_or_default();
+                let label_id: u32 = match self.catalog.get_label(&label)? {
+                    Some(id) => id as u32,
+                    None => {
+                        // Label not found → no matching nodes for this variable.
+                        var_candidates.insert(node_pat.var.clone(), vec![]);
+                        continue;
+                    }
+                };
+
+                let hwm = self.store.hwm_for_label(label_id)?;
+
+                // Collect col_ids needed for inline prop filtering.
+                let filter_col_ids: Vec<u32> = node_pat
+                    .props
+                    .iter()
+                    .map(|p| prop_name_to_col_id(&p.key))
+                    .collect();
+
+                let mut matching_ids: Vec<NodeId> = Vec::new();
+                for slot in 0..hwm {
+                    let node_id = NodeId(((label_id as u64) << 32) | slot);
+
+                    // Skip tombstoned nodes (col_0 == u64::MAX).
+                    // Treat a missing-file error as "not tombstoned".
+                    match self.store.get_node_raw(node_id, &[0u32]) {
+                        Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
+                            continue;
+                        }
+                        Ok(_) | Err(_) => {}
+                    }
+
+                    // Apply inline prop filter if any.
+                    if !node_pat.props.is_empty() {
+                        match self.store.get_node_raw(node_id, &filter_col_ids) {
+                            Ok(props) => {
+                                if !matches_prop_filter_static(&props, &node_pat.props) {
+                                    continue;
+                                }
+                            }
+                            // If a filter column doesn't exist on disk, the node
+                            // cannot satisfy the filter.
+                            Err(_) => continue,
+                        }
+                    }
+
+                    matching_ids.push(node_id);
+                }
+
+                var_candidates.insert(node_pat.var.clone(), matching_ids);
+            }
+        }
+
+        Ok(var_candidates)
     }
 
     // ── UNWIND ─────────────────────────────────────────────────────────────────
