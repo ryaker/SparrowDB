@@ -26,14 +26,14 @@ It runs Cypher queries over a durable on-disk graph using a factorized execution
 | 2 | WAL write-ahead log + 8 crash failpoints | ✅ Done |
 | 3 | CSR edge storage + node property columns | ✅ Done |
 | 4 | Cypher parser, binder, factorized execution engine | ✅ Done |
-| 6a | XChaCha20-Poly1305 at-rest page encryption | ✅ Done |
+| 5 | SWMR transactions, snapshot isolation, CHECKPOINT/OPTIMIZE | ✅ Done |
+| 6 | XChaCha20-Poly1305 encryption, WAL payload encryption, golden fixtures | ✅ Done |
 | infra | Criterion benchmarks + deterministic fixture generator | ✅ Done |
-| 5 | SWMR transactions + snapshot isolation | 🔄 Next |
-| 6b | Memory spill to disk | ⏳ Pending |
-| 6c | Python bindings (PyO3/maturin) | ⏳ Pending |
-| 7–11 | Full Cypher, LDBC SNB benchmark, publication | ⏳ Pending |
+| 6 (cont.) | Spill-to-disk (sort + ASP-Join), Python bindings, CLI, MCP server | 🔄 In Progress |
+| 7 | Mutation Cypher: MERGE, SET, DELETE, CREATE edge, MVCC conflicts | 🔄 In Progress |
+| 8–11 | Full Cypher, UNWIND, paths, functions, LDBC SNB, publication | ⏳ Planned |
 
-Acceptance checks passing: **#3** (1-hop scan), **#4** (2-hop ASP-Join), **#13** (encryption).
+Acceptance checks passing: 1-hop scan, 2-hop ASP-Join, WAL crash recovery, CHECKPOINT/OPTIMIZE, snapshot isolation, encryption auth.
 
 ---
 
@@ -106,9 +106,11 @@ crates/
   sparrowdb-storage/    # WAL, CSR, node/edge stores, metapage, encryption
   sparrowdb-catalog/    # Label and rel-table registry (TLV on-disk format)
   sparrowdb-cypher/     # Lexer, recursive-descent parser, AST, binder
-  sparrowdb-execution/  # TypedVector, FactorizedChunk, operators, ASP-Join, Engine
-  sparrowdb/            # Public Rust API (Engine entry point)
-  sparrowdb-python/     # PyO3 bindings (Phase 6)
+  sparrowdb-execution/  # TypedVector, FactorizedChunk, operators, ASP-Join, spill
+  sparrowdb/            # Public Rust API (GraphDb entry point)
+  sparrowdb-python/     # PyO3 bindings (maturin wheel)
+  sparrowdb-cli/        # `sparrowdb` CLI binary (query/checkpoint/info)
+  sparrowdb-mcp/        # JSON-RPC 2.0 MCP server over stdio
 
 tests/
   fixtures/             # Golden binary fixtures + small seeded JSON datasets
@@ -135,7 +137,7 @@ Queries return `FactorizedChunk` — a structure that tracks `multiplicity` rath
 
 ### Encryption
 
-Pass a 32-byte key to get XChaCha20-Poly1305 encryption of every page. Physical stride is `page_size + 40` bytes (`24` nonce + `16` AEAD tag). Wrong key → `Error::DecryptionFailed`. No key → transparent passthrough.
+Pass a 32-byte key to get XChaCha20-Poly1305 encryption of every page. Physical stride is `page_size + 40` bytes (`24` nonce + `16` AEAD tag). Wrong key → `Error::EncryptionAuthFailed`. No key → transparent passthrough. WAL records are also encrypted per-record with LSN as AAD.
 
 ---
 
