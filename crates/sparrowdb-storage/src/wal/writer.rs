@@ -63,7 +63,23 @@ impl WalWriter {
         // Find highest existing segment number and last LSN.
         let (seg_no, seg_offset, next_lsn) = Self::scan_wal_state(wal_dir)?;
 
+        // Truncate the active segment to the last valid CRC boundary before
+        // opening in append mode.  Without this, a torn partial record left by
+        // a previous crash becomes permanent garbage that replay will stop at.
         let path = segment_path(wal_dir, seg_no);
+        {
+            // Open with write access only (no truncate flag) so set_len can
+            // shrink the file to the last valid CRC boundary.  The file is
+            // created if it doesn't exist (new WAL directory), otherwise left
+            // in place for truncation.
+            let f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            f.set_len(seg_offset)?;
+        }
+
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         Ok(Self {
@@ -97,21 +113,52 @@ impl WalWriter {
         }
 
         let last_seg = *segments.last().unwrap();
+
+        // Scan the highest segment for the valid-record boundary and max LSN.
         let path = segment_path(wal_dir, last_seg);
         let data = std::fs::read(&path)?;
 
-        // Scan records to find offset and max LSN.
         let mut offset = 0usize;
         let mut max_lsn = 0u64;
+        let mut found_any = false;
         while offset < data.len() {
             match WalRecord::decode(&data[offset..]) {
                 Ok((rec, consumed)) => {
                     if rec.lsn.0 > max_lsn {
                         max_lsn = rec.lsn.0;
                     }
+                    found_any = true;
                     offset += consumed;
                 }
                 Err(_) => break, // Torn record or padding — stop here.
+            }
+        }
+
+        // If the highest segment has no valid records (e.g., crashed during the
+        // very first write into a new segment), scan lower segments descending
+        // until we find a valid LSN to continue from.
+        if !found_any {
+            for &seg in segments.iter().rev().skip(1) {
+                let prev_data = std::fs::read(segment_path(wal_dir, seg))?;
+                let mut prev_max = 0u64;
+                let mut prev_found = false;
+                let mut prev_off = 0usize;
+                while prev_off < prev_data.len() {
+                    match WalRecord::decode(&prev_data[prev_off..]) {
+                        Ok((rec, consumed)) => {
+                            if rec.lsn.0 > prev_max {
+                                prev_max = rec.lsn.0;
+                            }
+                            prev_found = true;
+                            prev_off += consumed;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if prev_found {
+                    max_lsn = prev_max;
+                    break;
+                }
             }
         }
 
@@ -155,8 +202,11 @@ impl WalWriter {
 
     /// Rotate to a new segment file.
     fn rotate(&mut self) -> Result<()> {
-        // Pad remaining bytes to zero (no-op for append-only files — we just move on).
+        // Flush OS buffers and fsync before closing the current segment handle
+        // so a transaction that spans two segments doesn't lose the first
+        // segment's data on a crash between the rotation and the next fsync.
         self.file.flush()?;
+        self.file.sync_all()?;
         self.seg_no += 1;
         self.seg_offset = 0;
         let path = segment_path(&self.wal_dir, self.seg_no);

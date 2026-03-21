@@ -192,6 +192,16 @@ impl WalRecord {
 
         // length field
         let length_val = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+
+        // Minimum valid length: kind(1) + lsn(8) + txn_id(8) + crc(4) = 21.
+        // A smaller value would make the payload slice bounds underflow/panic.
+        if length_val < 21 {
+            return Err(Error::Corruption(format!(
+                "WAL record length field too small: {} (minimum 21)",
+                length_val
+            )));
+        }
+
         let total_record_len = 4 + length_val;
 
         if bytes.len() < total_record_len {
