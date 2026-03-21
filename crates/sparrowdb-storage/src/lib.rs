@@ -2,19 +2,23 @@ pub mod metapage;
 
 use sparrowdb_common::{PageId, Result};
 
-/// Compute CRC32 of the entire buffer.
+/// Compute CRC32C (Castagnoli) of the entire buffer.
 pub fn crc32_of(buf: &[u8]) -> u32 {
-    crc32fast::hash(buf)
+    crc32c::crc32c(buf)
 }
 
-/// Compute CRC32 of `buf` treating `zeroed_offset..zeroed_offset+zeroed_len` as all zeros.
+/// Compute CRC32C (Castagnoli) of `buf` treating `zeroed_offset..zeroed_offset+zeroed_len`
+/// as all zeros.
 /// Used so CRC can be stored in the buffer itself (field is zeroed during calculation).
 pub fn crc32_zeroed_at(buf: &[u8], zeroed_offset: usize, zeroed_len: usize) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&buf[..zeroed_offset]);
-    hasher.update(&vec![0u8; zeroed_len]);
-    hasher.update(&buf[zeroed_offset + zeroed_len..]);
-    hasher.finalize()
+    // Feed the three segments separately; avoids any heap allocation.
+    let crc = crc32c::crc32c(&buf[..zeroed_offset]);
+    // zeroed_len is always small (4 bytes in all current callers); use a stack buffer.
+    const MAX_ZEROED: usize = 64;
+    assert!(zeroed_len <= MAX_ZEROED, "zeroed_len exceeds stack buffer size");
+    let zeros = [0u8; MAX_ZEROED];
+    let crc = crc32c::crc32c_append(crc, &zeros[..zeroed_len]);
+    crc32c::crc32c_append(crc, &buf[zeroed_offset + zeroed_len..])
 }
 
 /// Stub page store — full buffer pool implementation in Phase 2+.
@@ -51,10 +55,10 @@ mod tests {
         let mut buf = [0xABu8; 16];
         // Place a known value at [4..8]
         buf[4..8].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
-        // Manual: zero [4..8], compute crc
+        // Manual: zero [4..8], compute crc32c
         let mut manual = buf;
         manual[4..8].copy_from_slice(&[0u8; 4]);
-        let expected = crc32fast::hash(&manual);
+        let expected = crc32c::crc32c(&manual);
         let actual = crc32_zeroed_at(&buf, 4, 4);
         assert_eq!(actual, expected);
     }

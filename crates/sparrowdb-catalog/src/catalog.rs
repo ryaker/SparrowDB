@@ -64,12 +64,14 @@ impl Catalog {
             label_id: id,
             name: name.to_string(),
         };
-        self.labels.push(entry.clone());
-        self.next_label_id = self
+        let next = self
             .next_label_id
             .checked_add(1)
             .ok_or_else(|| Error::InvalidArgument("label_id overflow".to_string()))?;
-        self.append_entry(TlvEntry::Label(entry))?;
+        // Persist first; only update in-memory state if the write+fsync succeeds.
+        self.append_entry(TlvEntry::Label(entry.clone()))?;
+        self.labels.push(entry);
+        self.next_label_id = next;
         Ok(id)
     }
 
@@ -114,12 +116,14 @@ impl Catalog {
             dst_label_id,
             rel_type: rel_type.to_string(),
         };
-        self.rel_tables.push(entry.clone());
-        self.next_rel_table_id = self
+        let next = self
             .next_rel_table_id
             .checked_add(1)
             .ok_or_else(|| Error::InvalidArgument("rel_table_id overflow".to_string()))?;
-        self.append_entry(TlvEntry::RelTable(entry))?;
+        // Persist first; only update in-memory state if the write+fsync succeeds.
+        self.append_entry(TlvEntry::RelTable(entry.clone()))?;
+        self.rel_tables.push(entry);
+        self.next_rel_table_id = next;
         Ok(id)
     }
 
@@ -137,12 +141,24 @@ impl Catalog {
         for entry in entries {
             match entry {
                 TlvEntry::Label(e) => {
+                    if self.labels.iter().any(|x| x.label_id == e.label_id) {
+                        return Err(Error::Corruption(format!(
+                            "duplicate label_id {} in catalog file",
+                            e.label_id
+                        )));
+                    }
                     if e.label_id >= self.next_label_id {
                         self.next_label_id = e.label_id + 1;
                     }
                     self.labels.push(e);
                 }
                 TlvEntry::RelTable(e) => {
+                    if self.rel_tables.iter().any(|x| x.rel_table_id == e.rel_table_id) {
+                        return Err(Error::Corruption(format!(
+                            "duplicate rel_table_id {} in catalog file",
+                            e.rel_table_id
+                        )));
+                    }
                     if e.rel_table_id >= self.next_rel_table_id {
                         self.next_rel_table_id = e.rel_table_id + 1;
                     }

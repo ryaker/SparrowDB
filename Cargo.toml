@@ -26,6 +26,7 @@ sparrowdb-execution = { path = "crates/sparrowdb-execution" }
 sparrowdb = { path = "crates/sparrowdb" }
 tempfile  = "3"
 crc32fast = "1"
+crc32c    = "0.6"
 
 [profile.dev]
 opt-level = 0
