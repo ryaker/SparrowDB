@@ -1,9 +1,4 @@
-//! Regression tests for SPA-172: COUNT and DISTINCT bugs.
-//!
-//! Three bugs fixed:
-//! 1. COUNT(n) — parser only accepted COUNT(*), not COUNT(expr)
-//! 2. COUNT(*) — aggregate path not triggered; returned 0 per-row instead of total count
-//! 3. DISTINCT — simple node-scan path skipped deduplication
+//! Regression tests for COUNT aggregation and DISTINCT deduplication (SPA-172).
 
 use sparrowdb::open;
 use sparrowdb_execution::types::Value;
@@ -91,13 +86,8 @@ fn distinct_deduplicates_node_scan() {
         result.rows
     );
 
-    // None of the rows should be duplicated.
-    let ages: Vec<&Value> = result.rows.iter().map(|r| &r[0]).collect();
-    let mut unique = ages.clone();
-    unique.dedup();
-    // sort + dedup to check for duplicates regardless of order
-    let mut sorted_ages: Vec<String> = ages.iter().map(|v| v.to_string()).collect();
+    let mut sorted_ages: Vec<String> = result.rows.iter().map(|r| r[0].to_string()).collect();
     sorted_ages.sort();
     sorted_ages.dedup();
-    assert_eq!(sorted_ages.len(), 4, "No duplicate ages should appear in DISTINCT result");
+    assert_eq!(sorted_ages.len(), 4, "no duplicate ages in DISTINCT result");
 }

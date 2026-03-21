@@ -964,7 +964,6 @@ impl Engine {
                         Value::List(vec![Value::String(label.clone())]),
                     );
                 }
-                // Inject the node variable itself so COUNT(n) evaluates to non-null.
                 if !var_name.is_empty() {
                     row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
                 }
@@ -979,7 +978,6 @@ impl Engine {
         if use_agg {
             rows = aggregate_rows(&raw_rows, &m.return_clause.items);
         } else {
-            // DISTINCT
             if m.distinct {
                 deduplicate_rows(&mut rows);
             }
@@ -1160,6 +1158,12 @@ impl Engine {
                             format!("{}.__labels__", dst_node_pat.var),
                             Value::List(vec![Value::String(dst_label.clone())]),
                         );
+                    }
+                    if !src_node_pat.var.is_empty() {
+                        row_vals.insert(src_node_pat.var.clone(), Value::NodeRef(src_node));
+                    }
+                    if !dst_node_pat.var.is_empty() {
+                        row_vals.insert(dst_node_pat.var.clone(), Value::NodeRef(dst_node));
                     }
                     raw_rows.push(row_vals);
                 } else {
