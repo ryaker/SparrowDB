@@ -1042,7 +1042,7 @@ impl Parser {
             self.advance(); // consume IS
             if matches!(self.peek(), Token::Not) {
                 self.advance(); // consume NOT
-                // Expect NULL
+                                // Expect NULL
                 match self.peek().clone() {
                     Token::Null => {
                         self.advance();
