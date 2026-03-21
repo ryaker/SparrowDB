@@ -30,10 +30,11 @@ It runs Cypher queries over a durable on-disk graph using a factorized execution
 | 6 | XChaCha20-Poly1305 encryption, WAL payload encryption, golden fixtures | ✅ Done |
 | infra | Criterion benchmarks + deterministic fixture generator | ✅ Done |
 | 6 (cont.) | Spill-to-disk (ORDER BY + ASP-Join), PyO3 Python bindings, CLI + MCP server | ✅ Done |
-| 7 | Mutation Cypher: MERGE, SET, DELETE, CREATE edge, WAL records, MVCC | 🔄 In Review |
-| 8–11 | UNWIND, variable paths, function library, LDBC SNB, Neo4j import, publication | ⏳ Planned |
+| 7 | Mutation Cypher: MERGE, SET, DELETE, CREATE edge, WAL records, MVCC | ✅ Done |
+| 8 | UNWIND clause, multi-hop variable paths, function library | 🔄 In Progress |
+| 9–11 | LDBC SNB benchmark, Neo4j import bridge, publication | ⏳ Planned |
 
-Acceptance checks passing: 1-hop scan, 2-hop ASP-Join, WAL crash recovery, CHECKPOINT/OPTIMIZE, snapshot isolation, encryption auth, spill-to-disk sort + join, Python binding round-trip.
+Acceptance checks passing: 1-hop scan, 2-hop ASP-Join, WAL crash recovery, CHECKPOINT/OPTIMIZE, snapshot isolation, encryption auth, spill-to-disk sort + join, Python binding round-trip, mutation (MERGE/SET/DELETE/CREATE edge), MVCC write-write conflict detection.
 
 ---
 
@@ -120,6 +121,9 @@ Tools: `execute_cypher`, `checkpoint`, `info`.
 | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | ✅ |
 | Parameters `$param` | ✅ |
 | `DELETE`, `SET` | ✅ |
+| `MERGE` (upsert node) | ✅ |
+| `CREATE (a)-[:REL]->(b)` (edge creation) | ✅ |
+| MVCC write-write conflict detection | ✅ |
 | `OPTIONAL MATCH` | ❌ |
 | Variable-length paths `[:R*1..3]` | ❌ |
 | `UNION`, `UNWIND`, subqueries | ❌ |
