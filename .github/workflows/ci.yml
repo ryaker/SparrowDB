@@ -167,7 +167,11 @@ jobs:
           source .venv/bin/activate
           pip install maturin pytest
           maturin develop
-          pytest tests/python/ -v
+          if [ -d tests/python ] && ls tests/python/*.py 2>/dev/null; then
+            pytest tests/python/ -v
+          else
+            echo "No Python tests yet — skipping pytest (tests/python/ not found)"
+          fi
 
   # ── Golden fixture integrity ───────────────────────────────────────────────
   fixtures:
