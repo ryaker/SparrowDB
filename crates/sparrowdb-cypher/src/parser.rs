@@ -1172,9 +1172,20 @@ impl Parser {
             Token::Count => {
                 self.advance();
                 self.expect_tok(&Token::LParen)?;
-                self.expect_tok(&Token::Star)?;
-                self.expect_tok(&Token::RParen)?;
-                Ok(Expr::CountStar)
+                if self.peek() == &Token::Star {
+                    // COUNT(*) — the well-known star form.
+                    self.advance();
+                    self.expect_tok(&Token::RParen)?;
+                    Ok(Expr::CountStar)
+                } else {
+                    // COUNT(expr) — treat as a named aggregate FnCall.
+                    let arg = self.parse_expr()?;
+                    self.expect_tok(&Token::RParen)?;
+                    Ok(Expr::FnCall {
+                        name: "count".to_string(),
+                        args: vec![arg],
+                    })
+                }
             }
             Token::Integer(_)
             | Token::Float(_)

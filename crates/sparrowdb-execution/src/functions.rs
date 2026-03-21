@@ -70,9 +70,9 @@ pub fn dispatch_function(name: &str, args: Vec<Value>) -> Result<Value> {
         "isnull" => fn_is_null(args),
         "isnotnull" => fn_is_not_null(args),
 
-        // collect() is an aggregate — handled by the engine, not as a scalar function.
-        "collect" => Err(Error::InvalidArgument(
-            "collect() is an aggregate function and cannot be used as a scalar expression".into(),
+        // Aggregate functions — handled by the engine's aggregate_rows(), not as scalar functions.
+        "collect" | "count" | "sum" | "avg" | "min" | "max" => Err(Error::InvalidArgument(
+            format!("{name}() is an aggregate function and cannot be used as a scalar expression"),
         )),
 
         // ── Temporal functions ────────────────────────────────────────────────
