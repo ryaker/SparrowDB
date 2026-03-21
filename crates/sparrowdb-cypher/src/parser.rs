@@ -491,7 +491,7 @@ impl Parser {
                     Ok(path) => return Ok(Expr::NotExists(Box::new(ExistsPattern { path }))),
                     Err(_) => {
                         self.pos = saved_pos; // restore position
-                        // fall through to parse as normal NOT expr
+                                              // fall through to parse as normal NOT expr
                     }
                 }
             }
