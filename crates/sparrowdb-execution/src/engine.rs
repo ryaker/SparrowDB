@@ -42,6 +42,14 @@ impl Engine {
         self.execute_bound(bound.inner)
     }
 
+    /// Execute an already-bound [`Statement`] directly.
+    ///
+    /// Useful for callers (e.g. `WriteTx`) that have already parsed and bound
+    /// the statement and want to dispatch CHECKPOINT/OPTIMIZE themselves.
+    pub fn execute_statement(&self, stmt: Statement) -> Result<QueryResult> {
+        self.execute_bound(stmt)
+    }
+
     fn execute_bound(&self, stmt: Statement) -> Result<QueryResult> {
         match stmt {
             Statement::Match(m) => self.execute_match(&m),

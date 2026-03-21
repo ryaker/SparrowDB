@@ -25,7 +25,7 @@
 //! ```
 
 use std::fs;
-use std::io::Write as IoWrite;
+use std::io::{self, Write as IoWrite};
 use std::path::{Path, PathBuf};
 
 use sparrowdb_common::{EdgeId, Error, NodeId, Result};
@@ -180,19 +180,77 @@ impl EdgeStore {
     ///
     /// Returns [`Error::InvalidArgument`] if any node ID in the delta is >= `n_nodes`.
     ///
-    /// After writing the CSR files the delta log is truncated to zero so that
-    /// subsequent checkpoints do not re-process stale records.
+    /// Atomicity guarantee: CSR files are written to temp paths, then renamed
+    /// into place.  A crash before both renames leaves the old base files valid
+    /// for recovery.  After both renames the delta log is truncated to zero.
     pub fn checkpoint(&mut self, n_nodes: u64) -> Result<()> {
-        let records = self.read_delta()?;
+        let edges = self.build_sorted_edges(n_nodes)?;
+        self.write_csr_atomic(&edges, n_nodes)?;
+        self.truncate_delta()?;
+        Ok(())
+    }
 
-        // Build edge list as raw node IDs (the CSR works over packed u64).
-        // Sort by src so the CSR builder receives edges in node order, which is
-        // the documented precondition for correct neighbor placement.
-        let mut edges: Vec<(u64, u64)> = records.iter().map(|r| (r.src.0, r.dst.0)).collect();
+    /// OPTIMIZE: like CHECKPOINT but additionally sort each source node's
+    /// neighbor list by `(dst_node_id)` ascending.
+    ///
+    /// The CSR builder already receives edges sorted by `(src, dst)`, so the
+    /// neighbor arrays are naturally sorted after a regular checkpoint.  This
+    /// method exists as a named entry-point that makes the sort guarantee
+    /// explicit and can be extended in the future (e.g. secondary sort by
+    /// edge_id once edge properties are tracked in the CSR).
+    pub fn optimize(&mut self, n_nodes: u64) -> Result<()> {
+        // Collect delta records and sort by (src, dst) — identical to checkpoint
+        // but we name this method separately to convey intent.
+        let mut edges = self.build_sorted_edges(n_nodes)?;
+        // Ensure strict (src, dst) order for each src block (already sorted by
+        // build_sorted_edges, but we make it explicit here for OPTIMIZE).
         edges.sort_unstable_by_key(|&(src, dst)| (src, dst));
+        self.write_csr_atomic(&edges, n_nodes)?;
+        self.truncate_delta()?;
+        Ok(())
+    }
 
-        // Validate that all node IDs are within bounds.  The CSR builder indexes
-        // its degree/cursor arrays by node ID, so any out-of-range ID would panic.
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Read the current CSR base (if any) plus all delta records, merge them,
+    /// validate bounds, and return a deduplicated sorted `(src, dst)` edge list.
+    ///
+    /// This implements the "fold base + delta → fresh base" semantics: the new
+    /// CSR captures every edge that was previously checkpointed AND every edge
+    /// added since the last checkpoint.
+    fn build_sorted_edges(&self, n_nodes: u64) -> Result<Vec<(u64, u64)>> {
+        // ── 1. Load existing CSR base edges (may not exist on first checkpoint). ──
+        let mut edges: Vec<(u64, u64)> = Vec::new();
+        match CsrForward::open(&self.fwd_path()) {
+            Ok(fwd) => {
+                for src in 0..fwd.n_nodes() {
+                    for &dst in fwd.neighbors(src) {
+                        edges.push((src, dst));
+                    }
+                }
+            }
+            // File does not exist yet — normal on the first checkpoint.
+            Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::NotFound => {}
+            // Any other failure (permission denied, I/O error, corruption) must
+            // not be silently ignored: proceeding with an empty base would fold
+            // only the delta into the new CSR, permanently discarding all edges
+            // that were written during previous checkpoints.
+            Err(e) => return Err(e),
+        }
+
+        // ── 2. Apply delta records (insert-only for now). ─────────────────────
+        let records = self.read_delta()?;
+        for r in &records {
+            edges.push((r.src.0, r.dst.0));
+        }
+
+        // ── 3. Sort and deduplicate. ──────────────────────────────────────────
+        edges.sort_unstable_by_key(|&(src, dst)| (src, dst));
+        edges.dedup();
+
+        // ── 4. Validate bounds. ───────────────────────────────────────────────
+        // The CSR builder indexes its degree/cursor arrays by node ID, so any
+        // out-of-range ID would panic.
         for &(src, dst) in &edges {
             if src >= n_nodes {
                 return Err(Error::InvalidArgument(format!(
@@ -206,14 +264,36 @@ impl EdgeStore {
             }
         }
 
-        let fwd = CsrForward::build(n_nodes, &edges);
-        let bwd = CsrBackward::build(n_nodes, &edges);
+        Ok(edges)
+    }
 
-        fwd.write(&self.fwd_path())?;
-        bwd.write(&self.bwd_path())?;
+    /// Build CSR structs from `edges`, write them to temp files, then atomically
+    /// rename into the canonical base paths.
+    ///
+    /// Crash before rename: old base files (if any) remain intact.
+    /// Crash after rename: new files are in place, delta will be truncated on
+    /// the next call.
+    fn write_csr_atomic(&self, edges: &[(u64, u64)], n_nodes: u64) -> Result<()> {
+        let fwd = CsrForward::build(n_nodes, edges);
+        let bwd = CsrBackward::build(n_nodes, edges);
 
-        // Truncate the delta log so it does not grow unboundedly and future
-        // checkpoints do not re-process already-checkpointed edges.
+        // Write forward CSR to a temp file, then rename.
+        let fwd_tmp = self.rel_dir.join("base.fwd.csr.tmp");
+        let bwd_tmp = self.rel_dir.join("base.bwd.csr.tmp");
+        fwd.write(&fwd_tmp)?;
+        bwd.write(&bwd_tmp)?;
+
+        // Atomic rename — if rename fails after the first but before the second,
+        // the old bwd file is still consistent with the old (pre-checkpoint) state.
+        // Recovery will replay from the WAL CheckpointBegin LSN in that case.
+        fs::rename(&fwd_tmp, self.fwd_path()).map_err(Error::Io)?;
+        fs::rename(&bwd_tmp, self.bwd_path()).map_err(Error::Io)?;
+
+        Ok(())
+    }
+
+    /// Truncate the delta log to zero bytes and reset the in-memory counter.
+    fn truncate_delta(&mut self) -> Result<()> {
         let delta = self.delta_path();
         if delta.exists() {
             fs::OpenOptions::new()
@@ -223,7 +303,6 @@ impl EdgeStore {
                 .map_err(Error::Io)?;
         }
         self.next_edge_id = 0;
-
         Ok(())
     }
 
