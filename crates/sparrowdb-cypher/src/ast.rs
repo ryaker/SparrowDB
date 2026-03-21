@@ -59,6 +59,11 @@ pub struct RelPattern {
     pub rel_type: String,
     /// Direction from the perspective of the path order.
     pub dir: EdgeDir,
+    /// Minimum hops for variable-length paths (None = exactly 1 hop, i.e. not variable-length).
+    pub min_hops: Option<u32>,
+    /// Maximum hops for variable-length paths (None = unbounded, capped at 10 internally).
+    /// Only meaningful when `min_hops` is `Some`.
+    pub max_hops: Option<u32>,
 }
 
 /// A path pattern: a sequence of alternating nodes and relationships.

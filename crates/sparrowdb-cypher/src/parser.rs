@@ -818,12 +818,12 @@ impl Parser {
             _ => String::new(),
         };
 
-        // Check for variable-length syntax: *n..m or *n or *
+        // Parse optional colon before rel type (or error on bare star).
         if matches!(self.peek(), Token::Colon) {
             self.advance();
         } else if matches!(self.peek(), Token::Star) {
             return Err(Error::InvalidArgument(
-                "variable-length paths are not supported".into(),
+                "variable-length paths require a relationship type: use [:R*] not [*]".into(),
             ));
         }
 
@@ -837,12 +837,52 @@ impl Parser {
             }
         };
 
-        // Check for variable-length after rel type: [:REL*1..3]
-        if matches!(self.peek(), Token::Star) {
-            return Err(Error::InvalidArgument(
-                "variable-length paths are not supported".into(),
-            ));
-        }
+        // Parse optional variable-length hop spec after rel type:
+        //   [:R*]      -> min=1, max=unbounded (capped at 10 in engine)
+        //   [:R*N]     -> min=N, max=N
+        //   [:R*M..N]  -> min=M, max=N
+        //   [:R*M..]   -> min=M, max=unbounded
+        //   [:R*..N]   -> min=1, max=N
+        let (min_hops, max_hops) = if matches!(self.peek(), Token::Star) {
+            self.advance(); // consume '*'
+            if matches!(self.peek(), Token::DotDot) {
+                // [:R*..N]
+                self.advance(); // consume '..'
+                let max = match self.advance().clone() {
+                    Token::Integer(n) if n >= 0 => n as u32,
+                    other => {
+                        return Err(Error::InvalidArgument(format!(
+                            "expected integer after '..', got {:?}",
+                            other
+                        )))
+                    }
+                };
+                (Some(1u32), Some(max))
+            } else if let Token::Integer(n) = self.peek().clone() {
+                let first = n as u32;
+                self.advance(); // consume first integer
+                if matches!(self.peek(), Token::DotDot) {
+                    self.advance(); // consume '..'
+                    if let Token::Integer(m) = self.peek().clone() {
+                        let second = m as u32;
+                        self.advance(); // consume second integer
+                        // [:R*M..N]
+                        (Some(first), Some(second))
+                    } else {
+                        // [:R*M..] -> min=M, max=unbounded
+                        (Some(first), None)
+                    }
+                } else {
+                    // [:R*N] -> min=N, max=N
+                    (Some(first), Some(first))
+                }
+            } else {
+                // [:R*] -> min=1, max=unbounded
+                (Some(1u32), None)
+            }
+        } else {
+            (None, None)
+        };
 
         self.expect_tok(&Token::RBracket)?;
 
@@ -874,7 +914,13 @@ impl Parser {
             }
         };
 
-        Ok(RelPattern { var, rel_type, dir })
+        Ok(RelPattern {
+            var,
+            rel_type,
+            dir,
+            min_hops,
+            max_hops,
+        })
     }
 
     // ── Property map ──────────────────────────────────────────────────────────

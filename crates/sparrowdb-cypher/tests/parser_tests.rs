@@ -200,8 +200,13 @@ fn parse_detach_delete_rejected() {
 }
 
 #[test]
-fn parse_variable_length_path_rejected() {
-    assert!(parse("MATCH (a)-[:KNOWS*1..3]->(b) RETURN b").is_err());
+fn parse_variable_length_path_supported() {
+    // Variable-length paths are now supported (SPA-168+).
+    // Verify each syntax variant parses without error.
+    assert!(parse("MATCH (a:Person)-[:KNOWS*]->(b:Person) RETURN b.name").is_ok(), "[:R*] must parse");
+    assert!(parse("MATCH (a:Person)-[:KNOWS*2]->(b:Person) RETURN b.name").is_ok(), "[:R*N] must parse");
+    assert!(parse("MATCH (a:Person)-[:KNOWS*1..3]->(b:Person) RETURN b.name").is_ok(), "[:R*M..N] must parse");
+    assert!(parse("MATCH (a:Person)-[:KNOWS*..5]->(b:Person) RETURN b.name").is_ok(), "[:R*..N] must parse");
 }
 
 #[test]

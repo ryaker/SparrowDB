@@ -239,7 +239,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 while i < n && chars[i].is_ascii_digit() {
                     i += 1;
                 }
-                let is_float = i < n && chars[i] == '.';
+                // Only treat `1.x` as a float when the char after '.' is a digit,
+                // not when it's another '.' (which would form a `..` DotDot token).
+                let is_float = i < n && chars[i] == '.' && i + 1 < n && chars[i + 1] != '.';
                 if is_float {
                     i += 1;
                     while i < n && chars[i].is_ascii_digit() {
