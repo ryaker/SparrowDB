@@ -39,7 +39,7 @@ fn encrypt_decrypt_roundtrip() {
     );
 }
 
-// ── test 2: wrong key → DecryptionFailed ────────────────────────────────────
+// ── test 2: wrong key → EncryptionAuthFailed ─────────────────────────────────
 
 #[test]
 fn wrong_key_returns_decryption_failed() {
@@ -53,8 +53,8 @@ fn wrong_key_returns_decryption_failed() {
 
     let result = ctx_wrong.decrypt_page(1, &ciphertext);
     assert!(
-        matches!(result, Err(sparrowdb_common::Error::DecryptionFailed)),
-        "wrong key must return Error::DecryptionFailed, got: {result:?}"
+        matches!(result, Err(sparrowdb_common::Error::EncryptionAuthFailed)),
+        "wrong key must return Error::EncryptionAuthFailed, got: {result:?}"
     );
 }
 
@@ -130,7 +130,7 @@ fn golden_fixture_decrypt() {
 // ── test: page-swap attack is detected ──────────────────────────────────────
 // Page identity is cryptographically bound via AEAD AAD (page_id.to_le_bytes()).
 // Swapping page 1's ciphertext into slot 0 causes an AAD mismatch, which
-// makes the AEAD tag verification fail and returns DecryptionFailed.
+// makes the AEAD tag verification fail and returns EncryptionAuthFailed.
 
 #[test]
 fn page_swap_attack_detected() {
@@ -221,8 +221,8 @@ fn uc5_acceptance_check() {
     for (page_id, ct) in ciphertexts.iter().enumerate() {
         let result = ctx_wrong.decrypt_page(page_id as u64, ct);
         assert!(
-            matches!(result, Err(sparrowdb_common::Error::DecryptionFailed)),
-            "page {page_id}: wrong key must return DecryptionFailed"
+            matches!(result, Err(sparrowdb_common::Error::EncryptionAuthFailed)),
+            "page {page_id}: wrong key must return EncryptionAuthFailed"
         );
     }
 

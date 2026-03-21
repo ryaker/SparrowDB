@@ -52,6 +52,11 @@ impl EncryptionContext {
         }
     }
 
+    /// Returns `true` if this context has an encryption key (non-passthrough).
+    pub fn is_encrypted(&self) -> bool {
+        self.cipher.is_some()
+    }
+
     /// Encrypt a plaintext page and return the on-disk representation.
     ///
     /// A fresh 24-byte nonce is generated from the OS CSPRNG on every call.
@@ -108,7 +113,7 @@ impl EncryptionContext {
     /// In passthrough mode the data is returned as-is.
     ///
     /// # Errors
-    /// - [`Error::DecryptionFailed`] — the AEAD authentication tag was
+    /// - [`Error::EncryptionAuthFailed`] — the AEAD authentication tag was
     ///   rejected (wrong key, corrupted data, or page-swap attack detected).
     /// - [`Error::InvalidArgument`] — `encrypted` is shorter than 40 bytes.
     pub fn decrypt_page(&self, page_id: u64, encrypted: &[u8]) -> Result<Vec<u8>> {
@@ -134,7 +139,7 @@ impl EncryptionContext {
                     aad: &aad,
                 },
             )
-            .map_err(|_| Error::DecryptionFailed)?;
+            .map_err(|_| Error::EncryptionAuthFailed)?;
 
         Ok(plaintext)
     }

@@ -35,6 +35,10 @@ pub enum Error {
     DecryptionFailed,
     /// A write transaction is already active; only one writer is allowed at a time.
     WriterBusy,
+    /// AEAD authentication tag rejected on page/WAL decrypt — signals that the
+    /// database was opened with the wrong encryption key (distinct from a
+    /// generic checksum error so callers can present a clear "wrong key" message).
+    EncryptionAuthFailed,
 }
 
 impl std::fmt::Display for Error {
@@ -52,6 +56,10 @@ impl std::fmt::Display for Error {
             Error::Unimplemented => write!(f, "not yet implemented"),
             Error::DecryptionFailed => write!(f, "decryption failed: wrong key or corrupted data"),
             Error::WriterBusy => write!(f, "writer busy: a write transaction is already active"),
+            Error::EncryptionAuthFailed => write!(
+                f,
+                "encryption authentication failed: wrong key or corrupted ciphertext"
+            ),
         }
     }
 }
