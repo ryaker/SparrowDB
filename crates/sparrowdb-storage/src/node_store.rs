@@ -95,11 +95,7 @@ impl Value {
         match bytes[7] {
             TAG_BYTES => {
                 // Inline string: bytes[0..7] hold the data; strip trailing zeros.
-                let data: Vec<u8> = bytes[..7]
-                    .iter()
-                    .copied()
-                    .take_while(|&b| b != 0)
-                    .collect();
+                let data: Vec<u8> = bytes[..7].iter().copied().take_while(|&b| b != 0).collect();
                 Value::Bytes(data)
             }
             _ => {

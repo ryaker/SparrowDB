@@ -94,9 +94,8 @@ impl SparrowDB {
         // SparrowDB wraps GraphDb directly (not behind a shared reference that
         // could be dropped independently), so the guard lives as long as this
         // SparrowDB object, which napi-rs keeps alive while JS holds the handle.
-        let tx: ::sparrowdb::WriteTx<'static> = unsafe {
-            std::mem::transmute(self.inner.begin_write().map_err(to_napi)?)
-        };
+        let tx: ::sparrowdb::WriteTx<'static> =
+            unsafe { std::mem::transmute(self.inner.begin_write().map_err(to_napi)?) };
         Ok(WriteTx { inner: Some(tx) })
     }
 }
