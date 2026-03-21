@@ -9,7 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 sparrowdb = { path = "../sparrowdb" }
+sparrowdb-execution = { path = "../sparrowdb-execution" }
 clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
 serde_json = "1"
 
 [dev-dependencies]

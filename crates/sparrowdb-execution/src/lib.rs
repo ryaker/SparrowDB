@@ -4,11 +4,13 @@ pub mod engine;
 pub mod functions;
 pub mod join;
 pub mod join_spill;
+pub mod json;
 pub mod operators;
 pub mod sort_spill;
 pub mod types;
 
 pub use engine::Engine;
+pub use json::{query_result_to_json, value_to_json};
 pub use operators::UnwindOperator;
 pub use types::{FactorizedChunk, QueryResult, Value, VectorGroup};
 
