@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 /// Activated only when compiled with `--features python`.
 #[cfg(feature = "python")]
 #[pymodule]
-fn sparrowdb_python(_py: Python<'_>, _m: &PyModule) -> PyResult<()> {
+fn sparrowdb_python(_m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Phase 0 stub — bindings implemented in Phase 6.
     Ok(())
 }
