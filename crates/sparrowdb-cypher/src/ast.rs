@@ -240,6 +240,51 @@ pub struct MatchWithStatement {
     pub distinct: bool,
 }
 
+/// OPTIONAL MATCH statement (standalone).
+///
+/// Left-outer-join semantics: if no rows match (label missing or zero nodes),
+/// returns exactly one row with NULL values for all RETURN columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OptionalMatchStatement {
+    pub pattern: Vec<PathPattern>,
+    pub where_clause: Option<Expr>,
+    pub return_clause: ReturnClause,
+    pub order_by: Vec<(Expr, SortDir)>,
+    pub limit: Option<u64>,
+    pub distinct: bool,
+}
+
+/// MATCH … OPTIONAL MATCH … RETURN statement.
+///
+/// For every row produced by the leading MATCH, attempt the OPTIONAL MATCH
+/// sub-pattern.  If no sub-rows are found for a given leading row, emit that
+/// leading row with NULL values for the OPTIONAL MATCH variables.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchOptionalMatchStatement {
+    /// The leading MATCH patterns (must produce rows).
+    pub match_patterns: Vec<PathPattern>,
+    pub match_where: Option<Expr>,
+    /// The OPTIONAL MATCH patterns (may produce NULLs).
+    pub optional_patterns: Vec<PathPattern>,
+    pub optional_where: Option<Expr>,
+    /// Combined RETURN clause evaluated over both MATCH and OPTIONAL MATCH variables.
+    pub return_clause: ReturnClause,
+    pub order_by: Vec<(Expr, SortDir)>,
+    pub limit: Option<u64>,
+    pub distinct: bool,
+}
+
+/// UNION / UNION ALL — combine two complete queries.
+///
+/// When `all` is `false` duplicate rows are eliminated (UNION); when `true`
+/// all rows from both sides are returned (UNION ALL).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionStatement {
+    pub left: Box<Statement>,
+    pub right: Box<Statement>,
+    pub all: bool,
+}
+
 /// Top-level statement variants.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -250,6 +295,9 @@ pub enum Statement {
     Unwind(UnwindStatement),
     Merge(MergeStatement),
     MatchMutate(MatchMutateStatement),
+    OptionalMatch(OptionalMatchStatement),
+    MatchOptionalMatch(MatchOptionalMatchStatement),
+    Union(UnionStatement),
     Checkpoint,
     Optimize,
 }
