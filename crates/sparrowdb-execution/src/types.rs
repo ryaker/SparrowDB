@@ -56,6 +56,8 @@ pub enum Value {
     String(String),
     NodeRef(NodeId),
     EdgeRef(EdgeId),
+    /// A list of values, produced by `collect()` aggregation.
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -78,6 +80,16 @@ impl std::fmt::Display for Value {
             Value::String(v) => write!(f, "{v}"),
             Value::NodeRef(n) => write!(f, "node({})", n.0),
             Value::EdgeRef(e) => write!(f, "edge({})", e.0),
+            Value::List(items) => {
+                write!(f, "[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }

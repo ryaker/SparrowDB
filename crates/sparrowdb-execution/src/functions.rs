@@ -70,6 +70,17 @@ pub fn dispatch_function(name: &str, args: Vec<Value>) -> Result<Value> {
         "isnull" => fn_is_null(args),
         "isnotnull" => fn_is_not_null(args),
 
+        // collect() is an aggregate — handled by the engine, not as a scalar function.
+        "collect" => Err(Error::InvalidArgument(
+            "collect() is an aggregate function and cannot be used as a scalar expression".into(),
+        )),
+
+        // ── Temporal functions ────────────────────────────────────────────────
+        "datetime" => fn_datetime(args),
+        "timestamp" => fn_datetime(args), // alias for datetime()
+        "date" => fn_date(args),
+        "duration" => fn_duration(args),
+
         other => Err(Error::InvalidArgument(format!(
             "unknown function: {other}"
         ))),
@@ -492,6 +503,7 @@ fn fn_to_string(args: Vec<Value>) -> Result<Value> {
         Value::Bool(b) => Ok(Value::String(b.to_string())),
         Value::NodeRef(id) => Ok(Value::String(format!("node({})", id.0))),
         Value::EdgeRef(id) => Ok(Value::String(format!("edge({})", id.0))),
+        Value::List(_) => Ok(Value::String("[]".into())),
     }
 }
 
@@ -639,4 +651,127 @@ fn fn_is_null(args: Vec<Value>) -> Result<Value> {
 fn fn_is_not_null(args: Vec<Value>) -> Result<Value> {
     expect_arity("isNotNull", &args, 1)?;
     Ok(Value::Bool(!matches!(args[0], Value::Null)))
+}
+
+// ── Temporal functions ─────────────────────────────────────────────────────────
+
+/// `datetime()` / `timestamp()` — current UTC time as epoch milliseconds.
+///
+/// Returns `Value::Int64` with the number of milliseconds since the Unix epoch
+/// (1970-01-01T00:00:00Z).  No arguments are accepted.
+fn fn_datetime(args: Vec<Value>) -> Result<Value> {
+    expect_arity("datetime", &args, 0)?;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(Value::Int64(millis))
+}
+
+/// `date()` — today as days since the Unix epoch.
+///
+/// Returns `Value::Int64`.  Computed directly from whole seconds to avoid
+/// floating-point rounding errors.
+fn fn_date(args: Vec<Value>) -> Result<Value> {
+    expect_arity("date", &args, 0)?;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(Value::Int64(secs / 86_400))
+}
+
+/// `duration(iso_string)` — minimal ISO-8601 duration stub.
+///
+/// Parses a small subset of ISO-8601 period strings and returns the
+/// equivalent number of **milliseconds** as `Value::Int64`.
+///
+/// Supported tokens: `P`, `nY`, `nM`, `nW`, `nD`, `T`, `nH`, `nM`, `nS`.
+/// Calendar approximations: 1 year ≈ 365 days, 1 month ≈ 30 days.
+///
+/// Unrecognised strings return `Err(InvalidArgument)`.
+fn fn_duration(args: Vec<Value>) -> Result<Value> {
+    expect_arity("duration", &args, 1)?;
+    if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let s = as_string("duration", &args[0])?;
+    let millis = parse_iso_duration(s).ok_or_else(|| {
+        Error::InvalidArgument(format!("duration(): cannot parse ISO-8601 duration: {s}"))
+    })?;
+    Ok(Value::Int64(millis))
+}
+
+/// Parse a tiny subset of ISO-8601 duration strings → milliseconds.
+fn parse_iso_duration(s: &str) -> Option<i64> {
+    let s = s.trim();
+    // Must start with 'P' or 'p'.
+    let s = if s.starts_with(['P', 'p']) {
+        &s[1..]
+    } else {
+        return None;
+    };
+
+    const MS_PER_SEC: i64 = 1_000;
+    const MS_PER_MIN: i64 = 60 * MS_PER_SEC;
+    const MS_PER_HOUR: i64 = 60 * MS_PER_MIN;
+    const MS_PER_DAY: i64 = 24 * MS_PER_HOUR;
+    const MS_PER_WEEK: i64 = 7 * MS_PER_DAY;
+    const MS_PER_MONTH: i64 = 30 * MS_PER_DAY;
+    const MS_PER_YEAR: i64 = 365 * MS_PER_DAY;
+
+    let mut total: i64 = 0;
+    let mut in_time = false;
+    let mut buf = String::new();
+
+    for ch in s.chars() {
+        match ch {
+            'T' | 't' => {
+                in_time = true;
+                buf.clear();
+            }
+            '0'..='9' | '.' => buf.push(ch),
+            'Y' | 'y' if !in_time => {
+                let n: i64 = buf.parse().ok()?;
+                total += n * MS_PER_YEAR;
+                buf.clear();
+            }
+            'M' | 'm' if !in_time => {
+                let n: i64 = buf.parse().ok()?;
+                total += n * MS_PER_MONTH;
+                buf.clear();
+            }
+            'W' | 'w' if !in_time => {
+                let n: i64 = buf.parse().ok()?;
+                total += n * MS_PER_WEEK;
+                buf.clear();
+            }
+            'D' | 'd' if !in_time => {
+                let n: i64 = buf.parse().ok()?;
+                total += n * MS_PER_DAY;
+                buf.clear();
+            }
+            'H' | 'h' if in_time => {
+                let n: i64 = buf.parse().ok()?;
+                total += n * MS_PER_HOUR;
+                buf.clear();
+            }
+            'M' | 'm' if in_time => {
+                let n: i64 = buf.parse().ok()?;
+                total += n * MS_PER_MIN;
+                buf.clear();
+            }
+            'S' | 's' if in_time => {
+                // Seconds may have a fractional part.
+                let f: f64 = buf.parse().ok()?;
+                total += (f * MS_PER_SEC as f64) as i64;
+                buf.clear();
+            }
+            _ => return None,
+        }
+    }
+
+    Some(total)
 }
