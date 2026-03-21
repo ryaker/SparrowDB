@@ -40,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use tracing::info_span;
 
 // ── Version chain ─────────────────────────────────────────────────────────────
 
@@ -278,14 +279,26 @@ impl GraphDb {
 
     /// Execute a read-only Cypher query and return the result.
     pub fn execute(&self, cypher: &str) -> Result<QueryResult> {
-        let csr = open_csr_forward(&self.inner.path);
-        let engine = Engine::new(
-            NodeStore::open(&self.inner.path)?,
-            Catalog::open(&self.inner.path)?,
-            csr,
-            &self.inner.path,
-        );
-        engine.execute(cypher)
+        let _span = info_span!("sparrowdb.query", cypher = cypher).entered();
+
+        let engine = {
+            let _open_span = info_span!("sparrowdb.open_engine").entered();
+            let csr = open_csr_forward(&self.inner.path);
+            Engine::new(
+                NodeStore::open(&self.inner.path)?,
+                Catalog::open(&self.inner.path)?,
+                csr,
+                &self.inner.path,
+            )
+        };
+
+        let result = {
+            let _exec_span = info_span!("sparrowdb.execute").entered();
+            engine.execute(cypher)?
+        };
+
+        tracing::debug!(rows = result.rows.len(), "query complete");
+        Ok(result)
     }
 }
 
