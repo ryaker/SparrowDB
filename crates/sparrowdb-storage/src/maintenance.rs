@@ -81,12 +81,7 @@ impl MaintenanceEngine {
         self.db_root.join("wal")
     }
 
-    fn run_maintenance(
-        &self,
-        rel_table_ids: &[u32],
-        n_nodes: u64,
-        sorted: bool,
-    ) -> Result<()> {
+    fn run_maintenance(&self, rel_table_ids: &[u32], n_nodes: u64, sorted: bool) -> Result<()> {
         let wal_dir = self.wal_dir();
 
         // Step 1: emit CheckpointBegin and fsync.
@@ -148,6 +143,7 @@ impl MaintenanceEngine {
             // Extend the file (or create it) with zeros.
             let f = fs::OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .write(true)
                 .open(&self.catalog_path)
                 .map_err(sparrowdb_common::Error::Io)?;
@@ -223,13 +219,13 @@ impl MaintenanceEngine {
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&self.catalog_path)
             .map_err(sparrowdb_common::Error::Io)?;
         use std::io::Seek;
         f.seek(std::io::SeekFrom::Start(offset as u64))
             .map_err(sparrowdb_common::Error::Io)?;
-        f.write_all(&encoded)
-            .map_err(sparrowdb_common::Error::Io)?;
+        f.write_all(&encoded).map_err(sparrowdb_common::Error::Io)?;
         f.sync_all().map_err(sparrowdb_common::Error::Io)?;
         Ok(())
     }
@@ -269,10 +265,7 @@ mod tests {
         // WAL directory must exist with at least one segment.
         let wal_dir = db_root.join("wal");
         assert!(wal_dir.exists(), "WAL directory must be created");
-        let entries: Vec<_> = fs::read_dir(&wal_dir)
-            .unwrap()
-            .flatten()
-            .collect();
+        let entries: Vec<_> = fs::read_dir(&wal_dir).unwrap().flatten().collect();
         assert!(!entries.is_empty(), "WAL must have at least one segment");
 
         // Delta log must be empty after checkpoint.
@@ -332,7 +325,10 @@ mod tests {
             .iter()
             .position(|k| *k == WalRecordKind::CheckpointEnd)
             .unwrap();
-        assert!(begin_pos < end_pos, "CheckpointBegin must precede CheckpointEnd");
+        assert!(
+            begin_pos < end_pos,
+            "CheckpointBegin must precede CheckpointEnd"
+        );
     }
 
     #[test]
@@ -352,14 +348,21 @@ mod tests {
 
         // Read the catalog.bin and verify metapage has a non-zero checkpoint LSN.
         let catalog_path = db_root.join("catalog.bin");
-        assert!(catalog_path.exists(), "catalog.bin must exist after checkpoint");
+        assert!(
+            catalog_path.exists(),
+            "catalog.bin must exist after checkpoint"
+        );
         let data = fs::read(&catalog_path).unwrap();
         assert!(data.len() >= (METAPAGE_B_OFFSET as usize) + METAPAGE_SIZE);
 
         let mut a_buf = [0u8; METAPAGE_SIZE];
         let mut b_buf = [0u8; METAPAGE_SIZE];
-        a_buf.copy_from_slice(&data[METAPAGE_A_OFFSET as usize..METAPAGE_A_OFFSET as usize + METAPAGE_SIZE]);
-        b_buf.copy_from_slice(&data[METAPAGE_B_OFFSET as usize..METAPAGE_B_OFFSET as usize + METAPAGE_SIZE]);
+        a_buf.copy_from_slice(
+            &data[METAPAGE_A_OFFSET as usize..METAPAGE_A_OFFSET as usize + METAPAGE_SIZE],
+        );
+        b_buf.copy_from_slice(
+            &data[METAPAGE_B_OFFSET as usize..METAPAGE_B_OFFSET as usize + METAPAGE_SIZE],
+        );
 
         let winner = select_winner(&a_buf, &b_buf).expect("metapage must be valid");
         assert!(
@@ -395,7 +398,8 @@ mod tests {
             v
         };
         assert_eq!(
-            neighbors, sorted.as_slice(),
+            neighbors,
+            sorted.as_slice(),
             "neighbor list must be sorted after OPTIMIZE"
         );
     }

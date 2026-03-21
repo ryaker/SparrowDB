@@ -211,30 +211,35 @@ fn checkpoint_and_optimize_clean_base() {
     }
 
     // ── Step 6: Cypher MATCH query returns correct results.
-    // We use WriteTx::execute to route through the full engine path.
+    // We use db.checkpoint()/optimize() to route through the full engine path.
     {
         let db = GraphDb::open(db_root).expect("open db for Cypher query");
 
-        // CHECKPOINT via Cypher path (WriteTx).
-        let tx = db.begin_write();
-        tx.execute("CHECKPOINT")
-            .expect("CHECKPOINT via WriteTx must succeed");
+        // CHECKPOINT via direct API.
+        db.checkpoint().expect("CHECKPOINT must succeed");
 
-        // OPTIMIZE via Cypher path (WriteTx).
-        tx.execute("OPTIMIZE")
-            .expect("OPTIMIZE via WriteTx must succeed");
+        // OPTIMIZE via direct API.
+        db.optimize().expect("OPTIMIZE must succeed");
 
         // Verify edges still correct after Cypher-path maintenance.
         let store = EdgeStore::open(db_root, RelTableId(0)).expect("edge store");
         let fwd = store.open_fwd().expect("open_fwd after Cypher CHECKPOINT");
-        assert!(fwd.neighbors(0).contains(&1), "Alice→Bob after Cypher CHECKPOINT");
-        assert!(fwd.neighbors(2).contains(&3), "Carol→Dave after Cypher CHECKPOINT");
-        assert!(fwd.neighbors(4).contains(&5), "Eve→Frank after Cypher CHECKPOINT");
+        assert!(
+            fwd.neighbors(0).contains(&1),
+            "Alice→Bob after Cypher CHECKPOINT"
+        );
+        assert!(
+            fwd.neighbors(2).contains(&3),
+            "Carol→Dave after Cypher CHECKPOINT"
+        );
+        assert!(
+            fwd.neighbors(4).contains(&5),
+            "Eve→Frank after Cypher CHECKPOINT"
+        );
     }
 }
 
-/// Verify that CHECKPOINT via WriteTx routes to the maintenance engine
-/// (not a no-op stub).
+/// Verify that CHECKPOINT routes to the maintenance engine (not a no-op stub).
 #[test]
 fn writetx_checkpoint_routes_to_engine() {
     let dir = tempfile::tempdir().unwrap();
@@ -251,15 +256,14 @@ fn writetx_checkpoint_routes_to_engine() {
     }
 
     let db = GraphDb::open(db_root).expect("open db");
-    let tx = db.begin_write();
-    tx.execute("CHECKPOINT").expect("CHECKPOINT via WriteTx");
+    db.checkpoint().expect("CHECKPOINT must succeed");
 
     // Delta must be empty — confirms real checkpoint ran, not a stub.
     assert_delta_empty(db_root);
     assert_csr_base_exists(db_root);
 }
 
-/// Verify that OPTIMIZE via WriteTx sorts neighbor lists.
+/// Verify that OPTIMIZE sorts neighbor lists.
 #[test]
 fn writetx_optimize_sorts_neighbors() {
     let dir = tempfile::tempdir().unwrap();
@@ -277,8 +281,7 @@ fn writetx_optimize_sorts_neighbors() {
     }
 
     let db = GraphDb::open(db_root).expect("open db");
-    let tx = db.begin_write();
-    tx.execute("OPTIMIZE").expect("OPTIMIZE via WriteTx");
+    db.optimize().expect("OPTIMIZE must succeed");
 
     assert_neighbors_sorted(db_root);
 }

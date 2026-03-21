@@ -552,7 +552,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = GraphDb::open(dir.path()).unwrap();
         // Checkpoint on empty DB must not panic or error.
-        db.checkpoint().expect("checkpoint must succeed on empty DB");
+        db.checkpoint()
+            .expect("checkpoint must succeed on empty DB");
     }
 
     #[test]
