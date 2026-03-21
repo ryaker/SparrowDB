@@ -11,12 +11,13 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, Expr, Literal, MatchStatement, ReturnItem, SortDir, Statement, UnwindStatement,
+    BinOpKind, CreateStatement, Expr, Literal, MatchStatement, ReturnItem, SortDir, Statement,
+    UnwindStatement,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
-use sparrowdb_storage::node_store::NodeStore;
+use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
 
 use crate::types::{QueryResult, Value};
 
@@ -39,7 +40,10 @@ impl Engine {
     }
 
     /// Parse, bind, plan, and execute a Cypher query.
-    pub fn execute(&self, cypher: &str) -> Result<QueryResult> {
+    ///
+    /// Takes `&mut self` because `CREATE` statements auto-register labels in
+    /// the catalog and write nodes to the node store (SPA-156).
+    pub fn execute(&mut self, cypher: &str) -> Result<QueryResult> {
         let stmt = {
             let _parse_span = info_span!("sparrowdb.parse", cypher = cypher).entered();
             parse(cypher)?
@@ -60,18 +64,15 @@ impl Engine {
     ///
     /// Useful for callers (e.g. `WriteTx`) that have already parsed and bound
     /// the statement and want to dispatch CHECKPOINT/OPTIMIZE themselves.
-    pub fn execute_statement(&self, stmt: Statement) -> Result<QueryResult> {
+    pub fn execute_statement(&mut self, stmt: Statement) -> Result<QueryResult> {
         self.execute_bound(stmt)
     }
 
-    fn execute_bound(&self, stmt: Statement) -> Result<QueryResult> {
+    fn execute_bound(&mut self, stmt: Statement) -> Result<QueryResult> {
         match stmt {
             Statement::Match(m) => self.execute_match(&m),
             Statement::Unwind(u) => self.execute_unwind(&u),
-            Statement::Create(_) => {
-                // CREATE is a write — not handled in read-only engine stub.
-                Ok(QueryResult::empty(vec![]))
-            }
+            Statement::Create(c) => self.execute_create(&c),
             Statement::MatchCreate(_) => Ok(QueryResult::empty(vec![])),
             Statement::Checkpoint | Statement::Optimize => Ok(QueryResult::empty(vec![])),
         }
@@ -137,6 +138,40 @@ impl Engine {
         })
     }
 
+    // ── CREATE node execution ─────────────────────────────────────────────────
+
+    /// Execute a `CREATE` statement, auto-registering labels as needed (SPA-156).
+    ///
+    /// For each node in the CREATE clause:
+    /// 1. Look up (or create) its primary label in the catalog.
+    /// 2. Convert inline properties to `(col_id, StoreValue)` pairs using the
+    ///    same FNV-1a hash used by `WriteTx::merge_node`.
+    /// 3. Write the node to the node store.
+    fn execute_create(&mut self, create: &CreateStatement) -> Result<QueryResult> {
+        for node in &create.nodes {
+            // Resolve the primary label, creating it if absent.
+            let label = node.labels.first().cloned().unwrap_or_default();
+            let label_id: u32 = match self.catalog.get_label(&label)? {
+                Some(id) => id as u32,
+                None => self.catalog.create_label(&label)? as u32,
+            };
+
+            // Convert AST props to (col_id, StoreValue) pairs.
+            let props: Vec<(u32, StoreValue)> = node
+                .props
+                .iter()
+                .map(|entry| {
+                    let col_id = prop_name_to_col_id(&entry.key);
+                    let store_val = literal_to_store_value(&entry.value);
+                    (col_id, store_val)
+                })
+                .collect();
+
+            self.store.create_node(label_id, &props)?;
+        }
+        Ok(QueryResult::empty(vec![]))
+    }
+
     fn execute_match(&self, m: &MatchStatement) -> Result<QueryResult> {
         if m.pattern.is_empty() {
             return Ok(QueryResult::empty(vec![]));
@@ -176,9 +211,21 @@ impl Engine {
         let hwm = self.store.hwm_for_label(label_id_u32)?;
         tracing::debug!(label = %label, hwm = hwm, "node scan start");
 
-        // Collect all col_ids we need.
+        // Collect all col_ids we need: RETURN columns + WHERE clause columns +
+        // inline prop filter columns.
         let col_ids = collect_col_ids_from_columns(column_names);
-        let all_col_ids: Vec<u32> = col_ids.clone();
+        let mut all_col_ids: Vec<u32> = col_ids.clone();
+        // Add col_ids referenced by the WHERE clause.
+        if let Some(ref where_expr) = m.where_clause {
+            collect_col_ids_from_expr(where_expr, &mut all_col_ids);
+        }
+        // Add col_ids for inline prop filters on the node pattern.
+        for p in &node.props {
+            let col_id = prop_name_to_col_id(&p.key);
+            if !all_col_ids.contains(&col_id) {
+                all_col_ids.push(col_id);
+            }
+        }
 
         let mut rows = Vec::new();
 
@@ -536,11 +583,11 @@ impl Engine {
 
             let matches = match &f.value {
                 Literal::Int(n) => stored_val == Some(*n as u64),
-                Literal::String(_) => {
-                    // Strings are stored as i64 hash — for test simplicity we
-                    // compare using string-to-i64 lookup table.
-                    // In production this would use the overflow store.
-                    false
+                Literal::String(s) => {
+                    // Strings are stored inline as up to 8 bytes packed into a
+                    // u64 (little-endian, zero-padded).  Encode the literal the
+                    // same way and compare against the stored raw value (SPA-161).
+                    stored_val == Some(string_to_raw_u64(s))
                 }
                 Literal::Param(_) => true, // params always pass in current impl
                 _ => false,
@@ -612,6 +659,57 @@ fn extract_return_column_names(items: &[ReturnItem]) -> Vec<String> {
         .collect()
 }
 
+/// Collect all column IDs referenced by property accesses in an expression.
+///
+/// Used to ensure that every column needed by a WHERE clause is read from
+/// disk before predicate evaluation, even when it is not in the RETURN list.
+fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
+    match expr {
+        Expr::PropAccess { prop, .. } => {
+            let col_id = prop_name_to_col_id(prop);
+            if !out.contains(&col_id) {
+                out.push(col_id);
+            }
+        }
+        Expr::BinOp { left, right, .. } => {
+            collect_col_ids_from_expr(left, out);
+            collect_col_ids_from_expr(right, out);
+        }
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            collect_col_ids_from_expr(l, out);
+            collect_col_ids_from_expr(r, out);
+        }
+        Expr::Not(inner) => collect_col_ids_from_expr(inner, out),
+        _ => {}
+    }
+}
+
+/// Convert an AST `Literal` to the `StoreValue` used by the node store.
+///
+/// Integers are stored as `Int64`; strings are stored as `Bytes` (up to 8 bytes
+/// inline, matching the storage layer's encoding in `Value::to_u64`).
+fn literal_to_store_value(lit: &Literal) -> StoreValue {
+    match lit {
+        Literal::Int(n) => StoreValue::Int64(*n),
+        Literal::String(s) => StoreValue::Bytes(s.as_bytes().to_vec()),
+        Literal::Float(f) => StoreValue::Int64(f64::to_bits(*f) as i64),
+        Literal::Bool(b) => StoreValue::Int64(if *b { 1 } else { 0 }),
+        Literal::Null | Literal::Param(_) => StoreValue::Int64(0),
+    }
+}
+
+/// Encode a string literal the same way the storage layer does (inline ≤ 8 bytes).
+///
+/// Returns the `u64` that `StoreValue::Bytes(s.as_bytes()).to_u64()` would produce,
+/// allowing WHERE-clause string comparisons against raw column values.
+fn string_to_raw_u64(s: &str) -> u64 {
+    let b = s.as_bytes();
+    let mut arr = [0u8; 8];
+    let len = b.len().min(8);
+    arr[..len].copy_from_slice(&b[..len]);
+    u64::from_le_bytes(arr)
+}
+
 /// Map a property name like "col_0" or "name" to a col_id.
 ///
 /// Uses the canonical [`sparrowdb_common::col_id_of`] FNV-1a hash so that
@@ -676,14 +774,37 @@ fn build_row_vals(
     map
 }
 
+/// Compare two `Value`s for equality, handling the mixed `Int64`/`String` case.
+///
+/// Properties are stored as raw `u64` and read back as `Value::Int64` by
+/// `build_row_vals`, while a WHERE string literal evaluates to `Value::String`.
+/// When one side is `Int64` and the other is `String`, encode the string using
+/// the same inline-bytes encoding the storage layer uses and compare numerically
+/// (SPA-161).
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        // Normal same-type comparisons.
+        (Value::Int64(x), Value::Int64(y)) => x == y,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Float64(x), Value::Float64(y)) => x == y,
+        // Mixed: stored raw-int vs string literal — compare via inline encoding.
+        (Value::Int64(raw), Value::String(s)) => *raw as u64 == string_to_raw_u64(s),
+        (Value::String(s), Value::Int64(raw)) => string_to_raw_u64(s) == *raw as u64,
+        // Null is only equal to null.
+        (Value::Null, Value::Null) => true,
+        _ => false,
+    }
+}
+
 fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
     match expr {
         Expr::BinOp { left, op, right } => {
             let lv = eval_expr(left, vals);
             let rv = eval_expr(right, vals);
             match op {
-                BinOpKind::Eq => lv == rv,
-                BinOpKind::Neq => lv != rv,
+                BinOpKind::Eq => values_equal(&lv, &rv),
+                BinOpKind::Neq => !values_equal(&lv, &rv),
                 BinOpKind::Contains => lv.contains(&rv),
                 BinOpKind::StartsWith => {
                     matches!((&lv, &rv), (Value::String(l), Value::String(r)) if l.starts_with(r.as_str()))
@@ -722,8 +843,17 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
 fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
     match expr {
         Expr::PropAccess { var, prop } => {
+            // First try the direct name key (e.g. "n.name").
             let key = format!("{var}.{prop}");
-            vals.get(&key).cloned().unwrap_or(Value::Null)
+            if let Some(v) = vals.get(&key) {
+                return v.clone();
+            }
+            // Fall back to the hashed col_id key (e.g. "n.col_12345").
+            // build_row_vals stores values under this form because the storage
+            // layer does not carry property names — only numeric col IDs.
+            let col_id = prop_name_to_col_id(prop);
+            let fallback_key = format!("{var}.col_{col_id}");
+            vals.get(&fallback_key).cloned().unwrap_or(Value::Null)
         }
         Expr::Var(v) => vals.get(v.as_str()).cloned().unwrap_or(Value::Null),
         Expr::Literal(lit) => match lit {

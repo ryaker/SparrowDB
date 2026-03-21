@@ -2,11 +2,18 @@
 //!
 //! Returns `Err(Error::InvalidArgument)` for unknown labels or rel types,
 //! and `Err(Error::Unimplemented)` for unsupported constructs.
+//!
+//! **CREATE vs MATCH semantics:**
+//! - `MATCH` labels and rel-types must exist in the catalog (otherwise there is
+//!   nothing to scan).
+//! - `CREATE` labels and rel-types need NOT exist yet — they are auto-registered
+//!   by the execution engine on first use (SPA-156).  The binder therefore skips
+//!   existence checks for `CREATE` patterns.
 
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{Error, Result};
 
-use crate::ast::{CreateStatement, MatchStatement, PathPattern, Statement};
+use crate::ast::{MatchStatement, PathPattern, Statement};
 
 /// A bound statement — the AST annotated with resolved catalog IDs.
 ///
@@ -21,17 +28,19 @@ pub struct BoundStatement {
 /// Bind a parsed `Statement` against `catalog`.
 ///
 /// Returns `Err` if:
-/// - any label name is unknown
-/// - any relationship type is unknown
+/// - a MATCH label name is unknown (CREATE labels are auto-registered)
+/// - any relationship type referenced in MATCH is unknown
 /// - unsupported syntax is used
 pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
     match &stmt {
-        Statement::Create(c) => bind_create(c, catalog)?,
+        // CREATE: labels are auto-registered on execution — no existence check.
+        Statement::Create(_c) => {}
         Statement::MatchCreate(mc) => {
+            // MATCH patterns must reference existing labels.
             for pat in &mc.match_patterns {
                 bind_path_pattern(pat, catalog)?;
             }
-            bind_create(&mc.create, catalog)?;
+            // CREATE patterns: labels auto-registered — skip existence check.
         }
         Statement::Match(m) => bind_match(m, catalog)?,
         // UNWIND does not reference labels or rel types — nothing to bind.
@@ -39,18 +48,6 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
         Statement::Checkpoint | Statement::Optimize => {}
     }
     Ok(BoundStatement { inner: stmt })
-}
-
-fn bind_create(create: &CreateStatement, catalog: &Catalog) -> Result<()> {
-    for node in &create.nodes {
-        for label in &node.labels {
-            ensure_label(label, catalog)?;
-        }
-    }
-    for (_src, rel, _dst) in &create.edges {
-        ensure_rel_type(&rel.rel_type, catalog)?;
-    }
-    Ok(())
 }
 
 fn bind_match(m: &MatchStatement, catalog: &Catalog) -> Result<()> {
@@ -133,5 +130,24 @@ mod tests {
         let (_dir, cat) = make_catalog();
         let stmt = parse("MATCH (a:Person)-[:HATES]->(b:Person) RETURN b.name").unwrap();
         assert!(bind(stmt, &cat).is_err());
+    }
+
+    /// SPA-156: CREATE with a label that is not yet in the catalog must bind
+    /// successfully (labels are auto-registered at execution time).
+    #[test]
+    fn bind_create_unknown_label_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cat = Catalog::open(dir.path()).expect("empty catalog");
+        // "Ghost" is not registered — but CREATE should still bind OK.
+        let stmt = parse("CREATE (n:Ghost {name: 'Casper'})").unwrap();
+        bind(stmt, &cat).expect("CREATE with unknown label must bind OK");
+    }
+
+    /// SPA-156: CREATE with a label that is already registered should also succeed.
+    #[test]
+    fn bind_create_known_label_ok() {
+        let (_dir, cat) = make_catalog();
+        let stmt = parse("CREATE (n:Person {name: 'Alice'})").unwrap();
+        bind(stmt, &cat).expect("CREATE with known label must bind OK");
     }
 }

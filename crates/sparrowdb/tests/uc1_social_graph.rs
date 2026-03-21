@@ -76,7 +76,7 @@ fn setup_social_graph(dir: &std::path::Path) -> Engine {
 #[test]
 fn single_reader_match_person_names() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = setup_social_graph(dir.path());
+    let mut engine = setup_social_graph(dir.path());
 
     // This is the acceptance check query: MATCH (p:Person)-[:KNOWS]->(f:Person) RETURN f.name
     // Since names are stored as i64, we check that we get the right count.
@@ -102,7 +102,7 @@ fn single_reader_match_person_names() {
 #[test]
 fn two_hop_match_via_binary_asp_join() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = setup_social_graph(dir.path());
+    let mut engine = setup_social_graph(dir.path());
 
     // 2-hop: friends of Alice's friends excluding direct friends of Alice
     let result = engine

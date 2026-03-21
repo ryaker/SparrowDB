@@ -293,11 +293,15 @@ impl GraphDb {
         engine.optimize(&rel_table_ids, n_nodes)
     }
 
-    /// Execute a read-only Cypher query and return the result.
+    /// Execute a Cypher query and return the result.
+    ///
+    /// `CREATE` statements auto-register labels and write nodes (SPA-156);
+    /// the engine is created fresh per call so mutations do not bleed across
+    /// calls on this `GraphDb` handle.
     pub fn execute(&self, cypher: &str) -> Result<QueryResult> {
         let _span = info_span!("sparrowdb.query").entered();
 
-        let engine = {
+        let mut engine = {
             let _open_span = info_span!("sparrowdb.open_engine").entered();
             let csr = open_csr_forward(&self.inner.path);
             Engine::new(
