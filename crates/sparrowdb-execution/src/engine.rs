@@ -11,8 +11,8 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CreateStatement, Expr, Literal, MatchMutateStatement, MatchStatement,
-    MergeStatement, Mutation, ReturnItem, SortDir, Statement, UnwindStatement,
+    BinOpKind, CreateStatement, Expr, Literal, MatchMutateStatement, MatchStatement, Mutation,
+    ReturnItem, SortDir, Statement, UnwindStatement,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
@@ -101,6 +101,16 @@ impl Engine {
     pub fn scan_match_mutate(&self, mm: &MatchMutateStatement) -> Result<Vec<NodeId>> {
         if mm.match_patterns.is_empty() {
             return Ok(vec![]);
+        }
+
+        // Guard: only single-node patterns (no multi-pattern, no relationship hops)
+        // are supported.  Silently ignoring extra patterns would mutate the wrong
+        // nodes; instead we surface a clear error.
+        if mm.match_patterns.len() != 1 || !mm.match_patterns[0].rels.is_empty() {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "MATCH...SET/DELETE currently supports only single-node patterns (no relationships)"
+                    .into(),
+            ));
         }
 
         let pat = &mm.match_patterns[0];
@@ -697,21 +707,6 @@ fn matches_prop_filter_static(
         }
     }
     true
-}
-
-// ── Mutation value helpers ────────────────────────────────────────────────────
-
-/// Convert a Cypher literal to a `StoreValue` for use in write-path mutations
-/// (MERGE properties).  Uses `Int64` for numbers and FNV-1a hash for strings
-/// (matching the scan-side encoding used by the storage layer for inline props).
-fn literal_to_storage_value(lit: &Literal) -> StoreValue {
-    match lit {
-        Literal::Int(n) => StoreValue::Int64(*n),
-        Literal::Float(f) => StoreValue::Int64(f.to_bits() as i64),
-        Literal::Bool(b) => StoreValue::Int64(if *b { 1 } else { 0 }),
-        Literal::String(s) => StoreValue::Bytes(s.as_bytes().to_vec()),
-        Literal::Null | Literal::Param(_) => StoreValue::Int64(0),
-    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

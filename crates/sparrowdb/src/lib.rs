@@ -351,10 +351,22 @@ impl GraphDb {
     }
 
     /// Internal: execute a MATCH … SET / DELETE by scanning then writing.
+    ///
+    /// The write lock is acquired **before** the scan so that no concurrent
+    /// writer can commit between the scan and the mutation, preventing stale
+    /// matches from being mutated.
     fn execute_match_mutate(
         &self,
         mm: &sparrowdb_cypher::ast::MatchMutateStatement,
     ) -> Result<QueryResult> {
+        // Acquire the write lock first.  From this point on no other writer
+        // can commit until we call tx.commit() or drop tx.
+        let mut tx = self.begin_write()?;
+
+        // Build an Engine that reads from the same on-disk snapshot the write
+        // transaction was opened against.  Because we hold the write lock,
+        // the data on disk cannot change between this scan and the mutations
+        // below.
         let csr = open_csr_forward(&self.inner.path);
         let engine = Engine::new(
             NodeStore::open(&self.inner.path)?,
@@ -363,14 +375,12 @@ impl GraphDb {
             &self.inner.path,
         );
 
-        // Collect matching node ids via the engine's read-only scan.
+        // Collect matching node ids via the engine's scan (lock already held).
         let matching_ids = engine.scan_match_mutate(mm)?;
 
         if matching_ids.is_empty() {
             return Ok(QueryResult::empty(vec![]));
         }
-
-        let mut tx = self.begin_write()?;
 
         match &mm.mutation {
             sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
