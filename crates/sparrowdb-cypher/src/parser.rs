@@ -1207,8 +1207,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_optional_match_fails() {
-        assert!(parse("OPTIONAL MATCH (n:Person) RETURN n").is_err());
+    fn parse_optional_match_ok() {
+        // OPTIONAL MATCH standalone is supported (SPA-131).
+        let stmt = parse("OPTIONAL MATCH (n:Person) RETURN n.name").unwrap();
+        assert!(matches!(stmt, Statement::OptionalMatch(_)));
+    }
+
+    #[test]
+    fn parse_optional_match_missing_return_fails() {
+        assert!(parse("OPTIONAL MATCH (n:Person)").is_err());
     }
 
     #[test]
