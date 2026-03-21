@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use sparrowdb_execution::{query_result_to_json, value_to_json};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -50,7 +51,9 @@ enum Commands {
         /// Path to the database directory
         #[arg(long)]
         db: PathBuf,
-        /// Optional encryption key (hex-encoded 32 bytes)
+        /// Encryption key (hex-encoded 32 bytes).
+        /// TODO: wire through to GraphDb::open_encrypted once that API is
+        /// stable (tracked in SPA-97 / SPA-98).
         #[arg(long)]
         key: Option<String>,
     },
@@ -63,51 +66,13 @@ fn main() {
         Commands::Query { db, cypher } => cmd_query(&db, &cypher),
         Commands::Checkpoint { db } => cmd_checkpoint(&db),
         Commands::Info { db } => cmd_info(&db),
-        Commands::Serve { db, key: _ } => cmd_serve(&db),
+        Commands::Serve { db, key } => cmd_serve(&db, key.as_deref()),
     };
 
     if let Err(e) = result {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
-}
-
-// ── Value → JSON ──────────────────────────────────────────────────────────────
-
-fn value_to_json(v: &sparrowdb_execution::Value) -> serde_json::Value {
-    use sparrowdb_execution::Value;
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Int64(i) => serde_json::json!(i),
-        Value::Float64(f) => serde_json::json!(f),
-        Value::Bool(b) => serde_json::json!(b),
-        Value::String(s) => serde_json::json!(s),
-        // NodeRef / EdgeRef: expose as tagged objects so the caller can
-        // distinguish them from plain integers.
-        Value::NodeRef(n) => serde_json::json!({"$type": "node", "id": n.0}),
-        Value::EdgeRef(e) => serde_json::json!({"$type": "edge", "id": e.0}),
-    }
-}
-
-fn query_result_to_json(result: &sparrowdb_execution::QueryResult) -> serde_json::Value {
-    let rows: Vec<serde_json::Value> = result
-        .rows
-        .iter()
-        .map(|row| {
-            let obj: serde_json::Map<String, serde_json::Value> = result
-                .columns
-                .iter()
-                .zip(row.iter())
-                .map(|(col, val)| (col.clone(), value_to_json(val)))
-                .collect();
-            serde_json::Value::Object(obj)
-        })
-        .collect();
-
-    serde_json::json!({
-        "columns": result.columns,
-        "rows": rows,
-    })
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -174,7 +139,12 @@ struct ServeResponse {
     error: Option<String>,
 }
 
-fn cmd_serve(db_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_serve(
+    db_path: &std::path::Path,
+    _key: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // TODO: pass `_key` to GraphDb::open_encrypted once that API is stable
+    //       (SPA-97 / SPA-98 track at-rest encryption).
     let db = sparrowdb::GraphDb::open(db_path)?;
 
     let stdin = io::stdin();
@@ -228,15 +198,20 @@ fn cmd_serve(db_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>
             },
         };
 
-        let resp_str = match serde_json::to_string(&response) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if writeln!(out, "{resp_str}").is_err() {
-            break;
-        }
-        if out.flush().is_err() {
-            break;
+        match serde_json::to_string(&response) {
+            Ok(resp_str) => {
+                if writeln!(out, "{resp_str}").is_err() {
+                    break;
+                }
+                if out.flush().is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                // JSON serialization failure is a bug — log to stderr so the
+                // caller isn't left waiting for a response that never arrives.
+                eprintln!("sparrowdb-cli: failed to serialize response: {e}");
+            }
         }
     }
     Ok(())

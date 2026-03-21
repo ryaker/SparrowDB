@@ -10,55 +10,14 @@
 #![deny(clippy::all)]
 
 use napi_derive::napi;
+use sparrowdb_execution::query_result_to_json;
 
-// ── Value conversion ──────────────────────────────────────────────────────────
+// ── Error helper ──────────────────────────────────────────────────────────────
 
-/// Convert a `sparrowdb_execution::Value` to a `serde_json::Value` for
-/// automatic conversion to a JavaScript value by napi-rs.
-fn value_to_json(v: &sparrowdb_execution::Value) -> serde_json::Value {
-    use sparrowdb_execution::Value;
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Int64(i) => serde_json::json!(i),
-        Value::Float64(f) => serde_json::json!(f),
-        Value::Bool(b) => serde_json::json!(b),
-        Value::String(s) => serde_json::json!(s),
-        // NodeRef / EdgeRef: tagged objects so JS callers can distinguish them
-        // from plain numbers.  The id is represented as a number; u64 values
-        // > Number.MAX_SAFE_INTEGER are rare (label_id lives in upper 16 bits)
-        // but callers should treat the id as opaque.
-        Value::NodeRef(n) => serde_json::json!({"$type": "node", "id": n.0}),
-        Value::EdgeRef(e) => serde_json::json!({"$type": "edge", "id": e.0}),
-    }
-}
-
-/// Materialize a `QueryResult` into a plain JSON object:
-///
-/// ```json
-/// {
-///   "columns": ["n.name", "n.age"],
-///   "rows": [{"n.name": "Alice", "n.age": 30}, ...]
-/// }
-/// ```
-fn query_result_to_json(result: &sparrowdb_execution::QueryResult) -> serde_json::Value {
-    let rows: Vec<serde_json::Value> = result
-        .rows
-        .iter()
-        .map(|row| {
-            let obj: serde_json::Map<String, serde_json::Value> = result
-                .columns
-                .iter()
-                .zip(row.iter())
-                .map(|(col, val)| (col.clone(), value_to_json(val)))
-                .collect();
-            serde_json::Value::Object(obj)
-        })
-        .collect();
-
-    serde_json::json!({
-        "columns": result.columns,
-        "rows": rows,
-    })
+/// Convert any `Display`-able error into a `napi::Error`.
+#[inline]
+fn to_napi<E: std::fmt::Display>(e: E) -> napi::Error {
+    napi::Error::from_reason(e.to_string())
 }
 
 // ── SparrowDB ─────────────────────────────────────────────────────────────────
@@ -73,7 +32,7 @@ fn query_result_to_json(result: &sparrowdb_execution::QueryResult) -> serde_json
 /// for (const row of result.rows) {
 ///   console.log(row['n.name'])
 /// }
-/// db.close()
+/// db.checkpoint()
 /// ```
 #[napi]
 pub struct SparrowDB {
@@ -90,8 +49,7 @@ impl SparrowDB {
     /// Throws if the path cannot be created or the database files are corrupt.
     #[napi(factory)]
     pub fn open(path: String) -> napi::Result<Self> {
-        let db = ::sparrowdb::GraphDb::open(std::path::Path::new(&path))
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let db = ::sparrowdb::GraphDb::open(std::path::Path::new(&path)).map_err(to_napi)?;
         Ok(SparrowDB { inner: db })
     }
 
@@ -102,37 +60,27 @@ impl SparrowDB {
     /// `{ $type: "node", id: number }`, `{ $type: "edge", id: number }`.
     #[napi]
     pub fn execute(&self, cypher: String) -> napi::Result<serde_json::Value> {
-        let result = self
-            .inner
-            .execute(&cypher)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let result = self.inner.execute(&cypher).map_err(to_napi)?;
         Ok(query_result_to_json(&result))
     }
 
     /// Flush the WAL and compact the database.
     #[napi]
     pub fn checkpoint(&self) -> napi::Result<()> {
-        self.inner
-            .checkpoint()
-            .map_err(|e| napi::Error::from_reason(e.to_string()))
+        self.inner.checkpoint().map_err(to_napi)
     }
 
     /// Checkpoint + sort neighbour lists for faster traversal.
     #[napi]
     pub fn optimize(&self) -> napi::Result<()> {
-        self.inner
-            .optimize()
-            .map_err(|e| napi::Error::from_reason(e.to_string()))
+        self.inner.optimize().map_err(to_napi)
     }
 
     /// Open a read-only snapshot transaction pinned to the current committed
     /// state.  Multiple readers may coexist with an active writer.
     #[napi]
     pub fn begin_read(&self) -> napi::Result<ReadTx> {
-        let tx = self
-            .inner
-            .begin_read()
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let tx = self.inner.begin_read().map_err(to_napi)?;
         Ok(ReadTx { inner: tx })
     }
 
@@ -146,11 +94,7 @@ impl SparrowDB {
         // could be dropped independently), so the guard lives as long as this
         // SparrowDB object, which napi-rs keeps alive while JS holds the handle.
         let tx: ::sparrowdb::WriteTx<'static> = unsafe {
-            std::mem::transmute(
-                self.inner
-                    .begin_write()
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?,
-            )
+            std::mem::transmute(self.inner.begin_write().map_err(to_napi)?)
         };
         Ok(WriteTx { inner: Some(tx) })
     }
@@ -217,9 +161,7 @@ impl WriteTx {
     pub fn commit(&mut self) -> napi::Result<u32> {
         match self.inner.take() {
             Some(tx) => {
-                let txn_id = tx
-                    .commit()
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                let txn_id = tx.commit().map_err(to_napi)?;
                 Ok(txn_id.0 as u32)
             }
             None => Err(napi::Error::from_reason(
@@ -232,7 +174,6 @@ impl WriteTx {
     /// transaction without committing.
     #[napi]
     pub fn rollback(&mut self) {
-        // Drop the inner WriteTx which triggers rollback on drop.
         self.inner = None;
     }
 }
