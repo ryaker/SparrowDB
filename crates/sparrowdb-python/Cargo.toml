@@ -11,8 +11,9 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-python = ["dep:pyo3", "dep:sparrowdb"]
+python = ["dep:pyo3", "dep:sparrowdb", "dep:sparrowdb-execution"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"], optional = true }
 sparrowdb = { workspace = true, optional = true }
+sparrowdb-execution = { workspace = true, optional = true }

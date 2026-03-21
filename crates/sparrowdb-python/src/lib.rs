@@ -1,27 +1,237 @@
-/// PyO3 bindings for SparrowDB.
-///
-/// Phase 0: stub only. Build with `--features python` (or via `maturin`) to
-/// activate the extension module.  Without that feature the crate is an empty
-/// `rlib` so that `cargo test --workspace` never fails due to a missing pyo3
-/// installation.
+//! PyO3 Python bindings for SparrowDB.
+//!
+//! Exposes [`GraphDb`], [`PyReadTx`], and [`PyWriteTx`] to Python under the
+//! module name `sparrowdb`.
+//!
+//! Build with `maturin develop` (or `maturin build --release`) to produce the
+//! importable extension module.  The `python` feature is required; it is
+//! activated automatically by maturin via `pyproject.toml`.
+
+// ── Python feature guard ──────────────────────────────────────────────────────
+
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::{PyDict, PyList};
 
-/// Python extension module entry point.
+// ── Value → Python conversion ─────────────────────────────────────────────────
+
+/// Convert a `sparrowdb_execution::Value` into a Python object.
+#[cfg(feature = "python")]
+fn value_to_py(py: Python<'_>, v: &sparrowdb_execution::Value) -> PyObject {
+    use sparrowdb_execution::Value;
+    match v {
+        Value::Null => py.None(),
+        Value::Int64(i) => i.into_py(py),
+        Value::Float64(f) => f.into_py(py),
+        Value::Bool(b) => b.into_py(py),
+        Value::String(s) => s.into_py(py),
+        // NodeRef / EdgeRef: expose the packed u64 id to Python.
+        Value::NodeRef(n) => n.0.into_py(py),
+        Value::EdgeRef(e) => e.0.into_py(py),
+    }
+}
+
+// ── PyGraphDb ─────────────────────────────────────────────────────────────────
+
+/// Python wrapper around the top-level SparrowDB handle.
 ///
-/// Activated only when compiled with `--features python`.
+/// ```python
+/// import sparrowdb, tempfile, os
+/// with tempfile.TemporaryDirectory() as d:
+///     db = sparrowdb.GraphDb(os.path.join(d, "test.db"))
+///     db.checkpoint()
+/// ```
+#[cfg(feature = "python")]
+#[pyclass(name = "GraphDb")]
+struct PyGraphDb {
+    inner: ::sparrowdb::GraphDb,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyGraphDb {
+    /// Open (or create) a SparrowDB database at *path*.
+    #[new]
+    fn new(path: &str) -> PyResult<Self> {
+        let db = ::sparrowdb::GraphDb::open(std::path::Path::new(path))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyGraphDb { inner: db })
+    }
+
+    /// Run a WAL checkpoint — folds the delta log into the CSR base files.
+    fn checkpoint(&self) -> PyResult<()> {
+        self.inner
+            .checkpoint()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Run an OPTIMIZE — like checkpoint but also sorts neighbour lists.
+    fn optimize(&self) -> PyResult<()> {
+        self.inner
+            .optimize()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Open a read-only snapshot transaction.
+    fn begin_read(&self) -> PyResult<PyReadTx> {
+        let tx = self
+            .inner
+            .begin_read()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyReadTx { inner: tx })
+    }
+
+    /// Open a write transaction.
+    ///
+    /// Raises ``RuntimeError`` if another write transaction is already active
+    /// (single-writer semantics).
+    fn begin_write(&self) -> PyResult<PyWriteTx> {
+        // Safety: we transmute WriteTx<'_> to WriteTx<'static> so it can be
+        // stored in a PyO3 class.  This is safe because:
+        // 1. The `'db` lifetime on WriteTx only constrains the MutexGuard,
+        //    which holds the write-lock on `inner.write_lock`.
+        // 2. `PyGraphDb` holds `inner: GraphDb` which contains the Arc<DbInner>
+        //    keeping the Mutex alive for the whole program lifetime of the db.
+        // 3. PyWriteTx will be dropped (releasing the guard) before `inner`
+        //    is dropped, enforced by Python's GC reference counting.
+        let tx: ::sparrowdb::WriteTx<'static> = unsafe {
+            std::mem::transmute(
+                self.inner
+                    .begin_write()
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?,
+            )
+        };
+        Ok(PyWriteTx { inner: Some(tx) })
+    }
+
+    /// Execute a read-only Cypher query and return a list of row-dicts.
+    ///
+    /// Each row is a ``dict`` mapping column name → value.  Supported value
+    /// types: ``None``, ``int``, ``float``, ``bool``, ``str``.
+    /// ``NodeRef`` and ``EdgeRef`` are returned as ``int`` (their packed id).
+    ///
+    /// Example::
+    ///
+    ///     results = db.execute("MATCH (n) RETURN n.name LIMIT 10")
+    ///     # [{"n.name": "Alice"}, ...]
+    fn execute(&self, py: Python<'_>, cypher: &str) -> PyResult<PyObject> {
+        let result = self
+            .inner
+            .execute(cypher)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let list = PyList::empty_bound(py);
+        for row in &result.rows {
+            let dict = PyDict::new_bound(py);
+            for (col, val) in result.columns.iter().zip(row.iter()) {
+                dict.set_item(col, value_to_py(py, val))?;
+            }
+            list.append(dict)?;
+        }
+        Ok(list.into())
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "GraphDb(<sparrowdb>)"
+    }
+}
+
+// ── PyReadTx ──────────────────────────────────────────────────────────────────
+
+/// Python wrapper around a read-only snapshot transaction.
+///
+/// Obtained via :meth:`GraphDb.begin_read`.
+#[cfg(feature = "python")]
+#[pyclass(name = "ReadTx")]
+struct PyReadTx {
+    inner: ::sparrowdb::ReadTx,
+}
+
+// ReadTx contains Arc<DbInner> (Send) + NodeStore (file handles).
+// PyO3 requires pyclass types to be Send.  NodeStore only holds a PathBuf and
+// opens files per-operation, making cross-thread use safe in practice.
+#[cfg(feature = "python")]
+unsafe impl Send for PyReadTx {}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyReadTx {
+    /// The committed ``txn_id`` this reader is pinned to.
+    #[getter]
+    fn snapshot_txn_id(&self) -> u64 {
+        self.inner.snapshot_txn_id
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ReadTx(snapshot_txn_id={})", self.inner.snapshot_txn_id)
+    }
+}
+
+// ── PyWriteTx ─────────────────────────────────────────────────────────────────
+
+/// Python wrapper around a write transaction.
+///
+/// Obtained via :meth:`GraphDb.begin_write`.  Commit explicitly with
+/// :meth:`commit`; dropping without committing discards staged changes
+/// (rollback semantics).
+#[cfg(feature = "python")]
+#[pyclass(name = "WriteTx")]
+struct PyWriteTx {
+    /// `None` after commit/rollback so use-after-commit is detected.
+    inner: Option<::sparrowdb::WriteTx<'static>>,
+}
+
+// WriteTx<'static> contains a MutexGuard<'static, ()> which is !Send.
+// We serialise access via the GIL: Python is single-threaded by default and
+// the GIL prevents concurrent access to PyO3 objects from multiple threads.
+// The underlying Arc<DbInner> is Send + Sync; the guard is released on drop.
+#[cfg(feature = "python")]
+unsafe impl Send for PyWriteTx {}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyWriteTx {
+    /// Commit the transaction and return the new transaction id (``int``).
+    ///
+    /// Raises ``RuntimeError`` if already committed or rolled back.
+    fn commit(&mut self) -> PyResult<u64> {
+        match self.inner.take() {
+            Some(tx) => {
+                let txn_id = tx
+                    .commit()
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                Ok(txn_id.0)
+            }
+            None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "transaction already committed or rolled back",
+            )),
+        }
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "WriteTx(<sparrowdb>)"
+    }
+}
+
+// ── Module entry point ────────────────────────────────────────────────────────
+
+/// Python extension module.  Import as ``import sparrowdb``.
 #[cfg(feature = "python")]
 #[pymodule]
-fn sparrowdb_python(_m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Phase 0 stub — bindings implemented in Phase 6.
+fn sparrowdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyGraphDb>()?;
+    m.add_class::<PyReadTx>()?;
+    m.add_class::<PyWriteTx>()?;
     Ok(())
 }
+
+// ── Tests (no pyo3 needed) ────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn crate_compiles() {
-        // Verify the crate builds without pyo3 installed.
-        // No assertion needed — if this function is reached, the crate compiled.
+        // Verify the crate builds without pyo3 installed (no `python` feature).
     }
 }
