@@ -18,7 +18,13 @@ pub mod node_store;
 /// Edge delta log and CSR rebuild on checkpoint.
 pub mod edge_store;
 
-use sparrowdb_common::{PageId, Result};
+use std::io::{Read as IoRead, Seek, SeekFrom, Write as IoWrite};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use sparrowdb_common::{Error, PageId, Result};
+
+use crate::encryption::EncryptionContext;
 
 /// Compute CRC32C (Castagnoli) of the entire buffer.
 pub fn crc32_of(buf: &[u8]) -> u32 {
@@ -62,23 +68,162 @@ pub fn crc32_zeroed_at(
     Ok(crc32c::crc32c_append(crc, &buf[end..]))
 }
 
-/// Stub page store — full buffer pool implementation in Phase 2+.
-pub struct PageStore;
+/// Page store: maps logical page IDs to on-disk locations, with optional
+/// at-rest encryption via [`EncryptionContext`].
+///
+/// ## On-disk layout
+///
+/// When encryption is **disabled** (passthrough mode), each page occupies
+/// exactly `page_size` bytes at offset `page_id * page_size`.
+///
+/// When encryption is **enabled**, each page occupies `page_size + 40` bytes
+/// (the "encrypted stride"):
+///
+/// ```text
+/// ┌────────────────────────┬───────────────────────────────────┐
+/// │  nonce (24 bytes)      │  ciphertext + auth tag            │
+/// │                        │  (page_size + 16 bytes)           │
+/// └────────────────────────┴───────────────────────────────────┘
+/// total: page_size + 40 bytes per page slot
+/// ```
+///
+/// The encryption stride ensures that a file opened without a key cannot be
+/// accidentally decoded as raw pages (sizes won't align).
+pub struct PageStore {
+    /// The backing data file.
+    file: Mutex<std::fs::File>,
+    /// Logical page size in bytes (plaintext).
+    page_size: usize,
+    /// The encryption context — passthrough if no key was provided.
+    enc: EncryptionContext,
+    /// Path for diagnostics.
+    _path: PathBuf,
+}
 
 impl PageStore {
-    /// Open (or create) a page store rooted at `path`.
-    pub fn open(_path: &std::path::Path) -> Result<Self> {
-        unimplemented!("PageStore::open — implemented in Phase 2")
+    /// Open (or create) a page store at `path` with the given `page_size` and
+    /// no encryption.
+    ///
+    /// Use [`PageStore::open_encrypted`] to enable at-rest encryption.
+    pub fn open(path: &Path) -> Result<Self> {
+        Self::open_inner(path, 4096, EncryptionContext::none())
     }
 
-    /// Read a page by ID into the provided buffer.
-    pub fn read_page(&self, _id: PageId, _buf: &mut [u8]) -> Result<()> {
-        unimplemented!("PageStore::read_page — implemented in Phase 2")
+    /// Open (or create) a page store with the given page size and no encryption.
+    pub fn open_with_page_size(path: &Path, page_size: usize) -> Result<Self> {
+        Self::open_inner(path, page_size, EncryptionContext::none())
     }
 
-    /// Write a page by ID from the provided buffer.
-    pub fn write_page(&self, _id: PageId, _buf: &[u8]) -> Result<()> {
-        unimplemented!("PageStore::write_page — implemented in Phase 2")
+    /// Open (or create) an **encrypted** page store.
+    ///
+    /// `key` — 32-byte master encryption key (XChaCha20-Poly1305).
+    ///
+    /// If the file already exists and was written with a different key, the
+    /// first `read_page` call will return
+    /// [`Error::EncryptionAuthFailed`].
+    pub fn open_encrypted(path: &Path, page_size: usize, key: [u8; 32]) -> Result<Self> {
+        Self::open_inner(path, page_size, EncryptionContext::with_key(key))
+    }
+
+    fn open_inner(path: &Path, page_size: usize, enc: EncryptionContext) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+        Ok(PageStore {
+            file: Mutex::new(file),
+            page_size,
+            enc,
+            _path: path.to_path_buf(),
+        })
+    }
+
+    /// Byte offset of page `id` in the backing file.
+    fn page_offset(&self, id: PageId) -> u64 {
+        let stride = if self.enc.is_encrypted() {
+            self.page_size + 40
+        } else {
+            self.page_size
+        };
+        id.0 * stride as u64
+    }
+
+    /// Read page `id` into `buf`.
+    ///
+    /// `buf` must be exactly `page_size` bytes.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidArgument`] — `buf.len() != page_size`.
+    /// - [`Error::EncryptionAuthFailed`] — AEAD tag rejected (wrong key or
+    ///   corrupted page).
+    /// - [`Error::Io`] — underlying I/O failure.
+    pub fn read_page(&self, id: PageId, buf: &mut [u8]) -> Result<()> {
+        if buf.len() != self.page_size {
+            return Err(Error::InvalidArgument(format!(
+                "read_page: buf len {} != page_size {}",
+                buf.len(),
+                self.page_size
+            )));
+        }
+
+        let offset = self.page_offset(id);
+        let on_disk_size = if self.enc.is_encrypted() {
+            self.page_size + 40
+        } else {
+            self.page_size
+        };
+
+        let mut on_disk_buf = vec![0u8; on_disk_size];
+        let mut file = self.file.lock().expect("page store lock poisoned");
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut on_disk_buf)?;
+        drop(file);
+
+        if self.enc.is_encrypted() {
+            let plaintext = self.enc.decrypt_page(id.0, &on_disk_buf)?;
+            buf.copy_from_slice(&plaintext);
+        } else {
+            buf.copy_from_slice(&on_disk_buf);
+        }
+
+        Ok(())
+    }
+
+    /// Write `buf` as page `id`.
+    ///
+    /// `buf` must be exactly `page_size` bytes.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidArgument`] — `buf.len() != page_size`.
+    /// - [`Error::Io`] — underlying I/O failure.
+    pub fn write_page(&self, id: PageId, buf: &[u8]) -> Result<()> {
+        if buf.len() != self.page_size {
+            return Err(Error::InvalidArgument(format!(
+                "write_page: buf len {} != page_size {}",
+                buf.len(),
+                self.page_size
+            )));
+        }
+
+        let on_disk_data = if self.enc.is_encrypted() {
+            self.enc.encrypt_page(id.0, buf)?
+        } else {
+            buf.to_vec()
+        };
+
+        let offset = self.page_offset(id);
+        let mut file = self.file.lock().expect("page store lock poisoned");
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&on_disk_data)?;
+        Ok(())
+    }
+
+    /// Flush and fsync the backing file to durable storage.
+    pub fn fsync(&self) -> Result<()> {
+        let file = self.file.lock().expect("page store lock poisoned");
+        file.sync_all()?;
+        Ok(())
     }
 }
 
@@ -88,7 +233,78 @@ mod tests {
 
     #[test]
     fn page_store_type_exists() {
-        let _: fn(&std::path::Path) -> Result<PageStore> = PageStore::open;
+        // Verify the open function compiles with the right signature.
+        let _: fn(&Path) -> Result<PageStore> = PageStore::open;
+    }
+
+    #[test]
+    fn page_store_plaintext_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pages.bin");
+        let store = PageStore::open_with_page_size(&path, 512).unwrap();
+
+        let write_buf = vec![0x42u8; 512];
+        store.write_page(PageId(0), &write_buf).unwrap();
+
+        let mut read_buf = vec![0u8; 512];
+        store.read_page(PageId(0), &mut read_buf).unwrap();
+        assert_eq!(read_buf, write_buf);
+    }
+
+    #[test]
+    fn page_store_encrypted_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enc_pages.bin");
+        let key = [0x11u8; 32];
+        let store = PageStore::open_encrypted(&path, 512, key).unwrap();
+
+        let write_buf = vec![0xAAu8; 512];
+        store.write_page(PageId(3), &write_buf).unwrap();
+
+        let mut read_buf = vec![0u8; 512];
+        store.read_page(PageId(3), &mut read_buf).unwrap();
+        assert_eq!(read_buf, write_buf);
+    }
+
+    #[test]
+    fn page_store_wrong_key_returns_auth_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enc_pages.bin");
+
+        // Write with key A.
+        {
+            let store = PageStore::open_encrypted(&path, 512, [0xAAu8; 32]).unwrap();
+            store.write_page(PageId(0), &vec![0x55u8; 512]).unwrap();
+        }
+
+        // Read with key B.
+        let store = PageStore::open_encrypted(&path, 512, [0xBBu8; 32]).unwrap();
+        let mut buf = vec![0u8; 512];
+        let result = store.read_page(PageId(0), &mut buf);
+        assert!(
+            matches!(result, Err(Error::EncryptionAuthFailed)),
+            "expected EncryptionAuthFailed, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn page_store_multiple_pages_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.bin");
+        let key = [0x33u8; 32];
+        let store = PageStore::open_encrypted(&path, 256, key).unwrap();
+
+        for i in 0u64..4 {
+            let buf = vec![i as u8; 256];
+            store.write_page(PageId(i), &buf).unwrap();
+        }
+
+        for i in 0u64..4 {
+            let mut buf = vec![0u8; 256];
+            store.read_page(PageId(i), &mut buf).unwrap();
+            assert!(buf.iter().all(|&b| b == i as u8));
+        }
     }
 
     #[test]
