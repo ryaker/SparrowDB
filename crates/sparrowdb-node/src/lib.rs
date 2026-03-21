@@ -1,0 +1,238 @@
+//! napi-rs native Node.js/TypeScript bindings for SparrowDB.
+//!
+//! Build with:
+//!   cargo build --release -p sparrowdb-node
+//!   # or via napi-cli: napi build --platform --release
+//!
+//! The resulting `sparrowdb.node` file can be loaded from Node.js:
+//!   const { SparrowDB } = require('./sparrowdb.node')
+
+#![deny(clippy::all)]
+
+use napi_derive::napi;
+
+// ── Value conversion ──────────────────────────────────────────────────────────
+
+/// Convert a `sparrowdb_execution::Value` to a `serde_json::Value` for
+/// automatic conversion to a JavaScript value by napi-rs.
+fn value_to_json(v: &sparrowdb_execution::Value) -> serde_json::Value {
+    use sparrowdb_execution::Value;
+    match v {
+        Value::Null => serde_json::Value::Null,
+        Value::Int64(i) => serde_json::json!(i),
+        Value::Float64(f) => serde_json::json!(f),
+        Value::Bool(b) => serde_json::json!(b),
+        Value::String(s) => serde_json::json!(s),
+        // NodeRef / EdgeRef: tagged objects so JS callers can distinguish them
+        // from plain numbers.  The id is represented as a number; u64 values
+        // > Number.MAX_SAFE_INTEGER are rare (label_id lives in upper 16 bits)
+        // but callers should treat the id as opaque.
+        Value::NodeRef(n) => serde_json::json!({"$type": "node", "id": n.0}),
+        Value::EdgeRef(e) => serde_json::json!({"$type": "edge", "id": e.0}),
+    }
+}
+
+/// Materialize a `QueryResult` into a plain JSON object:
+///
+/// ```json
+/// {
+///   "columns": ["n.name", "n.age"],
+///   "rows": [{"n.name": "Alice", "n.age": 30}, ...]
+/// }
+/// ```
+fn query_result_to_json(result: &sparrowdb_execution::QueryResult) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let obj: serde_json::Map<String, serde_json::Value> = result
+                .columns
+                .iter()
+                .zip(row.iter())
+                .map(|(col, val)| (col.clone(), value_to_json(val)))
+                .collect();
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+
+    serde_json::json!({
+        "columns": result.columns,
+        "rows": rows,
+    })
+}
+
+// ── SparrowDB ─────────────────────────────────────────────────────────────────
+
+/// Top-level database handle.
+///
+/// ```typescript
+/// import { SparrowDB } from 'sparrowdb'
+///
+/// const db = SparrowDB.open('/path/to/my.db')
+/// const result = db.execute('MATCH (n:Person) RETURN n.name LIMIT 5')
+/// for (const row of result.rows) {
+///   console.log(row['n.name'])
+/// }
+/// db.close()
+/// ```
+#[napi]
+pub struct SparrowDB {
+    inner: ::sparrowdb::GraphDb,
+}
+
+// GraphDb uses Arc<DbInner> internally; cross-thread use is safe.
+unsafe impl Send for SparrowDB {}
+
+#[napi]
+impl SparrowDB {
+    /// Open (or create) a SparrowDB database at `path`.
+    ///
+    /// Throws if the path cannot be created or the database files are corrupt.
+    #[napi(factory)]
+    pub fn open(path: String) -> napi::Result<Self> {
+        let db = ::sparrowdb::GraphDb::open(std::path::Path::new(&path))
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(SparrowDB { inner: db })
+    }
+
+    /// Execute a Cypher query and return `{ columns, rows }`.
+    ///
+    /// Each row is a plain object mapping column name → value.
+    /// Supported value types: `null`, `number`, `boolean`, `string`,
+    /// `{ $type: "node", id: number }`, `{ $type: "edge", id: number }`.
+    #[napi]
+    pub fn execute(&self, cypher: String) -> napi::Result<serde_json::Value> {
+        let result = self
+            .inner
+            .execute(&cypher)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(query_result_to_json(&result))
+    }
+
+    /// Flush the WAL and compact the database.
+    #[napi]
+    pub fn checkpoint(&self) -> napi::Result<()> {
+        self.inner
+            .checkpoint()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Checkpoint + sort neighbour lists for faster traversal.
+    #[napi]
+    pub fn optimize(&self) -> napi::Result<()> {
+        self.inner
+            .optimize()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Open a read-only snapshot transaction pinned to the current committed
+    /// state.  Multiple readers may coexist with an active writer.
+    #[napi]
+    pub fn begin_read(&self) -> napi::Result<ReadTx> {
+        let tx = self
+            .inner
+            .begin_read()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(ReadTx { inner: tx })
+    }
+
+    /// Open a write transaction.  Only one writer may be active at a time;
+    /// throws `WriterBusy` if another writer is already open.
+    #[napi]
+    pub fn begin_write(&self) -> napi::Result<WriteTx> {
+        // Safety: same transmute as in the PyO3 bindings.  WriteTx<'db> only
+        // holds a MutexGuard whose lifetime is constrained to the GraphDb.
+        // SparrowDB wraps GraphDb directly (not behind a shared reference that
+        // could be dropped independently), so the guard lives as long as this
+        // SparrowDB object, which napi-rs keeps alive while JS holds the handle.
+        let tx: ::sparrowdb::WriteTx<'static> = unsafe {
+            std::mem::transmute(
+                self.inner
+                    .begin_write()
+                    .map_err(|e| napi::Error::from_reason(e.to_string()))?,
+            )
+        };
+        Ok(WriteTx { inner: Some(tx) })
+    }
+}
+
+// ── ReadTx ────────────────────────────────────────────────────────────────────
+
+/// Read-only snapshot transaction.  Sees only data committed at or before the
+/// snapshot point; immune to concurrent writes.
+#[napi]
+pub struct ReadTx {
+    inner: ::sparrowdb::ReadTx,
+}
+
+unsafe impl Send for ReadTx {}
+
+#[napi]
+impl ReadTx {
+    /// The committed `txn_id` this reader is pinned to.
+    #[napi(getter)]
+    pub fn snapshot_txn_id(&self) -> u32 {
+        self.inner.snapshot_txn_id as u32
+    }
+}
+
+// ── WriteTx ───────────────────────────────────────────────────────────────────
+
+/// Write transaction.  Commit explicitly; dropping without committing rolls
+/// back all staged changes.
+#[napi]
+pub struct WriteTx {
+    /// `None` after commit or rollback so use-after-commit is detected.
+    inner: Option<::sparrowdb::WriteTx<'static>>,
+}
+
+unsafe impl Send for WriteTx {}
+
+#[napi]
+impl WriteTx {
+    /// Execute a Cypher mutation statement inside this transaction.
+    ///
+    /// Returns `{ columns, rows }` (typically empty for write statements).
+    #[napi]
+    pub fn execute(&mut self, _cypher: String) -> napi::Result<serde_json::Value> {
+        match &self.inner {
+            Some(_) => {
+                // WriteTx doesn't expose a Cypher execute method directly;
+                // mutations go through GraphDb.execute in an implicit tx.
+                Err(napi::Error::from_reason(
+                    "WriteTx.execute not yet available; use SparrowDB.execute for mutations",
+                ))
+            }
+            None => Err(napi::Error::from_reason(
+                "transaction already committed or rolled back",
+            )),
+        }
+    }
+
+    /// Commit all staged changes and return the new transaction id.
+    ///
+    /// Throws if the transaction was already committed or rolled back, or if
+    /// a write-write conflict is detected.
+    #[napi]
+    pub fn commit(&mut self) -> napi::Result<u32> {
+        match self.inner.take() {
+            Some(tx) => {
+                let txn_id = tx
+                    .commit()
+                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                Ok(txn_id.0 as u32)
+            }
+            None => Err(napi::Error::from_reason(
+                "transaction already committed or rolled back",
+            )),
+        }
+    }
+
+    /// Roll back all staged changes explicitly.  Equivalent to dropping the
+    /// transaction without committing.
+    #[napi]
+    pub fn rollback(&mut self) {
+        // Drop the inner WriteTx which triggers rollback on drop.
+        self.inner = None;
+    }
+}
