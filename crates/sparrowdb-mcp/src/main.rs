@@ -65,7 +65,9 @@ fn handle_request(req: JsonRpcRequest) -> JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id: req.id,
             result: None,
-            error: Some(json!({"code": -32600, "message": "Invalid Request: jsonrpc must be \"2.0\""})),
+            error: Some(
+                json!({"code": -32600, "message": "Invalid Request: jsonrpc must be \"2.0\""}),
+            ),
         };
     }
 
