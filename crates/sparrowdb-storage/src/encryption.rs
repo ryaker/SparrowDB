@@ -93,13 +93,18 @@ impl EncryptionContext {
     ///
     /// Expects `encrypted` to be at least 40 bytes (`24` nonce + `16` tag).
     ///
+    /// The stored nonce is validated against the nonce derived from `page_id`
+    /// before decryption is attempted. This enforces page-location integrity:
+    /// a ciphertext blob from page A cannot be silently accepted as page B.
+    ///
     /// In passthrough mode the data is returned as-is.
     ///
     /// # Errors
-    /// - [`Error::DecryptionFailed`] — AEAD authentication tag rejected.
-    ///   This means the wrong key was supplied or the page is corrupted.
+    /// - [`Error::DecryptionFailed`] — stored nonce does not match the nonce
+    ///   derived from `page_id` (page-swap / relocation attack detected), or
+    ///   the AEAD authentication tag was rejected (wrong key or corrupted data).
     /// - [`Error::InvalidArgument`] — `encrypted` is shorter than 40 bytes.
-    pub fn decrypt_page(&self, _page_id: u64, encrypted: &[u8]) -> Result<Vec<u8>> {
+    pub fn decrypt_page(&self, page_id: u64, encrypted: &[u8]) -> Result<Vec<u8>> {
         let cipher = match &self.cipher {
             None => return Ok(encrypted.to_vec()),
             Some(c) => c,
@@ -112,9 +117,14 @@ impl EncryptionContext {
             )));
         }
 
-        let nonce = XNonce::from_slice(&encrypted[..24]);
+        let expected_nonce = Self::nonce_for(page_id);
+        let stored_nonce = &encrypted[..24];
+        if stored_nonce != expected_nonce.as_slice() {
+            return Err(Error::DecryptionFailed);
+        }
+
         let plaintext = cipher
-            .decrypt(nonce, &encrypted[24..])
+            .decrypt(&expected_nonce, &encrypted[24..])
             .map_err(|_| Error::DecryptionFailed)?;
 
         Ok(plaintext)

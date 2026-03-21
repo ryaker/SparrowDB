@@ -128,6 +128,24 @@ fn golden_fixture_decrypt() {
     );
 }
 
+// ── test: page-swap attack is detected ──────────────────────────────────────
+
+#[test]
+fn page_swap_attack_detected() {
+    let key = [0x42u8; 32];
+    let ctx = EncryptionContext::with_key(key);
+    let pt = vec![0xABu8; 512];
+    let ct0 = ctx.encrypt_page(0, &pt).unwrap();
+    let ct1 = ctx.encrypt_page(1, &pt).unwrap();
+    // Swapping page 1's ciphertext into slot 0 must be rejected
+    assert!(
+        ctx.decrypt_page(0, &ct1).is_err(),
+        "page swap must be detected"
+    );
+    // Correct page still decrypts fine
+    assert!(ctx.decrypt_page(0, &ct0).is_ok());
+}
+
 // ── test 6: different page_ids produce different ciphertext ──────────────────
 
 #[test]
