@@ -19,8 +19,11 @@ function loadNative() {
   if (pkg) {
     try {
       return require(pkg)
-    } catch (_) {
-      // Package not installed — fall through to local .node file.
+    } catch (err) {
+      // Only fall through if the package simply isn't installed.
+      // Re-throw any other error (ABI mismatch, init failure, etc.) so it
+      // isn't silently swallowed and we don't end up loading the wrong binary.
+      if (err.code !== 'MODULE_NOT_FOUND') throw err
     }
   }
 
@@ -32,10 +35,14 @@ function loadNative() {
   }
 
   // 3. Try the workspace target directory (useful during development without copying).
+  //    Node native addons must be loaded as .node files regardless of platform.
+  //    Use `napi-cli` or manually rename the compiled artifact:
+  //      Linux:   target/release/libsparrowdb_node.so  → sparrowdb.node
+  //      macOS:   target/release/libsparrowdb_node.dylib → sparrowdb.node
+  //      Windows: target/release/sparrowdb_node.dll    → sparrowdb.node
   const targets = [
-    join(__dirname, '..', '..', 'target', 'release', 'libsparrowdb_node.so'),
-    join(__dirname, '..', '..', 'target', 'release', 'libsparrowdb_node.dylib'),
-    join(__dirname, '..', '..', 'target', 'release', 'sparrowdb_node.dll'),
+    join(__dirname, '..', '..', 'target', 'release', 'sparrowdb.node'),
+    join(__dirname, '..', '..', 'target', 'debug',   'sparrowdb.node'),
   ]
   for (const t of targets) {
     if (existsSync(t)) {

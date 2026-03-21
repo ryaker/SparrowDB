@@ -51,9 +51,8 @@ enum Commands {
         /// Path to the database directory
         #[arg(long)]
         db: PathBuf,
-        /// Encryption key (hex-encoded 32 bytes).
-        /// TODO: wire through to GraphDb::open_encrypted once that API is
-        /// stable (tracked in SPA-97 / SPA-98).
+        /// Hex-encoded 32-byte encryption key (not yet implemented — see SPA-97).
+        /// Passing this flag will return an error until at-rest encryption lands.
         #[arg(long)]
         key: Option<String>,
     },
@@ -131,7 +130,6 @@ struct ServeResponse {
     /// Echoed correlation id from the request (null for parse errors).
     id: serde_json::Value,
     /// Column names in projection order; null on error.
-    #[serde(skip_serializing_if = "Option::is_none")]
     columns: Option<Vec<String>>,
     /// Rows as column-name → value objects; null on error.
     rows: Option<Vec<serde_json::Value>>,
@@ -141,10 +139,19 @@ struct ServeResponse {
 
 fn cmd_serve(
     db_path: &std::path::Path,
-    _key: Option<&str>,
+    key: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // TODO: pass `_key` to GraphDb::open_encrypted once that API is stable
-    //       (SPA-97 / SPA-98 track at-rest encryption).
+    if key.is_some() {
+        // Encryption is not yet wired through to the storage layer (SPA-97 /
+        // SPA-98).  Refuse to continue rather than silently opening the
+        // database unencrypted and giving the caller a false sense of security.
+        return Err(
+            "sparrowdb serve --key: at-rest encryption is not yet available. \
+             Remove --key to open the database without encryption, or wait for \
+             SPA-97 to land."
+                .into(),
+        );
+    }
     let db = sparrowdb::GraphDb::open(db_path)?;
 
     let stdin = io::stdin();

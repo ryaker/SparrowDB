@@ -17,8 +17,10 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Float64(f) => serde_json::json!(f),
         Value::Bool(b) => serde_json::json!(b),
         Value::String(s) => serde_json::json!(s),
-        Value::NodeRef(n) => serde_json::json!({"$type": "node", "id": n.0}),
-        Value::EdgeRef(e) => serde_json::json!({"$type": "edge", "id": e.0}),
+        // IDs are u64, which exceeds JavaScript's safe integer range (2^53-1).
+        // Serialize as strings so precision is preserved across the JSON boundary.
+        Value::NodeRef(n) => serde_json::json!({"$type": "node", "id": n.0.to_string()}),
+        Value::EdgeRef(e) => serde_json::json!({"$type": "edge", "id": e.0.to_string()}),
     }
 }
 

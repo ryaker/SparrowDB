@@ -130,6 +130,13 @@ pub struct WriteTx {
     inner: Option<::sparrowdb::WriteTx<'static>>,
 }
 
+// SAFETY: napi-rs requires Send on all #[napi] types.  WriteTx<'static> wraps a
+// MutexGuard whose lock was acquired on the JS main thread.  We uphold safety by
+// documenting that WriteTx MUST NOT be transferred to a napi worker thread (e.g.
+// via AsyncTask); it is only safe to use from the same thread that opened it.
+// napi-rs currently does not guarantee single-threaded access for object methods
+// without explicit AsyncTask, so callers must not call beginWrite() inside an
+// async napi task.
 unsafe impl Send for WriteTx {}
 
 #[napi]

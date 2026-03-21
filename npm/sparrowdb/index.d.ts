@@ -20,15 +20,25 @@
 /** A node reference returned from a Cypher query. */
 export interface NodeRef {
   $type: 'node'
-  /** Packed node id (upper 16 bits: label id, lower 48 bits: slot id). */
-  id: number
+  /**
+   * Packed node id (upper 16 bits: label id, lower 48 bits: slot id).
+   *
+   * Serialized as a **string** to preserve u64 precision — JavaScript's
+   * `number` type can only represent integers up to 2^53-1 safely.
+   */
+  id: string
 }
 
 /** An edge reference returned from a Cypher query. */
 export interface EdgeRef {
   $type: 'edge'
-  /** Monotonic edge id. */
-  id: number
+  /**
+   * Monotonic edge id.
+   *
+   * Serialized as a **string** to preserve u64 precision — JavaScript's
+   * `number` type can only represent integers up to 2^53-1 safely.
+   */
+  id: string
 }
 
 /** A scalar value in a query result row. */
@@ -128,10 +138,13 @@ export declare class WriteTx {
   /**
    * Execute a Cypher mutation statement inside this transaction.
    *
-   * @returns `{ columns, rows }` — typically empty for pure write statements.
-   * @throws if the transaction is already committed or rolled back.
+   * **Not yet implemented.** This method always throws. Mutations currently
+   * go through {@link SparrowDB.execute} in an implicit auto-committed
+   * transaction. Per-transaction Cypher execution is tracked in SPA-99.
+   *
+   * @throws always — use `SparrowDB.execute()` for mutations instead.
    */
-  execute(cypher: string): QueryResult
+  execute(cypher: string): never
 
   /**
    * Commit all staged changes and return the new transaction id.
