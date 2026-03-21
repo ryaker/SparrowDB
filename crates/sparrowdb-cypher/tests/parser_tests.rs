@@ -157,8 +157,31 @@ fn parse_union_rejected() {
 }
 
 #[test]
-fn parse_unwind_rejected() {
-    assert!(parse("UNWIND [1,2,3] AS x RETURN x").is_err());
+fn parse_unwind_list_literal() {
+    // Phase 8: UNWIND [1,2,3] AS x RETURN x is now supported.
+    let stmt = parse("UNWIND [1,2,3] AS x RETURN x").expect("UNWIND must parse");
+    assert!(
+        matches!(stmt, sparrowdb_cypher::ast::Statement::Unwind(_)),
+        "expected Unwind statement"
+    );
+}
+
+#[test]
+fn parse_unwind_empty_list() {
+    let stmt = parse("UNWIND [] AS x RETURN x").expect("UNWIND [] must parse");
+    assert!(matches!(stmt, sparrowdb_cypher::ast::Statement::Unwind(_)));
+}
+
+#[test]
+fn parse_unwind_string_list() {
+    let stmt = parse("UNWIND ['a', 'b'] AS s RETURN s").expect("UNWIND string list must parse");
+    assert!(matches!(stmt, sparrowdb_cypher::ast::Statement::Unwind(_)));
+}
+
+#[test]
+fn parse_unwind_param() {
+    let stmt = parse("UNWIND $items AS item RETURN item").expect("UNWIND $param must parse");
+    assert!(matches!(stmt, sparrowdb_cypher::ast::Statement::Unwind(_)));
 }
 
 #[test]

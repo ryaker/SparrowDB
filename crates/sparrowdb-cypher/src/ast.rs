@@ -95,6 +95,8 @@ pub enum Expr {
     CountStar,
     /// Function call (for aggregate stubs).
     FnCall { name: String, args: Vec<Expr> },
+    /// A list literal: `[expr, expr, ...]`.
+    List(Vec<Expr>),
 }
 
 /// An existence pattern used in `NOT (a)-[:R]->(b)`.
@@ -161,12 +163,29 @@ pub struct MatchStatement {
     pub distinct: bool,
 }
 
+/// UNWIND statement: iterates a list expression, binding each element to an alias.
+///
+/// ```cypher
+/// UNWIND [1, 2, 3] AS x RETURN x
+/// UNWIND $items   AS item RETURN item
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnwindStatement {
+    /// The list expression to iterate.
+    pub expr: Expr,
+    /// Variable bound to each element.
+    pub alias: String,
+    /// The RETURN clause following UNWIND.
+    pub return_clause: ReturnClause,
+}
+
 /// Top-level statement variants.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Create(CreateStatement),
     MatchCreate(MatchCreateStatement),
     Match(MatchStatement),
+    Unwind(UnwindStatement),
     Checkpoint,
     Optimize,
 }

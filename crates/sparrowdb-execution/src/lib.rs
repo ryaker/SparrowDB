@@ -6,6 +6,7 @@ pub mod operators;
 pub mod types;
 
 pub use engine::Engine;
+pub use operators::UnwindOperator;
 pub use types::{FactorizedChunk, QueryResult, Value, VectorGroup};
 
 #[cfg(test)]

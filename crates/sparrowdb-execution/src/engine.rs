@@ -9,7 +9,7 @@ use std::path::Path;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, Expr, Literal, MatchStatement, ReturnItem, SortDir, Statement,
+    BinOpKind, Expr, Literal, MatchStatement, ReturnItem, SortDir, Statement, UnwindStatement,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
@@ -53,6 +53,7 @@ impl Engine {
     fn execute_bound(&self, stmt: Statement) -> Result<QueryResult> {
         match stmt {
             Statement::Match(m) => self.execute_match(&m),
+            Statement::Unwind(u) => self.execute_unwind(&u),
             Statement::Create(_) => {
                 // CREATE is a write — not handled in read-only engine stub.
                 Ok(QueryResult::empty(vec![]))
@@ -60,6 +61,52 @@ impl Engine {
             Statement::MatchCreate(_) => Ok(QueryResult::empty(vec![])),
             Statement::Checkpoint | Statement::Optimize => Ok(QueryResult::empty(vec![])),
         }
+    }
+
+    // ── UNWIND ─────────────────────────────────────────────────────────────────
+
+    fn execute_unwind(&self, u: &UnwindStatement) -> Result<QueryResult> {
+        use crate::operators::{Operator, UnwindOperator};
+
+        // Evaluate the list expression to a Vec<Value>.
+        let values = eval_list_expr(&u.expr)?;
+
+        // Determine the output column name from the RETURN clause.
+        let column_names = extract_return_column_names(&u.return_clause.items);
+
+        if values.is_empty() {
+            return Ok(QueryResult::empty(column_names));
+        }
+
+        let mut op = UnwindOperator::new(u.alias.clone(), values);
+        let chunks = op.collect_all()?;
+
+        // Materialize: for each chunk/group/row, project the RETURN columns.
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for chunk in &chunks {
+            for group in &chunk.groups {
+                let n = group.len();
+                for row_idx in 0..n {
+                    let row = column_names
+                        .iter()
+                        .map(|col| {
+                            // The RETURN item may be the alias directly (e.g. `RETURN x`)
+                            // or an alias-renamed expression.
+                            group
+                                .get_value(col, row_idx)
+                                .or_else(|| group.get_value(&u.alias, row_idx))
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect();
+                    rows.push(row);
+                }
+            }
+        }
+
+        Ok(QueryResult {
+            columns: column_names,
+            rows,
+        })
     }
 
     fn execute_match(&self, m: &MatchStatement) -> Result<QueryResult> {
@@ -386,6 +433,49 @@ impl Engine {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Evaluate an UNWIND list expression to a concrete `Vec<Value>`.
+///
+/// Supports:
+/// - `Expr::List([...])` — list literal
+/// - `Expr::Literal(Param(_))` — parameter (returns empty list; callers supply params separately)
+///
+/// `range()` function support is a future TODO.
+fn eval_list_expr(expr: &Expr) -> Result<Vec<Value>> {
+    match expr {
+        Expr::List(elems) => {
+            let mut values = Vec::with_capacity(elems.len());
+            for elem in elems {
+                values.push(eval_scalar_expr(elem));
+            }
+            Ok(values)
+        }
+        Expr::Literal(Literal::Param(_)) => {
+            // Parameters are not resolved by the read-only engine stub.
+            // Callers that need param support should bind params before calling execute().
+            Ok(vec![])
+        }
+        other => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "UNWIND expression is not a list: {:?}",
+            other
+        ))),
+    }
+}
+
+/// Evaluate a scalar expression to a `Value` (no row context needed).
+fn eval_scalar_expr(expr: &Expr) -> Value {
+    match expr {
+        Expr::Literal(lit) => match lit {
+            Literal::Int(n) => Value::Int64(*n),
+            Literal::Float(f) => Value::Float64(*f),
+            Literal::Bool(b) => Value::Bool(*b),
+            Literal::String(s) => Value::String(s.clone()),
+            Literal::Null => Value::Null,
+            Literal::Param(_) => Value::Null,
+        },
+        _ => Value::Null,
+    }
+}
 
 fn extract_return_column_names(items: &[ReturnItem]) -> Vec<String> {
     items
