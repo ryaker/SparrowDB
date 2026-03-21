@@ -36,10 +36,7 @@ fn tracing_no_subscriber_does_not_panic() {
 
     // We don't assert specific row counts because the write path may not
     // have created rows in this minimal setup; we only need no panic.
-    assert!(
-        result.is_ok() || result.is_err(),
-        "execute must return Ok or a typed Err — not panic"
-    );
+    assert!(result.is_ok(), "execute must return Ok for a valid query");
 }
 
 /// Execute multiple queries in sequence to verify span nesting is sound.

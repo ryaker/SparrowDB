@@ -122,7 +122,9 @@ impl Engine {
 
         for slot in 0..hwm {
             let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
-            tracing::trace!(slot = slot, node_id = node_id.0, "scan emit");
+            if slot < 1024 || slot % 10_000 == 0 {
+                tracing::trace!(slot = slot, node_id = node_id.0, "scan emit");
+            }
             let props = self.store.get_node_raw(node_id, &all_col_ids)?;
 
             // Apply inline prop filter from the pattern.

@@ -279,7 +279,7 @@ impl GraphDb {
 
     /// Execute a read-only Cypher query and return the result.
     pub fn execute(&self, cypher: &str) -> Result<QueryResult> {
-        let _span = info_span!("sparrowdb.query", cypher = cypher).entered();
+        let _span = info_span!("sparrowdb.query").entered();
 
         let engine = {
             let _open_span = info_span!("sparrowdb.open_engine").entered();
