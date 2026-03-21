@@ -6,6 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use tracing::info_span;
+
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{NodeId, Result};
 use sparrowdb_cypher::ast::{
@@ -37,9 +39,20 @@ impl Engine {
 
     /// Parse, bind, plan, and execute a Cypher query.
     pub fn execute(&self, cypher: &str) -> Result<QueryResult> {
-        let stmt = parse(cypher)?;
-        let bound = bind(stmt, &self.catalog)?;
-        self.execute_bound(bound.inner)
+        let stmt = {
+            let _parse_span = info_span!("sparrowdb.parse", cypher = cypher).entered();
+            parse(cypher)?
+        };
+
+        let bound = {
+            let _bind_span = info_span!("sparrowdb.bind").entered();
+            bind(stmt, &self.catalog)?
+        };
+
+        {
+            let _plan_span = info_span!("sparrowdb.plan_execute").entered();
+            self.execute_bound(bound.inner)
+        }
     }
 
     /// Execute an already-bound [`Statement`] directly.
@@ -99,6 +112,7 @@ impl Engine {
         let label_id_u32 = label_id as u32;
 
         let hwm = self.store.hwm_for_label(label_id_u32)?;
+        tracing::debug!(label = %label, hwm = hwm, "node scan start");
 
         // Collect all col_ids we need.
         let col_ids = collect_col_ids_from_columns(column_names);
@@ -108,6 +122,9 @@ impl Engine {
 
         for slot in 0..hwm {
             let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
+            if slot < 1024 || slot % 10_000 == 0 {
+                tracing::trace!(slot = slot, node_id = node_id.0, "scan emit");
+            }
             let props = self.store.get_node_raw(node_id, &all_col_ids)?;
 
             // Apply inline prop filter from the pattern.
@@ -137,6 +154,7 @@ impl Engine {
             rows.truncate(lim as usize);
         }
 
+        tracing::debug!(rows = rows.len(), "node scan complete");
         Ok(QueryResult {
             columns: column_names.to_vec(),
             rows,
@@ -166,6 +184,7 @@ impl Engine {
             .ok_or(sparrowdb_common::Error::NotFound)? as u32;
 
         let hwm_src = self.store.hwm_for_label(src_label_id)?;
+        tracing::debug!(src_label = %src_label, dst_label = %dst_label, hwm_src = hwm_src, "one-hop traversal start");
 
         let col_ids_src = collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
         let col_ids_dst = collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
@@ -246,6 +265,7 @@ impl Engine {
             rows.truncate(lim as usize);
         }
 
+        tracing::debug!(rows = rows.len(), "one-hop traversal complete");
         Ok(QueryResult {
             columns: column_names.to_vec(),
             rows,
@@ -274,6 +294,7 @@ impl Engine {
             .ok_or(sparrowdb_common::Error::NotFound)? as u32;
 
         let hwm_src = self.store.hwm_for_label(src_label_id)?;
+        tracing::debug!(src_label = %src_label, fof_label = %fof_label, hwm_src = hwm_src, "two-hop traversal start");
 
         // Collect col_ids for fof: projected columns plus any columns referenced by prop filters.
         let col_ids_fof = {
@@ -349,6 +370,7 @@ impl Engine {
             rows.truncate(lim as usize);
         }
 
+        tracing::debug!(rows = rows.len(), "two-hop traversal complete");
         Ok(QueryResult {
             columns: column_names.to_vec(),
             rows,

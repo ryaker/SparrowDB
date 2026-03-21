@@ -37,6 +37,8 @@ serde             = { version = "1", features = ["derive"] }
 serde_json        = "1"
 bincode           = "1"
 clap              = { version = "4", features = ["derive"] }
+tracing           = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.dev]
 opt-level = 0
