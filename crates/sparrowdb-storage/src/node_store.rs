@@ -144,9 +144,17 @@ impl NodeStore {
     }
 
     /// Read the `u64` stored at `slot` in the given column file.
+    ///
+    /// Returns `Ok(0)` when the column file does not exist yet — a missing file
+    /// means no value has ever been written for this `(label_id, col_id)` pair,
+    /// which is represented as the zero bit-pattern (SPA-166).
     fn read_col_slot(&self, label_id: u32, col_id: u32, slot: u32) -> Result<u64> {
         let path = self.col_path(label_id, col_id);
-        let bytes = fs::read(&path).map_err(Error::Io)?;
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(Error::Io(e)),
+        };
         let offset = slot as usize * 8;
         if bytes.len() < offset + 8 {
             return Err(Error::NotFound);
