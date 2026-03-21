@@ -41,6 +41,10 @@ pub enum Token {
     With,
     Exists,
     In,
+    Any,
+    All,
+    NoneKw,
+    Single,
 
     // Punctuation
     LParen,    // (
@@ -316,6 +320,10 @@ fn keyword_or_ident(word: String) -> Token {
         "WITH" => Token::With,
         "EXISTS" => Token::Exists,
         "IN" => Token::In,
+        "ANY" => Token::Any,
+        "ALL" => Token::All,
+        "NONE" => Token::NoneKw,
+        "SINGLE" => Token::Single,
         _ => Token::Ident(word),
     }
 }

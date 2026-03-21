@@ -6,10 +6,10 @@
 use sparrowdb_common::{Error, Result};
 
 use crate::ast::{
-    BinOpKind, CreateStatement, EdgeDir, ExistsPattern, Expr, Literal, MatchCreateStatement,
-    MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement, MergeStatement, Mutation,
-    NodePattern, OptionalMatchStatement, PathPattern, PropEntry, RelPattern, ReturnClause,
-    ReturnItem, SortDir, Statement, UnionStatement, UnwindStatement,
+    BinOpKind, CreateStatement, EdgeDir, ExistsPattern, Expr, ListPredicateKind, Literal,
+    MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement,
+    MergeStatement, Mutation, NodePattern, OptionalMatchStatement, PathPattern, PropEntry,
+    RelPattern, ReturnClause, ReturnItem, SortDir, Statement, UnionStatement, UnwindStatement,
 };
 use crate::lexer::{tokenize, Token};
 
@@ -26,7 +26,9 @@ pub fn parse(input: &str) -> Result<Statement> {
     // Check for UNION / UNION ALL between two statements.
     let stmt = if matches!(p.peek(), Token::Union) {
         p.advance();
-        let all = if matches!(p.peek(), Token::Ident(ref s) if s.to_uppercase() == "ALL") {
+        let all = if matches!(p.peek(), Token::All)
+            || matches!(p.peek(), Token::Ident(ref s) if s.to_uppercase() == "ALL")
+        {
             p.advance();
             true
         } else {
@@ -1207,6 +1209,31 @@ impl Parser {
                 let e = self.parse_expr()?;
                 self.expect_tok(&Token::RParen)?;
                 Ok(e)
+            }
+            // Inline list literal: [expr, expr, ...]
+            Token::LBracket => self.parse_list_literal(),
+            // List predicate: ANY(x IN list_expr WHERE predicate)
+            Token::Any | Token::All | Token::NoneKw | Token::Single => {
+                let kind = match self.advance().clone() {
+                    Token::Any => ListPredicateKind::Any,
+                    Token::All => ListPredicateKind::All,
+                    Token::NoneKw => ListPredicateKind::None,
+                    Token::Single => ListPredicateKind::Single,
+                    _ => unreachable!(),
+                };
+                self.expect_tok(&Token::LParen)?;
+                let variable = self.expect_ident()?;
+                self.expect_tok(&Token::In)?;
+                let list_expr = self.parse_expr()?;
+                self.expect_tok(&Token::Where)?;
+                let predicate = self.parse_expr()?;
+                self.expect_tok(&Token::RParen)?;
+                Ok(Expr::ListPredicate {
+                    kind,
+                    variable,
+                    list_expr: Box::new(list_expr),
+                    predicate: Box::new(predicate),
+                })
             }
             // Unary minus: -expr (negates a numeric literal or sub-expression).
             Token::Dash => {
