@@ -114,9 +114,27 @@ unsafe impl Send for ReadTx {}
 #[napi]
 impl ReadTx {
     /// The committed `txn_id` this reader is pinned to.
+    ///
+    /// Returned as a decimal **string** to preserve the full u64 range —
+    /// JavaScript's `Number` can only represent integers up to 2^53-1 safely.
     #[napi(getter)]
-    pub fn snapshot_txn_id(&self) -> u32 {
-        self.inner.snapshot_txn_id as u32
+    pub fn snapshot_txn_id(&self) -> String {
+        self.inner.snapshot_txn_id.to_string()
+    }
+
+    /// Execute a read-only Cypher query against this snapshot.
+    ///
+    /// **Not yet implemented.** The underlying `GraphDb::execute` always reads
+    /// from the latest committed state; snapshot-pinned execution is tracked
+    /// in SPA-100.  Use `SparrowDB.execute()` for reads against current state.
+    ///
+    /// Throws always until SPA-100 lands.
+    #[napi]
+    pub fn execute(&self, _cypher: String) -> napi::Result<serde_json::Value> {
+        Err(napi::Error::from_reason(
+            "ReadTx.execute not yet available; snapshot-pinned query execution is tracked \
+             in SPA-100. Use SparrowDB.execute() to query the latest committed state.",
+        ))
     }
 }
 
@@ -162,14 +180,17 @@ impl WriteTx {
 
     /// Commit all staged changes and return the new transaction id.
     ///
+    /// The id is returned as a decimal **string** to preserve the full u64
+    /// range — JavaScript's `Number` can only represent integers up to 2^53-1.
+    ///
     /// Throws if the transaction was already committed or rolled back, or if
     /// a write-write conflict is detected.
     #[napi]
-    pub fn commit(&mut self) -> napi::Result<u32> {
+    pub fn commit(&mut self) -> napi::Result<String> {
         match self.inner.take() {
             Some(tx) => {
                 let txn_id = tx.commit().map_err(to_napi)?;
-                Ok(txn_id.0 as u32)
+                Ok(txn_id.0.to_string())
             }
             None => Err(napi::Error::from_reason(
                 "transaction already committed or rolled back",

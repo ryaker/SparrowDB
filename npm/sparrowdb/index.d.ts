@@ -123,8 +123,23 @@ export declare class SparrowDB {
  * before the snapshot point.
  */
 export declare class ReadTx {
-  /** The committed `txn_id` this reader is pinned to. */
-  readonly snapshotTxnId: number
+  /**
+   * The committed `txn_id` this reader is pinned to.
+   *
+   * Returned as a **string** to preserve u64 precision (JS Number is only
+   * safe up to 2^53-1).
+   */
+  readonly snapshotTxnId: string
+
+  /**
+   * Execute a read-only Cypher query against this snapshot.
+   *
+   * **Not yet implemented.** Snapshot-pinned execution is tracked in SPA-100.
+   * Use {@link SparrowDB.execute} to query the latest committed state.
+   *
+   * @throws always — use `SparrowDB.execute()` instead.
+   */
+  execute(cypher: string): never
 }
 
 /**
@@ -149,9 +164,12 @@ export declare class WriteTx {
   /**
    * Commit all staged changes and return the new transaction id.
    *
+   * Returned as a **string** to preserve u64 precision (JS Number is only
+   * safe up to 2^53-1).
+   *
    * @throws on write-write conflict or if already committed / rolled back.
    */
-  commit(): number
+  commit(): string
 
   /**
    * Roll back all staged changes explicitly.
