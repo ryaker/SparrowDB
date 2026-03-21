@@ -24,14 +24,15 @@ sparrowdb-catalog = { path = "crates/sparrowdb-catalog" }
 sparrowdb-cypher  = { path = "crates/sparrowdb-cypher" }
 sparrowdb-execution = { path = "crates/sparrowdb-execution" }
 sparrowdb = { path = "crates/sparrowdb" }
-tempfile  = "3"
-crc32fast = "1"
-crc32c    = "0.6"
-criterion = { version = "0.5", features = ["html_reports"] }
-rand      = { version = "0.8", features = ["small_rng"] }
-serde     = { version = "1", features = ["derive"] }
-serde_json = "1"
-clap      = { version = "4", features = ["derive"] }
+tempfile          = "3"
+crc32fast         = "1"
+crc32c            = "0.6"
+chacha20poly1305  = "0.10"
+criterion         = { version = "0.5", features = ["html_reports"] }
+rand              = { version = "0.8", features = ["small_rng"] }
+serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
+clap              = { version = "4", features = ["derive"] }
 
 [profile.dev]
 opt-level = 0

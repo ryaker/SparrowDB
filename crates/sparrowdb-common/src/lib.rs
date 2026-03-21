@@ -31,6 +31,8 @@ pub enum Error {
     Corruption(String),
     OutOfMemory,
     Unimplemented,
+    /// AEAD authentication tag verification failed — wrong key or corrupted ciphertext.
+    DecryptionFailed,
 }
 
 impl std::fmt::Display for Error {
@@ -46,6 +48,7 @@ impl std::fmt::Display for Error {
             Error::Corruption(s) => write!(f, "corruption: {s}"),
             Error::OutOfMemory => write!(f, "out of memory"),
             Error::Unimplemented => write!(f, "not yet implemented"),
+            Error::DecryptionFailed => write!(f, "decryption failed: wrong key or corrupted data"),
         }
     }
 }
