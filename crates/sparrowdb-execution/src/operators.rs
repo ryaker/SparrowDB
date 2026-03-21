@@ -384,3 +384,110 @@ impl<'a, O: Operator> Operator for Expand<'a, O> {
         }
     }
 }
+
+// ── UnwindOperator ────────────────────────────────────────────────────────────
+
+/// Iterates a list of scalar `Value`s, emitting one row per element.
+///
+/// Each row has a single column named after `alias`.
+/// Empty lists produce zero rows.
+pub struct UnwindOperator {
+    /// Pre-evaluated list of values to iterate.
+    values: Vec<crate::types::Value>,
+    /// Column name bound to each element.
+    alias: String,
+    /// Index of the next value to emit.
+    idx: usize,
+    done: bool,
+}
+
+impl UnwindOperator {
+    /// Create an UNWIND operator that emits each element of `values` in turn.
+    pub fn new(alias: String, values: Vec<crate::types::Value>) -> Self {
+        let done = values.is_empty();
+        UnwindOperator {
+            values,
+            alias,
+            idx: 0,
+            done,
+        }
+    }
+}
+
+impl Operator for UnwindOperator {
+    fn next_chunk(&mut self) -> Result<Option<FactorizedChunk>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        // Emit all elements in a single chunk as typed vectors.
+        // We detect the type from the first element and coerce the rest;
+        // mixed-type lists produce Int64 / String / Float64 chunks respectively.
+        let remaining = &self.values[self.idx..];
+        if remaining.is_empty() {
+            self.done = true;
+            return Ok(None);
+        }
+
+        // Build a TypedVector matching the dominant type.
+        let typed = build_typed_vector(remaining);
+        self.idx = self.values.len();
+        self.done = true;
+
+        let mut group = VectorGroup::new(1);
+        group.add_column(self.alias.clone(), typed);
+        let mut chunk = FactorizedChunk::new();
+        chunk.push_group(group);
+        Ok(Some(chunk))
+    }
+}
+
+/// Convert a slice of `Value`s into a `TypedVector`.
+///
+/// If all values are the same primitive type, uses that type's vector;
+/// otherwise falls back to `String` (via `Display`).
+fn build_typed_vector(values: &[crate::types::Value]) -> TypedVector {
+    use crate::types::Value;
+
+    // Check if all values are Int64.
+    if values.iter().all(|v| matches!(v, Value::Int64(_))) {
+        return TypedVector::Int64(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::Int64(n) => *n,
+                    _ => unreachable!(),
+                })
+                .collect(),
+        );
+    }
+
+    // Check if all values are Float64.
+    if values.iter().all(|v| matches!(v, Value::Float64(_))) {
+        return TypedVector::Float64(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::Float64(f) => *f,
+                    _ => unreachable!(),
+                })
+                .collect(),
+        );
+    }
+
+    // Check if all values are Bool.
+    if values.iter().all(|v| matches!(v, Value::Bool(_))) {
+        return TypedVector::Bool(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::Bool(b) => *b,
+                    _ => unreachable!(),
+                })
+                .collect(),
+        );
+    }
+
+    // Fall back to String.
+    TypedVector::String(values.iter().map(|v| v.to_string()).collect())
+}

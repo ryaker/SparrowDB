@@ -34,6 +34,8 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
             bind_create(&mc.create, catalog)?;
         }
         Statement::Match(m) => bind_match(m, catalog)?,
+        // UNWIND does not reference labels or rel types — nothing to bind.
+        Statement::Unwind(_) => {}
         Statement::Checkpoint | Statement::Optimize => {}
     }
     Ok(BoundStatement { inner: stmt })

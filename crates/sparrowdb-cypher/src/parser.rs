@@ -8,7 +8,7 @@ use sparrowdb_common::{Error, Result};
 use crate::ast::{
     BinOpKind, CreateStatement, EdgeDir, ExistsPattern, Expr, Literal, MatchCreateStatement,
     MatchStatement, NodePattern, PathPattern, PropEntry, RelPattern, ReturnClause, ReturnItem,
-    SortDir, Statement,
+    SortDir, Statement, UnwindStatement,
 };
 use crate::lexer::{tokenize, Token};
 
@@ -109,7 +109,7 @@ impl Parser {
                 "OPTIONAL MATCH is not supported".into(),
             )),
             Token::Union => Err(Error::InvalidArgument("UNION is not supported".into())),
-            Token::Unwind => Err(Error::InvalidArgument("UNWIND is not supported".into())),
+            Token::Unwind => self.parse_unwind(),
             other => Err(Error::InvalidArgument(format!(
                 "unexpected token at statement start: {:?}",
                 other
@@ -229,6 +229,67 @@ impl Parser {
         self.expect_tok(&Token::Create)?;
         let body = self.parse_create_body()?;
         Ok(Statement::Create(body))
+    }
+
+    // ── UNWIND ────────────────────────────────────────────────────────────────
+
+    /// Parse `UNWIND <expr> AS <var> RETURN <items>`.
+    ///
+    /// The list expression may be:
+    /// - A list literal:    `[1, 2, 3]`
+    /// - A parameter ref:   `$items`
+    ///
+    /// NOTE: `range(start, end)` function support is a TODO — it will be added
+    /// when the function-call execution layer is extended.
+    fn parse_unwind(&mut self) -> Result<Statement> {
+        self.expect_tok(&Token::Unwind)?;
+        let expr = self.parse_unwind_expr()?;
+        self.expect_tok(&Token::As)?;
+        let alias = self.expect_ident()?;
+        self.expect_tok(&Token::Return)?;
+        let items = self.parse_return_items()?;
+        Ok(Statement::Unwind(UnwindStatement {
+            expr,
+            alias,
+            return_clause: ReturnClause { items },
+        }))
+    }
+
+    /// Parse the list-producing expression for UNWIND.
+    ///
+    /// Accepts:
+    /// - `[elem, ...]`  — list literal
+    /// - `$param`       — parameter (evaluated at runtime to a list)
+    fn parse_unwind_expr(&mut self) -> Result<Expr> {
+        match self.peek().clone() {
+            Token::LBracket => self.parse_list_literal(),
+            Token::Param(p) => {
+                self.advance();
+                Ok(Expr::Literal(Literal::Param(p)))
+            }
+            other => Err(Error::InvalidArgument(format!(
+                "UNWIND expects a list literal [..] or $param, got {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// Parse `[expr, expr, ...]` into `Expr::List`.
+    fn parse_list_literal(&mut self) -> Result<Expr> {
+        self.expect_tok(&Token::LBracket)?;
+        let mut elems = Vec::new();
+        if !matches!(self.peek(), Token::RBracket) {
+            loop {
+                elems.push(self.parse_expr()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect_tok(&Token::RBracket)?;
+        Ok(Expr::List(elems))
     }
 
     fn parse_create_body(&mut self) -> Result<CreateStatement> {
