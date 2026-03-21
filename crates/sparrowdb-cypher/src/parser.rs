@@ -1037,6 +1037,41 @@ impl Parser {
     fn parse_comparison(&mut self) -> Result<Expr> {
         let left = self.parse_atom()?;
 
+        // Handle `expr IS NULL` / `expr IS NOT NULL`
+        if matches!(self.peek(), Token::Is) {
+            self.advance(); // consume IS
+            if matches!(self.peek(), Token::Not) {
+                self.advance(); // consume NOT
+                // Expect NULL
+                match self.peek().clone() {
+                    Token::Null => {
+                        self.advance();
+                        return Ok(Expr::IsNotNull(Box::new(left)));
+                    }
+                    other => {
+                        return Err(Error::InvalidArgument(format!(
+                            "expected NULL after IS NOT, got {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else {
+                // Expect NULL
+                match self.peek().clone() {
+                    Token::Null => {
+                        self.advance();
+                        return Ok(Expr::IsNull(Box::new(left)));
+                    }
+                    other => {
+                        return Err(Error::InvalidArgument(format!(
+                            "expected NULL after IS, got {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        }
+
         // Handle `expr IN [...]`
         if matches!(self.peek(), Token::In) {
             self.advance(); // consume IN

@@ -612,7 +612,7 @@ impl Engine {
 
             // Collect col_ids needed by WHERE + WITH projections + inline prop filters.
             let mut all_col_ids: Vec<u32> = Vec::new();
-            if let Some(ref wexpr) = where_clause {
+            if let Some(wexpr) = &where_clause {
                 collect_col_ids_from_expr(wexpr, &mut all_col_ids);
             }
             for item in &with_clause.items {
@@ -637,7 +637,7 @@ impl Engine {
                     continue;
                 }
                 let row_vals = build_row_vals(&props, var_name, &all_col_ids);
-                if let Some(ref wexpr) = where_clause {
+                if let Some(wexpr) = &where_clause {
                     if !eval_where(wexpr, &row_vals) {
                         continue;
                     }
@@ -938,6 +938,7 @@ impl Engine {
 
     /// Scan neighbors of `src_slot` via delta log + CSR for the optional 1-hop,
     /// returning one `HashMap<String,Value>` per matching destination node.
+    #[allow(clippy::too_many_arguments)]
     fn optional_one_hop_sub_rows(
         &self,
         src_slot: u64,
@@ -1965,6 +1966,7 @@ fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
 ///
 /// Integers are stored as `Int64`; strings are stored as `Bytes` (up to 8 bytes
 /// inline, matching the storage layer's encoding in `Value::to_u64`).
+#[allow(dead_code)]
 fn literal_to_store_value(lit: &Literal) -> StoreValue {
     match lit {
         Literal::Int(n) => StoreValue::Int64(*n),
@@ -2373,6 +2375,7 @@ fn project_row(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn project_hop_row(
     src_props: &[(u32, u64)],
     dst_props: &[(u32, u64)],
