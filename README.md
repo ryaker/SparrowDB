@@ -74,6 +74,36 @@ Full guide: [docs/getting-started.md](docs/getting-started.md)
 
 ---
 
+## CLI Usage
+
+```bash
+# Run a Cypher query
+sparrowdb query --db my.db "MATCH (n:Person) RETURN n.name LIMIT 5"
+
+# Checkpoint the WAL
+sparrowdb checkpoint --db my.db
+
+# Show database metadata
+sparrowdb info --db my.db
+```
+
+Build from source:
+```bash
+cargo build --release --bin sparrowdb --bin sparrowdb-mcp
+```
+
+## MCP Server
+
+`sparrowdb-mcp` speaks JSON-RPC 2.0 over stdio — compatible with any MCP client (Claude Code, etc.):
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+```
+
+Tools: `execute_cypher`, `checkpoint`, `info`.
+
+---
+
 ## Cypher Support (v0.1)
 
 | Feature | Supported |
