@@ -81,6 +81,7 @@ pub fn dispatch_function(name: &str, args: Vec<Value>) -> Result<Value> {
         "date" => fn_date(args),
         "duration" => fn_duration(args),
 
+
         other => Err(Error::InvalidArgument(format!(
             "unknown function: {other}"
         ))),
@@ -503,7 +504,7 @@ fn fn_to_string(args: Vec<Value>) -> Result<Value> {
         Value::Bool(b) => Ok(Value::String(b.to_string())),
         Value::NodeRef(id) => Ok(Value::String(format!("node({})", id.0))),
         Value::EdgeRef(id) => Ok(Value::String(format!("edge({})", id.0))),
-        Value::List(_) => Ok(Value::String("[]".into())),
+        Value::List(items) => Ok(Value::String(format!("{}", crate::types::Value::List(items.clone())))),
     }
 }
 

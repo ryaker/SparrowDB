@@ -905,6 +905,15 @@ impl Engine {
         }
 
         let use_agg = has_collect_in_return(&m.return_clause.items);
+        if use_agg {
+            // Aggregate expressions reference properties not captured by
+            // column_names (e.g. collect(p.name) -> column "collect(p.name)").
+            // Extract col_ids from every RETURN expression so the scan reads
+            // all necessary columns.
+            for item in &m.return_clause.items {
+                collect_col_ids_from_expr(&item.expr, &mut all_col_ids);
+            }
+        }
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
@@ -993,10 +1002,19 @@ impl Engine {
         let hwm_src = self.store.hwm_for_label(src_label_id)?;
         tracing::debug!(src_label = %src_label, dst_label = %dst_label, hwm_src = hwm_src, "one-hop traversal start");
 
-        let col_ids_src = collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
-        let col_ids_dst = collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
+        let mut col_ids_src =
+            collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
+        let mut col_ids_dst =
+            collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
 
         let use_agg = has_collect_in_return(&m.return_clause.items);
+        if use_agg {
+            // Collect col_ids referenced inside collect() argument expressions.
+            for item in &m.return_clause.items {
+                collect_col_ids_from_expr(&item.expr, &mut col_ids_src);
+                collect_col_ids_from_expr(&item.expr, &mut col_ids_dst);
+            }
+        }
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
@@ -1670,6 +1688,12 @@ fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
             collect_col_ids_from_expr(expr, out);
             for item in list {
                 collect_col_ids_from_expr(item, out);
+            }
+        }
+        // FnCall arguments (e.g. collect(p.name)) may reference properties.
+        Expr::FnCall { args, .. } => {
+            for arg in args {
+                collect_col_ids_from_expr(arg, out);
             }
         }
         _ => {}
