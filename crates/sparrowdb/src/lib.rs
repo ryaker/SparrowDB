@@ -568,6 +568,8 @@ impl<'db> WriteTx<'db> {
     /// SPA-126: Create a directed edge `src → dst` with the given type.
     ///
     /// Appends to the edge delta log and queues an `EdgeCreate` WAL record.
+    /// Registers the relationship type name in the catalog so that queries
+    /// like `MATCH (a)-[:REL]->(b)` can resolve the type (SPA-158).
     /// Returns the new [`EdgeId`].
     pub fn create_edge(
         &mut self,
@@ -576,8 +578,20 @@ impl<'db> WriteTx<'db> {
         rel_type: &str,
         _props: HashMap<String, Value>,
     ) -> Result<EdgeId> {
-        let mut es = EdgeStore::open(&self.inner.path, RelTableId(0))?;
-        let edge_id = es.create_edge(src, RelTableId(0), dst)?;
+        // Derive label IDs from the packed node IDs (upper 32 bits).
+        let src_label_id = (src.0 >> 32) as u16;
+        let dst_label_id = (dst.0 >> 32) as u16;
+
+        // Register (or retrieve) the rel type in the catalog so that the
+        // binder can resolve `[:REL_TYPE]` patterns in Cypher queries.
+        // The catalog returns a u64 id; the storage layer uses a u32 newtype.
+        let catalog_rel_id =
+            self.catalog
+                .get_or_create_rel_type_id(src_label_id, dst_label_id, rel_type)?;
+        let rel_table_id = RelTableId(catalog_rel_id as u32);
+
+        let mut es = EdgeStore::open(&self.inner.path, rel_table_id)?;
+        let edge_id = es.create_edge(src, rel_table_id, dst)?;
         self.wal_mutations.push(WalMutation::EdgeCreate {
             edge_id,
             src,

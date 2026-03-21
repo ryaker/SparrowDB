@@ -75,6 +75,17 @@ impl Catalog {
         Ok(id)
     }
 
+    /// Find or create a label by name, returning its id.
+    ///
+    /// If the label already exists, returns the existing id.
+    /// If it does not exist, creates it and returns the new id.
+    pub fn get_or_create_label_id(&mut self, name: &str) -> Result<LabelId> {
+        if let Some(id) = self.get_label(name)? {
+            return Ok(id);
+        }
+        self.create_label(name)
+    }
+
     /// Look up a label by name.
     pub fn get_label(&self, name: &str) -> Result<Option<LabelId>> {
         Ok(self
@@ -94,6 +105,22 @@ impl Catalog {
     }
 
     // --- Relationship table CRUD ---
+
+    /// Find or create a relationship table entry for `(src_label_id, dst_label_id, rel_type)`.
+    ///
+    /// If a matching entry already exists, returns its id.
+    /// Otherwise creates a new entry, persists it to disk, and returns the new id.
+    pub fn get_or_create_rel_type_id(
+        &mut self,
+        src_label_id: u16,
+        dst_label_id: u16,
+        rel_type: &str,
+    ) -> Result<RelTableId> {
+        if let Some(id) = self.get_rel_table(src_label_id, dst_label_id, rel_type)? {
+            return Ok(id);
+        }
+        self.create_rel_table(src_label_id, dst_label_id, rel_type)
+    }
 
     /// Create a new relationship table entry.
     pub fn create_rel_table(
