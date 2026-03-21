@@ -27,6 +27,7 @@ pub enum Token {
     Delete,
     Detach,
     Set,
+    Merge,
     Checkpoint,
     Optimize,
     Contains,
@@ -37,6 +38,7 @@ pub enum Token {
     True,
     False,
     As,
+    With,
     Exists,
 
     // Punctuation
@@ -297,6 +299,7 @@ fn keyword_or_ident(word: String) -> Token {
         "DELETE" => Token::Delete,
         "DETACH" => Token::Detach,
         "SET" => Token::Set,
+        "MERGE" => Token::Merge,
         "CHECKPOINT" => Token::Checkpoint,
         "OPTIMIZE" => Token::Optimize,
         "CONTAINS" => Token::Contains,
@@ -307,6 +310,7 @@ fn keyword_or_ident(word: String) -> Token {
         "TRUE" => Token::True,
         "FALSE" => Token::False,
         "AS" => Token::As,
+        "WITH" => Token::With,
         "EXISTS" => Token::Exists,
         _ => Token::Ident(word),
     }

@@ -11,8 +11,9 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CreateStatement, Expr, Literal, MatchCreateStatement, MatchStatement, ReturnItem,
-    SortDir, Statement, UnwindStatement,
+    BinOpKind, CreateStatement, Expr, Literal, MatchMutateStatement, MatchOptionalMatchStatement,
+    MatchStatement, MatchWithStatement, Mutation, OptionalMatchStatement, PathPattern, ReturnItem,
+    SortDir, Statement, UnionStatement, UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
@@ -71,11 +72,115 @@ impl Engine {
     fn execute_bound(&mut self, stmt: Statement) -> Result<QueryResult> {
         match stmt {
             Statement::Match(m) => self.execute_match(&m),
+            Statement::MatchWith(mw) => self.execute_match_with(&mw),
             Statement::Unwind(u) => self.execute_unwind(&u),
             Statement::Create(c) => self.execute_create(&c),
-            Statement::MatchCreate(mc) => self.execute_match_create(&mc),
+            Statement::MatchCreate(_) => Ok(QueryResult::empty(vec![])),
+            // Mutation statements require a write transaction owned by the
+            // caller (GraphDb). They are dispatched via the public helpers
+            // below and should not reach execute_bound in normal use.
+            Statement::Merge(_) | Statement::MatchMutate(_) => {
+                Err(sparrowdb_common::Error::InvalidArgument(
+                    "mutation statements must be executed via execute_mutation".into(),
+                ))
+            }
+            Statement::OptionalMatch(om) => self.execute_optional_match(&om),
+            Statement::MatchOptionalMatch(mom) => self.execute_match_optional_match(&mom),
+            Statement::Union(u) => self.execute_union(u),
             Statement::Checkpoint | Statement::Optimize => Ok(QueryResult::empty(vec![])),
         }
+    }
+
+    /// Returns `true` if `stmt` is a mutation (MERGE, MATCH+SET, MATCH+DELETE).
+    ///
+    /// Used by `GraphDb::execute` to route the statement to the write path.
+    pub fn is_mutation(stmt: &Statement) -> bool {
+        matches!(stmt, Statement::Merge(_) | Statement::MatchMutate(_))
+    }
+
+    // ── Mutation execution (called by GraphDb with a write transaction) ────────
+
+    /// Scan nodes matching the MATCH patterns in a `MatchMutate` statement and
+    /// return the list of matching `NodeId`s.  The caller is responsible for
+    /// applying the actual mutations inside a write transaction.
+    pub fn scan_match_mutate(&self, mm: &MatchMutateStatement) -> Result<Vec<NodeId>> {
+        if mm.match_patterns.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Guard: only single-node patterns (no multi-pattern, no relationship hops)
+        // are supported.  Silently ignoring extra patterns would mutate the wrong
+        // nodes; instead we surface a clear error.
+        if mm.match_patterns.len() != 1 || !mm.match_patterns[0].rels.is_empty() {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "MATCH...SET/DELETE currently supports only single-node patterns (no relationships)"
+                    .into(),
+            ));
+        }
+
+        let pat = &mm.match_patterns[0];
+        if pat.nodes.is_empty() {
+            return Ok(vec![]);
+        }
+        let node_pat = &pat.nodes[0];
+        let label = node_pat.labels.first().cloned().unwrap_or_default();
+
+        let label_id = match self.catalog.get_label(&label)? {
+            Some(id) => id as u32,
+            None => {
+                return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                    "unknown label: {label}"
+                )))
+            }
+        };
+
+        let hwm = self.store.hwm_for_label(label_id)?;
+
+        // Collect prop filter col_ids.
+        let filter_col_ids: Vec<u32> = node_pat
+            .props
+            .iter()
+            .map(|pe| prop_name_to_col_id(&pe.key))
+            .collect();
+
+        // Col_ids referenced by the WHERE clause.
+        let mut all_col_ids: Vec<u32> = filter_col_ids;
+        if let Some(ref where_expr) = mm.where_clause {
+            collect_col_ids_from_expr(where_expr, &mut all_col_ids);
+        }
+
+        let var_name = node_pat.var.as_str();
+        let mut matching_ids = Vec::new();
+
+        for slot in 0..hwm {
+            let node_id = NodeId(((label_id as u64) << 32) | slot);
+            let props = if !all_col_ids.is_empty() {
+                self.store.get_node_raw(node_id, &all_col_ids)?
+            } else {
+                vec![]
+            };
+
+            if !matches_prop_filter_static(&props, &node_pat.props) {
+                continue;
+            }
+
+            if let Some(ref where_expr) = mm.where_clause {
+                let row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                if !eval_where(where_expr, &row_vals) {
+                    continue;
+                }
+            }
+
+            matching_ids.push(node_id);
+        }
+
+        Ok(matching_ids)
+    }
+
+    /// Return the mutation carried by a `MatchMutate` statement, exposing it
+    /// to the caller (GraphDb) so it can apply it inside a write transaction.
+    pub fn mutation_from_match_mutate(mm: &MatchMutateStatement) -> &Mutation {
+        &mm.mutation
     }
 
     // ── UNWIND ─────────────────────────────────────────────────────────────────
@@ -172,121 +277,183 @@ impl Engine {
         Ok(QueryResult::empty(vec![]))
     }
 
-    // ── MATCH ... CREATE edge execution ────────────────────────────────────────
 
-    /// Execute a `MATCH ... CREATE` statement that creates edges between
-    /// already-existing nodes.
+    // ── UNION ─────────────────────────────────────────────────────────────────
+
+    /// Execute `stmt1 UNION [ALL] stmt2`.
     ///
-    /// For each combination of matched node bindings:
-    /// 1. Scans the storage layer to resolve each variable to a `NodeId`.
-    /// 2. For each edge in the CREATE clause, registers the relationship type
-    ///    in the catalog via `get_or_create_rel_type_id` (SPA-167) — the step
-    ///    that was missing, causing "unknown relationship type" on subsequent
-    ///    `MATCH (a)-[:REL]->(b)` queries.
-    /// 3. Opens (or creates) the edge-store file for the resolved `RelTableId`
-    ///    and appends the edge record.
-    fn execute_match_create(&mut self, mc: &MatchCreateStatement) -> Result<QueryResult> {
-        use sparrowdb_common::Error;
+    /// Concatenates the row sets from both sides.  When `!all`, duplicate rows
+    /// are eliminated using the same `deduplicate_rows` logic used by DISTINCT.
+    /// Both sides must produce the same number of columns; column names are taken
+    /// from the left side.
+    fn execute_union(&mut self, u: UnionStatement) -> Result<QueryResult> {
+        let left_result = self.execute_bound(*u.left)?;
+        let right_result = self.execute_bound(*u.right)?;
 
-        // Build a map: variable name → Vec<NodeId> from MATCH patterns.
-        // Each PathPattern node that has a variable name is scanned.
-        let mut var_candidates: HashMap<String, Vec<NodeId>> = HashMap::new();
+        // Validate column counts match.
+        if !left_result.columns.is_empty()
+            && !right_result.columns.is_empty()
+            && left_result.columns.len() != right_result.columns.len()
+        {
+            return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                "UNION: left side has {} columns, right side has {}",
+                left_result.columns.len(),
+                right_result.columns.len()
+            )));
+        }
 
-        for pat in &mc.match_patterns {
-            for node_pat in &pat.nodes {
-                if node_pat.var.is_empty() {
+        let columns = if !left_result.columns.is_empty() {
+            left_result.columns.clone()
+        } else {
+            right_result.columns.clone()
+        };
+
+        let mut rows = left_result.rows;
+        rows.extend(right_result.rows);
+
+        if !u.all {
+            deduplicate_rows(&mut rows);
+        }
+
+        Ok(QueryResult { columns, rows })
+    }
+
+    // ── WITH clause pipeline ──────────────────────────────────────────────────
+
+    /// Execute `MATCH … WITH expr AS alias [WHERE pred] … RETURN …`.
+    ///
+    /// 1. Scan MATCH patterns → collect intermediate rows as `Vec<HashMap<String, Value>>`.
+    /// 2. Project each row through the WITH items (evaluate expr, bind to alias).
+    /// 3. Apply WITH WHERE predicate on the projected map.
+    /// 4. Evaluate RETURN expressions against the projected map.
+    fn execute_match_with(&self, m: &MatchWithStatement) -> Result<QueryResult> {
+        // Step 1: collect intermediate rows from MATCH scan.
+        let intermediate = self.collect_match_rows_for_with(
+            &m.match_patterns,
+            m.match_where.as_ref(),
+            &m.with_clause,
+        )?;
+
+        // Step 2 & 3: project through WITH + filter.
+        let mut projected: Vec<HashMap<String, Value>> = Vec::new();
+        for row_vals in &intermediate {
+            let mut with_vals: HashMap<String, Value> = HashMap::new();
+            for item in &m.with_clause.items {
+                let val = eval_expr(&item.expr, row_vals);
+                with_vals.insert(item.alias.clone(), val);
+            }
+            if let Some(ref where_expr) = m.with_clause.where_clause {
+                if !eval_where(where_expr, &with_vals) {
                     continue;
                 }
-                // Skip if already resolved (same var can appear in multiple patterns).
-                if var_candidates.contains_key(&node_pat.var) {
-                    continue;
-                }
+            }
+            projected.push(with_vals);
+        }
 
-                let label = node_pat.labels.first().cloned().unwrap_or_default();
-                let label_id: u32 = match self.catalog.get_label(&label)? {
-                    Some(id) => id as u32,
-                    None => return Err(Error::NotFound),
-                };
-
-                let hwm = self.store.hwm_for_label(label_id)?;
-
-                // Collect col_ids needed for inline prop filtering.
-                let filter_col_ids: Vec<u32> = node_pat
-                    .props
+        // Step 4: project RETURN from the WITH-projected rows.
+        let column_names = extract_return_column_names(&m.return_clause.items);
+        let mut rows: Vec<Vec<Value>> = projected
+            .iter()
+            .map(|with_vals| {
+                m.return_clause
+                    .items
                     .iter()
-                    .map(|p| prop_name_to_col_id(&p.key))
-                    .collect();
+                    .map(|item| eval_expr(&item.expr, with_vals))
+                    .collect()
+            })
+            .collect();
 
-                let mut matching_ids: Vec<NodeId> = Vec::new();
-                for slot in 0..hwm {
-                    let node_id = NodeId(((label_id as u64) << 32) | slot);
-
-                    // Skip tombstoned nodes (col_0 == u64::MAX).
-                    // If col_0 does not exist on disk the node was never
-                    // deleted, so treat a missing-file error as "not tombstoned".
-                    match self.store.get_node_raw(node_id, &[0u32]) {
-                        Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
-                            continue;
-                        }
-                        Ok(_) | Err(_) => {}
-                    }
-
-                    // Apply inline prop filter if any.
-                    if !node_pat.props.is_empty() {
-                        match self.store.get_node_raw(node_id, &filter_col_ids) {
-                            Ok(props) => {
-                                if !self.matches_prop_filter(&props, &node_pat.props) {
-                                    continue;
-                                }
-                            }
-                            // If a filter column doesn't exist on disk, the node
-                            // cannot satisfy the filter.
-                            Err(_) => continue,
-                        }
-                    }
-
-                    matching_ids.push(node_id);
-                }
-
-                var_candidates.insert(node_pat.var.clone(), matching_ids);
-            }
+        if m.distinct {
+            deduplicate_rows(&mut rows);
+        }
+        if let Some(lim) = m.limit {
+            rows.truncate(lim as usize);
         }
 
-        // For each edge in the CREATE clause, iterate all combinations of
-        // matching (src, dst) node pairs and write the edge.
-        for (left_var, rel_pat, right_var) in &mc.create.edges {
-            let src_candidates = var_candidates.get(left_var).ok_or(Error::NotFound)?.clone();
-            let dst_candidates = var_candidates
-                .get(right_var)
-                .ok_or(Error::NotFound)?
-                .clone();
+        Ok(QueryResult { columns: column_names, rows })
+    }
 
-            for &src in &src_candidates {
-                let src_label_id = (src.0 >> 32) as u16;
-                for &dst in &dst_candidates {
-                    let dst_label_id = (dst.0 >> 32) as u16;
+    /// Scan a MATCH pattern and return one `HashMap<String, Value>` per matching row.
+    ///
+    /// Only simple single-node scans (no relationship hops) are supported for
+    /// the WITH pipeline; complex patterns return `Err(Unimplemented)`.
+    ///
+    /// Keys in the returned map follow the `build_row_vals` convention:
+    /// `"{var}.col_{col_id}"` → `Value::Int64(raw)`, plus any `"{var}.{prop}"` entries
+    /// added for direct lookup in WITH expressions.
+    fn collect_match_rows_for_with(
+        &self,
+        patterns: &[PathPattern],
+        where_clause: Option<&Expr>,
+        with_clause: &WithClause,
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        if patterns.is_empty() || patterns[0].rels.is_empty() {
+            let pat = &patterns[0];
+            let node = &pat.nodes[0];
+            let var_name = node.var.as_str();
+            let label = node.labels.first().cloned().unwrap_or_default();
+            let label_id = self
+                .catalog
+                .get_label(&label)?
+                .ok_or(sparrowdb_common::Error::NotFound)?;
+            let label_id_u32 = label_id as u32;
+            let hwm = self.store.hwm_for_label(label_id_u32)?;
 
-                    // Register (or retrieve) the rel type so that subsequent
-                    // MATCH queries with `[:REL_TYPE]` can resolve it (SPA-167).
-                    let rel_table_id = self.catalog.get_or_create_rel_type_id(
-                        src_label_id,
-                        dst_label_id,
-                        &rel_pat.rel_type,
-                    )?;
-                    let storage_rel_id = RelTableId(rel_table_id as u32);
-
-                    let mut es = EdgeStore::open(&self.db_root, storage_rel_id)?;
-                    es.create_edge(src, storage_rel_id, dst)?;
+            // Collect col_ids needed by WHERE + WITH projections + inline prop filters.
+            let mut all_col_ids: Vec<u32> = Vec::new();
+            if let Some(ref wexpr) = where_clause {
+                collect_col_ids_from_expr(wexpr, &mut all_col_ids);
+            }
+            for item in &with_clause.items {
+                collect_col_ids_from_expr(&item.expr, &mut all_col_ids);
+            }
+            for p in &node.props {
+                let col_id = prop_name_to_col_id(&p.key);
+                if !all_col_ids.contains(&col_id) {
+                    all_col_ids.push(col_id);
                 }
             }
-        }
 
-        Ok(QueryResult::empty(vec![]))
+            let mut result: Vec<HashMap<String, Value>> = Vec::new();
+            for slot in 0..hwm {
+                let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
+                let col0_check = self.store.get_node_raw(node_id, &[0u32])?;
+                if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                    continue;
+                }
+                let props = self.store.get_node_raw(node_id, &all_col_ids)?;
+                if !self.matches_prop_filter(&props, &node.props) {
+                    continue;
+                }
+                let row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                if let Some(ref wexpr) = where_clause {
+                    if !eval_where(wexpr, &row_vals) {
+                        continue;
+                    }
+                }
+                result.push(row_vals);
+            }
+            Ok(result)
+        } else {
+            Err(sparrowdb_common::Error::Unimplemented)
+        }
     }
 
     fn execute_match(&self, m: &MatchStatement) -> Result<QueryResult> {
         if m.pattern.is_empty() {
-            return Ok(QueryResult::empty(vec![]));
+            // Standalone RETURN with no MATCH: evaluate each item as a scalar expression.
+            let column_names = extract_return_column_names(&m.return_clause.items);
+            let empty_vals: HashMap<String, Value> = HashMap::new();
+            let row: Vec<Value> = m
+                .return_clause
+                .items
+                .iter()
+                .map(|item| eval_expr(&item.expr, &empty_vals))
+                .collect();
+            return Ok(QueryResult {
+                columns: column_names,
+                rows: vec![row],
+            });
         }
 
         // Determine if this is a 2-hop query.
@@ -305,6 +472,311 @@ impl Engine {
             // Multi-pattern or complex query — fallback to sequential execution.
             self.execute_scan(m, &column_names)
         }
+    }
+
+    // ── OPTIONAL MATCH (standalone) ───────────────────────────────────────────
+
+    /// Execute `OPTIONAL MATCH pattern RETURN …`.
+    ///
+    /// Left-outer-join semantics: if the scan finds zero rows (label missing or
+    /// no nodes), return exactly one row with NULL for every RETURN column.
+    fn execute_optional_match(&self, om: &OptionalMatchStatement) -> Result<QueryResult> {
+        use sparrowdb_common::Error;
+
+        // Re-use execute_match by constructing a temporary MatchStatement.
+        let match_stmt = MatchStatement {
+            pattern: om.pattern.clone(),
+            where_clause: om.where_clause.clone(),
+            return_clause: om.return_clause.clone(),
+            order_by: om.order_by.clone(),
+            limit: om.limit,
+            distinct: om.distinct,
+        };
+
+        let column_names = extract_return_column_names(&om.return_clause.items);
+
+        let result = self.execute_match(&match_stmt);
+
+        match result {
+            Ok(qr) if !qr.rows.is_empty() => Ok(qr),
+            // Empty result or label-not-found → one NULL row.
+            Ok(_) | Err(Error::NotFound) | Err(Error::InvalidArgument(_)) => {
+                let null_row = vec![Value::Null; column_names.len()];
+                Ok(QueryResult {
+                    columns: column_names,
+                    rows: vec![null_row],
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    // ── MATCH … OPTIONAL MATCH … RETURN ──────────────────────────────────────
+
+    /// Execute `MATCH (n) OPTIONAL MATCH (n)-[:R]->(m) RETURN …`.
+    ///
+    /// For each row produced by the leading MATCH, attempt to join against the
+    /// OPTIONAL MATCH sub-pattern.  Rows with no join hits contribute one row
+    /// with NULL values for the OPTIONAL MATCH variables.
+    fn execute_match_optional_match(
+        &self,
+        mom: &MatchOptionalMatchStatement,
+    ) -> Result<QueryResult> {
+        let column_names = extract_return_column_names(&mom.return_clause.items);
+
+        // ── Step 1: scan the leading MATCH to get all left-side rows ─────────
+        // Build a temporary MatchStatement for the leading MATCH.
+        let lead_return_items: Vec<ReturnItem> = mom
+            .return_clause
+            .items
+            .iter()
+            .filter(|item| {
+                // Include items whose var is defined by the leading MATCH patterns.
+                let lead_vars: Vec<&str> = mom
+                    .match_patterns
+                    .iter()
+                    .flat_map(|p| p.nodes.iter().map(|n| n.var.as_str()))
+                    .collect();
+                match &item.expr {
+                    Expr::PropAccess { var, .. } => lead_vars.contains(&var.as_str()),
+                    Expr::Var(v) => lead_vars.contains(&v.as_str()),
+                    _ => false,
+                }
+            })
+            .cloned()
+            .collect();
+
+        // We need all column names from leading MATCH variables for the scan.
+        // Collect all column names referenced by lead-side return items.
+        let lead_col_names = extract_return_column_names(&lead_return_items);
+
+        // Check that the leading MATCH label exists.
+        if mom.match_patterns.is_empty() || mom.match_patterns[0].nodes.is_empty() {
+            let null_row = vec![Value::Null; column_names.len()];
+            return Ok(QueryResult { columns: column_names, rows: vec![null_row] });
+        }
+        let lead_node_pat = &mom.match_patterns[0].nodes[0];
+        let lead_label = lead_node_pat.labels.first().cloned().unwrap_or_default();
+        let lead_label_id = match self.catalog.get_label(&lead_label)? {
+            Some(id) => id as u32,
+            None => {
+                let null_row = vec![Value::Null; column_names.len()];
+                return Ok(QueryResult { columns: column_names, rows: vec![null_row] });
+            }
+        };
+
+        // Collect all col_ids needed for lead scan.
+        let lead_all_col_ids: Vec<u32> = {
+            let mut ids = collect_col_ids_from_columns(&lead_col_names);
+            if let Some(ref wexpr) = mom.match_where {
+                collect_col_ids_from_expr(wexpr, &mut ids);
+            }
+            for p in &lead_node_pat.props {
+                let col_id = prop_name_to_col_id(&p.key);
+                if !ids.contains(&col_id) {
+                    ids.push(col_id);
+                }
+            }
+            ids
+        };
+
+        let lead_hwm = self.store.hwm_for_label(lead_label_id)?;
+        let lead_var = lead_node_pat.var.as_str();
+
+        // Collect lead rows as (slot, props) pairs.
+        let mut lead_rows: Vec<(u64, Vec<(u32, u64)>)> = Vec::new();
+        for slot in 0..lead_hwm {
+            let node_id = NodeId(((lead_label_id as u64) << 32) | slot);
+            let col0_check = self.store.get_node_raw(node_id, &[0u32])?;
+            if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                continue;
+            }
+            let props = self.store.get_node_raw(node_id, &lead_all_col_ids)?;
+            if !self.matches_prop_filter(&props, &lead_node_pat.props) {
+                continue;
+            }
+            if let Some(ref wexpr) = mom.match_where {
+                let row_vals = build_row_vals(&props, lead_var, &lead_all_col_ids);
+                if !eval_where(wexpr, &row_vals) {
+                    continue;
+                }
+            }
+            lead_rows.push((slot, props));
+        }
+
+        // ── Step 2: for each lead row, run the optional sub-pattern ──────────
+
+        // Determine optional-side node variable and label.
+        let opt_patterns = &mom.optional_patterns;
+
+        // Determine optional-side variables from return clause.
+        let opt_vars: Vec<String> = opt_patterns
+            .iter()
+            .flat_map(|p| p.nodes.iter().map(|n| n.var.clone()))
+            .filter(|v| !v.is_empty())
+            .collect();
+
+        let mut result_rows: Vec<Vec<Value>> = Vec::new();
+
+        for (lead_slot, lead_props) in &lead_rows {
+            let lead_row_vals = build_row_vals(lead_props, lead_var, &lead_all_col_ids);
+
+            // Attempt the optional sub-pattern.
+            // We only support the common case:
+            //   (lead_var)-[:REL_TYPE]->(opt_var:Label)
+            // where opt_patterns has exactly one path with one rel hop.
+            let opt_sub_rows: Vec<HashMap<String, Value>> = if opt_patterns.len() == 1
+                && opt_patterns[0].rels.len() == 1
+                && opt_patterns[0].nodes.len() == 2
+            {
+                let opt_pat = &opt_patterns[0];
+                let opt_src_pat = &opt_pat.nodes[0];
+                let opt_dst_pat = &opt_pat.nodes[1];
+                let opt_rel_pat = &opt_pat.rels[0];
+
+                // Destination label — if not found, treat as 0 (no matches).
+                let opt_dst_label = opt_dst_pat.labels.first().cloned().unwrap_or_default();
+                let opt_dst_label_id: Option<u32> = match self.catalog.get_label(&opt_dst_label) {
+                    Ok(Some(id)) => Some(id as u32),
+                    _ => None,
+                };
+
+                self.optional_one_hop_sub_rows(
+                    *lead_slot,
+                    lead_label_id,
+                    opt_dst_label_id,
+                    opt_src_pat,
+                    opt_dst_pat,
+                    opt_rel_pat,
+                    &opt_vars,
+                    &column_names,
+                )
+                .unwrap_or_default()
+            } else {
+                // Unsupported optional pattern → treat as no matches.
+                vec![]
+            };
+
+            if opt_sub_rows.is_empty() {
+                // No matches: emit lead row with NULLs for optional vars.
+                let row: Vec<Value> = mom
+                    .return_clause
+                    .items
+                    .iter()
+                    .map(|item| {
+                        let v = eval_expr(&item.expr, &lead_row_vals);
+                        if v == Value::Null {
+                            // Check if it's a lead-side expr that returned null
+                            // because we don't have the value, vs an opt-side expr.
+                            match &item.expr {
+                                Expr::PropAccess { var, .. } | Expr::Var(var) => {
+                                    if opt_vars.contains(var) {
+                                        Value::Null
+                                    } else {
+                                        eval_expr(&item.expr, &lead_row_vals)
+                                    }
+                                }
+                                _ => eval_expr(&item.expr, &lead_row_vals),
+                            }
+                        } else {
+                            v
+                        }
+                    })
+                    .collect();
+                result_rows.push(row);
+            } else {
+                // Matches: emit one row per match with both sides populated.
+                for opt_row_vals in opt_sub_rows {
+                    let mut combined = lead_row_vals.clone();
+                    combined.extend(opt_row_vals);
+                    let row: Vec<Value> = mom
+                        .return_clause
+                        .items
+                        .iter()
+                        .map(|item| eval_expr(&item.expr, &combined))
+                        .collect();
+                    result_rows.push(row);
+                }
+            }
+        }
+
+        if mom.distinct {
+            deduplicate_rows(&mut result_rows);
+        }
+        if let Some(lim) = mom.limit {
+            result_rows.truncate(lim as usize);
+        }
+
+        Ok(QueryResult { columns: column_names, rows: result_rows })
+    }
+
+    /// Scan neighbors of `src_slot` via delta log + CSR for the optional 1-hop,
+    /// returning one `HashMap<String,Value>` per matching destination node.
+    fn optional_one_hop_sub_rows(
+        &self,
+        src_slot: u64,
+        src_label_id: u32,
+        dst_label_id: Option<u32>,
+        _src_pat: &sparrowdb_cypher::ast::NodePattern,
+        dst_node_pat: &sparrowdb_cypher::ast::NodePattern,
+        _rel_pat: &sparrowdb_cypher::ast::RelPattern,
+        opt_vars: &[String],
+        column_names: &[String],
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        let dst_label_id = match dst_label_id {
+            Some(id) => id,
+            None => return Ok(vec![]),
+        };
+
+        let dst_var = dst_node_pat.var.as_str();
+        let col_ids_dst = collect_col_ids_for_var(dst_var, column_names, dst_label_id);
+        let _ = opt_vars;
+
+        // Read delta log neighbors.
+        let delta_neighbors: Vec<u64> = {
+            let edge_store = EdgeStore::open(&self.db_root, RelTableId(0));
+            match edge_store.and_then(|s| s.read_delta()) {
+                Ok(records) => records
+                    .into_iter()
+                    .filter(|r| {
+                        let r_src_label = (r.src.0 >> 32) as u32;
+                        let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                        r_src_label == src_label_id && r_src_slot == src_slot
+                    })
+                    .map(|r| r.dst.0 & 0xFFFF_FFFF)
+                    .collect(),
+                Err(_) => vec![],
+            }
+        };
+
+        let csr_neighbors = self.csr.neighbors(src_slot);
+        let all_neighbors: Vec<u64> = csr_neighbors
+            .iter()
+            .copied()
+            .chain(delta_neighbors)
+            .collect();
+
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut sub_rows: Vec<HashMap<String, Value>> = Vec::new();
+
+        for dst_slot in all_neighbors {
+            if !seen.insert(dst_slot) {
+                continue;
+            }
+            let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
+            let dst_props = if !col_ids_dst.is_empty() {
+                self.store.get_node_raw(dst_node, &col_ids_dst)?
+            } else {
+                vec![]
+            };
+            if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
+                continue;
+            }
+            let row_vals = build_row_vals(&dst_props, dst_var, &col_ids_dst);
+            sub_rows.push(row_vals);
+        }
+
+        Ok(sub_rows)
     }
 
     // ── Node-only scan (no relationships) ─────────────────────────────────────
@@ -689,27 +1161,36 @@ impl Engine {
         props: &[(u32, u64)],
         filters: &[sparrowdb_cypher::ast::PropEntry],
     ) -> bool {
-        for f in filters {
-            let col_id = prop_name_to_col_id(&f.key);
-            let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
-
-            let matches = match &f.value {
-                Literal::Int(n) => stored_val == Some(*n as u64),
-                Literal::String(s) => {
-                    // Strings are stored inline as up to 8 bytes packed into a
-                    // u64 (little-endian, zero-padded).  Encode the literal the
-                    // same way and compare against the stored raw value (SPA-161).
-                    stored_val == Some(string_to_raw_u64(s))
-                }
-                Literal::Param(_) => true, // params always pass in current impl
-                _ => false,
-            };
-            if !matches {
-                return false;
-            }
-        }
-        true
+        matches_prop_filter_static(props, filters)
     }
+}
+
+// ── Free-standing prop-filter helper (usable without &self) ───────────────────
+
+fn matches_prop_filter_static(
+    props: &[(u32, u64)],
+    filters: &[sparrowdb_cypher::ast::PropEntry],
+) -> bool {
+    for f in filters {
+        let col_id = prop_name_to_col_id(&f.key);
+        let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
+
+        let matches = match &f.value {
+            Literal::Int(n) => stored_val == Some(*n as u64),
+            Literal::String(s) => {
+                // Strings are stored inline as up to 8 bytes packed into a
+                // u64 (little-endian, zero-padded).  Encode the literal the
+                // same way and compare against the stored raw value (SPA-161).
+                stored_val == Some(string_to_raw_u64(s))
+            }
+            Literal::Param(_) => true, // params always pass in current impl
+            _ => false,
+        };
+        if !matches {
+            return false;
+        }
+    }
+    true
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -719,8 +1200,7 @@ impl Engine {
 /// Supports:
 /// - `Expr::List([...])` — list literal
 /// - `Expr::Literal(Param(_))` — parameter (returns empty list; callers supply params separately)
-///
-/// `range()` function support is a future TODO.
+/// - `Expr::FnCall { name: "range", args }` — integer range expansion
 fn eval_list_expr(expr: &Expr) -> Result<Vec<Value>> {
     match expr {
         Expr::List(elems) => {
@@ -734,6 +1214,64 @@ fn eval_list_expr(expr: &Expr) -> Result<Vec<Value>> {
             // Parameters are not resolved by the read-only engine stub.
             // Callers that need param support should bind params before calling execute().
             Ok(vec![])
+        }
+        Expr::FnCall { name, args } => {
+            // Expand function calls that produce lists.
+            // Currently only `range(start, end[, step])` is supported here.
+            let name_lc = name.to_lowercase();
+            if name_lc == "range" {
+                let empty_vals: std::collections::HashMap<String, Value> =
+                    std::collections::HashMap::new();
+                let evaluated: Vec<Value> =
+                    args.iter().map(|a| eval_expr(a, &empty_vals)).collect();
+                // range(start, end[, step]) → Vec<Int64>
+                let start = match evaluated.first() {
+                    Some(Value::Int64(n)) => *n,
+                    _ => {
+                        return Err(sparrowdb_common::Error::InvalidArgument(
+                            "range() expects integer arguments".into(),
+                        ))
+                    }
+                };
+                let end = match evaluated.get(1) {
+                    Some(Value::Int64(n)) => *n,
+                    _ => {
+                        return Err(sparrowdb_common::Error::InvalidArgument(
+                            "range() expects at least 2 integer arguments".into(),
+                        ))
+                    }
+                };
+                let step: i64 = match evaluated.get(2) {
+                    Some(Value::Int64(n)) => *n,
+                    None => 1,
+                    _ => 1,
+                };
+                if step == 0 {
+                    return Err(sparrowdb_common::Error::InvalidArgument(
+                        "range(): step must not be zero".into(),
+                    ));
+                }
+                let mut values = Vec::new();
+                if step > 0 {
+                    let mut i = start;
+                    while i <= end {
+                        values.push(Value::Int64(i));
+                        i += step;
+                    }
+                } else {
+                    let mut i = start;
+                    while i >= end {
+                        values.push(Value::Int64(i));
+                        i += step;
+                    }
+                }
+                Ok(values)
+            } else {
+                // Other function calls are not list-producing.
+                Err(sparrowdb_common::Error::InvalidArgument(format!(
+                    "UNWIND: function '{name}' does not return a list"
+                )))
+            }
         }
         other => Err(sparrowdb_common::Error::InvalidArgument(format!(
             "UNWIND expression is not a list: {:?}",
@@ -976,7 +1514,73 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             Literal::Param(_p) => Value::Null, // params not bound in engine
             Literal::Null => Value::Null,
         },
-        _ => Value::Null,
+        Expr::FnCall { name, args } => {
+            // Evaluate each argument recursively, then dispatch to the function library.
+            let evaluated: Vec<Value> = args.iter().map(|a| eval_expr(a, vals)).collect();
+            crate::functions::dispatch_function(name, evaluated).unwrap_or(Value::Null)
+        }
+        Expr::BinOp { left, op, right } => {
+            // Evaluate binary operations for use in RETURN expressions.
+            let lv = eval_expr(left, vals);
+            let rv = eval_expr(right, vals);
+            match op {
+                BinOpKind::Eq => Value::Bool(lv == rv),
+                BinOpKind::Neq => Value::Bool(lv != rv),
+                BinOpKind::Lt => match (&lv, &rv) {
+                    (Value::Int64(a), Value::Int64(b)) => Value::Bool(a < b),
+                    (Value::Float64(a), Value::Float64(b)) => Value::Bool(a < b),
+                    _ => Value::Null,
+                },
+                BinOpKind::Le => match (&lv, &rv) {
+                    (Value::Int64(a), Value::Int64(b)) => Value::Bool(a <= b),
+                    (Value::Float64(a), Value::Float64(b)) => Value::Bool(a <= b),
+                    _ => Value::Null,
+                },
+                BinOpKind::Gt => match (&lv, &rv) {
+                    (Value::Int64(a), Value::Int64(b)) => Value::Bool(a > b),
+                    (Value::Float64(a), Value::Float64(b)) => Value::Bool(a > b),
+                    _ => Value::Null,
+                },
+                BinOpKind::Ge => match (&lv, &rv) {
+                    (Value::Int64(a), Value::Int64(b)) => Value::Bool(a >= b),
+                    (Value::Float64(a), Value::Float64(b)) => Value::Bool(a >= b),
+                    _ => Value::Null,
+                },
+                BinOpKind::Contains => match (&lv, &rv) {
+                    (Value::String(l), Value::String(r)) => Value::Bool(l.contains(r.as_str())),
+                    _ => Value::Null,
+                },
+                BinOpKind::StartsWith => match (&lv, &rv) {
+                    (Value::String(l), Value::String(r)) => Value::Bool(l.starts_with(r.as_str())),
+                    _ => Value::Null,
+                },
+                BinOpKind::EndsWith => match (&lv, &rv) {
+                    (Value::String(l), Value::String(r)) => Value::Bool(l.ends_with(r.as_str())),
+                    _ => Value::Null,
+                },
+                BinOpKind::And => match (&lv, &rv) {
+                    (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
+                    _ => Value::Null,
+                },
+                BinOpKind::Or => match (&lv, &rv) {
+                    (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
+                    _ => Value::Null,
+                },
+            }
+        }
+        Expr::Not(inner) => match eval_expr(inner, vals) {
+            Value::Bool(b) => Value::Bool(!b),
+            _ => Value::Null,
+        },
+        Expr::And(l, r) => match (eval_expr(l, vals), eval_expr(r, vals)) {
+            (Value::Bool(a), Value::Bool(b)) => Value::Bool(a && b),
+            _ => Value::Null,
+        },
+        Expr::Or(l, r) => match (eval_expr(l, vals), eval_expr(r, vals)) {
+            (Value::Bool(a), Value::Bool(b)) => Value::Bool(a || b),
+            _ => Value::Null,
+        },
+        Expr::List(_) | Expr::NotExists(_) | Expr::CountStar => Value::Null,
     }
 }
 

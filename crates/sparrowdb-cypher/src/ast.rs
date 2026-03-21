@@ -179,13 +179,125 @@ pub struct UnwindStatement {
     pub return_clause: ReturnClause,
 }
 
+/// MERGE statement: find-or-create a single node.
+///
+/// `MERGE (:Label {prop: val, ...})`
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeStatement {
+    /// The primary label to merge on.
+    pub label: String,
+    /// Identity properties used to locate or create the node.
+    pub props: Vec<PropEntry>,
+}
+
+/// A mutation clause appended after a MATCH: SET or DELETE.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mutation {
+    /// `SET var.prop = expr`
+    Set {
+        var: String,
+        prop: String,
+        value: Expr,
+    },
+    /// `DELETE var`
+    Delete { var: String },
+}
+
+/// MATCH … SET/DELETE statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchMutateStatement {
+    /// The MATCH patterns (same structure as `MatchStatement::pattern`).
+    pub match_patterns: Vec<PathPattern>,
+    /// Optional WHERE predicate.
+    pub where_clause: Option<Expr>,
+    /// The mutation to apply to matched nodes.
+    pub mutation: Mutation,
+}
+
+/// A single projection in a WITH clause: `expr AS alias`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithItem {
+    pub expr: Expr,
+    pub alias: String,
+}
+
+/// WITH clause: materializes intermediate rows and optionally filters them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithClause {
+    pub items: Vec<WithItem>,
+    pub where_clause: Option<Expr>,
+}
+
+/// MATCH … WITH … RETURN statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchWithStatement {
+    pub match_patterns: Vec<PathPattern>,
+    pub match_where: Option<Expr>,
+    pub with_clause: WithClause,
+    pub return_clause: ReturnClause,
+    pub order_by: Vec<(Expr, SortDir)>,
+    pub limit: Option<u64>,
+    pub distinct: bool,
+}
+
+/// OPTIONAL MATCH statement (standalone).
+///
+/// Left-outer-join semantics: if no rows match (label missing or zero nodes),
+/// returns exactly one row with NULL values for all RETURN columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OptionalMatchStatement {
+    pub pattern: Vec<PathPattern>,
+    pub where_clause: Option<Expr>,
+    pub return_clause: ReturnClause,
+    pub order_by: Vec<(Expr, SortDir)>,
+    pub limit: Option<u64>,
+    pub distinct: bool,
+}
+
+/// MATCH … OPTIONAL MATCH … RETURN statement.
+///
+/// For every row produced by the leading MATCH, attempt the OPTIONAL MATCH
+/// sub-pattern.  If no sub-rows are found for a given leading row, emit that
+/// leading row with NULL values for the OPTIONAL MATCH variables.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchOptionalMatchStatement {
+    /// The leading MATCH patterns (must produce rows).
+    pub match_patterns: Vec<PathPattern>,
+    pub match_where: Option<Expr>,
+    /// The OPTIONAL MATCH patterns (may produce NULLs).
+    pub optional_patterns: Vec<PathPattern>,
+    pub optional_where: Option<Expr>,
+    /// Combined RETURN clause evaluated over both MATCH and OPTIONAL MATCH variables.
+    pub return_clause: ReturnClause,
+    pub order_by: Vec<(Expr, SortDir)>,
+    pub limit: Option<u64>,
+    pub distinct: bool,
+}
+
+/// UNION / UNION ALL — combine two complete queries.
+///
+/// When `all` is `false` duplicate rows are eliminated (UNION); when `true`
+/// all rows from both sides are returned (UNION ALL).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionStatement {
+    pub left: Box<Statement>,
+    pub right: Box<Statement>,
+    pub all: bool,
+}
+
 /// Top-level statement variants.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Create(CreateStatement),
     MatchCreate(MatchCreateStatement),
     Match(MatchStatement),
+    MatchWith(MatchWithStatement),
     Unwind(UnwindStatement),
+    Merge(MergeStatement),
+    MatchMutate(MatchMutateStatement),
+    OptionalMatch(OptionalMatchStatement),
+    MatchOptionalMatch(MatchOptionalMatchStatement),
+    Union(UnionStatement),
     Checkpoint,
     Optimize,
 }

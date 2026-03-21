@@ -7,8 +7,9 @@ use sparrowdb_common::{Error, Result};
 
 use crate::ast::{
     BinOpKind, CreateStatement, EdgeDir, ExistsPattern, Expr, Literal, MatchCreateStatement,
-    MatchStatement, NodePattern, PathPattern, PropEntry, RelPattern, ReturnClause, ReturnItem,
-    SortDir, Statement, UnwindStatement,
+    MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement, MergeStatement, Mutation,
+    NodePattern, OptionalMatchStatement, PathPattern, PropEntry, RelPattern, ReturnClause,
+    ReturnItem, SortDir, Statement, UnionStatement, UnwindStatement,
 };
 use crate::lexer::{tokenize, Token};
 
@@ -21,6 +22,26 @@ pub fn parse(input: &str) -> Result<Statement> {
     let tokens = tokenize(input)?;
     let mut p = Parser::new(tokens);
     let stmt = p.parse_statement()?;
+
+    // Check for UNION / UNION ALL between two statements.
+    let stmt = if matches!(p.peek(), Token::Union) {
+        p.advance();
+        let all = if matches!(p.peek(), Token::Ident(ref s) if s.to_uppercase() == "ALL") {
+            p.advance();
+            true
+        } else {
+            false
+        };
+        let right = p.parse_statement()?;
+        Statement::Union(UnionStatement {
+            left: Box::new(stmt),
+            right: Box::new(right),
+            all,
+        })
+    } else {
+        stmt
+    };
+
     // Consume optional trailing semicolon.
     if matches!(p.peek(), Token::Semicolon) {
         p.advance();
@@ -95,8 +116,9 @@ impl Parser {
 impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         match self.peek().clone() {
-            Token::Match => self.parse_match_or_match_create(),
+            Token::Match => self.parse_match_or_match_mutate(),
             Token::Create => self.parse_create(),
+            Token::Merge => self.parse_merge(),
             Token::Checkpoint => {
                 self.advance();
                 Ok(Statement::Checkpoint)
@@ -105,11 +127,13 @@ impl Parser {
                 self.advance();
                 Ok(Statement::Optimize)
             }
-            Token::Optional => Err(Error::InvalidArgument(
-                "OPTIONAL MATCH is not supported".into(),
+            Token::Optional => self.parse_optional_match(),
+            Token::Union => Err(Error::InvalidArgument(
+                "unexpected UNION: use 'MATCH ... RETURN ... UNION MATCH ... RETURN ...'".into(),
             )),
-            Token::Union => Err(Error::InvalidArgument("UNION is not supported".into())),
             Token::Unwind => self.parse_unwind(),
+            // Standalone RETURN (no MATCH): `RETURN expr [AS alias], ...`
+            Token::Return => self.parse_standalone_return(),
             other => Err(Error::InvalidArgument(format!(
                 "unexpected token at statement start: {:?}",
                 other
@@ -117,11 +141,34 @@ impl Parser {
         }
     }
 
-    // ── MATCH (or MATCH ... CREATE) ───────────────────────────────────────────
+    /// Parse `RETURN expr [AS alias], ...` with no preceding MATCH clause.
+    ///
+    /// Emits a `Statement::Match` with an empty pattern list.  The execution
+    /// engine detects the empty pattern and evaluates the RETURN items as
+    /// pure scalar expressions (functions, literals, etc.).
+    fn parse_standalone_return(&mut self) -> Result<Statement> {
+        self.expect_tok(&Token::Return)?;
+        let distinct = if matches!(self.peek(), Token::Distinct) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let items = self.parse_return_items()?;
+        Ok(Statement::Match(MatchStatement {
+            pattern: vec![],
+            where_clause: None,
+            return_clause: ReturnClause { items },
+            order_by: vec![],
+            limit: None,
+            distinct,
+        }))
+    }
 
-    fn parse_match_or_match_create(&mut self) -> Result<Statement> {
-        // Peek ahead to see if this is MATCH ... CREATE
-        // We parse the MATCH clause first, then check.
+    // ── MATCH (or MATCH ... CREATE / SET / DELETE) ────────────────────────────
+
+    fn parse_match_or_match_mutate(&mut self) -> Result<Statement> {
+        // Parse the MATCH clause first, then dispatch on the following keyword.
         self.expect_tok(&Token::Match)?;
 
         let patterns = self.parse_pattern_list()?;
@@ -137,90 +184,428 @@ impl Parser {
                     create,
                 }))
             }
-            Token::Return
-            | Token::Where
-            | Token::Order
-            | Token::Limit
-            | Token::Eof
-            | Token::Semicolon => {
-                let where_clause = if matches!(self.peek(), Token::Where) {
-                    self.advance();
-                    Some(self.parse_expr()?)
-                } else {
-                    None
-                };
-
-                // Reject UNION before RETURN
-                if matches!(self.peek(), Token::Union) {
-                    return Err(Error::InvalidArgument("UNION is not supported".into()));
-                }
-
-                // RETURN clause
-                let (distinct, return_clause) = if matches!(self.peek(), Token::Return) {
-                    self.advance();
-                    let distinct = if matches!(self.peek(), Token::Distinct) {
-                        self.advance();
-                        true
-                    } else {
-                        false
-                    };
-                    let items = self.parse_return_items()?;
-                    (distinct, ReturnClause { items })
-                } else {
-                    return Err(Error::InvalidArgument("expected RETURN clause".into()));
-                };
-
-                // Reject UNION after RETURN clause
-                if matches!(self.peek(), Token::Union) {
-                    return Err(Error::InvalidArgument("UNION is not supported".into()));
-                }
-
-                // ORDER BY
-                let order_by = if matches!(self.peek(), Token::Order) {
-                    self.advance();
-                    self.expect_tok(&Token::By)?;
-                    self.parse_order_by_items()?
-                } else {
-                    vec![]
-                };
-
-                // LIMIT
-                let limit = if matches!(self.peek(), Token::Limit) {
-                    self.advance();
-                    match self.advance().clone() {
-                        Token::Integer(n) => {
-                            if n < 0 {
-                                return Err(Error::InvalidArgument(
-                                    "LIMIT must be non-negative".into(),
-                                ));
-                            }
-                            Some(n as u64)
-                        }
-                        other => {
-                            return Err(Error::InvalidArgument(format!(
-                                "expected integer after LIMIT, got {:?}",
-                                other
-                            )))
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                Ok(Statement::Match(MatchStatement {
-                    pattern: patterns,
-                    where_clause,
-                    return_clause,
-                    order_by,
-                    limit,
-                    distinct,
+            Token::Set => {
+                // MATCH ... SET var.prop = expr
+                self.advance();
+                let var = self.expect_ident()?;
+                self.expect_tok(&Token::Dot)?;
+                let prop = self.expect_ident()?;
+                self.expect_tok(&Token::Eq)?;
+                let value = self.parse_expr()?;
+                Ok(Statement::MatchMutate(MatchMutateStatement {
+                    match_patterns: patterns,
+                    where_clause: None,
+                    mutation: Mutation::Set { var, prop, value },
                 }))
+            }
+            Token::Delete => {
+                // MATCH ... DELETE var
+                self.advance();
+                let var = self.expect_ident()?;
+                Ok(Statement::MatchMutate(MatchMutateStatement {
+                    match_patterns: patterns,
+                    where_clause: None,
+                    mutation: Mutation::Delete { var },
+                }))
+            }
+            Token::Where => {
+                // MATCH ... WHERE expr (SET|DELETE|RETURN)
+                self.advance();
+                let where_expr = self.parse_expr()?;
+                match self.peek().clone() {
+                    Token::Set => {
+                        self.advance();
+                        let var = self.expect_ident()?;
+                        self.expect_tok(&Token::Dot)?;
+                        let prop = self.expect_ident()?;
+                        self.expect_tok(&Token::Eq)?;
+                        let value = self.parse_expr()?;
+                        Ok(Statement::MatchMutate(MatchMutateStatement {
+                            match_patterns: patterns,
+                            where_clause: Some(where_expr),
+                            mutation: Mutation::Set { var, prop, value },
+                        }))
+                    }
+                    Token::Delete => {
+                        self.advance();
+                        let var = self.expect_ident()?;
+                        Ok(Statement::MatchMutate(MatchMutateStatement {
+                            match_patterns: patterns,
+                            where_clause: Some(where_expr),
+                            mutation: Mutation::Delete { var },
+                        }))
+                    }
+                    Token::With => {
+                        // MATCH … WHERE … WITH … RETURN
+                        self.parse_with_pipeline(patterns, Some(where_expr))
+                    }
+                    _ => {
+                        // Fall through to RETURN parsing with the parsed WHERE expr.
+                        self.finish_match_return(patterns, Some(where_expr))
+                    }
+                }
+            }
+            Token::With => {
+                // MATCH … WITH … RETURN pipeline
+                self.parse_with_pipeline(patterns, None)
+            }
+            Token::Return | Token::Order | Token::Limit | Token::Eof | Token::Semicolon => {
+                self.finish_match_return(patterns, None)
+            }
+            Token::Optional => {
+                // MATCH … OPTIONAL MATCH … RETURN
+                self.parse_match_optional_match_tail(patterns, None)
             }
             other => Err(Error::InvalidArgument(format!(
                 "unexpected token after MATCH pattern: {:?}",
                 other
             ))),
         }
+    }
+
+    // ── OPTIONAL MATCH (standalone) ───────────────────────────────────────────
+
+    /// Parse `OPTIONAL MATCH pattern [WHERE expr] RETURN …`
+    fn parse_optional_match(&mut self) -> Result<Statement> {
+        self.expect_tok(&Token::Optional)?;
+        self.expect_tok(&Token::Match)?;
+
+        let patterns = self.parse_pattern_list()?;
+
+        // Optional WHERE clause.
+        let where_clause = if matches!(self.peek(), Token::Where) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        // RETURN clause
+        self.expect_tok(&Token::Return)?;
+        let distinct = if matches!(self.peek(), Token::Distinct) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let items = self.parse_return_items()?;
+        let return_clause = ReturnClause { items };
+
+        // ORDER BY
+        let order_by = if matches!(self.peek(), Token::Order) {
+            self.advance();
+            self.expect_tok(&Token::By)?;
+            self.parse_order_by_items()?
+        } else {
+            vec![]
+        };
+
+        // LIMIT
+        let limit = if matches!(self.peek(), Token::Limit) {
+            self.advance();
+            match self.advance().clone() {
+                Token::Integer(n) => {
+                    if n < 0 {
+                        return Err(Error::InvalidArgument("LIMIT must be non-negative".into()));
+                    }
+                    Some(n as u64)
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected integer after LIMIT, got {:?}",
+                        other
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Statement::OptionalMatch(OptionalMatchStatement {
+            pattern: patterns,
+            where_clause,
+            return_clause,
+            order_by,
+            limit,
+            distinct,
+        }))
+    }
+
+    // ── MATCH … OPTIONAL MATCH … RETURN ───────────────────────────────────────
+
+    /// Parse the `OPTIONAL MATCH … RETURN` tail after `MATCH patterns` has been
+    /// consumed.  `match_patterns` is already parsed; `match_where` is the
+    /// WHERE predicate from the leading MATCH (if any).
+    fn parse_match_optional_match_tail(
+        &mut self,
+        match_patterns: Vec<PathPattern>,
+        match_where: Option<Expr>,
+    ) -> Result<Statement> {
+        // Consume OPTIONAL MATCH.
+        self.expect_tok(&Token::Optional)?;
+        self.expect_tok(&Token::Match)?;
+
+        let optional_patterns = self.parse_pattern_list()?;
+
+        // Optional WHERE clause on the OPTIONAL MATCH.
+        let optional_where = if matches!(self.peek(), Token::Where) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        // RETURN clause.
+        self.expect_tok(&Token::Return)?;
+        let distinct = if matches!(self.peek(), Token::Distinct) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let items = self.parse_return_items()?;
+        let return_clause = ReturnClause { items };
+
+        // ORDER BY
+        let order_by = if matches!(self.peek(), Token::Order) {
+            self.advance();
+            self.expect_tok(&Token::By)?;
+            self.parse_order_by_items()?
+        } else {
+            vec![]
+        };
+
+        // LIMIT
+        let limit = if matches!(self.peek(), Token::Limit) {
+            self.advance();
+            match self.advance().clone() {
+                Token::Integer(n) => {
+                    if n < 0 {
+                        return Err(Error::InvalidArgument("LIMIT must be non-negative".into()));
+                    }
+                    Some(n as u64)
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected integer after LIMIT, got {:?}",
+                        other
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Statement::MatchOptionalMatch(MatchOptionalMatchStatement {
+            match_patterns,
+            match_where,
+            optional_patterns,
+            optional_where,
+            return_clause,
+            order_by,
+            limit,
+            distinct,
+        }))
+    }
+
+    /// Shared helper: finish parsing a MATCH … RETURN statement after the
+    /// pattern list (and optional WHERE expr) have already been consumed.
+    fn finish_match_return(
+        &mut self,
+        patterns: Vec<PathPattern>,
+        pre_where: Option<Expr>,
+    ) -> Result<Statement> {
+        // If caller already parsed WHERE, use it; otherwise try to parse it now.
+        let where_clause = if pre_where.is_some() { pre_where } else { None };
+
+        // RETURN clause
+        let (distinct, return_clause) = if matches!(self.peek(), Token::Return) {
+            self.advance();
+            let distinct = if matches!(self.peek(), Token::Distinct) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            let items = self.parse_return_items()?;
+            (distinct, ReturnClause { items })
+        } else {
+            return Err(Error::InvalidArgument("expected RETURN clause".into()));
+        };
+
+        // ORDER BY
+        let order_by = if matches!(self.peek(), Token::Order) {
+            self.advance();
+            self.expect_tok(&Token::By)?;
+            self.parse_order_by_items()?
+        } else {
+            vec![]
+        };
+
+        // LIMIT
+        let limit = if matches!(self.peek(), Token::Limit) {
+            self.advance();
+            match self.advance().clone() {
+                Token::Integer(n) => {
+                    if n < 0 {
+                        return Err(Error::InvalidArgument("LIMIT must be non-negative".into()));
+                    }
+                    Some(n as u64)
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected integer after LIMIT, got {:?}",
+                        other
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Statement::Match(MatchStatement {
+            pattern: patterns,
+            where_clause,
+            return_clause,
+            order_by,
+            limit,
+            distinct,
+        }))
+    }
+
+    // ── MATCH … WITH … RETURN pipeline ────────────────────────────────────────
+
+    /// Parse `MATCH pattern [WHERE pred] WITH expr AS alias [, …] [WHERE pred] RETURN …`.
+    fn parse_with_pipeline(
+        &mut self,
+        patterns: Vec<PathPattern>,
+        match_where: Option<Expr>,
+    ) -> Result<Statement> {
+        use crate::ast::{MatchWithStatement, WithClause, WithItem};
+
+        // Consume WITH token.
+        self.expect_tok(&Token::With)?;
+
+        // Parse one or more `expr AS alias` items separated by commas.
+        let mut items: Vec<WithItem> = Vec::new();
+        loop {
+            let expr = self.parse_expr()?;
+            self.expect_tok(&Token::As)?;
+            let alias = self.expect_ident()?;
+            items.push(WithItem { expr, alias });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        // Optional WHERE clause on the WITH stage.
+        let with_where = if matches!(self.peek(), Token::Where) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        let with_clause = WithClause { items, where_clause: with_where };
+
+        // RETURN clause.
+        self.expect_tok(&Token::Return)?;
+        let distinct = if matches!(self.peek(), Token::Distinct) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let return_items = self.parse_return_items()?;
+        let return_clause = crate::ast::ReturnClause { items: return_items };
+
+        // ORDER BY
+        let order_by = if matches!(self.peek(), Token::Order) {
+            self.advance();
+            self.expect_tok(&Token::By)?;
+            self.parse_order_by_items()?
+        } else {
+            vec![]
+        };
+
+        // LIMIT
+        let limit = if matches!(self.peek(), Token::Limit) {
+            self.advance();
+            match self.advance().clone() {
+                Token::Integer(n) => {
+                    if n < 0 {
+                        return Err(Error::InvalidArgument("LIMIT must be non-negative".into()));
+                    }
+                    Some(n as u64)
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected integer after LIMIT, got {:?}",
+                        other
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Statement::MatchWith(MatchWithStatement {
+            match_patterns: patterns,
+            match_where,
+            with_clause,
+            return_clause,
+            order_by,
+            limit,
+            distinct,
+        }))
+    }
+
+    // ── MERGE ─────────────────────────────────────────────────────────────────
+
+    /// Parse `MERGE (:Label {prop: val, ...})`.
+    ///
+    /// Only single-node MERGE (no paths) is supported.
+    fn parse_merge(&mut self) -> Result<Statement> {
+        self.expect_tok(&Token::Merge)?;
+        self.expect_tok(&Token::LParen)?;
+
+        // Optional variable name (we discard it — MERGE doesn't bind variables).
+        if let Token::Ident(_) = self.peek().clone() {
+            if !matches!(self.peek2(), Token::Colon | Token::RParen) {
+                // ambiguous — treat as anonymous
+            } else if matches!(self.peek2(), Token::Colon) {
+                self.advance(); // consume var name
+            }
+        }
+
+        // Label(s) — at least one required for MERGE.
+        if !matches!(self.peek(), Token::Colon) {
+            return Err(Error::InvalidArgument(
+                "MERGE requires a label (e.g. MERGE (:Person {...}))".into(),
+            ));
+        }
+        self.advance(); // consume ':'
+        let label = match self.advance().clone() {
+            Token::Ident(s) => s,
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "expected label name after ':', got {:?}",
+                    other
+                )))
+            }
+        };
+
+        // Property map (optional but typical for MERGE).
+        let props = if matches!(self.peek(), Token::LBrace) {
+            self.parse_prop_map()?
+        } else {
+            vec![]
+        };
+
+        self.expect_tok(&Token::RParen)?;
+        Ok(Statement::Merge(MergeStatement { label, props }))
     }
 
     // ── CREATE ────────────────────────────────────────────────────────────────
@@ -260,6 +645,7 @@ impl Parser {
     /// Accepts:
     /// - `[elem, ...]`  — list literal
     /// - `$param`       — parameter (evaluated at runtime to a list)
+    /// - `fn(args)`     — function call that returns a list (e.g. `range(1, 5)`)
     fn parse_unwind_expr(&mut self) -> Result<Expr> {
         match self.peek().clone() {
             Token::LBracket => self.parse_list_literal(),
@@ -267,8 +653,12 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Literal(Literal::Param(p)))
             }
+            Token::Ident(_) => {
+                // May be a function call like range(1, 5).
+                self.parse_atom()
+            }
             other => Err(Error::InvalidArgument(format!(
-                "UNWIND expects a list literal [..] or $param, got {:?}",
+                "UNWIND expects a list literal [..], $param, or a function call, got {:?}",
                 other
             ))),
         }
@@ -603,7 +993,7 @@ impl Parser {
                 self.advance();
                 // STARTS WITH — the WITH keyword is mandatory.
                 match self.peek().clone() {
-                    Token::Ident(s) if s.to_uppercase() == "WITH" => {
+                    Token::With | Token::Ident(_) => {
                         self.advance();
                     }
                     other => {
@@ -624,7 +1014,7 @@ impl Parser {
                 self.advance();
                 // ENDS WITH — the WITH keyword is mandatory.
                 match self.peek().clone() {
-                    Token::Ident(s) if s.to_uppercase() == "WITH" => {
+                    Token::With | Token::Ident(_) => {
                         self.advance();
                     }
                     other => {
@@ -655,7 +1045,7 @@ impl Parser {
     fn parse_atom(&mut self) -> Result<Expr> {
         match self.peek().clone() {
             Token::Ident(var) => {
-                // Could be var.prop or just var or COUNT(*)
+                // Could be var.prop, a function call fn(args), or just var.
                 let next2 = self.peek2().clone();
                 if matches!(next2, Token::Dot) {
                     self.advance(); // var
@@ -670,6 +1060,23 @@ impl Parser {
                         }
                     };
                     Ok(Expr::PropAccess { var, prop })
+                } else if matches!(next2, Token::LParen) {
+                    // Function call: name(arg, arg, ...)
+                    self.advance(); // consume function name
+                    self.advance(); // consume '('
+                    let mut args = Vec::new();
+                    if !matches!(self.peek(), Token::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if matches!(self.peek(), Token::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect_tok(&Token::RParen)?;
+                    Ok(Expr::FnCall { name: var, args })
                 } else {
                     self.advance();
                     Ok(Expr::Var(var))
@@ -697,6 +1104,22 @@ impl Parser {
                 let e = self.parse_expr()?;
                 self.expect_tok(&Token::RParen)?;
                 Ok(e)
+            }
+            // Unary minus: -expr (negates a numeric literal or sub-expression).
+            Token::Dash => {
+                self.advance();
+                let inner = self.parse_atom()?;
+                match inner {
+                    Expr::Literal(Literal::Int(n)) => Ok(Expr::Literal(Literal::Int(-n))),
+                    Expr::Literal(Literal::Float(f)) => Ok(Expr::Literal(Literal::Float(-f))),
+                    // Wrap in a FnCall to negate: abs(0 - x) is wrong, use unary-minus fn.
+                    // Instead, emit FnCall("_neg", [inner]) — handled by dispatch as negation.
+                    // For now call a built-in no-op negation: use the integer math path.
+                    other => Ok(Expr::FnCall {
+                        name: "_neg".into(),
+                        args: vec![other],
+                    }),
+                }
             }
             other => Err(Error::InvalidArgument(format!(
                 "unexpected token in expression: {:?}",
