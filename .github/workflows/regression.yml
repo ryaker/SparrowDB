@@ -1,0 +1,39 @@
+name: Real-World Regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  regression:
+    name: Real-World Regression Suite
+    runs-on: self-hosted
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Generate fixtures
+        run: python3 scripts/generate_fixtures.py
+
+      - name: Run real-world regression tests
+        run: cargo test -p sparrowdb --test regression_real_world -- --nocapture 2>&1 | tee regression-results.txt
+
+      - name: Upload regression results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regression-results
+          path: regression-results.txt
+          retention-days: 30
