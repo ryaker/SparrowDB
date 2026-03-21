@@ -1,0 +1,376 @@
+{
+  "nodes": [
+    {
+      "id": 0,
+      "label": "Package",
+      "name": "pkg_0",
+      "version": "1.0.0"
+    },
+    {
+      "id": 1,
+      "label": "Package",
+      "name": "pkg_1",
+      "version": "1.1.0"
+    },
+    {
+      "id": 2,
+      "label": "Package",
+      "name": "pkg_2",
+      "version": "1.2.0"
+    },
+    {
+      "id": 3,
+      "label": "Package",
+      "name": "pkg_3",
+      "version": "1.3.0"
+    },
+    {
+      "id": 4,
+      "label": "Package",
+      "name": "pkg_4",
+      "version": "1.4.0"
+    },
+    {
+      "id": 5,
+      "label": "Package",
+      "name": "pkg_5",
+      "version": "1.5.0"
+    },
+    {
+      "id": 6,
+      "label": "Package",
+      "name": "pkg_6",
+      "version": "1.6.0"
+    },
+    {
+      "id": 7,
+      "label": "Package",
+      "name": "pkg_7",
+      "version": "1.7.0"
+    },
+    {
+      "id": 8,
+      "label": "Package",
+      "name": "pkg_8",
+      "version": "1.8.0"
+    },
+    {
+      "id": 9,
+      "label": "Package",
+      "name": "pkg_9",
+      "version": "1.9.0"
+    },
+    {
+      "id": 10,
+      "label": "Package",
+      "name": "pkg_10",
+      "version": "1.0.0"
+    },
+    {
+      "id": 11,
+      "label": "Package",
+      "name": "pkg_11",
+      "version": "1.1.0"
+    },
+    {
+      "id": 12,
+      "label": "Package",
+      "name": "pkg_12",
+      "version": "1.2.0"
+    },
+    {
+      "id": 13,
+      "label": "Package",
+      "name": "pkg_13",
+      "version": "1.3.0"
+    },
+    {
+      "id": 14,
+      "label": "Package",
+      "name": "pkg_14",
+      "version": "1.4.0"
+    },
+    {
+      "id": 15,
+      "label": "Package",
+      "name": "pkg_15",
+      "version": "1.5.0"
+    },
+    {
+      "id": 16,
+      "label": "Package",
+      "name": "pkg_16",
+      "version": "1.6.0"
+    },
+    {
+      "id": 17,
+      "label": "Package",
+      "name": "pkg_17",
+      "version": "1.7.0"
+    },
+    {
+      "id": 18,
+      "label": "Package",
+      "name": "pkg_18",
+      "version": "1.8.0"
+    },
+    {
+      "id": 19,
+      "label": "Package",
+      "name": "pkg_19",
+      "version": "1.9.0"
+    }
+  ],
+  "edges": [
+    {
+      "src": 0,
+      "dst": 4,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 0,
+      "dst": 5,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 0,
+      "dst": 6,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 1,
+      "dst": 4,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 1,
+      "dst": 7,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 2,
+      "dst": 4,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 2,
+      "dst": 6,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 2,
+      "dst": 7,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 3,
+      "dst": 4,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 3,
+      "dst": 5,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 4,
+      "dst": 8,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 4,
+      "dst": 9,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 4,
+      "dst": 10,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 4,
+      "dst": 11,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 5,
+      "dst": 8,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 5,
+      "dst": 9,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 6,
+      "dst": 8,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 6,
+      "dst": 9,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 6,
+      "dst": 10,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 6,
+      "dst": 11,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 7,
+      "dst": 8,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 7,
+      "dst": 9,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 7,
+      "dst": 10,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 7,
+      "dst": 11,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 8,
+      "dst": 12,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 8,
+      "dst": 13,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 8,
+      "dst": 14,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 8,
+      "dst": 15,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 9,
+      "dst": 12,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 9,
+      "dst": 14,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 10,
+      "dst": 12,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 10,
+      "dst": 13,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 10,
+      "dst": 14,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 10,
+      "dst": 15,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 11,
+      "dst": 12,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 11,
+      "dst": 13,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 11,
+      "dst": 15,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 12,
+      "dst": 16,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 12,
+      "dst": 17,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 12,
+      "dst": 18,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 12,
+      "dst": 19,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 13,
+      "dst": 16,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 13,
+      "dst": 17,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 13,
+      "dst": 18,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 14,
+      "dst": 16,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 14,
+      "dst": 18,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 14,
+      "dst": 19,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 15,
+      "dst": 16,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 15,
+      "dst": 17,
+      "rel": "DEPENDS_ON"
+    },
+    {
+      "src": 15,
+      "dst": 18,
+      "rel": "DEPENDS_ON"
+    }
+  ]
+}

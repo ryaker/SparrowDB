@@ -1,0 +1,756 @@
+{
+  "nodes": [
+    {
+      "id": 0,
+      "label": "Person",
+      "name": "Person_0"
+    },
+    {
+      "id": 1,
+      "label": "Person",
+      "name": "Person_1"
+    },
+    {
+      "id": 2,
+      "label": "Person",
+      "name": "Person_2"
+    },
+    {
+      "id": 3,
+      "label": "Person",
+      "name": "Person_3"
+    },
+    {
+      "id": 4,
+      "label": "Person",
+      "name": "Person_4"
+    },
+    {
+      "id": 5,
+      "label": "Person",
+      "name": "Person_5"
+    },
+    {
+      "id": 6,
+      "label": "Person",
+      "name": "Person_6"
+    },
+    {
+      "id": 7,
+      "label": "Person",
+      "name": "Person_7"
+    },
+    {
+      "id": 8,
+      "label": "Person",
+      "name": "Person_8"
+    },
+    {
+      "id": 9,
+      "label": "Person",
+      "name": "Person_9"
+    },
+    {
+      "id": 10,
+      "label": "Person",
+      "name": "Person_10"
+    },
+    {
+      "id": 11,
+      "label": "Person",
+      "name": "Person_11"
+    },
+    {
+      "id": 12,
+      "label": "Person",
+      "name": "Person_12"
+    },
+    {
+      "id": 13,
+      "label": "Person",
+      "name": "Person_13"
+    },
+    {
+      "id": 14,
+      "label": "Person",
+      "name": "Person_14"
+    },
+    {
+      "id": 15,
+      "label": "Person",
+      "name": "Person_15"
+    },
+    {
+      "id": 16,
+      "label": "Person",
+      "name": "Person_16"
+    },
+    {
+      "id": 17,
+      "label": "Person",
+      "name": "Person_17"
+    },
+    {
+      "id": 18,
+      "label": "Person",
+      "name": "Person_18"
+    },
+    {
+      "id": 19,
+      "label": "Person",
+      "name": "Person_19"
+    },
+    {
+      "id": 20,
+      "label": "Person",
+      "name": "Person_20"
+    },
+    {
+      "id": 21,
+      "label": "Person",
+      "name": "Person_21"
+    },
+    {
+      "id": 22,
+      "label": "Person",
+      "name": "Person_22"
+    },
+    {
+      "id": 23,
+      "label": "Person",
+      "name": "Person_23"
+    },
+    {
+      "id": 24,
+      "label": "Person",
+      "name": "Person_24"
+    },
+    {
+      "id": 25,
+      "label": "Person",
+      "name": "Person_25"
+    },
+    {
+      "id": 26,
+      "label": "Person",
+      "name": "Person_26"
+    },
+    {
+      "id": 27,
+      "label": "Person",
+      "name": "Person_27"
+    },
+    {
+      "id": 28,
+      "label": "Person",
+      "name": "Person_28"
+    },
+    {
+      "id": 29,
+      "label": "Person",
+      "name": "Person_29"
+    },
+    {
+      "id": 30,
+      "label": "Person",
+      "name": "Person_30"
+    },
+    {
+      "id": 31,
+      "label": "Person",
+      "name": "Person_31"
+    },
+    {
+      "id": 32,
+      "label": "Person",
+      "name": "Person_32"
+    },
+    {
+      "id": 33,
+      "label": "Person",
+      "name": "Person_33"
+    },
+    {
+      "id": 34,
+      "label": "Person",
+      "name": "Person_34"
+    },
+    {
+      "id": 35,
+      "label": "Person",
+      "name": "Person_35"
+    },
+    {
+      "id": 36,
+      "label": "Person",
+      "name": "Person_36"
+    },
+    {
+      "id": 37,
+      "label": "Person",
+      "name": "Person_37"
+    },
+    {
+      "id": 38,
+      "label": "Person",
+      "name": "Person_38"
+    },
+    {
+      "id": 39,
+      "label": "Person",
+      "name": "Person_39"
+    },
+    {
+      "id": 40,
+      "label": "Person",
+      "name": "Person_40"
+    },
+    {
+      "id": 41,
+      "label": "Person",
+      "name": "Person_41"
+    },
+    {
+      "id": 42,
+      "label": "Person",
+      "name": "Person_42"
+    },
+    {
+      "id": 43,
+      "label": "Person",
+      "name": "Person_43"
+    },
+    {
+      "id": 44,
+      "label": "Person",
+      "name": "Person_44"
+    },
+    {
+      "id": 45,
+      "label": "Person",
+      "name": "Person_45"
+    },
+    {
+      "id": 46,
+      "label": "Person",
+      "name": "Person_46"
+    },
+    {
+      "id": 47,
+      "label": "Person",
+      "name": "Person_47"
+    },
+    {
+      "id": 48,
+      "label": "Person",
+      "name": "Person_48"
+    },
+    {
+      "id": 49,
+      "label": "Person",
+      "name": "Person_49"
+    }
+  ],
+  "edges": [
+    {
+      "src": 0,
+      "dst": 3,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 6,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 7,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 8,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 11,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 12,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 13,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 14,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 15,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 17,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 19,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 20,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 24,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 26,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 27,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 29,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 36,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 38,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 39,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 44,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 45,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 0,
+      "dst": 47,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 1,
+      "dst": 3,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 1,
+      "dst": 11,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 1,
+      "dst": 12,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 1,
+      "dst": 21,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 1,
+      "dst": 23,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 1,
+      "dst": 29,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 1,
+      "dst": 34,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 1,
+      "dst": 37,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 1,
+      "dst": 42,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 1,
+      "dst": 46,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 1,
+      "dst": 47,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 2,
+      "dst": 6,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 2,
+      "dst": 18,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 2,
+      "dst": 19,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 2,
+      "dst": 21,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 2,
+      "dst": 22,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 2,
+      "dst": 27,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 2,
+      "dst": 31,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 3,
+      "dst": 9,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 3,
+      "dst": 19,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 3,
+      "dst": 26,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 3,
+      "dst": 33,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 3,
+      "dst": 39,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 3,
+      "dst": 41,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 4,
+      "dst": 5,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 4,
+      "dst": 20,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 4,
+      "dst": 25,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 4,
+      "dst": 31,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 5,
+      "dst": 32,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 5,
+      "dst": 36,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 5,
+      "dst": 40,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 5,
+      "dst": 44,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 6,
+      "dst": 8,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 6,
+      "dst": 19,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 6,
+      "dst": 31,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 7,
+      "dst": 31,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 7,
+      "dst": 33,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 7,
+      "dst": 46,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 8,
+      "dst": 34,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 8,
+      "dst": 48,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 9,
+      "dst": 19,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 9,
+      "dst": 42,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 10,
+      "dst": 13,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 10,
+      "dst": 26,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 11,
+      "dst": 30,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 11,
+      "dst": 34,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 12,
+      "dst": 2,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 12,
+      "dst": 36,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 13,
+      "dst": 9,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 13,
+      "dst": 49,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 14,
+      "dst": 40,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 15,
+      "dst": 39,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 16,
+      "dst": 8,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 17,
+      "dst": 13,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 18,
+      "dst": 48,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 19,
+      "dst": 2,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 20,
+      "dst": 29,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 21,
+      "dst": 31,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 22,
+      "dst": 8,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 23,
+      "dst": 35,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 24,
+      "dst": 7,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 25,
+      "dst": 43,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 26,
+      "dst": 30,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 27,
+      "dst": 0,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 28,
+      "dst": 17,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 29,
+      "dst": 19,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 30,
+      "dst": 12,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 31,
+      "dst": 17,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 32,
+      "dst": 39,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 33,
+      "dst": 15,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 34,
+      "dst": 35,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 35,
+      "dst": 28,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 36,
+      "dst": 48,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 37,
+      "dst": 49,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 38,
+      "dst": 30,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 39,
+      "dst": 33,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 40,
+      "dst": 25,
+      "rel": "KNOWS"
+    },
+    {
+      "src": 41,
+      "dst": 20,
+      "rel": "KNOWS"
+    }
+  ]
+}
