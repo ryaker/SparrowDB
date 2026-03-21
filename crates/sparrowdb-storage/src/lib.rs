@@ -3,6 +3,9 @@ pub mod metapage;
 /// At-rest page encryption using XChaCha20-Poly1305.
 pub mod encryption;
 
+/// CHECKPOINT and OPTIMIZE maintenance operations.
+pub mod maintenance;
+
 /// WAL subsystem — codec, writer, and replay.
 pub mod wal;
 
