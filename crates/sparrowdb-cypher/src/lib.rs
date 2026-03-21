@@ -1,37 +1,13 @@
-use sparrowdb_common::{Error, Result};
+//! sparrowdb-cypher: Cypher lexer, parser, AST, and binder.
 
-/// Top-level Cypher statement variants — AST stub.
-#[derive(Debug)]
-pub enum Statement {
-    Match,
-    Create,
-    Delete,
-    Set,
-    Return,
-    Checkpoint,
-    Optimize,
-}
+pub mod ast;
+pub mod binder;
+pub mod lexer;
+pub mod parser;
 
-/// Stub Cypher parser — full implementation in Phase 4a.
-pub struct Parser;
-
-impl Parser {
-    /// Create a new parser instance.
-    pub fn new() -> Self {
-        Parser
-    }
-
-    /// Parse a Cypher string into a `Statement`.
-    pub fn parse(&self, _input: &str) -> Result<Statement> {
-        Err(Error::Unimplemented)
-    }
-}
-
-impl Default for Parser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub use ast::Statement;
+pub use binder::{bind, BoundStatement};
+pub use parser::parse;
 
 #[cfg(test)]
 mod tests {
@@ -39,12 +15,13 @@ mod tests {
 
     #[test]
     fn parser_type_exists() {
-        let _p = Parser::new();
+        // Smoke test: the parse function is callable.
+        let _ = parse("CHECKPOINT");
     }
 
     #[test]
     fn statement_variants_debug() {
-        let s = Statement::Match;
+        let s = Statement::Checkpoint;
         assert!(!format!("{s:?}").is_empty());
     }
 }

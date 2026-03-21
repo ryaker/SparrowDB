@@ -158,6 +158,16 @@ impl NodeStore {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
+    /// Return the high-water mark (slot count) for a label.
+    ///
+    /// Returns `0` if no nodes have been created for that label yet.
+    pub fn hwm_for_label(&self, label_id: u32) -> Result<u64> {
+        if let Some(&h) = self.hwm.get(&label_id) {
+            return Ok(h);
+        }
+        self.load_hwm(label_id)
+    }
+
     /// Create a new node in `label_id` with the given properties.
     ///
     /// Returns the new [`NodeId`] packed as `(label_id << 32) | slot`.
