@@ -1,5 +1,8 @@
 pub mod metapage;
 
+/// At-rest page encryption using XChaCha20-Poly1305.
+pub mod encryption;
+
 /// WAL subsystem — codec, writer, and replay.
 pub mod wal;
 
