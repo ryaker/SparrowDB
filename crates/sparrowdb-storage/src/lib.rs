@@ -10,18 +10,38 @@ pub fn crc32_of(buf: &[u8]) -> u32 {
 /// Compute CRC32C (Castagnoli) of `buf` treating `zeroed_offset..zeroed_offset+zeroed_len`
 /// as all zeros.
 /// Used so CRC can be stored in the buffer itself (field is zeroed during calculation).
-pub fn crc32_zeroed_at(buf: &[u8], zeroed_offset: usize, zeroed_len: usize) -> u32 {
+///
+/// Returns `Err(Error::InvalidArgument)` if the zeroed range is out of bounds or overflows.
+pub fn crc32_zeroed_at(
+    buf: &[u8],
+    zeroed_offset: usize,
+    zeroed_len: usize,
+) -> sparrowdb_common::Result<u32> {
+    // Validate inputs before any arithmetic that could panic.
+    let end = zeroed_offset.checked_add(zeroed_len).ok_or_else(|| {
+        sparrowdb_common::Error::InvalidArgument("zeroed range overflows usize".into())
+    })?;
+    if end > buf.len() {
+        return Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "zeroed range {}..{} out of bounds for buffer of length {}",
+            zeroed_offset,
+            end,
+            buf.len()
+        )));
+    }
     // Feed the three segments separately; avoids any heap allocation.
     let crc = crc32c::crc32c(&buf[..zeroed_offset]);
-    // zeroed_len is always small (4 bytes in all current callers); use a stack buffer.
-    const MAX_ZEROED: usize = 64;
-    assert!(
-        zeroed_len <= MAX_ZEROED,
-        "zeroed_len exceeds stack buffer size"
-    );
-    let zeros = [0u8; MAX_ZEROED];
-    let crc = crc32c::crc32c_append(crc, &zeros[..zeroed_len]);
-    crc32c::crc32c_append(crc, &buf[zeroed_offset + zeroed_len..])
+    // Feed zeros in fixed-size stack chunks to support arbitrarily large zeroed_len.
+    const CHUNK: usize = 64;
+    let zeros = [0u8; CHUNK];
+    let mut crc = crc;
+    let mut remaining = zeroed_len;
+    while remaining > 0 {
+        let n = remaining.min(CHUNK);
+        crc = crc32c::crc32c_append(crc, &zeros[..n]);
+        remaining -= n;
+    }
+    Ok(crc32c::crc32c_append(crc, &buf[end..]))
 }
 
 /// Stub page store — full buffer pool implementation in Phase 2+.
@@ -62,7 +82,14 @@ mod tests {
         let mut manual = buf;
         manual[4..8].copy_from_slice(&[0u8; 4]);
         let expected = crc32c::crc32c(&manual);
-        let actual = crc32_zeroed_at(&buf, 4, 4);
+        let actual = crc32_zeroed_at(&buf, 4, 4).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn crc32_zeroed_at_rejects_out_of_bounds() {
+        let buf = [0u8; 16];
+        assert!(crc32_zeroed_at(&buf, 14, 4).is_err()); // 14+4=18 > 16
+        assert!(crc32_zeroed_at(&buf, usize::MAX, 1).is_err()); // overflow
     }
 }

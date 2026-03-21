@@ -84,7 +84,7 @@ impl Metapage {
             return Err(Error::InvalidMagic);
         }
         let stored_crc = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        let computed = crate::crc32_zeroed_at(buf, 4, 4);
+        let computed = crate::crc32_zeroed_at(buf, 4, 4)?;
         if computed != stored_crc {
             return Err(Error::ChecksumMismatch);
         }
