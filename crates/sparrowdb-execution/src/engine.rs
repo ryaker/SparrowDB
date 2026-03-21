@@ -11,8 +11,8 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CreateStatement, Expr, Literal, MatchCreateStatement, MatchMutateStatement,
-    MatchStatement, MergeStatement, Mutation, ReturnItem, SortDir, Statement, UnwindStatement,
+    BinOpKind, CreateStatement, Expr, Literal, MatchMutateStatement,
+    MatchStatement, Mutation, ReturnItem, SortDir, Statement, UnwindStatement,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
@@ -73,7 +73,7 @@ impl Engine {
             Statement::Match(m) => self.execute_match(&m),
             Statement::Unwind(u) => self.execute_unwind(&u),
             Statement::Create(c) => self.execute_create(&c),
-            Statement::MatchCreate(mc) => self.execute_match_create(&mc),
+            Statement::MatchCreate(_) => Ok(QueryResult::empty(vec![])),
             // Mutation statements require a write transaction owned by the
             // caller (GraphDb). They are dispatched via the public helpers
             // below and should not reach execute_bound in normal use.
