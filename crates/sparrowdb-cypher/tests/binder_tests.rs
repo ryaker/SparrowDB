@@ -45,20 +45,15 @@ fn bind_create_known_label_succeeds() {
 #[test]
 fn bind_match_1hop_known_rel_succeeds() {
     let (_dir, cat) = make_catalog();
-    let stmt = parse(
-        "MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->(f:Person) RETURN f.name",
-    )
-    .expect("parse");
+    let stmt = parse("MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->(f:Person) RETURN f.name")
+        .expect("parse");
     bind(stmt, &cat).expect("bind 1-hop KNOWS must succeed");
 }
 
 #[test]
 fn bind_match_unknown_rel_type_fails() {
     let (_dir, cat) = make_catalog();
-    let stmt = parse(
-        "MATCH (a:Person)-[:HATES]->(b:Person) RETURN b.name",
-    )
-    .expect("parse");
+    let stmt = parse("MATCH (a:Person)-[:HATES]->(b:Person) RETURN b.name").expect("parse");
     let result = bind(stmt, &cat);
     assert!(result.is_err(), "unknown rel type HATES must fail binder");
 }

@@ -10,3 +10,7 @@ sparrowdb-common  = { workspace = true }
 sparrowdb-storage = { workspace = true }
 sparrowdb-catalog = { workspace = true }
 sparrowdb-cypher  = { workspace = true }
+roaring = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

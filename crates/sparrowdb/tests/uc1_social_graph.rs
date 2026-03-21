@@ -4,8 +4,6 @@
 //! Acceptance check #4: two_hop_match_via_binary_asp_join
 
 use sparrowdb_catalog::catalog::Catalog;
-use sparrowdb_cypher::parser::parse;
-use sparrowdb_cypher::binder::bind;
 use sparrowdb_execution::engine::Engine;
 use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
@@ -22,26 +20,41 @@ fn setup_social_graph(dir: &std::path::Path) -> Engine {
     // col 0 = name (stored as i64 id: 1=Alice, 2=Bob, 3=Carol, 4=Dave, 5=Eve)
     // col 1 = age
     let alice = store
-        .create_node(person_id, &[(0, StoreValue::Int64(1)), (1, StoreValue::Int64(30))])
+        .create_node(
+            person_id,
+            &[(0, StoreValue::Int64(1)), (1, StoreValue::Int64(30))],
+        )
         .expect("Alice");
     let bob = store
-        .create_node(person_id, &[(0, StoreValue::Int64(2)), (1, StoreValue::Int64(25))])
+        .create_node(
+            person_id,
+            &[(0, StoreValue::Int64(2)), (1, StoreValue::Int64(25))],
+        )
         .expect("Bob");
     let carol = store
-        .create_node(person_id, &[(0, StoreValue::Int64(3)), (1, StoreValue::Int64(35))])
+        .create_node(
+            person_id,
+            &[(0, StoreValue::Int64(3)), (1, StoreValue::Int64(35))],
+        )
         .expect("Carol");
     let dave = store
-        .create_node(person_id, &[(0, StoreValue::Int64(4)), (1, StoreValue::Int64(28))])
+        .create_node(
+            person_id,
+            &[(0, StoreValue::Int64(4)), (1, StoreValue::Int64(28))],
+        )
         .expect("Dave");
     let _eve = store
-        .create_node(person_id, &[(0, StoreValue::Int64(5)), (1, StoreValue::Int64(22))])
+        .create_node(
+            person_id,
+            &[(0, StoreValue::Int64(5)), (1, StoreValue::Int64(22))],
+        )
         .expect("Eve");
 
     // Edges: Alice->Bob, Alice->Carol, Bob->Dave, Carol->Dave, Carol->Eve
-    let alice_slot = (alice.0 & 0xFFFF_FFFF) as u64;
-    let bob_slot = (bob.0 & 0xFFFF_FFFF) as u64;
-    let carol_slot = (carol.0 & 0xFFFF_FFFF) as u64;
-    let dave_slot = (dave.0 & 0xFFFF_FFFF) as u64;
+    let alice_slot = alice.0 & 0xFFFF_FFFF;
+    let bob_slot = bob.0 & 0xFFFF_FFFF;
+    let carol_slot = carol.0 & 0xFFFF_FFFF;
+    let dave_slot = dave.0 & 0xFFFF_FFFF;
 
     let edges = vec![
         (alice_slot, bob_slot),

@@ -1,0 +1,172 @@
+//! Cypher AST node types.
+//!
+//! Covers the minimum subset needed for UC-1 (social graph) and UC-3 (KMS)
+//! queries as specified in docs/use-cases.md.
+
+/// A parsed Cypher literal value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+    Param(String), // $param
+    Null,
+}
+
+/// Sort direction for ORDER BY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// A property map entry in a pattern: `{key: value}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropEntry {
+    pub key: String,
+    pub value: Literal,
+}
+
+/// A node pattern: `(var:Label {props})`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodePattern {
+    /// Variable name (may be empty string for anonymous nodes).
+    pub var: String,
+    /// Labels declared on this node pattern (first = primary).
+    pub labels: Vec<String>,
+    /// Inline property predicates.
+    pub props: Vec<PropEntry>,
+}
+
+/// Edge direction in a pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeDir {
+    /// `(a)-[:R]->(b)` — outgoing from left node.
+    Outgoing,
+    /// `(a)<-[:R]-(b)` — incoming to left node.
+    Incoming,
+    /// `(a)-[:R]-(b)` — undirected.
+    Both,
+}
+
+/// A relationship pattern: `-[:REL_TYPE]->`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelPattern {
+    /// Variable name (may be empty).
+    pub var: String,
+    /// Relationship type name.
+    pub rel_type: String,
+    /// Direction from the perspective of the path order.
+    pub dir: EdgeDir,
+}
+
+/// A path pattern: a sequence of alternating nodes and relationships.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathPattern {
+    pub nodes: Vec<NodePattern>,
+    pub rels: Vec<RelPattern>,
+}
+
+/// An expression used in WHERE, RETURN, ORDER BY.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    /// `variable.property`
+    PropAccess { var: String, prop: String },
+    /// Literal value.
+    Literal(Literal),
+    /// Binary comparison.
+    BinOp {
+        left: Box<Expr>,
+        op: BinOpKind,
+        right: Box<Expr>,
+    },
+    /// `NOT (a)-[:R]->(b)` — existence predicate negation.
+    NotExists(Box<ExistsPattern>),
+    /// `NOT expr`
+    Not(Box<Expr>),
+    /// `expr AND expr`
+    And(Box<Expr>, Box<Expr>),
+    /// `expr OR expr`
+    Or(Box<Expr>, Box<Expr>),
+    /// A variable reference (e.g. `RETURN k` without `.property`).
+    Var(String),
+    /// `COUNT(*)`
+    CountStar,
+    /// Function call (for aggregate stubs).
+    FnCall { name: String, args: Vec<Expr> },
+}
+
+/// An existence pattern used in `NOT (a)-[:R]->(b)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExistsPattern {
+    pub path: PathPattern,
+}
+
+/// Binary operator kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BinOpKind {
+    Eq,
+    Neq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Contains,
+    StartsWith,
+    EndsWith,
+    Or,
+    And,
+}
+
+/// RETURN clause item.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnItem {
+    pub expr: Expr,
+    /// Optional `AS alias`.
+    pub alias: Option<String>,
+}
+
+/// RETURN clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnClause {
+    pub items: Vec<ReturnItem>,
+}
+
+/// CREATE statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateStatement {
+    /// Nodes to create.
+    pub nodes: Vec<NodePattern>,
+    /// Edges to create (each is (left_var, rel, right_var)).
+    pub edges: Vec<(String, RelPattern, String)>,
+}
+
+/// MATCH+CREATE statement (MATCH ... CREATE edge).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchCreateStatement {
+    pub match_patterns: Vec<PathPattern>,
+    pub match_props: Vec<(String, Vec<PropEntry>)>, // (var, props) for filter
+    pub create: CreateStatement,
+}
+
+/// MATCH statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchStatement {
+    pub pattern: Vec<PathPattern>,
+    pub where_clause: Option<Expr>,
+    pub return_clause: ReturnClause,
+    pub order_by: Vec<(Expr, SortDir)>,
+    pub limit: Option<u64>,
+    pub distinct: bool,
+}
+
+/// Top-level statement variants.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Statement {
+    Create(CreateStatement),
+    MatchCreate(MatchCreateStatement),
+    Match(MatchStatement),
+    Checkpoint,
+    Optimize,
+}

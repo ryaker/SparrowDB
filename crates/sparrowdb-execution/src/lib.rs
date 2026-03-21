@@ -1,25 +1,12 @@
-use sparrowdb_common::{Error, Result};
+//! sparrowdb-execution: factorized execution engine.
 
-/// Stub query executor — full implementation in Phase 4b+.
-pub struct Executor;
+pub mod engine;
+pub mod join;
+pub mod operators;
+pub mod types;
 
-impl Executor {
-    /// Create a new executor.
-    pub fn new() -> Self {
-        Executor
-    }
-
-    /// Execute a bound plan and return raw rows (stub).
-    pub fn execute(&self) -> Result<Vec<Vec<u8>>> {
-        Err(Error::Unimplemented)
-    }
-}
-
-impl Default for Executor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub use engine::Engine;
+pub use types::{FactorizedChunk, QueryResult, Value, VectorGroup};
 
 #[cfg(test)]
 mod tests {
@@ -27,6 +14,9 @@ mod tests {
 
     #[test]
     fn executor_type_exists() {
-        let _e = Executor::new();
+        // Smoke test: the Engine type is accessible.
+        let _: fn() = || {
+            let _ = std::mem::size_of::<Engine>();
+        };
     }
 }

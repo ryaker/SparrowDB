@@ -127,6 +127,33 @@ impl Catalog {
         Ok(id)
     }
 
+    /// List all relationship tables as `(src_label_id, dst_label_id, rel_type)` triples.
+    pub fn list_rel_tables(&self) -> Result<Vec<(u16, u16, String)>> {
+        Ok(self
+            .rel_tables
+            .iter()
+            .map(|e| (e.src_label_id, e.dst_label_id, e.rel_type.clone()))
+            .collect())
+    }
+
+    /// Look up a relationship table by label IDs and type.
+    pub fn get_rel_table(
+        &self,
+        src_label_id: u16,
+        dst_label_id: u16,
+        rel_type: &str,
+    ) -> Result<Option<RelTableId>> {
+        Ok(self
+            .rel_tables
+            .iter()
+            .find(|e| {
+                e.src_label_id == src_label_id
+                    && e.dst_label_id == dst_label_id
+                    && e.rel_type == rel_type
+            })
+            .map(|e| e.rel_table_id))
+    }
+
     // --- Private helpers ---
 
     /// Load all TLV entries from the catalog file into memory.

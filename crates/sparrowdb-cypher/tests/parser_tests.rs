@@ -1,6 +1,6 @@
 //! Parser tests — RED phase: these must fail before Phase 4a implementation.
 
-use sparrowdb_cypher::ast::{CreateStatement, MatchStatement, ReturnClause, Statement};
+use sparrowdb_cypher::ast::Statement;
 use sparrowdb_cypher::parser::parse;
 
 // ── CREATE node ──────────────────────────────────────────────────────────────
@@ -51,8 +51,7 @@ fn parse_match_create_edge() {
 
 #[test]
 fn parse_match_node_return() {
-    let stmt =
-        parse("MATCH (n:Person {name: \"Alice\"}) RETURN n.name").expect("must parse");
+    let stmt = parse("MATCH (n:Person {name: \"Alice\"}) RETURN n.name").expect("must parse");
     if let Statement::Match(m) = stmt {
         assert_eq!(m.pattern.len(), 1);
         let p = &m.pattern[0];
@@ -66,10 +65,8 @@ fn parse_match_node_return() {
 #[test]
 fn parse_match_1hop_friends() {
     // UC-1 core query: Alice's friends
-    let stmt = parse(
-        "MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->(f:Person) RETURN f.name",
-    )
-    .expect("must parse");
+    let stmt = parse("MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->(f:Person) RETURN f.name")
+        .expect("must parse");
     if let Statement::Match(m) = stmt {
         assert_eq!(m.pattern.len(), 1);
         let p = &m.pattern[0];
@@ -101,10 +98,8 @@ fn parse_match_2hop_fof() {
 #[test]
 fn parse_match_where_contains() {
     // UC-3 KMS query with CONTAINS
-    let stmt = parse(
-        "MATCH (k:Knowledge) WHERE k.content CONTAINS $query RETURN k",
-    )
-    .expect("must parse");
+    let stmt =
+        parse("MATCH (k:Knowledge) WHERE k.content CONTAINS $query RETURN k").expect("must parse");
     if let Statement::Match(m) = stmt {
         assert!(m.where_clause.is_some());
     } else {
@@ -114,10 +109,8 @@ fn parse_match_where_contains() {
 
 #[test]
 fn parse_match_with_order_by_limit() {
-    let stmt = parse(
-        "MATCH (k:Knowledge) RETURN k ORDER BY k.confidence DESC LIMIT 20",
-    )
-    .expect("must parse");
+    let stmt = parse("MATCH (k:Knowledge) RETURN k ORDER BY k.confidence DESC LIMIT 20")
+        .expect("must parse");
     if let Statement::Match(m) = stmt {
         assert!(!m.order_by.is_empty());
         assert_eq!(m.limit, Some(20));

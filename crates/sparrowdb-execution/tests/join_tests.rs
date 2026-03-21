@@ -1,7 +1,6 @@
 //! 2-hop ASP-Join tests — RED phase.
 
 use sparrowdb_execution::join::AspJoin;
-use sparrowdb_execution::types::Value;
 use sparrowdb_storage::csr::CsrForward;
 
 /// Build a tiny social graph: 5 nodes, Alice=0, Bob=1, Carol=2, Dave=3, Eve=4
@@ -26,7 +25,7 @@ fn asp_join_2hop_fof_no_oom() {
     let alice = 0u64;
 
     // Build 2-hop via ASP-Join
-    let mut join = AspJoin::new(&csr);
+    let join = AspJoin::new(&csr);
     let fof = join.two_hop(alice).expect("2-hop must succeed");
 
     // fof of alice: Dave(3) and Eve(4) but NOT Bob(1) or Carol(2) (direct friends)
@@ -44,7 +43,7 @@ fn asp_join_2hop_multiplicity_preserved() {
     let csr = social_graph();
     let alice = 0u64;
 
-    let mut join = AspJoin::new(&csr);
+    let join = AspJoin::new(&csr);
     // Must not OOM or allocate O(N^2) during construction
     let result = join.two_hop_factorized(alice).expect("factorized 2-hop");
 
@@ -67,7 +66,7 @@ fn asp_join_semijoin_filter_eliminates_non_matches() {
     let csr = CsrForward::build(6, &edges);
     let alice = 0u64;
 
-    let mut join = AspJoin::new(&csr);
+    let join = AspJoin::new(&csr);
     let fof = join.two_hop(alice).expect("2-hop");
 
     // Alice's friend is Bob(1), Bob's friend is Frank(5)

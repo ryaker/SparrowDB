@@ -1,9 +1,8 @@
 //! Scan + Filter + Project operator tests — RED phase.
 
 use sparrowdb_catalog::catalog::Catalog;
-use sparrowdb_common::NodeId;
 use sparrowdb_execution::operators::{Filter, LabelScan, Operator, Project};
-use sparrowdb_execution::types::{FactorizedChunk, Value};
+use sparrowdb_execution::types::Value;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
 
 fn setup_person_store(dir: &std::path::Path) -> (NodeStore, Catalog, u32) {
@@ -13,13 +12,22 @@ fn setup_person_store(dir: &std::path::Path) -> (NodeStore, Catalog, u32) {
     // name col = 0, age col = 1
     // Store names as i64 hash (we'll use int for simplicity in unit tests)
     store
-        .create_node(label_id, &[(0, StoreValue::Int64(1)), (1, StoreValue::Int64(30))])
+        .create_node(
+            label_id,
+            &[(0, StoreValue::Int64(1)), (1, StoreValue::Int64(30))],
+        )
         .expect("Alice");
     store
-        .create_node(label_id, &[(0, StoreValue::Int64(2)), (1, StoreValue::Int64(25))])
+        .create_node(
+            label_id,
+            &[(0, StoreValue::Int64(2)), (1, StoreValue::Int64(25))],
+        )
         .expect("Bob");
     store
-        .create_node(label_id, &[(0, StoreValue::Int64(3)), (1, StoreValue::Int64(40))])
+        .create_node(
+            label_id,
+            &[(0, StoreValue::Int64(3)), (1, StoreValue::Int64(40))],
+        )
         .expect("Carol");
     (store, cat, label_id)
 }
@@ -70,10 +78,7 @@ fn project_selects_columns() {
     // Each group should only have col_0
     for chunk in &chunks {
         for group in &chunk.groups {
-            assert!(
-                group.has_column("col_0"),
-                "projected chunk must have col_0"
-            );
+            assert!(group.has_column("col_0"), "projected chunk must have col_0");
             assert!(
                 !group.has_column("col_1"),
                 "projected chunk must not have col_1"
