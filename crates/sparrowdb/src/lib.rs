@@ -924,8 +924,14 @@ impl<'db> WriteTx<'db> {
         write_mutation_wal(&self.inner.path, new_id, &updates, &self.wal_mutations)?;
 
         // Step 8: Flush any pending fulltext index updates.
-        for (_, mut idx) in self.fulltext_pending.drain() {
-            idx.flush()?;
+        // The primary DB mutations above are already durable (WAL written,
+        // txn_id advanced).  A flush failure here must NOT return Err and
+        // cause the caller to retry an already-committed transaction.  Log the
+        // error so operators can investigate but treat the commit as successful.
+        for (name, mut idx) in self.fulltext_pending.drain() {
+            if let Err(e) = idx.flush() {
+                tracing::error!(index = %name, error = %e, "fulltext index flush failed post-commit; index may be stale until next write");
+            }
         }
 
         self.committed = true;

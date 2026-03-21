@@ -1084,39 +1084,6 @@ impl Parser {
             });
         }
 
-        // Handle `expr IS NULL` / `expr IS NOT NULL`
-        if matches!(self.peek(), Token::Is) {
-            self.advance(); // consume IS
-            if matches!(self.peek(), Token::Not) {
-                self.advance(); // consume NOT
-                match self.peek().clone() {
-                    Token::Null => {
-                        self.advance();
-                        return Ok(Expr::IsNotNull(Box::new(left)));
-                    }
-                    other => {
-                        return Err(Error::InvalidArgument(format!(
-                            "expected NULL after IS NOT, got {:?}",
-                            other
-                        )));
-                    }
-                }
-            } else {
-                match self.peek().clone() {
-                    Token::Null => {
-                        self.advance();
-                        return Ok(Expr::IsNull(Box::new(left)));
-                    }
-                    other => {
-                        return Err(Error::InvalidArgument(format!(
-                            "expected NULL after IS, got {:?}",
-                            other
-                        )));
-                    }
-                }
-            }
-        }
-
         let op = match self.peek().clone() {
             Token::Eq => BinOpKind::Eq,
             Token::Neq => BinOpKind::Neq,

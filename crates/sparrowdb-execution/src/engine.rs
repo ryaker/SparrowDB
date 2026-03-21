@@ -1065,7 +1065,15 @@ impl Engine {
                 continue;
             }
 
-            let props = self.store.get_node_raw(node_id, &all_col_ids)?;
+            // Use nullable reads so that absent columns (property never written
+            // for this node) are omitted from the row map rather than surfacing
+            // as Err(NotFound).  Absent columns will evaluate to Value::Null in
+            // eval_expr, enabling correct IS NULL / IS NOT NULL semantics.
+            let nullable_props = self.store.get_node_raw_nullable(node_id, &all_col_ids)?;
+            let props: Vec<(u32, u64)> = nullable_props
+                .iter()
+                .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
+                .collect();
 
             // Apply inline prop filter from the pattern.
             if !self.matches_prop_filter(&props, &node.props) {
