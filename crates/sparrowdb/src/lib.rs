@@ -166,7 +166,7 @@ impl GraphDb {
                 // can be stored inside WriteTx alongside the Arc<DbInner>.
                 // The guard is released when WriteTx is dropped, which happens
                 // before the Arc (and the Mutex it contains) is destroyed.
-                unsafe { std::mem::transmute(g) }
+                unsafe { std::mem::transmute::<MutexGuard<'_, ()>, MutexGuard<'static, ()>>(g) }
             }
             Err(_) => return Err(Error::WriterBusy),
         };
@@ -307,7 +307,7 @@ impl<'db> WriteTx<'db> {
 
     /// Create a label in the schema catalog.
     pub fn create_label(&mut self, name: &str) -> Result<u16> {
-        self.catalog.create_label(name).map(|id| id as u16)
+        self.catalog.create_label(name)
     }
 
     /// Commit the transaction.
