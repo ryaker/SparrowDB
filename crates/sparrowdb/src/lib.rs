@@ -252,8 +252,16 @@ impl GraphDb {
     /// records, and publish the new `wal_checkpoint_lsn` to the metapage.
     ///
     /// Acquires the writer lock for the duration — no concurrent writes.
+    ///
+    /// Returns [`Error::WriterBusy`] immediately if a [`WriteTx`] is currently
+    /// active, rather than blocking indefinitely.  This prevents deadlocks on
+    /// single-threaded callers and avoids unbounded waits on multi-threaded ones.
     pub fn checkpoint(&self) -> Result<()> {
-        let _guard = self.inner.write_lock.lock().unwrap();
+        let _guard = self
+            .inner
+            .write_lock
+            .try_lock()
+            .map_err(|_| Error::WriterBusy)?;
         let catalog = Catalog::open(&self.inner.path)?;
         let node_store = NodeStore::open(&self.inner.path)?;
         let (rel_table_ids, n_nodes) =
@@ -266,8 +274,16 @@ impl GraphDb {
     /// node's neighbor list by `(dst_node_id)` ascending.
     ///
     /// Acquires the writer lock for the duration — no concurrent writes.
+    ///
+    /// Returns [`Error::WriterBusy`] immediately if a [`WriteTx`] is currently
+    /// active, rather than blocking indefinitely.  This prevents deadlocks on
+    /// single-threaded callers and avoids unbounded waits on multi-threaded ones.
     pub fn optimize(&self) -> Result<()> {
-        let _guard = self.inner.write_lock.lock().unwrap();
+        let _guard = self
+            .inner
+            .write_lock
+            .try_lock()
+            .map_err(|_| Error::WriterBusy)?;
         let catalog = Catalog::open(&self.inner.path)?;
         let node_store = NodeStore::open(&self.inner.path)?;
         let (rel_table_ids, n_nodes) =
@@ -940,5 +956,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = GraphDb::open(dir.path()).unwrap();
         db.optimize().expect("optimize must succeed on empty DB");
+    }
+
+    /// SPA-162: checkpoint() must not deadlock after a write transaction has
+    /// been committed and dropped.
+    #[test]
+    fn checkpoint_does_not_deadlock_after_write() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(GraphDb::open(dir.path()).unwrap());
+
+        // Run a write transaction and commit it.
+        let mut tx = db.begin_write().unwrap();
+        tx.create_node(0, &[]).unwrap();
+        tx.commit().unwrap();
+
+        // checkpoint() must complete without hanging — run it on a thread so
+        // the test runner can time out rather than block the whole suite.
+        let db2 = Arc::clone(&db);
+        let handle = std::thread::spawn(move || {
+            db2.checkpoint().unwrap();
+        });
+        handle
+            .join()
+            .expect("checkpoint thread must complete without panic");
+    }
+
+    /// SPA-162: checkpoint() must return WriterBusy (not deadlock) when a
+    /// WriteTx is currently active.  Before the fix, calling lock() from
+    /// checkpoint() while the same thread held the mutex would hang forever.
+    #[test]
+    fn checkpoint_returns_writer_busy_while_write_tx_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        // Hold an active write transaction without committing it.
+        let tx = db.begin_write().unwrap();
+
+        // checkpoint() must return WriterBusy immediately — not deadlock.
+        let result = db.checkpoint();
+        assert!(
+            matches!(result, Err(Error::WriterBusy)),
+            "expected WriterBusy while WriteTx active, got: {result:?}"
+        );
+
+        // Drop the transaction; checkpoint must now succeed.
+        drop(tx);
+        db.checkpoint()
+            .expect("checkpoint must succeed after WriteTx dropped");
     }
 }
