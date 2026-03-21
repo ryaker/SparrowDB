@@ -246,6 +246,7 @@ impl GraphDb {
             snapshot_txn_id,
             _guard: guard,
             committed: false,
+            fulltext_pending: HashMap::new(),
         })
     }
 
@@ -467,13 +468,15 @@ impl GraphDb {
     /// ```no_run
     /// db.create_fulltext_index("searchIndex", "Fact", &["content"])?;
     /// ```
-    pub fn create_fulltext_index(
-        &self,
-        name: &str,
-        _label: &str,
-        _props: &[&str],
-    ) -> Result<()> {
+    pub fn create_fulltext_index(&self, name: &str) -> Result<()> {
         use sparrowdb_storage::fulltext_index::FulltextIndex;
+        // Acquire the writer lock so this cannot race with an active WriteTx
+        // that is reading or flushing the same index file.
+        let _guard = self
+            .inner
+            .write_lock
+            .try_lock()
+            .map_err(|_| Error::WriterBusy)?;
         FulltextIndex::create(&self.inner.path, name)?;
         Ok(())
     }
@@ -552,6 +555,11 @@ pub struct WriteTx<'db> {
     /// Held for the lifetime of this WriteTx; released on drop.
     _guard: MutexGuard<'db, ()>,
     committed: bool,
+    /// In-flight fulltext index updates — flushed to disk on commit.
+    ///
+    /// Caching open indexes here avoids one open+flush per `add_to_fulltext_index`
+    /// call; instead we batch all additions and flush each index exactly once.
+    fulltext_pending: HashMap<String, sparrowdb_storage::fulltext_index::FulltextIndex>,
 }
 
 impl<'db> WriteTx<'db> {
@@ -829,9 +837,19 @@ impl<'db> WriteTx<'db> {
         text: &str,
     ) -> Result<()> {
         use sparrowdb_storage::fulltext_index::FulltextIndex;
-        let mut idx = FulltextIndex::open(&self.inner.path, index_name)?;
+        // Lazily open the index and cache it for the lifetime of this
+        // transaction.  All additions are batched and flushed once on commit,
+        // avoiding an open+flush round-trip per document.
+        let idx = match self.fulltext_pending.get_mut(index_name) {
+            Some(existing) => existing,
+            None => {
+                let opened = FulltextIndex::open(&self.inner.path, index_name)?;
+                self.fulltext_pending.insert(index_name.to_owned(), opened);
+                self.fulltext_pending.get_mut(index_name).unwrap()
+            }
+        };
         idx.add_document(node_id.0, text);
-        idx.flush()
+        Ok(())
     }
 
     // ── Commit ───────────────────────────────────────────────────────────────
@@ -893,6 +911,11 @@ impl<'db> WriteTx<'db> {
 
         // Step 7: Append WAL mutation records (SPA-127).
         write_mutation_wal(&self.inner.path, new_id, &updates, &self.wal_mutations)?;
+
+        // Step 8: Flush any pending fulltext index updates.
+        for (_, mut idx) in self.fulltext_pending.drain() {
+            idx.flush()?;
+        }
 
         self.committed = true;
         Ok(TxnId(new_id))

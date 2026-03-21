@@ -117,10 +117,11 @@ impl Engine {
     /// Returns one row per matching node with columns declared in YIELD
     /// (typically `node`).  Each `node` value is a `NodeRef`.
     fn call_fulltext_query_nodes(&self, c: &CallStatement) -> Result<QueryResult> {
-        // Validate argument count.
-        if c.args.len() < 2 {
+        // Validate argument count — must be exactly 2.
+        if c.args.len() != 2 {
             return Err(sparrowdb_common::Error::InvalidArgument(
-                "db.index.fulltext.queryNodes requires 2 arguments: (indexName, query)".into(),
+                "db.index.fulltext.queryNodes requires exactly 2 arguments: (indexName, query)"
+                    .into(),
             ));
         }
 
@@ -130,6 +131,7 @@ impl Engine {
         let query = eval_expr_to_string(&c.args[1])?;
 
         // Open the fulltext index (read-only; no flush on this path).
+        // `FulltextIndex::open` validates the name for path traversal.
         let index = FulltextIndex::open(&self.db_root, &index_name)?;
         let node_ids = index.search(&query);
 
@@ -141,19 +143,20 @@ impl Engine {
             c.yield_columns.clone()
         };
 
+        // Validate YIELD columns — only "node" is defined for this procedure.
+        if let Some(bad_col) = yield_cols.iter().find(|c| c.as_str() != "node") {
+            return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                "unsupported YIELD column for db.index.fulltext.queryNodes: {bad_col}"
+            )));
+        }
+
         // Build result rows: one per matching node.
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for raw_id in node_ids {
             let node_id = sparrowdb_common::NodeId(raw_id);
             let row: Vec<Value> = yield_cols
                 .iter()
-                .map(|col| {
-                    if col == "node" {
-                        Value::NodeRef(node_id)
-                    } else {
-                        Value::Null
-                    }
-                })
+                .map(|_| Value::NodeRef(node_id))
                 .collect();
             rows.push(row);
         }

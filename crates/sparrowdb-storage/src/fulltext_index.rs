@@ -19,7 +19,7 @@
 //! Multi-word queries return the **union** of nodes matching any query term
 //! (OR semantics), matching Neo4j's Lucene full-text search defaults.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 
@@ -33,8 +33,12 @@ pub struct FulltextIndex {
     name: String,
     /// Path of the `.fti` backing file.
     file_path: PathBuf,
-    /// In-memory inverted index: term → Vec<NodeId as u64>.
-    entries: HashMap<String, Vec<u64>>,
+    /// In-memory inverted index: term → BTreeSet<NodeId as u64>.
+    ///
+    /// `BTreeSet` is used instead of `Vec` so that:
+    /// - Deduplication on insert is O(log N) rather than O(N).
+    /// - On-disk output is deterministic (sorted) on every flush.
+    entries: HashMap<String, BTreeSet<u64>>,
     /// Whether the in-memory state differs from disk.
     dirty: bool,
 }
@@ -45,6 +49,7 @@ impl FulltextIndex {
     /// If the backing file does not exist yet, an empty index is returned
     /// and the directory is created lazily on the first [`flush`].
     pub fn open(db_root: &Path, name: &str) -> Result<Self> {
+        validate_index_name(name)?;
         let dir = db_root.join("fulltext");
         let file_path = dir.join(format!("{name}.fti"));
 
@@ -68,8 +73,7 @@ impl FulltextIndex {
     pub fn add_document(&mut self, node_id: u64, text: &str) {
         for term in tokenize(text) {
             let bucket = self.entries.entry(term).or_default();
-            if !bucket.contains(&node_id) {
-                bucket.push(node_id);
+            if bucket.insert(node_id) {
                 self.dirty = true;
             }
         }
@@ -79,7 +83,7 @@ impl FulltextIndex {
     ///
     /// Results are deduplicated; order is unspecified.
     pub fn search(&self, query: &str) -> Vec<u64> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::BTreeSet::new();
         let mut result = Vec::new();
         for term in tokenize(query) {
             if let Some(ids) = self.entries.get(&term) {
@@ -109,7 +113,11 @@ impl FulltextIndex {
         let tmp = self.file_path.with_extension("fti.tmp");
         let mut f = std::fs::File::create(&tmp).map_err(Error::Io)?;
 
-        for (term, ids) in &self.entries {
+        // Sort terms for deterministic output.
+        let mut terms: Vec<&String> = self.entries.keys().collect();
+        terms.sort();
+        for term in terms {
+            let ids = &self.entries[term];
             let id_str: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
             writeln!(f, "{}\t{}", term, id_str.join(",")).map_err(Error::Io)?;
         }
@@ -122,11 +130,12 @@ impl FulltextIndex {
 
     /// Create (or overwrite) a named full-text index definition.
     ///
-    /// Ensures the backing file exists so the index is registered even before
-    /// any documents are added.
+    /// Any existing index data is discarded — the resulting index is empty.
+    /// The backing file is created (or truncated) immediately.
     pub fn create(db_root: &Path, name: &str) -> Result<Self> {
         let mut idx = Self::open(db_root, name)?;
-        // Force a flush to create the file.
+        // Overwrite semantics: discard any entries loaded from disk.
+        idx.entries.clear();
         idx.dirty = true;
         idx.flush()?;
         Ok(idx)
@@ -135,11 +144,28 @@ impl FulltextIndex {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
+/// Validate that an index name is safe to use as a filename component.
+///
+/// Rejects empty names and names containing path separators or `..` sequences
+/// to prevent directory traversal attacks.
+fn validate_index_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+    {
+        return Err(Error::InvalidArgument(format!(
+            "invalid fulltext index name: {name:?} — must not be empty or contain path separators"
+        )));
+    }
+    Ok(())
+}
+
 /// Load the on-disk `.fti` file into a term → node-id map.
-fn load_from_file(path: &Path) -> Result<HashMap<String, Vec<u64>>> {
+fn load_from_file(path: &Path) -> Result<HashMap<String, BTreeSet<u64>>> {
     let file = std::fs::File::open(path).map_err(Error::Io)?;
     let reader = std::io::BufReader::new(file);
-    let mut entries: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut entries: HashMap<String, BTreeSet<u64>> = HashMap::new();
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.map_err(Error::Io)?;
@@ -154,7 +180,7 @@ fn load_from_file(path: &Path) -> Result<HashMap<String, Vec<u64>>> {
             continue;
         }
 
-        let ids: Vec<u64> = ids_str
+        let ids: BTreeSet<u64> = ids_str
             .split(',')
             .filter(|s| !s.is_empty())
             .map(|s| {
@@ -164,7 +190,7 @@ fn load_from_file(path: &Path) -> Result<HashMap<String, Vec<u64>>> {
                     ))
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<BTreeSet<_>>>()?;
 
         entries.insert(term, ids);
     }

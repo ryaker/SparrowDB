@@ -25,8 +25,8 @@ fn make_db() -> (tempfile::TempDir, GraphDb) {
 fn create_index_and_search() {
     let (_dir, db) = make_db();
 
-    // Create the full-text index on label "Fact", property "content".
-    db.create_fulltext_index("searchIndex", "Fact", &["content"])
+    // Create the full-text index.
+    db.create_fulltext_index("searchIndex")
         .expect("create_fulltext_index");
 
     // Insert two Fact nodes and index their content.
@@ -94,7 +94,7 @@ fn create_index_and_search() {
 fn search_partial_match() {
     let (_dir, db) = make_db();
 
-    db.create_fulltext_index("kmsIndex", "Article", &["body"])
+    db.create_fulltext_index("kmsIndex")
         .expect("create_fulltext_index");
 
     // Node A has unique term "economics".
@@ -164,7 +164,7 @@ fn search_partial_match() {
 fn call_yield_node_usable_in_return() {
     let (_dir, db) = make_db();
 
-    db.create_fulltext_index("propIndex", "Doc", &["title"])
+    db.create_fulltext_index("propIndex")
         .expect("create fulltext index");
 
     // Create a node with a known integer col_0 value.
@@ -180,20 +180,35 @@ fn call_yield_node_usable_in_return() {
         tx.commit().expect("commit");
     }
 
-    // CALL with RETURN projecting a property from the yielded node.
+    // CALL with RETURN node — verifies YIELD variable passes through.
     let result = db
         .execute(
             "CALL db.index.fulltext.queryNodes('propIndex', 'knowledge') YIELD node \
              RETURN node",
         )
-        .expect("CALL with RETURN");
+        .expect("CALL with RETURN node");
 
     assert_eq!(result.rows.len(), 1, "one node should match");
-    // The returned value should be the NodeRef (RETURN node returns the node ref).
     assert!(
         matches!(&result.rows[0][0], Value::NodeRef(_)),
         "RETURN node should produce a NodeRef, got {:?}",
         &result.rows[0][0]
+    );
+
+    // CALL with RETURN node.col_0 — verifies property projection from yielded NodeRef.
+    let result2 = db
+        .execute(
+            "CALL db.index.fulltext.queryNodes('propIndex', 'knowledge') YIELD node \
+             RETURN node.col_0",
+        )
+        .expect("CALL with RETURN node.col_0");
+
+    assert_eq!(result2.rows.len(), 1, "one node should match");
+    assert_eq!(
+        result2.rows[0][0],
+        Value::Int64(expected_val),
+        "RETURN node.col_0 should project the stored property value, got {:?}",
+        &result2.rows[0][0]
     );
 }
 
