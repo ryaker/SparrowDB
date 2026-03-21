@@ -283,10 +283,18 @@ impl NodeStore {
         let needed_len = (slot as u64 + 1) * 8;
         if existing_len < needed_len {
             // Extend file with zeros from existing_len to needed_len.
+            // Write in fixed-size chunks to avoid a single large allocation
+            // that could OOM when the node slot ID is very high.
             file.seek(SeekFrom::Start(existing_len))
                 .map_err(Error::Io)?;
-            let zeros = vec![0u8; (needed_len - existing_len) as usize];
-            file.write_all(&zeros).map_err(Error::Io)?;
+            const CHUNK: usize = 65536; // 64 KiB
+            let zeros = [0u8; CHUNK];
+            let mut remaining = (needed_len - existing_len) as usize;
+            while remaining > 0 {
+                let n = remaining.min(CHUNK);
+                file.write_all(&zeros[..n]).map_err(Error::Io)?;
+                remaining -= n;
+            }
         }
 
         // Seek to target slot and overwrite.

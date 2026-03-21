@@ -106,6 +106,10 @@ struct StagedUpdate {
     before_image: Option<(u64, Value)>, // (txn_id_to_store_at, value)
     /// The new value to commit.
     new_value: Value,
+    /// Human-readable property key name used for WAL emission.
+    /// For columns staged by col_id directly (e.g. from create_node), this is
+    /// the synthesized form `"col_{col_id}"`.
+    key_name: String,
 }
 
 /// Staged (uncommitted) property updates for an active `WriteTx`.
@@ -126,14 +130,6 @@ enum WalMutation {
         node_id: NodeId,
         label_id: u32,
         props: Vec<(u32, Value)>,
-    },
-    /// A named property was updated (SPA-124, SPA-127).
-    NodeUpdate {
-        node_id: NodeId,
-        key: String,
-        col_id: u32,
-        before: Vec<u8>,
-        after: Vec<u8>,
     },
     /// A node was deleted (SPA-125, SPA-127).
     NodeDelete { node_id: NodeId },
@@ -394,12 +390,25 @@ impl<'db> WriteTx<'db> {
     /// before-image so that readers with older snapshots continue to see the
     /// correct value after commit overwrites the column file.
     pub fn set_node_col(&mut self, node_id: NodeId, col_id: u32, value: Value) {
+        self.set_node_col_named(node_id, col_id, format!("col_{col_id}"), value);
+    }
+
+    /// Stage a property update with an explicit human-readable key name for WAL.
+    fn set_node_col_named(
+        &mut self,
+        node_id: NodeId,
+        col_id: u32,
+        key_name: String,
+        value: Value,
+    ) {
         let key = (node_id.0, col_id);
         self.dirty_nodes.insert(node_id.0);
 
         if self.write_buf.updates.contains_key(&key) {
             // Already staged this key — just update the new_value.
-            self.write_buf.updates.get_mut(&key).unwrap().new_value = value;
+            let entry = self.write_buf.updates.get_mut(&key).unwrap();
+            entry.new_value = value;
+            // Keep the key_name from the first staging (it's the same column).
             return;
         }
 
@@ -433,6 +442,7 @@ impl<'db> WriteTx<'db> {
             StagedUpdate {
                 before_image,
                 new_value: value,
+                key_name,
             },
         );
     }
@@ -504,36 +514,19 @@ impl<'db> WriteTx<'db> {
 
     /// SPA-124: Update a named property on a node.
     ///
-    /// Derives a stable column ID from `key` via [`fnv1a_col_id`], reads the
-    /// current on-disk value as the WAL before-image, then stages the update
-    /// through [`set_node_col`].  A `NodeUpdate` WAL record is queued for
-    /// emission at commit time.
+    /// Derives a stable column ID from `key` via [`fnv1a_col_id`] and stages
+    /// the update through [`set_node_col`] (which records the before-image in
+    /// the write buffer).  WAL emission happens once at commit time via the
+    /// `updates` loop in `write_mutation_wal`.
     pub fn set_property(&mut self, node_id: NodeId, key: &str, val: Value) -> Result<()> {
         let col_id = fnv1a_col_id(key);
         self.dirty_nodes.insert(node_id.0);
 
-        // Capture before-image for WAL (raw bytes).
-        let before_raw = self
-            .store
-            .get_node_raw(node_id, &[col_id])
-            .ok()
-            .and_then(|mut v| v.pop())
-            .map(|(_, raw)| raw)
-            .unwrap_or(0u64);
-        let before_bytes = before_raw.to_le_bytes().to_vec();
-        let after_bytes = val.to_u64().to_le_bytes().to_vec();
-
-        // Stage the update through the write buffer (handles version chain).
-        self.set_node_col(node_id, col_id, val);
-
-        // Queue WAL NodeUpdate record.
-        self.wal_mutations.push(WalMutation::NodeUpdate {
-            node_id,
-            key: key.to_string(),
-            col_id,
-            before: before_bytes,
-            after: after_bytes,
-        });
+        // Stage the update through the write buffer (records before-image for
+        // WAL and MVCC). WAL emission happens exactly once at commit time via
+        // the `updates` loop in `write_mutation_wal`.  Pass the human-readable
+        // key name so the WAL record carries it (not the synthesized col_{id}).
+        self.set_node_col_named(node_id, col_id, key.to_string(), val);
 
         Ok(())
     }
@@ -564,10 +557,13 @@ impl<'db> WriteTx<'db> {
             .join("col_0.bin");
         if col0.exists() {
             use std::io::{Seek, SeekFrom, Write};
-            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&col0) {
-                let _ = f.seek(SeekFrom::Start(slot as u64 * 8));
-                let _ = f.write_all(&u64::MAX.to_le_bytes());
-            }
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&col0)
+                .map_err(Error::Io)?;
+            f.seek(SeekFrom::Start(slot as u64 * 8))
+                .map_err(Error::Io)?;
+            f.write_all(&u64::MAX.to_le_bytes()).map_err(Error::Io)?;
         }
 
         self.dirty_nodes.insert(node_id.0);
@@ -728,7 +724,7 @@ fn write_mutation_wal(
             txn,
             WalPayload::NodeUpdate {
                 node_id: *node_raw,
-                key: format!("col_{col_id}"),
+                key: staged.key_name.clone(),
                 col_id: *col_id,
                 before: before_bytes,
                 after: after_bytes,
@@ -755,25 +751,6 @@ fn write_mutation_wal(
                         node_id: node_id.0,
                         label_id: *label_id,
                         props: wal_props,
-                    },
-                )?;
-            }
-            WalMutation::NodeUpdate {
-                node_id,
-                key,
-                col_id,
-                before,
-                after,
-            } => {
-                wal.append(
-                    WalRecordKind::NodeUpdate,
-                    txn,
-                    WalPayload::NodeUpdate {
-                        node_id: node_id.0,
-                        key: key.clone(),
-                        col_id: *col_id,
-                        before: before.clone(),
-                        after: after.clone(),
                     },
                 )?;
             }
