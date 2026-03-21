@@ -293,32 +293,101 @@ impl GraphDb {
         engine.optimize(&rel_table_ids, n_nodes)
     }
 
-    /// Execute a Cypher query and return the result.
+    /// Execute a Cypher query.
     ///
-    /// `CREATE` statements auto-register labels and write nodes (SPA-156);
-    /// the engine is created fresh per call so mutations do not bleed across
-    /// calls on this `GraphDb` handle.
+    /// Read-only statements (`MATCH … RETURN`) are executed against a
+    /// point-in-time snapshot.  Mutation statements (`MERGE`, `MATCH … SET`,
+    /// `MATCH … DELETE`) open a write transaction internally and commit on
+    /// success.  `CREATE` statements auto-register labels and write nodes (SPA-156).
     pub fn execute(&self, cypher: &str) -> Result<QueryResult> {
-        let _span = info_span!("sparrowdb.query").entered();
+        use sparrowdb_cypher::ast::Statement;
+        use sparrowdb_cypher::{bind, parse};
 
-        let mut engine = {
-            let _open_span = info_span!("sparrowdb.open_engine").entered();
-            let csr = open_csr_forward(&self.inner.path);
-            Engine::new(
-                NodeStore::open(&self.inner.path)?,
-                Catalog::open(&self.inner.path)?,
-                csr,
-                &self.inner.path,
-            )
-        };
+        let stmt = parse(cypher)?;
+        let catalog_snap = Catalog::open(&self.inner.path)?;
+        let bound = bind(stmt, &catalog_snap)?;
 
-        let result = {
-            let _exec_span = info_span!("sparrowdb.execute").entered();
-            engine.execute(cypher)?
-        };
+        if Engine::is_mutation(&bound.inner) {
+            match bound.inner {
+                Statement::Merge(ref m) => self.execute_merge(m),
+                Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
+                _ => unreachable!(),
+            }
+        } else {
+            let _span = info_span!("sparrowdb.query").entered();
 
-        tracing::debug!(rows = result.rows.len(), "query complete");
-        Ok(result)
+            let mut engine = {
+                let _open_span = info_span!("sparrowdb.open_engine").entered();
+                let csr = open_csr_forward(&self.inner.path);
+                Engine::new(
+                    NodeStore::open(&self.inner.path)?,
+                    catalog_snap,
+                    csr,
+                    &self.inner.path,
+                )
+            };
+
+            let result = {
+                let _exec_span = info_span!("sparrowdb.execute").entered();
+                engine.execute_statement(bound.inner)?
+            };
+
+            tracing::debug!(rows = result.rows.len(), "query complete");
+            Ok(result)
+        }
+    }
+
+    /// Internal: execute a MERGE statement by opening a write transaction.
+    fn execute_merge(&self, m: &sparrowdb_cypher::ast::MergeStatement) -> Result<QueryResult> {
+        let props: HashMap<String, Value> = m
+            .props
+            .iter()
+            .map(|pe| (pe.key.clone(), literal_to_value(&pe.value)))
+            .collect();
+        let mut tx = self.begin_write()?;
+        tx.merge_node(&m.label, props)?;
+        tx.commit()?;
+        Ok(QueryResult::empty(vec![]))
+    }
+
+    /// Internal: execute a MATCH … SET / DELETE by scanning then writing.
+    fn execute_match_mutate(
+        &self,
+        mm: &sparrowdb_cypher::ast::MatchMutateStatement,
+    ) -> Result<QueryResult> {
+        let csr = open_csr_forward(&self.inner.path);
+        let engine = Engine::new(
+            NodeStore::open(&self.inner.path)?,
+            Catalog::open(&self.inner.path)?,
+            csr,
+            &self.inner.path,
+        );
+
+        // Collect matching node ids via the engine's read-only scan.
+        let matching_ids = engine.scan_match_mutate(mm)?;
+
+        if matching_ids.is_empty() {
+            return Ok(QueryResult::empty(vec![]));
+        }
+
+        let mut tx = self.begin_write()?;
+
+        match &mm.mutation {
+            sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
+                let sv = expr_to_value(value);
+                for node_id in matching_ids {
+                    tx.set_property(node_id, prop, sv.clone())?;
+                }
+            }
+            sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                for node_id in matching_ids {
+                    tx.delete_node(node_id)?;
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(QueryResult::empty(vec![]))
     }
 }
 
@@ -836,6 +905,33 @@ fn write_mutation_wal(
 /// FNV-1a implementation shared by storage and execution (SPA-160).
 pub fn fnv1a_col_id(key: &str) -> u32 {
     col_id_of(key)
+}
+
+// ── Mutation value helpers ─────────────────────────────────────────────────────
+
+/// Convert a Cypher [`Literal`] to a storage [`Value`].
+fn literal_to_value(lit: &sparrowdb_cypher::ast::Literal) -> Value {
+    use sparrowdb_cypher::ast::Literal;
+    match lit {
+        Literal::Int(n) => Value::Int64(*n),
+        // Float stored as bitcast; String stored as Bytes.
+        // Full overflow-store support is Phase 9+.
+        Literal::Float(f) => Value::Int64(f.to_bits() as i64),
+        Literal::Bool(b) => Value::Int64(if *b { 1 } else { 0 }),
+        Literal::String(s) => Value::Bytes(s.as_bytes().to_vec()),
+        Literal::Null | Literal::Param(_) => Value::Int64(0),
+    }
+}
+
+/// Convert a Cypher [`Expr`] to a storage [`Value`].
+///
+/// Only literal expressions are supported for SET values at this stage.
+fn expr_to_value(expr: &sparrowdb_cypher::ast::Expr) -> Value {
+    use sparrowdb_cypher::ast::Expr;
+    match expr {
+        Expr::Literal(lit) => literal_to_value(lit),
+        _ => Value::Int64(0),
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

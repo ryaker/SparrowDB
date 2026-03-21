@@ -13,7 +13,7 @@
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{Error, Result};
 
-use crate::ast::{MatchStatement, PathPattern, Statement};
+use crate::ast::{MatchMutateStatement, MatchStatement, PathPattern, Statement};
 
 /// A bound statement — the AST annotated with resolved catalog IDs.
 ///
@@ -45,9 +45,24 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
         Statement::Match(m) => bind_match(m, catalog)?,
         // UNWIND does not reference labels or rel types — nothing to bind.
         Statement::Unwind(_) => {}
+        // MERGE: validate that the label exists (or will be created at execution
+        // time by merge_node).  We skip the strict "must exist" check so that
+        // MERGE can act as a schema-creating operation, consistent with how
+        // WriteTx::merge_node works (it calls create_label if missing).
+        Statement::Merge(_) => {}
+        Statement::MatchMutate(mm) => bind_match_mutate(mm, catalog)?,
         Statement::Checkpoint | Statement::Optimize => {}
     }
     Ok(BoundStatement { inner: stmt })
+}
+
+fn bind_match_mutate(mm: &MatchMutateStatement, catalog: &Catalog) -> Result<()> {
+    for pat in &mm.match_patterns {
+        bind_path_pattern(pat, catalog)?;
+    }
+    // The mutation itself (SET/DELETE) targets variables already bound by
+    // the MATCH patterns — no additional catalog lookups are needed here.
+    Ok(())
 }
 
 fn bind_match(m: &MatchStatement, catalog: &Catalog) -> Result<()> {

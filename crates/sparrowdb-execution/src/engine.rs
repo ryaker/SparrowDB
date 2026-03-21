@@ -11,8 +11,8 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CreateStatement, Expr, Literal, MatchStatement, ReturnItem, SortDir, Statement,
-    UnwindStatement,
+    BinOpKind, CreateStatement, Expr, Literal, MatchMutateStatement, MatchStatement,
+    MergeStatement, Mutation, ReturnItem, SortDir, Statement, UnwindStatement,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
@@ -74,8 +74,98 @@ impl Engine {
             Statement::Unwind(u) => self.execute_unwind(&u),
             Statement::Create(c) => self.execute_create(&c),
             Statement::MatchCreate(_) => Ok(QueryResult::empty(vec![])),
+            // Mutation statements require a write transaction owned by the
+            // caller (GraphDb). They are dispatched via the public helpers
+            // below and should not reach execute_bound in normal use.
+            Statement::Merge(_) | Statement::MatchMutate(_) => {
+                Err(sparrowdb_common::Error::InvalidArgument(
+                    "mutation statements must be executed via execute_mutation".into(),
+                ))
+            }
             Statement::Checkpoint | Statement::Optimize => Ok(QueryResult::empty(vec![])),
         }
+    }
+
+    /// Returns `true` if `stmt` is a mutation (MERGE, MATCH+SET, MATCH+DELETE).
+    ///
+    /// Used by `GraphDb::execute` to route the statement to the write path.
+    pub fn is_mutation(stmt: &Statement) -> bool {
+        matches!(stmt, Statement::Merge(_) | Statement::MatchMutate(_))
+    }
+
+    // ── Mutation execution (called by GraphDb with a write transaction) ────────
+
+    /// Scan nodes matching the MATCH patterns in a `MatchMutate` statement and
+    /// return the list of matching `NodeId`s.  The caller is responsible for
+    /// applying the actual mutations inside a write transaction.
+    pub fn scan_match_mutate(&self, mm: &MatchMutateStatement) -> Result<Vec<NodeId>> {
+        if mm.match_patterns.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let pat = &mm.match_patterns[0];
+        if pat.nodes.is_empty() {
+            return Ok(vec![]);
+        }
+        let node_pat = &pat.nodes[0];
+        let label = node_pat.labels.first().cloned().unwrap_or_default();
+
+        let label_id = match self.catalog.get_label(&label)? {
+            Some(id) => id as u32,
+            None => {
+                return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                    "unknown label: {label}"
+                )))
+            }
+        };
+
+        let hwm = self.store.hwm_for_label(label_id)?;
+
+        // Collect prop filter col_ids.
+        let filter_col_ids: Vec<u32> = node_pat
+            .props
+            .iter()
+            .map(|pe| prop_name_to_col_id(&pe.key))
+            .collect();
+
+        // Col_ids referenced by the WHERE clause.
+        let mut all_col_ids: Vec<u32> = filter_col_ids;
+        if let Some(ref where_expr) = mm.where_clause {
+            collect_col_ids_from_expr(where_expr, &mut all_col_ids);
+        }
+
+        let var_name = node_pat.var.as_str();
+        let mut matching_ids = Vec::new();
+
+        for slot in 0..hwm {
+            let node_id = NodeId(((label_id as u64) << 32) | slot);
+            let props = if !all_col_ids.is_empty() {
+                self.store.get_node_raw(node_id, &all_col_ids)?
+            } else {
+                vec![]
+            };
+
+            if !matches_prop_filter_static(&props, &node_pat.props) {
+                continue;
+            }
+
+            if let Some(ref where_expr) = mm.where_clause {
+                let row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                if !eval_where(where_expr, &row_vals) {
+                    continue;
+                }
+            }
+
+            matching_ids.push(node_id);
+        }
+
+        Ok(matching_ids)
+    }
+
+    /// Return the mutation carried by a `MatchMutate` statement, exposing it
+    /// to the caller (GraphDb) so it can apply it inside a write transaction.
+    pub fn mutation_from_match_mutate(mm: &MatchMutateStatement) -> &Mutation {
+        &mm.mutation
     }
 
     // ── UNWIND ─────────────────────────────────────────────────────────────────
@@ -577,26 +667,50 @@ impl Engine {
         props: &[(u32, u64)],
         filters: &[sparrowdb_cypher::ast::PropEntry],
     ) -> bool {
-        for f in filters {
-            let col_id = prop_name_to_col_id(&f.key);
-            let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
+        matches_prop_filter_static(props, filters)
+    }
+}
 
-            let matches = match &f.value {
-                Literal::Int(n) => stored_val == Some(*n as u64),
-                Literal::String(s) => {
-                    // Strings are stored inline as up to 8 bytes packed into a
-                    // u64 (little-endian, zero-padded).  Encode the literal the
-                    // same way and compare against the stored raw value (SPA-161).
-                    stored_val == Some(string_to_raw_u64(s))
-                }
-                Literal::Param(_) => true, // params always pass in current impl
-                _ => false,
-            };
-            if !matches {
-                return false;
+// ── Free-standing prop-filter helper (usable without &self) ───────────────────
+
+fn matches_prop_filter_static(
+    props: &[(u32, u64)],
+    filters: &[sparrowdb_cypher::ast::PropEntry],
+) -> bool {
+    for f in filters {
+        let col_id = prop_name_to_col_id(&f.key);
+        let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
+
+        let matches = match &f.value {
+            Literal::Int(n) => stored_val == Some(*n as u64),
+            Literal::String(s) => {
+                // Strings are stored inline as up to 8 bytes packed into a
+                // u64 (little-endian, zero-padded).  Encode the literal the
+                // same way and compare against the stored raw value (SPA-161).
+                stored_val == Some(string_to_raw_u64(s))
             }
+            Literal::Param(_) => true, // params always pass in current impl
+            _ => false,
+        };
+        if !matches {
+            return false;
         }
-        true
+    }
+    true
+}
+
+// ── Mutation value helpers ────────────────────────────────────────────────────
+
+/// Convert a Cypher literal to a `StoreValue` for use in write-path mutations
+/// (MERGE properties).  Uses `Int64` for numbers and FNV-1a hash for strings
+/// (matching the scan-side encoding used by the storage layer for inline props).
+fn literal_to_storage_value(lit: &Literal) -> StoreValue {
+    match lit {
+        Literal::Int(n) => StoreValue::Int64(*n),
+        Literal::Float(f) => StoreValue::Int64(f.to_bits() as i64),
+        Literal::Bool(b) => StoreValue::Int64(if *b { 1 } else { 0 }),
+        Literal::String(s) => StoreValue::Bytes(s.as_bytes().to_vec()),
+        Literal::Null | Literal::Param(_) => StoreValue::Int64(0),
     }
 }
 
