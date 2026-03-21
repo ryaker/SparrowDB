@@ -975,6 +975,11 @@ impl Engine {
         if use_agg {
             rows = aggregate_rows(&raw_rows, &m.return_clause.items);
         } else {
+            // DISTINCT
+            if m.distinct {
+                deduplicate_rows(&mut rows);
+            }
+
             // ORDER BY
             apply_order_by(&mut rows, m, column_names);
 

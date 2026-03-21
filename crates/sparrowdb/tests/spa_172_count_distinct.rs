@@ -1,0 +1,103 @@
+//! Regression tests for SPA-172: COUNT and DISTINCT bugs.
+//!
+//! Three bugs fixed:
+//! 1. COUNT(n) — parser only accepted COUNT(*), not COUNT(expr)
+//! 2. COUNT(*) — aggregate path not triggered; returned 0 per-row instead of total count
+//! 3. DISTINCT — simple node-scan path skipped deduplication
+
+use sparrowdb::open;
+use sparrowdb_execution::types::Value;
+
+fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(dir.path()).expect("open");
+    (dir, db)
+}
+
+// ── Bug 1: COUNT(n) parse error ───────────────────────────────────────────────
+
+/// COUNT(variable) must parse and return the same scalar count as COUNT(*).
+#[test]
+fn count_variable_parses_and_returns_total() {
+    let (_dir, db) = make_db();
+
+    db.execute("CREATE (n:Person {name: 'Alice', age: 30})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Bob',   age: 25})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Carol',  age: 35})").unwrap();
+
+    let result = db
+        .execute("MATCH (n:Person) RETURN COUNT(n)")
+        .expect("COUNT(n) must not raise a parse error");
+
+    assert_eq!(result.rows.len(), 1, "COUNT(n) should return exactly one row");
+    assert_eq!(
+        result.rows[0][0],
+        Value::Int64(3),
+        "COUNT(n) should equal the number of matched nodes"
+    );
+}
+
+// ── Bug 2: COUNT(*) returns wrong results ────────────────────────────────────
+
+/// COUNT(*) must return a single scalar with the total row count, not one row per node.
+#[test]
+fn count_star_returns_scalar_total() {
+    let (_dir, db) = make_db();
+
+    db.execute("CREATE (n:Person {name: 'Alice'})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Bob'})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Carol'})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Dave'})").unwrap();
+
+    let result = db
+        .execute("MATCH (n:Person) RETURN COUNT(*)")
+        .expect("COUNT(*) must succeed");
+
+    // Must return exactly one row, not one row per node.
+    assert_eq!(result.rows.len(), 1, "COUNT(*) must aggregate into a single row");
+    assert_eq!(
+        result.rows[0][0],
+        Value::Int64(4),
+        "COUNT(*) must equal total number of matched nodes"
+    );
+
+    // Column must be labelled count(*).
+    assert_eq!(result.columns[0], "count(*)");
+}
+
+// ── Bug 3: DISTINCT not deduplicating ────────────────────────────────────────
+
+/// RETURN DISTINCT must eliminate duplicate values in the simple node-scan path.
+#[test]
+fn distinct_deduplicates_node_scan() {
+    let (_dir, db) = make_db();
+
+    // Insert 5 nodes: two share age=30.
+    db.execute("CREATE (n:Person {name: 'Alice', age: 30})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Alice2', age: 30})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Bob',   age: 25})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Carol',  age: 35})").unwrap();
+    db.execute("CREATE (n:Person {name: 'Dave',   age: 40})").unwrap();
+
+    let result = db
+        .execute("MATCH (n:Person) RETURN DISTINCT n.age")
+        .expect("DISTINCT must succeed");
+
+    // 4 unique ages: 30, 25, 35, 40.
+    assert_eq!(
+        result.rows.len(),
+        4,
+        "DISTINCT should return 4 unique ages, got {:?}",
+        result.rows
+    );
+
+    // None of the rows should be duplicated.
+    let ages: Vec<&Value> = result.rows.iter().map(|r| &r[0]).collect();
+    let mut unique = ages.clone();
+    unique.dedup();
+    // sort + dedup to check for duplicates regardless of order
+    let mut sorted_ages: Vec<String> = ages.iter().map(|v| v.to_string()).collect();
+    sorted_ages.sort();
+    sorted_ages.dedup();
+    assert_eq!(sorted_ages.len(), 4, "No duplicate ages should appear in DISTINCT result");
+}
