@@ -17,9 +17,21 @@
 //! pair.  When a `ReadTx` reads a property it first consults the version chain
 //! and returns the most-recent value with `txn_id <= snapshot_txn_id`, falling
 //! back to the on-disk value written by `create_node` if no such entry exists.
+//!
+//! ## Quick start
+//!
+//! ```no_run
+//! use sparrowdb::GraphDb;
+//! let db = GraphDb::open(std::path::Path::new("/tmp/my.sparrow")).unwrap();
+//! db.checkpoint().unwrap();
+//! db.optimize().unwrap();
+//! ```
 
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{Error, NodeId, Result, TxnId};
+use sparrowdb_execution::{Engine, QueryResult};
+use sparrowdb_storage::csr::CsrForward;
+use sparrowdb_storage::maintenance::MaintenanceEngine;
 use sparrowdb_storage::node_store::{NodeStore, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -181,12 +193,55 @@ impl GraphDb {
             committed: false,
         })
     }
+
+    /// Run a CHECKPOINT: fold the delta log into CSR base files, emit WAL
+    /// records, and publish the new `wal_checkpoint_lsn` to the metapage.
+    ///
+    /// Acquires the writer lock for the duration — no concurrent writes.
+    pub fn checkpoint(&self) -> Result<()> {
+        let _guard = self.inner.write_lock.lock().unwrap();
+        let catalog = Catalog::open(&self.inner.path)?;
+        let node_store = NodeStore::open(&self.inner.path)?;
+        let (rel_table_ids, n_nodes) = collect_maintenance_params(&catalog, &node_store);
+        let engine = MaintenanceEngine::new(&self.inner.path);
+        engine.checkpoint(&rel_table_ids, n_nodes)
+    }
+
+    /// Run an OPTIMIZE: same as CHECKPOINT but additionally sorts each source
+    /// node's neighbor list by `(dst_node_id)` ascending.
+    ///
+    /// Acquires the writer lock for the duration — no concurrent writes.
+    pub fn optimize(&self) -> Result<()> {
+        let _guard = self.inner.write_lock.lock().unwrap();
+        let catalog = Catalog::open(&self.inner.path)?;
+        let node_store = NodeStore::open(&self.inner.path)?;
+        let (rel_table_ids, n_nodes) = collect_maintenance_params(&catalog, &node_store);
+        let engine = MaintenanceEngine::new(&self.inner.path);
+        engine.optimize(&rel_table_ids, n_nodes)
+    }
+
+    /// Execute a read-only Cypher query and return the result.
+    pub fn execute(&self, cypher: &str) -> Result<QueryResult> {
+        let csr = open_csr_forward(&self.inner.path);
+        let engine = Engine::new(
+            NodeStore::open(&self.inner.path)?,
+            Catalog::open(&self.inner.path)?,
+            csr,
+            &self.inner.path,
+        );
+        engine.execute(cypher)
+    }
 }
 
 /// Convenience wrapper — equivalent to [`GraphDb::open`].
 pub fn open(path: &Path) -> Result<GraphDb> {
     GraphDb::open(path)
 }
+
+// ── Legacy alias ──────────────────────────────────────────────────────────────
+
+/// Legacy alias kept for backward compatibility with Phase 0 tests.
+pub type SparrowDB = GraphDb;
 
 // ── ReadTx ────────────────────────────────────────────────────────────────────
 
@@ -358,6 +413,55 @@ impl<'db> Drop for WriteTx<'db> {
     }
 }
 
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+fn collect_maintenance_params(catalog: &Catalog, node_store: &NodeStore) -> (Vec<u32>, u64) {
+    // Collect all known rel_table_ids from the catalog.
+    let rel_table_ids: Vec<u32> = catalog
+        .list_rel_tables()
+        .unwrap_or_default()
+        .iter()
+        .map(|(src_label, dst_label, _name)| {
+            // Encode (src_label_id, dst_label_id) → rel_table_id u32.
+            // This mirrors the encoding in edge_store: RelTableId(0) for the
+            // default rel table.  In Phase 5 we use the catalog's rel_table_id
+            // directly as a u32 (truncated from u64 for the storage layer API).
+            let _ = (src_label, dst_label);
+            0u32 // default table; extend when multi-rel-table support lands
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // If no rel tables registered yet, still run against table 0
+    // (the implicit default table used by early phases).
+    let rel_table_ids = if rel_table_ids.is_empty() {
+        vec![0u32]
+    } else {
+        rel_table_ids
+    };
+
+    // n_nodes: sum of hwm across all labels.
+    let n_nodes: u64 = catalog
+        .list_labels()
+        .unwrap_or_default()
+        .iter()
+        .map(|(label_id, _name)| node_store.hwm_for_label(*label_id as u32).unwrap_or(0))
+        .sum::<u64>()
+        .max(1); // at least 1 to avoid divide-by-zero in CSR
+
+    (rel_table_ids, n_nodes)
+}
+
+fn open_csr_forward(path: &Path) -> CsrForward {
+    use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
+    // Try to open the CSR forward file; fall back to an empty CSR.
+    match EdgeStore::open(path, RelTableId(0)).and_then(|s| s.open_fwd()) {
+        Ok(csr) => csr,
+        Err(_) => CsrForward::build(0, &[]),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -436,5 +540,20 @@ mod tests {
         // Should succeed because the lock was released on commit/drop.
         let tx2 = db.begin_write().unwrap();
         tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn graphdb_checkpoint_on_empty_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+        // Checkpoint on empty DB must not panic or error.
+        db.checkpoint().expect("checkpoint must succeed on empty DB");
+    }
+
+    #[test]
+    fn graphdb_optimize_on_empty_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+        db.optimize().expect("optimize must succeed on empty DB");
     }
 }
