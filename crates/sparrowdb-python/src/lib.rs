@@ -176,18 +176,11 @@ impl PyReadTx {
 /// :meth:`commit`; dropping without committing discards staged changes
 /// (rollback semantics).
 #[cfg(feature = "python")]
-#[pyclass(name = "WriteTx")]
+#[pyclass(unsendable, name = "WriteTx")]
 struct PyWriteTx {
     /// `None` after commit/rollback so use-after-commit is detected.
     inner: Option<::sparrowdb::WriteTx<'static>>,
 }
-
-// WriteTx<'static> contains a MutexGuard<'static, ()> which is !Send.
-// We serialise access via the GIL: Python is single-threaded by default and
-// the GIL prevents concurrent access to PyO3 objects from multiple threads.
-// The underlying Arc<DbInner> is Send + Sync; the guard is released on drop.
-#[cfg(feature = "python")]
-unsafe impl Send for PyWriteTx {}
 
 #[cfg(feature = "python")]
 #[pymethods]
