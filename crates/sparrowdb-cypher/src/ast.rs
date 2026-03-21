@@ -179,6 +179,41 @@ pub struct UnwindStatement {
     pub return_clause: ReturnClause,
 }
 
+/// MERGE statement: find-or-create a single node.
+///
+/// `MERGE (:Label {prop: val, ...})`
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeStatement {
+    /// The primary label to merge on.
+    pub label: String,
+    /// Identity properties used to locate or create the node.
+    pub props: Vec<PropEntry>,
+}
+
+/// A mutation clause appended after a MATCH: SET or DELETE.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mutation {
+    /// `SET var.prop = expr`
+    Set {
+        var: String,
+        prop: String,
+        value: Expr,
+    },
+    /// `DELETE var`
+    Delete { var: String },
+}
+
+/// MATCH … SET/DELETE statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchMutateStatement {
+    /// The MATCH patterns (same structure as `MatchStatement::pattern`).
+    pub match_patterns: Vec<PathPattern>,
+    /// Optional WHERE predicate.
+    pub where_clause: Option<Expr>,
+    /// The mutation to apply to matched nodes.
+    pub mutation: Mutation,
+}
+
 /// Top-level statement variants.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -186,6 +221,8 @@ pub enum Statement {
     MatchCreate(MatchCreateStatement),
     Match(MatchStatement),
     Unwind(UnwindStatement),
+    Merge(MergeStatement),
+    MatchMutate(MatchMutateStatement),
     Checkpoint,
     Optimize,
 }

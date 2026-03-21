@@ -11,8 +11,8 @@ use tracing::info_span;
 use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CreateStatement, Expr, Literal, MatchCreateStatement, MatchStatement, ReturnItem,
-    SortDir, Statement, UnwindStatement,
+    BinOpKind, CreateStatement, Expr, Literal, MatchCreateStatement, MatchMutateStatement,
+    MatchStatement, MergeStatement, Mutation, ReturnItem, SortDir, Statement, UnwindStatement,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
@@ -74,8 +74,108 @@ impl Engine {
             Statement::Unwind(u) => self.execute_unwind(&u),
             Statement::Create(c) => self.execute_create(&c),
             Statement::MatchCreate(mc) => self.execute_match_create(&mc),
+            // Mutation statements require a write transaction owned by the
+            // caller (GraphDb). They are dispatched via the public helpers
+            // below and should not reach execute_bound in normal use.
+            Statement::Merge(_) | Statement::MatchMutate(_) => {
+                Err(sparrowdb_common::Error::InvalidArgument(
+                    "mutation statements must be executed via execute_mutation".into(),
+                ))
+            }
             Statement::Checkpoint | Statement::Optimize => Ok(QueryResult::empty(vec![])),
         }
+    }
+
+    /// Returns `true` if `stmt` is a mutation (MERGE, MATCH+SET, MATCH+DELETE).
+    ///
+    /// Used by `GraphDb::execute` to route the statement to the write path.
+    pub fn is_mutation(stmt: &Statement) -> bool {
+        matches!(stmt, Statement::Merge(_) | Statement::MatchMutate(_))
+    }
+
+    // ── Mutation execution (called by GraphDb with a write transaction) ────────
+
+    /// Scan nodes matching the MATCH patterns in a `MatchMutate` statement and
+    /// return the list of matching `NodeId`s.  The caller is responsible for
+    /// applying the actual mutations inside a write transaction.
+    pub fn scan_match_mutate(&self, mm: &MatchMutateStatement) -> Result<Vec<NodeId>> {
+        if mm.match_patterns.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Guard: only single-node patterns (no multi-pattern, no relationship hops)
+        // are supported.  Silently ignoring extra patterns would mutate the wrong
+        // nodes; instead we surface a clear error.
+        if mm.match_patterns.len() != 1 || !mm.match_patterns[0].rels.is_empty() {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "MATCH...SET/DELETE currently supports only single-node patterns (no relationships)"
+                    .into(),
+            ));
+        }
+
+        let pat = &mm.match_patterns[0];
+        if pat.nodes.is_empty() {
+            return Ok(vec![]);
+        }
+        let node_pat = &pat.nodes[0];
+        let label = node_pat.labels.first().cloned().unwrap_or_default();
+
+        let label_id = match self.catalog.get_label(&label)? {
+            Some(id) => id as u32,
+            None => {
+                return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                    "unknown label: {label}"
+                )))
+            }
+        };
+
+        let hwm = self.store.hwm_for_label(label_id)?;
+
+        // Collect prop filter col_ids.
+        let filter_col_ids: Vec<u32> = node_pat
+            .props
+            .iter()
+            .map(|pe| prop_name_to_col_id(&pe.key))
+            .collect();
+
+        // Col_ids referenced by the WHERE clause.
+        let mut all_col_ids: Vec<u32> = filter_col_ids;
+        if let Some(ref where_expr) = mm.where_clause {
+            collect_col_ids_from_expr(where_expr, &mut all_col_ids);
+        }
+
+        let var_name = node_pat.var.as_str();
+        let mut matching_ids = Vec::new();
+
+        for slot in 0..hwm {
+            let node_id = NodeId(((label_id as u64) << 32) | slot);
+            let props = if !all_col_ids.is_empty() {
+                self.store.get_node_raw(node_id, &all_col_ids)?
+            } else {
+                vec![]
+            };
+
+            if !matches_prop_filter_static(&props, &node_pat.props) {
+                continue;
+            }
+
+            if let Some(ref where_expr) = mm.where_clause {
+                let row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                if !eval_where(where_expr, &row_vals) {
+                    continue;
+                }
+            }
+
+            matching_ids.push(node_id);
+        }
+
+        Ok(matching_ids)
+    }
+
+    /// Return the mutation carried by a `MatchMutate` statement, exposing it
+    /// to the caller (GraphDb) so it can apply it inside a write transaction.
+    pub fn mutation_from_match_mutate(mm: &MatchMutateStatement) -> &Mutation {
+        &mm.mutation
     }
 
     // ── UNWIND ─────────────────────────────────────────────────────────────────
@@ -169,118 +269,6 @@ impl Engine {
 
             self.store.create_node(label_id, &props)?;
         }
-        Ok(QueryResult::empty(vec![]))
-    }
-
-    // ── MATCH ... CREATE edge execution ────────────────────────────────────────
-
-    /// Execute a `MATCH ... CREATE` statement that creates edges between
-    /// already-existing nodes.
-    ///
-    /// For each combination of matched node bindings:
-    /// 1. Scans the storage layer to resolve each variable to a `NodeId`.
-    /// 2. For each edge in the CREATE clause, registers the relationship type
-    ///    in the catalog via `get_or_create_rel_type_id` (SPA-167) — the step
-    ///    that was missing, causing "unknown relationship type" on subsequent
-    ///    `MATCH (a)-[:REL]->(b)` queries.
-    /// 3. Opens (or creates) the edge-store file for the resolved `RelTableId`
-    ///    and appends the edge record.
-    fn execute_match_create(&mut self, mc: &MatchCreateStatement) -> Result<QueryResult> {
-        use sparrowdb_common::Error;
-
-        // Build a map: variable name → Vec<NodeId> from MATCH patterns.
-        // Each PathPattern node that has a variable name is scanned.
-        let mut var_candidates: HashMap<String, Vec<NodeId>> = HashMap::new();
-
-        for pat in &mc.match_patterns {
-            for node_pat in &pat.nodes {
-                if node_pat.var.is_empty() {
-                    continue;
-                }
-                // Skip if already resolved (same var can appear in multiple patterns).
-                if var_candidates.contains_key(&node_pat.var) {
-                    continue;
-                }
-
-                let label = node_pat.labels.first().cloned().unwrap_or_default();
-                let label_id: u32 = match self.catalog.get_label(&label)? {
-                    Some(id) => id as u32,
-                    None => return Err(Error::NotFound),
-                };
-
-                let hwm = self.store.hwm_for_label(label_id)?;
-
-                // Collect col_ids needed for inline prop filtering.
-                let filter_col_ids: Vec<u32> = node_pat
-                    .props
-                    .iter()
-                    .map(|p| prop_name_to_col_id(&p.key))
-                    .collect();
-
-                let mut matching_ids: Vec<NodeId> = Vec::new();
-                for slot in 0..hwm {
-                    let node_id = NodeId(((label_id as u64) << 32) | slot);
-
-                    // Skip tombstoned nodes (col_0 == u64::MAX).
-                    // If col_0 does not exist on disk the node was never
-                    // deleted, so treat a missing-file error as "not tombstoned".
-                    match self.store.get_node_raw(node_id, &[0u32]) {
-                        Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
-                            continue;
-                        }
-                        Ok(_) | Err(_) => {}
-                    }
-
-                    // Apply inline prop filter if any.
-                    if !node_pat.props.is_empty() {
-                        match self.store.get_node_raw(node_id, &filter_col_ids) {
-                            Ok(props) => {
-                                if !self.matches_prop_filter(&props, &node_pat.props) {
-                                    continue;
-                                }
-                            }
-                            // If a filter column doesn't exist on disk, the node
-                            // cannot satisfy the filter.
-                            Err(_) => continue,
-                        }
-                    }
-
-                    matching_ids.push(node_id);
-                }
-
-                var_candidates.insert(node_pat.var.clone(), matching_ids);
-            }
-        }
-
-        // For each edge in the CREATE clause, iterate all combinations of
-        // matching (src, dst) node pairs and write the edge.
-        for (left_var, rel_pat, right_var) in &mc.create.edges {
-            let src_candidates = var_candidates.get(left_var).ok_or(Error::NotFound)?.clone();
-            let dst_candidates = var_candidates
-                .get(right_var)
-                .ok_or(Error::NotFound)?
-                .clone();
-
-            for &src in &src_candidates {
-                let src_label_id = (src.0 >> 32) as u16;
-                for &dst in &dst_candidates {
-                    let dst_label_id = (dst.0 >> 32) as u16;
-
-                    // Register (or retrieve) the rel type so that subsequent
-                    // MATCH queries with `[:REL_TYPE]` can resolve it (SPA-167).
-                    let rel_table_id = self.catalog.get_or_create_rel_type_id(
-                        src_label_id,
-                        dst_label_id,
-                        &rel_pat.rel_type,
-                    )?;
-                    let storage_rel_id = RelTableId(rel_table_id as u32);
-
-                    let mut es = EdgeStore::open(&self.db_root, storage_rel_id)?;
-                    es.create_edge(src, storage_rel_id, dst)?;
-                }
-            }
-        }
-
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -689,27 +677,36 @@ impl Engine {
         props: &[(u32, u64)],
         filters: &[sparrowdb_cypher::ast::PropEntry],
     ) -> bool {
-        for f in filters {
-            let col_id = prop_name_to_col_id(&f.key);
-            let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
-
-            let matches = match &f.value {
-                Literal::Int(n) => stored_val == Some(*n as u64),
-                Literal::String(s) => {
-                    // Strings are stored inline as up to 8 bytes packed into a
-                    // u64 (little-endian, zero-padded).  Encode the literal the
-                    // same way and compare against the stored raw value (SPA-161).
-                    stored_val == Some(string_to_raw_u64(s))
-                }
-                Literal::Param(_) => true, // params always pass in current impl
-                _ => false,
-            };
-            if !matches {
-                return false;
-            }
-        }
-        true
+        matches_prop_filter_static(props, filters)
     }
+}
+
+// ── Free-standing prop-filter helper (usable without &self) ───────────────────
+
+fn matches_prop_filter_static(
+    props: &[(u32, u64)],
+    filters: &[sparrowdb_cypher::ast::PropEntry],
+) -> bool {
+    for f in filters {
+        let col_id = prop_name_to_col_id(&f.key);
+        let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
+
+        let matches = match &f.value {
+            Literal::Int(n) => stored_val == Some(*n as u64),
+            Literal::String(s) => {
+                // Strings are stored inline as up to 8 bytes packed into a
+                // u64 (little-endian, zero-padded).  Encode the literal the
+                // same way and compare against the stored raw value (SPA-161).
+                stored_val == Some(string_to_raw_u64(s))
+            }
+            Literal::Param(_) => true, // params always pass in current impl
+            _ => false,
+        };
+        if !matches {
+            return false;
+        }
+    }
+    true
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
