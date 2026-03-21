@@ -497,10 +497,8 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
         Expr::And(l, r) => eval_where(l, vals) && eval_where(r, vals),
         Expr::Or(l, r) => eval_where(l, vals) || eval_where(r, vals),
         Expr::Not(inner) => !eval_where(inner, vals),
-        Expr::Literal(lit) => match lit {
-            Literal::Bool(b) => *b,
-            _ => false,
-        },
+        Expr::Literal(Literal::Bool(b)) => *b,
+        Expr::Literal(_) => false,
         _ => false, // unsupported expression — reject row rather than silently pass
     }
 }
