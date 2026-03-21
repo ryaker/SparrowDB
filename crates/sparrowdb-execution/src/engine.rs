@@ -1259,11 +1259,14 @@ fn matches_prop_filter_static(
         let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
 
         let matches = match &f.value {
-            Literal::Int(n) => stored_val == Some(*n as u64),
+            Literal::Int(n) => {
+                // Int64 values are stored with TAG_INT64 (0x00) in the top byte.
+                // Use StoreValue::to_u64() for canonical encoding (SPA-169).
+                stored_val == Some(StoreValue::Int64(*n).to_u64())
+            }
             Literal::String(s) => {
-                // Strings are stored inline as up to 8 bytes packed into a
-                // u64 (little-endian, zero-padded).  Encode the literal the
-                // same way and compare against the stored raw value (SPA-161).
+                // Strings are stored with TAG_BYTES (0x01) in the top byte.
+                // Encode the literal the same way and compare (SPA-161, SPA-169).
                 stored_val == Some(string_to_raw_u64(s))
             }
             Literal::Param(_) => true, // params always pass in current impl
@@ -1431,16 +1434,13 @@ fn literal_to_store_value(lit: &Literal) -> StoreValue {
     }
 }
 
-/// Encode a string literal the same way the storage layer does (inline ≤ 8 bytes).
+/// Encode a string literal using the type-tagged storage encoding (SPA-169).
 ///
-/// Returns the `u64` that `StoreValue::Bytes(s.as_bytes()).to_u64()` would produce,
-/// allowing WHERE-clause string comparisons against raw column values.
+/// Returns the `u64` that `StoreValue::Bytes(s.as_bytes()).to_u64()` produces
+/// with the new tagged encoding, allowing prop-filter and WHERE-clause
+/// comparisons against stored raw column values.
 fn string_to_raw_u64(s: &str) -> u64 {
-    let b = s.as_bytes();
-    let mut arr = [0u8; 8];
-    let len = b.len().min(8);
-    arr[..len].copy_from_slice(&b[..len]);
-    u64::from_le_bytes(arr)
+    StoreValue::Bytes(s.as_bytes().to_vec()).to_u64()
 }
 
 /// Map a property name like "col_0" or "name" to a col_id.
@@ -1494,6 +1494,19 @@ fn collect_col_ids_for_var(var: &str, column_names: &[String], _label_id: u32) -
     ids
 }
 
+/// Decode a raw `u64` column value (as returned by `get_node_raw`) into the
+/// execution-layer `Value` type.
+///
+/// Uses `StoreValue::from_u64` to honour the type tag embedded in the top
+/// byte (SPA-169), then maps `StoreValue::Bytes` → `Value::String` so that
+/// string properties are returned as strings, not garbage integers.
+fn decode_raw_val(raw: u64) -> Value {
+    match StoreValue::from_u64(raw) {
+        StoreValue::Int64(n) => Value::Int64(n),
+        StoreValue::Bytes(b) => Value::String(String::from_utf8_lossy(&b).into_owned()),
+    }
+}
+
 fn build_row_vals(
     props: &[(u32, u64)],
     var_name: &str,
@@ -1502,7 +1515,7 @@ fn build_row_vals(
     let mut map = HashMap::new();
     for &(col_id, raw) in props {
         let key = format!("{var_name}.col_{col_id}");
-        map.insert(key, Value::Int64(raw as i64));
+        map.insert(key, decode_raw_val(raw));
     }
     map
 }
@@ -1518,10 +1531,25 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         // Normal same-type comparisons.
         (Value::Int64(x), Value::Int64(y)) => x == y,
-        (Value::String(x), Value::String(y)) => x == y,
+        (Value::String(x), Value::String(y)) => {
+            // First try exact match (short strings, or both full strings).
+            if x == y {
+                return true;
+            }
+            // If the stored value was decoded from the 7-byte inline encoding,
+            // it is truncated.  Compare using the inline-encoded forms so that
+            // a truncated stored value matches the corresponding full literal
+            // (SPA-169).  Two distinct strings that share the same first 7
+            // bytes will incorrectly compare equal — this is an accepted
+            // limitation of the v1 inline encoding (overflow deferred).
+            StoreValue::Bytes(x.as_bytes().to_vec()).to_u64()
+                == StoreValue::Bytes(y.as_bytes().to_vec()).to_u64()
+        }
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Float64(x), Value::Float64(y)) => x == y,
-        // Mixed: stored raw-int vs string literal — compare via inline encoding.
+        // Mixed: stored raw-int vs string literal — kept for backwards
+        // compatibility; should not be triggered after SPA-169 since string
+        // props are now decoded to Value::String by decode_raw_val.
         (Value::Int64(raw), Value::String(s)) => *raw as u64 == string_to_raw_u64(s),
         (Value::String(s), Value::Int64(raw)) => string_to_raw_u64(s) == *raw as u64,
         // Null is only equal to null.
@@ -1676,7 +1704,7 @@ fn project_row(props: &[(u32, u64)], column_names: &[String], _col_ids: &[u32]) 
             props
                 .iter()
                 .find(|(c, _)| *c == col_id)
-                .map(|(_, v)| Value::Int64(*v as i64))
+                .map(|(_, v)| decode_raw_val(*v))
                 .unwrap_or(Value::Null)
         })
         .collect()
@@ -1698,7 +1726,7 @@ fn project_hop_row(
                 props
                     .iter()
                     .find(|(c, _)| *c == col_id)
-                    .map(|(_, val)| Value::Int64(*val as i64))
+                    .map(|(_, val)| decode_raw_val(*val))
                     .unwrap_or(Value::Null)
             } else {
                 Value::Null
@@ -1724,7 +1752,7 @@ fn project_fof_row(
             fof_props
                 .iter()
                 .find(|(c, _)| *c == col_id)
-                .map(|(_, v)| Value::Int64(*v as i64))
+                .map(|(_, v)| decode_raw_val(*v))
                 .unwrap_or(Value::Null)
         })
         .collect()
