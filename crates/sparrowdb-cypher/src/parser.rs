@@ -20,7 +20,19 @@ pub fn parse(input: &str) -> Result<Statement> {
     }
     let tokens = tokenize(input)?;
     let mut p = Parser::new(tokens);
-    p.parse_statement()
+    let stmt = p.parse_statement()?;
+    // Consume optional trailing semicolon.
+    if matches!(p.peek(), Token::Semicolon) {
+        p.advance();
+    }
+    // All tokens must now be consumed.
+    if !matches!(p.peek(), Token::Eof) {
+        return Err(Error::InvalidArgument(format!(
+            "unexpected trailing token: {:?}",
+            p.peek()
+        )));
+    }
+    Ok(stmt)
 }
 
 // ── Parser cursor ─────────────────────────────────────────────────────────────
@@ -252,6 +264,12 @@ impl Parser {
             }
         }
 
+        if nodes.is_empty() && edges.is_empty() {
+            return Err(Error::InvalidArgument(
+                "CREATE body must contain at least one node or edge pattern".into(),
+            ));
+        }
+
         Ok(CreateStatement { nodes, edges })
     }
 
@@ -342,7 +360,7 @@ impl Parser {
         self.expect_tok(&Token::LBracket)?;
 
         let var = match self.peek().clone() {
-            Token::Ident(s) if !matches!(self.peek2(), Token::Colon) => {
+            Token::Ident(s) if matches!(self.peek2(), Token::Colon) => {
                 self.advance();
                 s
             }
@@ -379,13 +397,18 @@ impl Parser {
 
         // -> or - (outgoing/undirected) or -
         let dir = if incoming {
-            // <-[:R]- means incoming
+            // <-[:R]- means incoming; the trailing '-' is required.
             if matches!(self.peek(), Token::Dash) {
                 self.advance();
+            } else {
+                return Err(Error::InvalidArgument(format!(
+                    "expected '-' after ']' for incoming relationship, got {:?}",
+                    self.peek()
+                )));
             }
             EdgeDir::Incoming
         } else {
-            // -[:R]-> or -[:R]-
+            // -[:R]-> or -[:R]-; an arrow or dash is required.
             if matches!(self.peek(), Token::Arrow) {
                 self.advance();
                 EdgeDir::Outgoing
@@ -393,7 +416,10 @@ impl Parser {
                 self.advance();
                 EdgeDir::Both
             } else {
-                EdgeDir::Outgoing
+                return Err(Error::InvalidArgument(format!(
+                    "expected '->' or '-' after ']' for outgoing/undirected relationship, got {:?}",
+                    self.peek()
+                )));
             }
         };
 
@@ -514,9 +540,17 @@ impl Parser {
             Token::Contains => BinOpKind::Contains,
             Token::StartsWith => {
                 self.advance();
-                // STARTS WITH (two tokens)
-                if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "WITH") {
-                    self.advance();
+                // STARTS WITH — the WITH keyword is mandatory.
+                match self.peek().clone() {
+                    Token::Ident(s) if s.to_uppercase() == "WITH" => {
+                        self.advance();
+                    }
+                    other => {
+                        return Err(Error::InvalidArgument(format!(
+                            "expected WITH after STARTS, got {:?}",
+                            other
+                        )));
+                    }
                 }
                 let right = self.parse_atom()?;
                 return Ok(Expr::BinOp {
@@ -527,8 +561,17 @@ impl Parser {
             }
             Token::EndsWith => {
                 self.advance();
-                if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "WITH") {
-                    self.advance();
+                // ENDS WITH — the WITH keyword is mandatory.
+                match self.peek().clone() {
+                    Token::Ident(s) if s.to_uppercase() == "WITH" => {
+                        self.advance();
+                    }
+                    other => {
+                        return Err(Error::InvalidArgument(format!(
+                            "expected WITH after ENDS, got {:?}",
+                            other
+                        )));
+                    }
                 }
                 let right = self.parse_atom()?;
                 return Ok(Expr::BinOp {
