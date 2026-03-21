@@ -964,6 +964,10 @@ impl Engine {
                         Value::List(vec![Value::String(label.clone())]),
                     );
                 }
+                // Inject the node variable itself so COUNT(n) evaluates to non-null.
+                if !var_name.is_empty() {
+                    row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+                }
                 raw_rows.push(row_vals);
             } else {
                 // Project RETURN columns directly (fast path).
