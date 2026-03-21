@@ -2,7 +2,9 @@
 
 pub mod engine;
 pub mod join;
+pub mod join_spill;
 pub mod operators;
+pub mod sort_spill;
 pub mod types;
 
 pub use engine::Engine;
