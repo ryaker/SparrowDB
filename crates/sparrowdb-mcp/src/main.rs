@@ -26,7 +26,11 @@ fn main() {
     let mut out = stdout.lock();
 
     for line in stdin.lock().lines() {
-        let line = line.unwrap();
+        // Stdin EOF or read error → exit gracefully
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
         if line.is_empty() {
             continue;
         }
@@ -41,14 +45,29 @@ fn main() {
             },
         };
 
-        let resp_str = serde_json::to_string(&response).unwrap();
-        writeln!(out, "{resp_str}").unwrap();
-        out.flush().unwrap();
+        let resp_str = match serde_json::to_string(&response) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Stdout write error (broken pipe) → exit gracefully
+        if writeln!(out, "{resp_str}").is_err() {
+            break;
+        }
+        if out.flush().is_err() {
+            break;
+        }
     }
 }
 
 fn handle_request(req: JsonRpcRequest) -> JsonRpcResponse {
-    let _ = &req.jsonrpc;
+    if req.jsonrpc != "2.0" {
+        return JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: req.id,
+            result: None,
+            error: Some(json!({"code": -32600, "message": "Invalid Request: jsonrpc must be \"2.0\""})),
+        };
+    }
 
     let result = match req.method.as_str() {
         "initialize" => Ok(json!({
