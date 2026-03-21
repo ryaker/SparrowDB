@@ -28,7 +28,7 @@
 //! ```
 
 use sparrowdb_catalog::catalog::Catalog;
-use sparrowdb_common::{EdgeId, Error, NodeId, Result, TxnId};
+use sparrowdb_common::{col_id_of, EdgeId, Error, NodeId, Result, TxnId};
 use sparrowdb_execution::{Engine, QueryResult};
 use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
@@ -798,16 +798,10 @@ fn write_mutation_wal(
 
 /// Derive a stable `u32` column ID from a property key name.
 ///
-/// Uses FNV-1a 32-bit hash for deterministic, catalog-free mapping.
+/// Delegates to [`sparrowdb_common::col_id_of`] — the single canonical
+/// FNV-1a implementation shared by storage and execution (SPA-160).
 pub fn fnv1a_col_id(key: &str) -> u32 {
-    const FNV_PRIME: u32 = 16_777_619;
-    const OFFSET_BASIS: u32 = 2_166_136_261;
-    let mut hash = OFFSET_BASIS;
-    for byte in key.bytes() {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    col_id_of(key)
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

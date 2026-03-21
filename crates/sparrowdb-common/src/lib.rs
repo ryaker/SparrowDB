@@ -100,6 +100,25 @@ impl From<std::io::Error> for Error {
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
+// ── Canonical column-ID derivation ───────────────────────────────────────────
+
+/// Derive a stable `u32` column ID from a property key name.
+///
+/// Uses FNV-1a 32-bit hash for deterministic, catalog-free mapping.
+/// This is the **single authoritative implementation** — both the storage
+/// layer and the execution engine must call this function so that the
+/// `col_id` written to disk and the `col_id` used at query time always agree.
+pub fn col_id_of(name: &str) -> u32 {
+    const FNV_PRIME: u32 = 16_777_619;
+    const OFFSET_BASIS: u32 = 2_166_136_261;
+    let mut hash = OFFSET_BASIS;
+    for byte in name.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,7 +9,7 @@ use std::path::Path;
 use tracing::info_span;
 
 use sparrowdb_catalog::catalog::Catalog;
-use sparrowdb_common::{NodeId, Result};
+use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
     BinOpKind, Expr, Literal, MatchStatement, ReturnItem, SortDir, Statement, UnwindStatement,
 };
@@ -528,17 +528,14 @@ fn extract_return_column_names(items: &[ReturnItem]) -> Vec<String> {
 }
 
 /// Map a property name like "col_0" or "name" to a col_id.
+///
+/// Uses the canonical [`sparrowdb_common::col_id_of`] FNV-1a hash so that
+/// this always agrees with what the storage layer wrote to disk (SPA-160).
 fn prop_name_to_col_id(name: &str) -> u32 {
     if let Some(suffix) = name.strip_prefix("col_") {
         suffix.parse().unwrap_or(0)
     } else {
-        // Hash the name to an id for non-prefixed properties.
-        // In production the catalog would provide field_id.
-        let mut h: u32 = 5381;
-        for b in name.bytes() {
-            h = h.wrapping_mul(33).wrapping_add(b as u32);
-        }
-        h % 64
+        col_id_of(name)
     }
 }
 
