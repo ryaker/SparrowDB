@@ -146,7 +146,7 @@ impl MaintenanceEngine {
 
         if current_size < min_size {
             // Extend the file (or create it) with zeros.
-            let mut f = fs::OpenOptions::new()
+            let f = fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .open(&self.catalog_path)
