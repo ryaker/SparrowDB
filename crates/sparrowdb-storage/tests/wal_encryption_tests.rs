@@ -23,10 +23,7 @@ fn encrypted_wal_write_and_replay_roundtrip() {
     let dir = TempDir::new().unwrap();
 
     // Write two committed transactions.
-    let expected: Vec<(u64, Vec<u8>)> = vec![
-        (0, vec![0x11u8; 64]),
-        (1, vec![0x22u8; 64]),
-    ];
+    let expected: Vec<(u64, Vec<u8>)> = vec![(0, vec![0x11u8; 64]), (1, vec![0x22u8; 64])];
     {
         let mut writer = open_encrypted_writer(&dir, KEY_A);
         for (page_id, image) in &expected {
@@ -38,11 +35,12 @@ fn encrypted_wal_write_and_replay_roundtrip() {
 
     // Replay with the correct key.
     let mut applied: HashMap<u64, Vec<u8>> = HashMap::new();
-    let result = WalReplayer::replay_encrypted(dir.path(), Lsn(0), KEY_A, |page_id, image, _lsn| {
-        applied.insert(page_id, image.to_vec());
-        Ok(())
-    })
-    .unwrap();
+    let result =
+        WalReplayer::replay_encrypted(dir.path(), Lsn(0), KEY_A, |page_id, image, _lsn| {
+            applied.insert(page_id, image.to_vec());
+            Ok(())
+        })
+        .unwrap();
 
     assert_eq!(result.pages_applied, 2, "both pages must be applied");
     for (page_id, image) in &expected {

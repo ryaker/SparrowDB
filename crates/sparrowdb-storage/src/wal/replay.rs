@@ -55,7 +55,12 @@ impl WalReplayer {
         last_applied_lsn: Lsn,
         apply_fn: impl FnMut(u64, &[u8], Lsn) -> Result<()>,
     ) -> Result<ReplayResult> {
-        Self::replay_inner(wal_dir, last_applied_lsn, EncryptionContext::none(), apply_fn)
+        Self::replay_inner(
+            wal_dir,
+            last_applied_lsn,
+            EncryptionContext::none(),
+            apply_fn,
+        )
     }
 
     /// Replay an encrypted WAL written with [`WalWriter::open_encrypted`].

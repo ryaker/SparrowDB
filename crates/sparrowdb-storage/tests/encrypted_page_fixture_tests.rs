@@ -78,7 +78,10 @@ fn encrypt_decrypt_produces_original_plaintext() {
     let recovered = ctx
         .decrypt_page(PAGE_ID, &ciphertext)
         .expect("decrypt must succeed");
-    assert_eq!(recovered, plaintext, "round-trip must recover original plaintext");
+    assert_eq!(
+        recovered, plaintext,
+        "round-trip must recover original plaintext"
+    );
 }
 
 // ── Test 4: corruption — flip one ciphertext byte ────────────────────────────

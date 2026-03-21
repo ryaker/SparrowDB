@@ -130,6 +130,7 @@ impl PageStore {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
         Ok(PageStore {
             file: Mutex::new(file),
