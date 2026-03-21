@@ -46,21 +46,76 @@ pub enum Value {
     Bytes(Vec<u8>),
 }
 
+/// Type tag embedded in the top byte (byte index 7 in LE) of a stored `u64`.
+///
+/// - `0x00` = `Int64`  — lower 7 bytes hold the signed integer (56-bit range).
+/// - `0x01` = `Bytes`  — lower 7 bytes hold up to 7 bytes of inline string data.
+///
+/// This encoding lets `from_u64` reconstruct the original `Value` variant
+/// without needing an out-of-band schema lookup, fixing SPA-169.
+const TAG_INT64: u8 = 0x00;
+const TAG_BYTES: u8 = 0x01;
+
 impl Value {
     /// Encode as a packed `u64` for column storage.
+    ///
+    /// The top byte (byte 7 in little-endian) is a type tag; the remaining
+    /// 7 bytes carry the payload.  This allows `from_u64` to reconstruct the
+    /// correct variant at read time (SPA-169).
+    ///
+    /// # Int64 range
+    /// Only the lower 56 bits of the integer are stored.  This covers all
+    /// practical node IDs and numeric property values; very large i64 values
+    /// (> 2^55 or < -2^55) would be truncated.  Full 64-bit range is deferred
+    /// to a later overflow encoding.
     pub fn to_u64(&self) -> u64 {
         match self {
-            Value::Int64(v) => *v as u64,
+            Value::Int64(v) => {
+                // Top byte = TAG_INT64 (0x00); lower 7 bytes = lower 56 bits of v.
+                // For TAG_INT64 = 0x00 this is just the value masked to 56 bits,
+                // which is a no-op for any i64 whose top byte is already 0x00.
+                let payload = (*v as u64) & 0x00FF_FFFF_FFFF_FFFF;
+                // Tag byte goes into byte 7 (the most significant byte in LE).
+                payload | ((TAG_INT64 as u64) << 56)
+            }
             Value::Bytes(b) => {
                 let mut arr = [0u8; 8];
-                let len = b.len().min(8);
+                arr[7] = TAG_BYTES; // type tag in top byte
+                let len = b.len().min(7);
                 arr[..len].copy_from_slice(&b[..len]);
                 u64::from_le_bytes(arr)
             }
         }
     }
 
+    /// Reconstruct a `Value` from a stored `u64`, using the top byte as a
+    /// type tag (SPA-169).
+    pub fn from_u64(v: u64) -> Self {
+        let bytes = v.to_le_bytes(); // bytes[7] = top byte = tag
+        match bytes[7] {
+            TAG_BYTES => {
+                // Inline string: bytes[0..7] hold the data; strip trailing zeros.
+                let data: Vec<u8> = bytes[..7]
+                    .iter()
+                    .copied()
+                    .take_while(|&b| b != 0)
+                    .collect();
+                Value::Bytes(data)
+            }
+            _ => {
+                // TAG_INT64 (0x00) or any unrecognised tag → Int64.
+                // Sign-extend from 56 bits: shift left 8 to bring bit 55 into
+                // sign position, then arithmetic shift right 8.
+                let shifted = (v << 8) as i64;
+                Value::Int64(shifted >> 8)
+            }
+        }
+    }
+
     /// Reconstruct an `Int64` value from a stored `u64`.
+    ///
+    /// Preserved for callers that know the column type is always Int64 (e.g.
+    /// pre-SPA-169 paths).  New code should prefer `from_u64`.
     pub fn int64_from_u64(v: u64) -> Self {
         Value::Int64(v as i64)
     }
@@ -328,15 +383,17 @@ impl NodeStore {
         Ok(result)
     }
 
-    /// Retrieve the `Int64` property values for a node.
+    /// Retrieve the typed property values for a node.
     ///
-    /// Convenience wrapper over [`get_node_raw`] that interprets every column
-    /// as an `Int64` (two's-complement re-interpretation of the stored `u64`).
+    /// Convenience wrapper over [`get_node_raw`] that uses the type tag
+    /// embedded in the stored `u64` to reconstruct the correct `Value` variant
+    /// (SPA-169).  The returned `Value` will be `Int64` or `Bytes` depending
+    /// on what was written by `create_node`.
     pub fn get_node(&self, node_id: NodeId, col_ids: &[u32]) -> Result<Vec<(u32, Value)>> {
         let raw = self.get_node_raw(node_id, col_ids)?;
         Ok(raw
             .into_iter()
-            .map(|(col_id, v)| (col_id, Value::int64_from_u64(v)))
+            .map(|(col_id, v)| (col_id, Value::from_u64(v)))
             .collect())
     }
 }

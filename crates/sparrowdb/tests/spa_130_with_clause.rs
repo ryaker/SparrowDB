@@ -82,19 +82,12 @@ fn spa130_with_where_string_filter() {
         result.rows.len()
     );
 
-    // Verify the surviving row contains the Alice string (stored as raw u64
-    // little-endian bytes in the current storage encoding).
+    // SPA-169: string properties are now decoded to Value::String, not raw Int64.
     use sparrowdb_execution::types::Value;
-    let alice_raw: u64 = {
-        let b = b"Alice";
-        let mut arr = [0u8; 8];
-        arr[..b.len()].copy_from_slice(b);
-        u64::from_le_bytes(arr)
-    };
     assert_eq!(
         result.rows[0][0],
-        Value::Int64(alice_raw as i64),
-        "surviving row must encode 'Alice' as raw u64"
+        Value::String("Alice".to_string()),
+        "surviving row must return 'Alice' as a String (SPA-169 fix)"
     );
 }
 
