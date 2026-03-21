@@ -27,6 +27,7 @@ use sparrowdb_common::{Error, Lsn, Result};
 
 use super::codec::{WalPayload, WalRecord, WalRecordKind};
 use super::writer::segment_path;
+use crate::encryption::EncryptionContext;
 
 /// Result of a WAL replay pass.
 pub struct ReplayResult {
@@ -52,6 +53,33 @@ impl WalReplayer {
     pub fn replay(
         wal_dir: &Path,
         last_applied_lsn: Lsn,
+        apply_fn: impl FnMut(u64, &[u8], Lsn) -> Result<()>,
+    ) -> Result<ReplayResult> {
+        Self::replay_inner(wal_dir, last_applied_lsn, EncryptionContext::none(), apply_fn)
+    }
+
+    /// Replay an encrypted WAL written with [`WalWriter::open_encrypted`].
+    ///
+    /// Identical to [`replay`] but decrypts each non-empty payload using the
+    /// provided key before dispatching to `apply_fn`.
+    pub fn replay_encrypted(
+        wal_dir: &Path,
+        last_applied_lsn: Lsn,
+        key: [u8; 32],
+        apply_fn: impl FnMut(u64, &[u8], Lsn) -> Result<()>,
+    ) -> Result<ReplayResult> {
+        Self::replay_inner(
+            wal_dir,
+            last_applied_lsn,
+            EncryptionContext::with_key(key),
+            apply_fn,
+        )
+    }
+
+    fn replay_inner(
+        wal_dir: &Path,
+        last_applied_lsn: Lsn,
+        enc: EncryptionContext,
         mut apply_fn: impl FnMut(u64, &[u8], Lsn) -> Result<()>,
     ) -> Result<ReplayResult> {
         let segments = collect_segments(wal_dir)?;
@@ -134,7 +162,17 @@ impl WalReplayer {
                 let _ = lsn_limit;
             }
             if rec.kind == WalRecordKind::Write && committed.contains(&rec.txn_id.0) {
-                if let WalPayload::Write { page_id, image } = &rec.payload {
+                // Resolve the payload — decrypt if it came from an encrypted WAL.
+                let resolved = match &rec.payload {
+                    WalPayload::Raw(encrypted_bytes) => {
+                        // Decrypt using the record's own LSN as AAD.
+                        let plaintext = enc.decrypt_wal_payload(*lsn, encrypted_bytes)?;
+                        WalPayload::decode_raw(rec.kind, &plaintext)?
+                    }
+                    other => other.clone(),
+                };
+
+                if let WalPayload::Write { page_id, image } = &resolved {
                     apply_fn(*page_id, image, Lsn(*lsn))?;
                     pages_applied += 1;
                     txns_replayed_set.insert(rec.txn_id.0);

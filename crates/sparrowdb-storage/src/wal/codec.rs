@@ -73,9 +73,17 @@ pub enum WalPayload {
         /// Raw page image bytes.
         image: Vec<u8>,
     },
+    /// Opaque pre-encoded (possibly encrypted) payload bytes.
+    ///
+    /// Used internally by the WAL writer when encryption is enabled: the
+    /// plaintext `WalPayload::encode()` bytes are encrypted and stored here
+    /// so the codec writes them verbatim.  The replayer decrypts them and
+    /// calls `WalPayload::decode_raw()` to recover the structured payload.
+    Raw(Vec<u8>),
 }
 
 impl WalPayload {
+    /// Encode to on-disk bytes (plaintext structured form).
     pub fn encode(&self) -> Vec<u8> {
         match self {
             WalPayload::Empty => vec![],
@@ -86,9 +94,12 @@ impl WalPayload {
                 buf.extend_from_slice(image);
                 buf
             }
+            // Raw bytes are already in their final on-disk form.
+            WalPayload::Raw(bytes) => bytes.clone(),
         }
     }
 
+    /// Decode from the raw byte slice in a WAL record.
     pub fn decode(kind: WalRecordKind, bytes: &[u8]) -> Result<Self> {
         match kind {
             WalRecordKind::Begin
@@ -121,6 +132,14 @@ impl WalPayload {
                 Ok(WalPayload::Write { page_id, image })
             }
         }
+    }
+
+    /// Decode from already-decrypted (plaintext) raw bytes for a given `kind`.
+    ///
+    /// This is identical to [`decode`] but exists as a named alias for clarity
+    /// at the call-site in the WAL replayer's decryption path.
+    pub fn decode_raw(kind: WalRecordKind, plaintext_bytes: &[u8]) -> Result<Self> {
+        Self::decode(kind, plaintext_bytes)
     }
 }
 
