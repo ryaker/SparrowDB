@@ -1,0 +1,18 @@
+/// WAL (Write-Ahead Log) subsystem.
+///
+/// Binary format per record:
+///   [4-byte length (u32 LE, covers everything after the length field)]
+///   [1-byte record type]
+///   [8-byte LSN (u64 LE)]
+///   [8-byte txn_id (u64 LE)]
+///   [payload (type-specific)]
+///   [4-byte CRC32 of (type + lsn + txn_id + payload)]
+///
+/// Segments: `wal/segment-{:020}.wal`, 64 MiB each.
+pub mod codec;
+pub mod replay;
+pub mod writer;
+
+pub use codec::{WalPayload, WalRecord, WalRecordKind};
+pub use replay::WalReplayer;
+pub use writer::WalWriter;
