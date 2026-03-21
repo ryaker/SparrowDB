@@ -89,6 +89,29 @@ fn unwind_single_element_list() {
     assert_eq!(result.rows[0], vec![Value::Int64(42)]);
 }
 
+// ── Wrong RETURN variable does NOT leak alias value ────────────────────────────
+//
+// Regression guard for the projection bug where `or_else` caused any missing
+// column to fall back to the alias column, making `RETURN y` silently return
+// the `x` values instead of NULL.
+
+#[test]
+fn unwind_return_wrong_variable_yields_null() {
+    let (_dir, db) = make_db();
+    // `y` is not in scope; each row should be NULL, not the `x` value.
+    let result = db.execute("UNWIND [1, 2, 3] AS x RETURN y").unwrap();
+
+    assert_eq!(result.columns, vec!["y"]);
+    assert_eq!(result.rows.len(), 3, "still 3 rows");
+    for row in &result.rows {
+        assert_eq!(
+            row,
+            &vec![Value::Null],
+            "out-of-scope variable must be NULL, not the alias value"
+        );
+    }
+}
+
 // ── Float list ────────────────────────────────────────────────────────────────
 
 #[test]

@@ -82,20 +82,34 @@ impl Engine {
         let chunks = op.collect_all()?;
 
         // Materialize: for each chunk/group/row, project the RETURN columns.
+        //
+        // Only fall back to the UNWIND alias value when the output column
+        // actually corresponds to the alias variable.  Returning a value for
+        // an unrelated variable (e.g. `RETURN y` when alias is `x`) would
+        // silently produce wrong results instead of NULL.
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for chunk in &chunks {
             for group in &chunk.groups {
                 let n = group.len();
                 for row_idx in 0..n {
-                    let row = column_names
+                    let row = u
+                        .return_clause
+                        .items
                         .iter()
-                        .map(|col| {
-                            // The RETURN item may be the alias directly (e.g. `RETURN x`)
-                            // or an alias-renamed expression.
-                            group
-                                .get_value(col, row_idx)
-                                .or_else(|| group.get_value(&u.alias, row_idx))
-                                .unwrap_or(Value::Null)
+                        .map(|item| {
+                            // Determine whether this RETURN item refers to the
+                            // alias variable produced by UNWIND.
+                            let is_alias = match &item.expr {
+                                Expr::Var(name) => name == &u.alias,
+                                _ => false,
+                            };
+                            if is_alias {
+                                group.get_value(&u.alias, row_idx).unwrap_or(Value::Null)
+                            } else {
+                                // Variable is not in scope for this UNWIND —
+                                // return NULL rather than leaking the alias value.
+                                Value::Null
+                            }
                         })
                         .collect();
                     rows.push(row);
