@@ -526,3 +526,123 @@ fn write_write_conflict_path_returns_error() {
 
     drop(dir);
 }
+
+// ── SPA-158: create_edge registers rel type in catalog ────────────────────────
+
+/// After `create_edge`, the relationship type name must be persisted in the
+/// catalog so that Cypher queries with `[:REL_TYPE]` can resolve the type.
+#[test]
+fn create_edge_registers_rel_type_in_catalog() {
+    let (dir, db) = make_db();
+
+    // Create two nodes with label_id=0.
+    let (alice, bob);
+    {
+        let mut tx = db.begin_write().unwrap();
+        alice = tx.create_node(0, &[(0u32, Value::Int64(1))]).unwrap();
+        bob = tx.create_node(0, &[(0u32, Value::Int64(2))]).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Create an edge with rel_type "KNOWS".
+    {
+        let mut tx = db.begin_write().unwrap();
+        tx.create_edge(alice, bob, "KNOWS", HashMap::new())
+            .expect("create_edge must succeed");
+        tx.commit().unwrap();
+    }
+
+    // Reopen the catalog and verify "KNOWS" is registered.
+    {
+        let catalog = sparrowdb_catalog::catalog::Catalog::open(dir.path()).unwrap();
+        let tables = catalog.list_rel_tables().unwrap();
+        let found = tables.iter().any(|(_, _, rt)| rt == "KNOWS");
+        assert!(
+            found,
+            "rel type 'KNOWS' must be persisted in catalog after create_edge, got: {tables:?}"
+        );
+    }
+
+    drop(dir);
+}
+
+/// Calling `create_edge` twice with the same rel_type must not create duplicate
+/// catalog entries — the second call is idempotent in the catalog.
+#[test]
+fn create_edge_rel_type_catalog_idempotent() {
+    let (dir, db) = make_db();
+
+    let (a, b);
+    {
+        let mut tx = db.begin_write().unwrap();
+        a = tx.create_node(0, &[(0u32, Value::Int64(10))]).unwrap();
+        b = tx.create_node(0, &[(0u32, Value::Int64(20))]).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Create the same rel_type twice across two transactions.
+    for _ in 0..2 {
+        let mut tx = db.begin_write().unwrap();
+        tx.create_edge(a, b, "FOLLOWS", HashMap::new())
+            .expect("create_edge must succeed");
+        tx.commit().unwrap();
+    }
+
+    // Only one catalog entry should exist for "FOLLOWS".
+    {
+        let catalog = sparrowdb_catalog::catalog::Catalog::open(dir.path()).unwrap();
+        let tables = catalog.list_rel_tables().unwrap();
+        let count = tables.iter().filter(|(_, _, rt)| rt == "FOLLOWS").count();
+        assert_eq!(
+            count, 1,
+            "rel type 'FOLLOWS' must appear exactly once in catalog, got: {tables:?}"
+        );
+    }
+
+    drop(dir);
+}
+
+// ── SPA-159: merge_node is idempotent within the same transaction ─────────────
+
+/// Calling `merge_node` twice within a single `WriteTx` must return the same
+/// `NodeId` — the second call must find the node written by the first call
+/// (visible through the in-memory node store) rather than creating a new slot.
+#[test]
+fn merge_node_idempotent_within_single_tx() {
+    let (dir, db) = make_db();
+
+    let mut props = HashMap::new();
+    props.insert("name".to_string(), Value::Int64(9001));
+
+    let (id1, id2);
+    {
+        let mut tx = db.begin_write().unwrap();
+        id1 = tx
+            .merge_node("Topic", props.clone())
+            .expect("first merge_node");
+        id2 = tx
+            .merge_node("Topic", props.clone())
+            .expect("second merge_node within same tx");
+        tx.commit().unwrap();
+    }
+
+    assert_eq!(
+        id1, id2,
+        "merge_node called twice within the same tx must return the same NodeId"
+    );
+
+    // Verify only one node was created.
+    let store = sparrowdb_storage::node_store::NodeStore::open(dir.path()).unwrap();
+    let catalog = sparrowdb_catalog::catalog::Catalog::open(dir.path()).unwrap();
+    let label_id = catalog
+        .get_label("Topic")
+        .unwrap()
+        .expect("Topic label must exist") as u32;
+    let hwm = store.hwm_for_label(label_id).unwrap();
+    assert_eq!(
+        hwm, 1,
+        "exactly one node must exist after two identical merges in same tx"
+    );
+
+    drop(dir);
+}
