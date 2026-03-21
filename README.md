@@ -1,6 +1,6 @@
 # SparrowDB
 
-> An embedded Rust graph database with a durable storage format, factorized execution, and Cypher query support.
+> An embedded Rust graph database with Cypher queries, WAL-backed crash recovery, and factorized execution.
 
 [![CI](https://github.com/ryaker/SparrowDB/actions/workflows/ci.yml/badge.svg)](https://github.com/ryaker/SparrowDB/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -9,167 +9,192 @@
 
 ## What It Is
 
-SparrowDB is an embedded graph database written in Rust. It proves four things in v1:
+SparrowDB is an embedded graph database written in Rust. Drop it into a process — no server, no daemon, no cloud dependency.
 
-1. **Durable storage** — creates and reopens a stable, versioned on-disk database
-2. **Real queries** — runs a narrow but real Cypher subset over factorized operators
-3. **Safe mutations** — mutates nodes and edges with WAL-backed crash recovery
-4. **Accessible** — exposes the engine through both Rust and Python APIs
+It runs Cypher queries over a durable on-disk graph using a factorized execution engine that avoids Cartesian blowup on multi-hop traversals. The storage format is byte-stable and versioned.
 
-SparrowDB is **not** a general-purpose distributed database. v1 is a proof that the durable storage contract and factorized execution model are real enough to justify a broader roadmap.
+**First production target:** replace Neo4j Aura in a local Knowledge Management System — same Cypher, local on-device, zero latency, no subscription.
 
 ---
 
-## Status: Building in Public
-
-This project is under active development. The v1 implementation has not shipped yet. We are working from a finalized spec and building phase by phase with integration gates.
+## Status
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| 0 | Repo bootstrap, CI, crate skeletons | 🔄 In progress |
-| 1 | Durable core codecs (superblock, metapage) | ⏳ Pending |
-| 2 | Catalog and nodes | ⏳ Pending |
-| 3 | Edges, WAL, and recovery | ⏳ Pending |
-| 4a | Parser and binder | ⏳ Pending |
-| 4b | Scan, filter, project | ⏳ Pending |
-| 4c | Expand, joins, aggregates | ⏳ Pending |
-| 5 | Transactions and maintenance | ⏳ Pending |
-| 6 | Encryption, spill, Python bindings | ⏳ Pending |
+| 0 | Repo, CI, 7-crate workspace scaffold | ✅ Done |
+| 1 | TLV catalog codec + dual metapage | ✅ Done |
+| 2 | WAL write-ahead log + 8 crash failpoints | ✅ Done |
+| 3 | CSR edge storage + node property columns | ✅ Done |
+| 4 | Cypher parser, binder, factorized execution engine | ✅ Done |
+| 6a | XChaCha20-Poly1305 at-rest page encryption | ✅ Done |
+| infra | Criterion benchmarks + deterministic fixture generator | ✅ Done |
+| 5 | SWMR transactions + snapshot isolation | 🔄 Next |
+| 6b | Memory spill to disk | ⏳ Pending |
+| 6c | Python bindings (PyO3/maturin) | ⏳ Pending |
+| 7–11 | Full Cypher, LDBC SNB benchmark, publication | ⏳ Pending |
 
-v1 is done when the 14 named acceptance checks pass (see `specs/`).
-
----
-
-## Design Principles
-
-- **Format stability over peak performance** — byte layouts are nailed down before code is written
-- **Correctness over planner sophistication** — the execution model is explicit, not magic
-- **Explicit testability** — golden binary fixtures, crash failpoints, and integration gates
-- **Narrow but dependable public API** — small surface, zero dead modules
+Acceptance checks passing: **#3** (1-hop scan), **#4** (2-hop ASP-Join), **#13** (encryption).
 
 ---
 
-## Architecture at a Glance
+## Quickstart
+
+```rust
+use sparrowdb::Engine;
+
+// Open or create a database directory
+let engine = Engine::open("my.db")?;
+
+// Create nodes
+engine.execute("CREATE (a:Person {name: \"Alice\"})")?;
+engine.execute("CREATE (b:Person {name: \"Bob\"})")?;
+
+// Create an edge
+engine.execute(
+    "MATCH (a:Person {name: \"Alice\"}), (b:Person {name: \"Bob\"})
+     CREATE (a)-[:KNOWS]->(b)"
+)?;
+
+// 1-hop query
+let result = engine.execute(
+    "MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->(f:Person) RETURN f.name"
+)?;
+for row in &result.rows {
+    println!("{:?}", row);
+}
+
+// 2-hop query (factorized, no Cartesian blowup)
+let fof = engine.execute(
+    "MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->()-[:KNOWS]->(fof:Person)
+     RETURN DISTINCT fof.name"
+)?;
+```
+
+Full guide: [docs/getting-started.md](docs/getting-started.md)
+
+---
+
+## Cypher Support (v0.1)
+
+| Feature | Supported |
+|---------|-----------|
+| `CREATE (n:Label {prop: val})` | ✅ |
+| `MATCH (n:Label) RETURN n.prop` | ✅ |
+| `WHERE n.prop = val` | ✅ |
+| `WHERE n.prop CONTAINS str` | ✅ |
+| 1-hop `MATCH (a)-[:REL]->(b)` | ✅ |
+| 2-hop `MATCH (a)-[:R]->()-[:R]->(c)` | ✅ |
+| Relationship variables `[r:REL]` | ✅ |
+| `RETURN DISTINCT` | ✅ |
+| `ORDER BY`, `LIMIT` | ✅ |
+| `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | ✅ |
+| Parameters `$param` | ✅ |
+| `DELETE`, `SET` | ✅ |
+| `OPTIONAL MATCH` | ❌ |
+| Variable-length paths `[:R*1..3]` | ❌ |
+| `UNION`, `UNWIND`, subqueries | ❌ |
+
+Full reference: [docs/cypher-reference.md](docs/cypher-reference.md)
+
+---
+
+## Architecture
 
 ```
 crates/
-  sparrowdb-common/      # ID types, error taxonomy, CRC32, encoding helpers
-  sparrowdb-storage/     # Page codecs, buffer pool, WAL, node/edge file families
-  sparrowdb-catalog/     # Labels, rel tables, schema, reverse index
-  sparrowdb-cypher/      # Parser, AST, binder, logical/physical plans
-  sparrowdb-execution/   # Typed vectors, factorized chunks, operators, joins, spill
-  sparrowdb/             # Public Rust API — GraphDb, ReadTx, WriteTx
-  sparrowdb-python/      # PyO3 bindings
+  sparrowdb-common/     # ID types, Error enum, CRC32C helpers
+  sparrowdb-storage/    # WAL, CSR, node/edge stores, metapage, encryption
+  sparrowdb-catalog/    # Label and rel-table registry (TLV on-disk format)
+  sparrowdb-cypher/     # Lexer, recursive-descent parser, AST, binder
+  sparrowdb-execution/  # TypedVector, FactorizedChunk, operators, ASP-Join, Engine
+  sparrowdb/            # Public Rust API (Engine entry point)
+  sparrowdb-python/     # PyO3 bindings (Phase 6)
 
-specs/                   # Implementation spec (source of truth)
-fixtures/
-  golden/                # Binary reference fixtures for every durable format
-  recovery/              # Crash-recovery test databases
-  compatibility/         # Frozen v1.0 fixture for forward-compat tests
+tests/
+  fixtures/             # Golden binary fixtures + small seeded JSON datasets
+  integration/          # End-to-end use-case tests (UC-1 through UC-6)
+
+benches/                # Criterion benchmarks (WAL, CSR, metapage, CRC32C)
+specs/                  # Byte-exact implementation spec (source of truth)
+docs/                   # User-facing guides and API reference
 ```
 
-### Storage Layout
-
-Each database is a directory:
+### Database directory layout
 
 ```
-db/
-  catalog.bin            # Superblock + dual metapages + catalog payload pages
-  nodes/{label_id}/      # Per-label column files, validity bitmaps, overflow
-  edges/{rel_table_id}/  # CSR base files, delta log, edge ID columns
-  wal/                   # WAL segments
+my.db/
+  catalog.bin           # TLV catalog entries + dual metapages
+  nodes/{label_id}/     # Per-label property column files
+  edges/{rel_id}/       # CSR forward + backward + delta.log
+  wal/                  # WAL segments (000000.wal, ...)
 ```
 
-### Factorized Execution
+### Factorized execution
 
-Queries execute over `FactorizedChunk` — a structure that delays materialization until the projection boundary. A chunk with `multiplicity = 2`, one flat group, and one unflat group of size 3 represents 6 logical rows without emitting 6 physical rows. This is the core of the execution model.
+Queries return `FactorizedChunk` — a structure that tracks `multiplicity` rather than materializing repeated rows. A 2-hop friend-of-friend query over 10 k nodes never emits O(N²) intermediate rows; multiplicity is resolved only at `RETURN`.
+
+### Encryption
+
+Pass a 32-byte key to get XChaCha20-Poly1305 encryption of every page. Physical stride is `page_size + 40` bytes (`24` nonce + `16` AEAD tag). Wrong key → `Error::DecryptionFailed`. No key → transparent passthrough.
 
 ---
 
-## Quickstart (once v1 ships)
+## Installation
 
-```rust
-use sparrowdb::{GraphDb, OpenOptions};
+### From source (Rust stable 1.75+)
 
-let db = GraphDb::open("my.db")?;
-let mut tx = db.begin_write()?;
-
-tx.execute("CREATE (a:Person {name: 'Alice'})")?;
-tx.execute("CREATE (b:Person {name: 'Bob'})")?;
-tx.execute("MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)")?;
-tx.commit()?;
-
-let tx = db.begin_read()?;
-let result = tx.query("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name")?;
+```bash
+git clone https://github.com/ryaker/SparrowDB
+cd SparrowDB
+cargo build --release
 ```
 
-```python
-import sparrowdb
+### As a library dependency
 
-db = sparrowdb.open("my.db")
-with db.write() as tx:
-    tx.execute("CREATE (a:Person {name: 'Alice'})")
-    tx.execute("CREATE (b:Person {name: 'Bob'})")
-
-with db.read() as tx:
-    result = tx.query("MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name, b.name")
-    for row in result.rows:
-        print(row)
+```toml
+# Cargo.toml
+[dependencies]
+sparrowdb = { git = "https://github.com/ryaker/SparrowDB" }
 ```
 
----
+Crates.io publication planned for v0.1 release.
 
-## Cypher Support (v1)
-
-Supported:
-
-- `CREATE (n:Label {prop: value})`
-- `CREATE (n:LabelA:LabelB)` — multi-label nodes
-- `CREATE (a)-[:REL]->(b)` and `CREATE (a)-[:REL]-(b)` (undirected sugar)
-- `MATCH (n:Label) RETURN ...`
-- `MATCH ... WHERE n.prop = value RETURN ...`
-- 2-hop patterns: `MATCH (a)-[:R]->(b)-[:R]->(c) RETURN ...`
-- `DELETE`, `SET`
-- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
-- Schema: `ALTER :Label ADD COLUMN name TYPE`
-- Maintenance: `CHECKPOINT`, `OPTIMIZE`
-
-Not in v1: `OPTIONAL MATCH`, variable-length paths, `ORDER BY`, `LIMIT`, `UNION`, `UNWIND`, subqueries.
-
----
-
-## Spec
-
-The implementation spec lives in `specs/sparrowdb-v3-implementation-spec.md`. It defines:
-
-- byte-exact layout tables for every durable structure
-- golden fixture requirements
-- crash failpoint matrix
-- 14 acceptance checks that constitute "done"
+Full install guide: [docs/getting-started.md](docs/getting-started.md)
 
 ---
 
 ## Development
 
 ```bash
-# Build
-cargo build --workspace
-
-# Test
-cargo test --workspace
-
-# Lint
-cargo clippy -- -D warnings
-cargo fmt --check
+cargo build --workspace                          # build everything
+cargo test --workspace                           # all tests
+cargo bench -p sparrowdb-storage                 # benchmarks
+cargo run --bin gen-fixtures -- --seed 42 \
+  --out tests/fixtures/                          # regenerate datasets
+cargo clippy --all-targets -- -D warnings        # lint
+cargo fmt --all                                  # format
 ```
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for full setup instructions.
+See [DEVELOPMENT.md](DEVELOPMENT.md) for worktree workflow, TDD conventions, and CI pipeline details.
+
+---
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/getting-started.md](docs/getting-started.md) | Install, first run, compile from source |
+| [docs/api-reference.md](docs/api-reference.md) | `Engine` API, `QueryResult`, error handling |
+| [docs/cypher-reference.md](docs/cypher-reference.md) | Full Cypher support table with examples |
+| [docs/use-cases.md](docs/use-cases.md) | Concrete workloads and perf targets |
+| [DEVELOPMENT.md](DEVELOPMENT.md) | Contributor workflow, TDD, CI |
 
 ---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and discussions welcome. PRs require passing CI and golden fixtures for any new durable format.
+See [CONTRIBUTING.md](CONTRIBUTING.md). PRs require passing CI, clippy, and fmt.
+New durable formats require a committed golden binary fixture.
 
 ---
 
