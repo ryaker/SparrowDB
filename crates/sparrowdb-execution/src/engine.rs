@@ -941,7 +941,14 @@ impl Engine {
             // Apply WHERE clause.
             let var_name = node.var.as_str();
             if let Some(ref where_expr) = m.where_clause {
-                let row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                // Inject label metadata so labels(n) works in WHERE.
+                if !var_name.is_empty() && !label.is_empty() {
+                    row_vals.insert(
+                        format!("{}.__labels__", var_name),
+                        Value::List(vec![Value::String(label.clone())]),
+                    );
+                }
                 if !eval_where(where_expr, &row_vals) {
                     continue;
                 }
@@ -949,11 +956,18 @@ impl Engine {
 
             if use_agg {
                 // Build eval_expr-compatible map for aggregation path.
-                let row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                // Inject label metadata for aggregation.
+                if !var_name.is_empty() && !label.is_empty() {
+                    row_vals.insert(
+                        format!("{}.__labels__", var_name),
+                        Value::List(vec![Value::String(label.clone())]),
+                    );
+                }
                 raw_rows.push(row_vals);
             } else {
                 // Project RETURN columns directly (fast path).
-                let row = project_row(&props, column_names, &all_col_ids);
+                let row = project_row(&props, column_names, &all_col_ids, var_name, &label);
                 rows.push(row);
             }
         }
@@ -1089,6 +1103,26 @@ impl Engine {
                 if let Some(ref where_expr) = m.where_clause {
                     let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
                     row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
+                    // Inject relationship metadata so type(r) works in WHERE.
+                    if !rel_pat.var.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__type__", rel_pat.var),
+                            Value::String(rel_pat.rel_type.clone()),
+                        );
+                    }
+                    // Inject node label metadata so labels(n) works in WHERE.
+                    if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", src_node_pat.var),
+                            Value::List(vec![Value::String(src_label.clone())]),
+                        );
+                    }
+                    if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", dst_node_pat.var),
+                            Value::List(vec![Value::String(dst_label.clone())]),
+                        );
+                    }
                     if !eval_where(where_expr, &row_vals) {
                         continue;
                     }
@@ -1099,15 +1133,54 @@ impl Engine {
                         build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
                     row_vals
                         .extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
+                    // Inject relationship and label metadata for aggregate path.
+                    if !rel_pat.var.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__type__", rel_pat.var),
+                            Value::String(rel_pat.rel_type.clone()),
+                        );
+                    }
+                    if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", src_node_pat.var),
+                            Value::List(vec![Value::String(src_label.clone())]),
+                        );
+                    }
+                    if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", dst_node_pat.var),
+                            Value::List(vec![Value::String(dst_label.clone())]),
+                        );
+                    }
                     raw_rows.push(row_vals);
                 } else {
                     // Build result row.
+                    // For the fast-path projection, pass rel type and node labels
+                    // so columns like type(r) and labels(n) can be resolved.
+                    let rel_var_type = if !rel_pat.var.is_empty() {
+                        Some((rel_pat.var.as_str(), rel_pat.rel_type.as_str()))
+                    } else {
+                        None
+                    };
+                    let src_label_meta = if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                        Some((src_node_pat.var.as_str(), src_label.as_str()))
+                    } else {
+                        None
+                    };
+                    let dst_label_meta = if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
+                        Some((dst_node_pat.var.as_str(), dst_label.as_str()))
+                    } else {
+                        None
+                    };
                     let row = project_hop_row(
                         &src_props,
                         &dst_props,
                         column_names,
                         &src_node_pat.var,
                         &dst_node_pat.var,
+                        rel_var_type,
+                        src_label_meta,
+                        dst_label_meta,
                     );
                     rows.push(row);
                 }
@@ -1455,17 +1528,55 @@ impl Engine {
                     let mut row_vals =
                         build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
                     row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
+                    // Inject relationship metadata so type(r) works in WHERE.
+                    if !rel_pat.var.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__type__", rel_pat.var),
+                            Value::String(rel_pat.rel_type.clone()),
+                        );
+                    }
+                    // Inject node label metadata so labels(n) works in WHERE.
+                    if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", src_node_pat.var),
+                            Value::List(vec![Value::String(src_label.clone())]),
+                        );
+                    }
+                    if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", dst_node_pat.var),
+                            Value::List(vec![Value::String(dst_label.clone())]),
+                        );
+                    }
                     if !eval_where(where_expr, &row_vals) {
                         continue;
                     }
                 }
 
+                let rel_var_type = if !rel_pat.var.is_empty() {
+                    Some((rel_pat.var.as_str(), rel_pat.rel_type.as_str()))
+                } else {
+                    None
+                };
+                let src_label_meta = if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                    Some((src_node_pat.var.as_str(), src_label.as_str()))
+                } else {
+                    None
+                };
+                let dst_label_meta = if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
+                    Some((dst_node_pat.var.as_str(), dst_label.as_str()))
+                } else {
+                    None
+                };
                 let row = project_hop_row(
                     &src_props,
                     &dst_props,
                     column_names,
                     &src_node_pat.var,
                     &dst_node_pat.var,
+                    rel_var_type,
+                    src_label_meta,
+                    dst_label_meta,
                 );
                 rows.push(row);
             }
@@ -1928,6 +2039,22 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             Literal::Null => Value::Null,
         },
         Expr::FnCall { name, args } => {
+            // Special-case metadata functions that need direct row-map access.
+            // type(r) and labels(n) look up pre-inserted metadata keys rather
+            // than dispatching through the function library with evaluated args.
+            let name_lc = name.to_lowercase();
+            if name_lc == "type" {
+                if let Some(Expr::Var(var_name)) = args.first() {
+                    let meta_key = format!("{}.__type__", var_name);
+                    return vals.get(&meta_key).cloned().unwrap_or(Value::Null);
+                }
+            }
+            if name_lc == "labels" {
+                if let Some(Expr::Var(var_name)) = args.first() {
+                    let meta_key = format!("{}.__labels__", var_name);
+                    return vals.get(&meta_key).cloned().unwrap_or(Value::Null);
+                }
+            }
             // Evaluate each argument recursively, then dispatch to the function library.
             let evaluated: Vec<Value> = args.iter().map(|a| eval_expr(a, vals)).collect();
             crate::functions::dispatch_function(name, evaluated).unwrap_or(Value::Null)
@@ -2002,10 +2129,25 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
     }
 }
 
-fn project_row(props: &[(u32, u64)], column_names: &[String], _col_ids: &[u32]) -> Vec<Value> {
+fn project_row(
+    props: &[(u32, u64)],
+    column_names: &[String],
+    _col_ids: &[u32],
+    // Variable name for the scanned node (e.g. "n"), used for labels(n) columns.
+    var_name: &str,
+    // Primary label for the scanned node, used for labels(n) columns.
+    node_label: &str,
+) -> Vec<Value> {
     column_names
         .iter()
         .map(|col_name| {
+            // Handle labels(var) column.
+            if let Some(inner) = col_name.strip_prefix("labels(").and_then(|s| s.strip_suffix(')')) {
+                if inner == var_name && !node_label.is_empty() {
+                    return Value::List(vec![Value::String(node_label.to_string())]);
+                }
+                return Value::Null;
+            }
             let prop = col_name.split('.').next_back().unwrap_or(col_name.as_str());
             let col_id = prop_name_to_col_id(prop);
             props
@@ -2023,10 +2165,40 @@ fn project_hop_row(
     column_names: &[String],
     src_var: &str,
     _dst_var: &str,
+    // Optional (rel_var, rel_type) for resolving `type(rel_var)` columns.
+    rel_var_type: Option<(&str, &str)>,
+    // Optional (src_var, src_label) for resolving `labels(src_var)` columns.
+    src_label_meta: Option<(&str, &str)>,
+    // Optional (dst_var, dst_label) for resolving `labels(dst_var)` columns.
+    dst_label_meta: Option<(&str, &str)>,
 ) -> Vec<Value> {
     column_names
         .iter()
         .map(|col_name| {
+            // Handle metadata function calls: type(r) → "type(r)" column name.
+            if let Some(inner) = col_name.strip_prefix("type(").and_then(|s| s.strip_suffix(')')) {
+                // inner is the variable name, e.g. "r"
+                if let Some((rel_var, rel_type)) = rel_var_type {
+                    if inner == rel_var {
+                        return Value::String(rel_type.to_string());
+                    }
+                }
+                return Value::Null;
+            }
+            // Handle labels(n) → "labels(n)" column name.
+            if let Some(inner) = col_name.strip_prefix("labels(").and_then(|s| s.strip_suffix(')')) {
+                if let Some((meta_var, label)) = src_label_meta {
+                    if inner == meta_var {
+                        return Value::List(vec![Value::String(label.to_string())]);
+                    }
+                }
+                if let Some((meta_var, label)) = dst_label_meta {
+                    if inner == meta_var {
+                        return Value::List(vec![Value::String(label.to_string())]);
+                    }
+                }
+                return Value::Null;
+            }
             if let Some((v, prop)) = col_name.split_once('.') {
                 let col_id = prop_name_to_col_id(prop);
                 let props = if v == src_var { src_props } else { dst_props };
