@@ -59,7 +59,7 @@ impl<'a> SpillingHashJoin<'a> {
         SpillingHashJoin {
             csr,
             spill_threshold,
-            num_partitions,
+            num_partitions: num_partitions.max(1), // clamp to avoid divide-by-zero
         }
     }
 
@@ -260,5 +260,15 @@ mod tests {
         let spilling = SpillingHashJoin::new(&csr);
         let got = spilling.two_hop(0).unwrap();
         assert!(got.is_empty());
+    }
+
+    /// Passing `num_partitions = 0` must not panic (clamped to 1 internally).
+    #[test]
+    fn join_spill_zero_partitions_does_not_panic() {
+        let csr = CsrForward::build(3u64, &[(0u64, 1u64), (1u64, 2u64)]);
+        // threshold=0 forces the spill path; num_partitions=0 must be clamped to 1
+        let join = SpillingHashJoin::with_thresholds(&csr, 0, 0);
+        let result = join.two_hop(0).unwrap();
+        assert_eq!(result, vec![2]);
     }
 }

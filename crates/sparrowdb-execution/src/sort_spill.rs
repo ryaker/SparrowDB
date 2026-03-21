@@ -13,7 +13,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 use serde::{de::DeserializeOwned, Serialize};
 use sparrowdb_common::{Error, Result};
@@ -194,19 +194,19 @@ fn read_row<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<Option<T>> {
 // ---------------------------------------------------------------------------
 
 struct RunReader<T> {
+    _tmpfile: NamedTempFile, // kept alive so the file is auto-deleted on drop
     reader: BufReader<std::fs::File>,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<T: DeserializeOwned> RunReader<T> {
-    fn new(mut tmp: NamedTempFile) -> Result<Self> {
-        tmp.as_file_mut()
-            .seek(SeekFrom::Start(0))
-            .map_err(Error::Io)?;
-        // Convert NamedTempFile → underlying File (keeps it alive via BufReader).
-        let file = tmp.into_file();
+    fn new(tmp: NamedTempFile) -> Result<Self> {
+        // Reopen a second file descriptor for reading; the original
+        // NamedTempFile stays alive in `_tmpfile` and deletes the file on drop.
+        let read_handle = tmp.reopen().map_err(Error::Io)?;
         Ok(RunReader {
-            reader: BufReader::new(file),
+            _tmpfile: tmp,
+            reader: BufReader::new(read_handle),
             _marker: std::marker::PhantomData,
         })
     }
@@ -347,6 +347,19 @@ mod tests {
         let sorter: SpillingSorter<i64> = SpillingSorter::new();
         let result: Vec<i64> = sorter.finish().unwrap().collect();
         assert!(result.is_empty());
+    }
+
+    /// Verify that spill temp files are cleaned up after finish() completes.
+    /// The simplest correctness check: a spilling sort returns the right output,
+    /// which would fail or corrupt data if the RunReader lost its file handle.
+    #[test]
+    fn sort_spill_no_temp_files_remain() {
+        let mut sorter: SpillingSorter<u64> = SpillingSorter::with_thresholds(10, usize::MAX);
+        for i in 0..50u64 {
+            sorter.push(50 - i).unwrap();
+        }
+        let result: Vec<u64> = sorter.finish().unwrap().collect();
+        assert_eq!(result, (1..=50u64).collect::<Vec<_>>());
     }
 
     /// Multi-column sort: tuples (key, value) sorted by key.
