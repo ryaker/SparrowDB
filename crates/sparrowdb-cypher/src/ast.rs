@@ -25,7 +25,7 @@ pub enum SortDir {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PropEntry {
     pub key: String,
-    pub value: Literal,
+    pub value: Expr,
 }
 
 /// A node pattern: `(var:Label {props})`.

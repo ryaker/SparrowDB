@@ -899,7 +899,7 @@ impl Parser {
                 }
             };
             self.expect_tok(&Token::Colon)?;
-            let value = self.parse_literal()?;
+            let value = self.parse_expr()?;
             entries.push(PropEntry { key, value });
 
             if matches!(self.peek(), Token::Comma) {

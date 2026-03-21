@@ -345,12 +345,16 @@ impl Engine {
             };
 
             // Convert AST props to (col_id, StoreValue) pairs.
+            // Property values are full expressions (e.g. `datetime()`),
+            // evaluated with an empty binding map.
+            let empty_bindings: HashMap<String, Value> = HashMap::new();
             let props: Vec<(u32, StoreValue)> = node
                 .props
                 .iter()
                 .map(|entry| {
                     let col_id = prop_name_to_col_id(&entry.key);
-                    let store_val = literal_to_store_value(&entry.value);
+                    let val = eval_expr(&entry.value, &empty_bindings);
+                    let store_val = value_to_store_value(val);
                     (col_id, store_val)
                 })
                 .collect();
@@ -894,7 +898,9 @@ impl Engine {
             }
         }
 
-        let mut rows = Vec::new();
+        let use_agg = has_collect_in_return(&m.return_clause.items);
+        let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
+        let mut rows: Vec<Vec<Value>> = Vec::new();
 
         for slot in 0..hwm {
             let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
@@ -918,25 +924,35 @@ impl Engine {
             }
 
             // Apply WHERE clause.
+            let var_name = node.var.as_str();
             if let Some(ref where_expr) = m.where_clause {
-                let var_name = node.var.as_str();
                 let row_vals = build_row_vals(&props, var_name, &all_col_ids);
                 if !eval_where(where_expr, &row_vals) {
                     continue;
                 }
             }
 
-            // Project RETURN columns.
-            let row = project_row(&props, column_names, &all_col_ids);
-            rows.push(row);
+            if use_agg {
+                // Build eval_expr-compatible map for aggregation path.
+                let row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                raw_rows.push(row_vals);
+            } else {
+                // Project RETURN columns directly (fast path).
+                let row = project_row(&props, column_names, &all_col_ids);
+                rows.push(row);
+            }
         }
 
-        // ORDER BY
-        apply_order_by(&mut rows, m, column_names);
+        if use_agg {
+            rows = aggregate_rows(&raw_rows, &m.return_clause.items);
+        } else {
+            // ORDER BY
+            apply_order_by(&mut rows, m, column_names);
 
-        // LIMIT
-        if let Some(lim) = m.limit {
-            rows.truncate(lim as usize);
+            // LIMIT
+            if let Some(lim) = m.limit {
+                rows.truncate(lim as usize);
+            }
         }
 
         tracing::debug!(rows = rows.len(), "node scan complete");
@@ -974,7 +990,9 @@ impl Engine {
         let col_ids_src = collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
         let col_ids_dst = collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
 
-        let mut rows = Vec::new();
+        let use_agg = has_collect_in_return(&m.return_clause.items);
+        let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
+        let mut rows: Vec<Vec<Value>> = Vec::new();
 
         // Scan source nodes.
         for src_slot in 0..hwm_src {
@@ -1052,29 +1070,41 @@ impl Engine {
                     }
                 }
 
-                // Build result row.
-                let row = project_hop_row(
-                    &src_props,
-                    &dst_props,
-                    column_names,
-                    &src_node_pat.var,
-                    &dst_node_pat.var,
-                );
-                rows.push(row);
+                if use_agg {
+                    let mut row_vals =
+                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
+                    row_vals
+                        .extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
+                    raw_rows.push(row_vals);
+                } else {
+                    // Build result row.
+                    let row = project_hop_row(
+                        &src_props,
+                        &dst_props,
+                        column_names,
+                        &src_node_pat.var,
+                        &dst_node_pat.var,
+                    );
+                    rows.push(row);
+                }
             }
         }
 
-        // DISTINCT
-        if m.distinct {
-            deduplicate_rows(&mut rows);
-        }
+        if use_agg {
+            rows = aggregate_rows(&raw_rows, &m.return_clause.items);
+        } else {
+            // DISTINCT
+            if m.distinct {
+                deduplicate_rows(&mut rows);
+            }
 
-        // ORDER BY
-        apply_order_by(&mut rows, m, column_names);
+            // ORDER BY
+            apply_order_by(&mut rows, m, column_names);
 
-        // LIMIT
-        if let Some(lim) = m.limit {
-            rows.truncate(lim as usize);
+            // LIMIT
+            if let Some(lim) = m.limit {
+                rows.truncate(lim as usize);
+            }
         }
 
         tracing::debug!(rows = rows.len(), "one-hop traversal complete");
@@ -1258,18 +1288,21 @@ fn matches_prop_filter_static(
         let col_id = prop_name_to_col_id(&f.key);
         let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
 
-        let matches = match &f.value {
-            Literal::Int(n) => {
+        // Evaluate the filter expression (supports literals and function calls).
+        let empty_filter_bindings: HashMap<String, Value> = HashMap::new();
+        let filter_val = eval_expr(&f.value, &empty_filter_bindings);
+        let matches = match filter_val {
+            Value::Int64(n) => {
                 // Int64 values are stored with TAG_INT64 (0x00) in the top byte.
                 // Use StoreValue::to_u64() for canonical encoding (SPA-169).
-                stored_val == Some(StoreValue::Int64(*n).to_u64())
+                stored_val == Some(StoreValue::Int64(n).to_u64())
             }
-            Literal::String(s) => {
+            Value::String(s) => {
                 // Strings are stored with TAG_BYTES (0x01) in the top byte.
                 // Encode the literal the same way and compare (SPA-161, SPA-169).
-                stored_val == Some(string_to_raw_u64(s))
+                stored_val == Some(string_to_raw_u64(&s))
             }
-            Literal::Param(_) => true, // params always pass in current impl
+            Value::Null => true, // null filter passes (param-like behaviour)
             _ => false,
         };
         if !matches {
@@ -1389,6 +1422,17 @@ fn extract_return_column_names(items: &[ReturnItem]) -> Vec<String> {
             None => match &item.expr {
                 Expr::PropAccess { var, prop } => format!("{var}.{prop}"),
                 Expr::Var(v) => v.clone(),
+                Expr::FnCall { name, args } => {
+                    let arg_str = args
+                        .first()
+                        .map(|a| match a {
+                            Expr::PropAccess { var, prop } => format!("{var}.{prop}"),
+                            Expr::Var(v) => v.clone(),
+                            _ => "*".to_string(),
+                        })
+                        .unwrap_or_else(|| "*".to_string());
+                    format!("{}({})", name.to_lowercase(), arg_str)
+                }
                 _ => "?".to_string(),
             },
         })
@@ -1431,6 +1475,23 @@ fn literal_to_store_value(lit: &Literal) -> StoreValue {
         Literal::Float(f) => StoreValue::Int64(f64::to_bits(*f) as i64),
         Literal::Bool(b) => StoreValue::Int64(if *b { 1 } else { 0 }),
         Literal::Null | Literal::Param(_) => StoreValue::Int64(0),
+    }
+}
+
+/// Convert an evaluated `Value` to the `StoreValue` used by the node store.
+///
+/// Used when a node property value is an arbitrary expression (e.g.
+/// `datetime()`), rather than a bare literal.
+fn value_to_store_value(val: Value) -> StoreValue {
+    match val {
+        Value::Int64(n) => StoreValue::Int64(n),
+        Value::Float64(f) => StoreValue::Int64(f64::to_bits(f) as i64),
+        Value::Bool(b) => StoreValue::Int64(if b { 1 } else { 0 }),
+        Value::String(s) => StoreValue::Bytes(s.into_bytes()),
+        Value::Null => StoreValue::Int64(0),
+        Value::NodeRef(id) => StoreValue::Int64(id.0 as i64),
+        Value::EdgeRef(id) => StoreValue::Int64(id.0 as i64),
+        Value::List(_) => StoreValue::Int64(0),
     }
 }
 
@@ -1812,4 +1873,113 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::String(x), Value::String(y)) => x.cmp(y),
         _ => std::cmp::Ordering::Equal,
     }
+}
+
+// ── collect() aggregation ─────────────────────────────────────────────────────
+
+/// Returns `true` if any RETURN item contains a `collect()` aggregate call.
+fn has_collect_in_return(items: &[ReturnItem]) -> bool {
+    items.iter().any(|item| expr_has_collect(&item.expr))
+}
+
+fn expr_has_collect(expr: &Expr) -> bool {
+    matches!(expr, Expr::FnCall { name, .. } if name.to_lowercase() == "collect")
+}
+
+/// Aggregate a set of flat `HashMap<String, Value>` rows by evaluating RETURN
+/// items that contain `collect()`.
+///
+/// Non-aggregate RETURN items become the group key; `collect()` items accumulate
+/// a `Value::List` per group.  Returns one output `Vec<Value>` per unique key
+/// in the same column order as `return_items`.
+fn aggregate_rows(
+    rows: &[HashMap<String, Value>],
+    return_items: &[ReturnItem],
+) -> Vec<Vec<Value>> {
+    let key_indices: Vec<usize> = return_items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !expr_has_collect(&item.expr))
+        .map(|(i, _)| i)
+        .collect();
+
+    let collect_indices: Vec<usize> = return_items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| expr_has_collect(&item.expr))
+        .map(|(i, _)| i)
+        .collect();
+
+    // No collect() items — fall through to plain projection.
+    if collect_indices.is_empty() {
+        return rows
+            .iter()
+            .map(|row_vals| {
+                return_items
+                    .iter()
+                    .map(|item| eval_expr(&item.expr, row_vals))
+                    .collect()
+            })
+            .collect();
+    }
+
+    // Build groups preserving insertion order.
+    let mut group_keys: Vec<Vec<Value>> = Vec::new();
+    // [group_idx][collect_col_idx] → accumulated values
+    let mut group_collects: Vec<Vec<Vec<Value>>> = Vec::new();
+
+    for row_vals in rows {
+        let key: Vec<Value> = key_indices
+            .iter()
+            .map(|&i| eval_expr(&return_items[i].expr, row_vals))
+            .collect();
+
+        let group_idx = if let Some(pos) = group_keys.iter().position(|k| k == &key) {
+            pos
+        } else {
+            group_keys.push(key);
+            group_collects.push(vec![vec![]; collect_indices.len()]);
+            group_keys.len() - 1
+        };
+
+        for (ci, &ri) in collect_indices.iter().enumerate() {
+            let collect_arg_val = match &return_items[ri].expr {
+                Expr::FnCall { args, .. } if !args.is_empty() => eval_expr(&args[0], row_vals),
+                _ => Value::Null,
+            };
+            // Standard Cypher: collect() ignores nulls.
+            if !matches!(collect_arg_val, Value::Null) {
+                group_collects[group_idx][ci].push(collect_arg_val);
+            }
+        }
+    }
+
+    // No rows and only collect() columns → one row with an empty list.
+    if group_keys.is_empty() && key_indices.is_empty() {
+        return vec![return_items.iter().map(|_| Value::List(vec![])).collect()];
+    }
+
+    // No rows and there are grouping keys → no output rows.
+    if group_keys.is_empty() {
+        return vec![];
+    }
+
+    // Assemble output rows — one per group.
+    let mut out: Vec<Vec<Value>> = Vec::with_capacity(group_keys.len());
+    for (gi, key_vals) in group_keys.into_iter().enumerate() {
+        let mut output_row: Vec<Value> = Vec::with_capacity(return_items.len());
+        let mut ki = 0usize;
+        let mut ci = 0usize;
+        for item in return_items.iter() {
+            if expr_has_collect(&item.expr) {
+                output_row.push(Value::List(group_collects[gi][ci].clone()));
+                ci += 1;
+            } else {
+                output_row.push(key_vals[ki].clone());
+                ki += 1;
+            }
+        }
+        out.push(output_row);
+    }
+    out
 }

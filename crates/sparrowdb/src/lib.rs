@@ -343,7 +343,7 @@ impl GraphDb {
         let props: HashMap<String, Value> = m
             .props
             .iter()
-            .map(|pe| (pe.key.clone(), literal_to_value(&pe.value)))
+            .map(|pe| (pe.key.clone(), expr_to_value(&pe.value)))
             .collect();
         let mut tx = self.begin_write()?;
         tx.merge_node(&m.label, props)?;
