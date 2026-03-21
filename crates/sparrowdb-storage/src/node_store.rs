@@ -249,6 +249,61 @@ impl NodeStore {
             .map_err(Error::Io)
     }
 
+    /// Write or create a column value for a node, creating and zero-padding the
+    /// column file if it does not yet exist.
+    ///
+    /// Unlike [`set_node_col`], this method creates the column file and fills all
+    /// slots from 0 to `slot - 1` with zeros before writing the target value.
+    /// This supports adding new property columns to existing nodes (Phase 7
+    /// `set_property` semantics).
+    pub fn upsert_node_col(&self, node_id: NodeId, col_id: u32, value: &Value) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let label_id = (node_id.0 >> 32) as u32;
+        let slot = (node_id.0 & 0xFFFF_FFFF) as u32;
+        let path = self.col_path(label_id, col_id);
+
+        // Ensure parent directory exists.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(Error::Io)?;
+        }
+
+        // Open the file (create if absent), then pad with zeros up to and
+        // including the target slot, and finally seek back to write the value.
+        // We must NOT truncate: we only update a specific slot, not the whole file.
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(Error::Io)?;
+
+        // How many bytes are already in the file?
+        let existing_len = file.seek(SeekFrom::End(0)).map_err(Error::Io)?;
+        let needed_len = (slot as u64 + 1) * 8;
+        if existing_len < needed_len {
+            // Extend file with zeros from existing_len to needed_len.
+            // Write in fixed-size chunks to avoid a single large allocation
+            // that could OOM when the node slot ID is very high.
+            file.seek(SeekFrom::Start(existing_len))
+                .map_err(Error::Io)?;
+            const CHUNK: usize = 65536; // 64 KiB
+            let zeros = [0u8; CHUNK];
+            let mut remaining = (needed_len - existing_len) as usize;
+            while remaining > 0 {
+                let n = remaining.min(CHUNK);
+                file.write_all(&zeros[..n]).map_err(Error::Io)?;
+                remaining -= n;
+            }
+        }
+
+        // Seek to target slot and overwrite.
+        file.seek(SeekFrom::Start(slot as u64 * 8))
+            .map_err(Error::Io)?;
+        file.write_all(&value.to_u64().to_le_bytes())
+            .map_err(Error::Io)
+    }
+
     /// Retrieve all stored properties of a node.
     ///
     /// Returns `(col_id, raw_u64)` pairs in the order the columns were defined.

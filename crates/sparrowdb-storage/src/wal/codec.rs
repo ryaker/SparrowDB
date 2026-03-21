@@ -37,6 +37,14 @@ pub enum WalRecordKind {
     CheckpointBegin = 0x05,
     /// End a checkpoint.
     CheckpointEnd = 0x06,
+    /// Create a new node (Phase 7 mutation).
+    NodeCreate = 0x10,
+    /// Update a node property (Phase 7 mutation).
+    NodeUpdate = 0x11,
+    /// Delete a node (Phase 7 mutation).
+    NodeDelete = 0x12,
+    /// Create a new edge (Phase 7 mutation).
+    EdgeCreate = 0x13,
 }
 
 impl WalRecordKind {
@@ -48,6 +56,10 @@ impl WalRecordKind {
             0x04 => Ok(Self::Abort),
             0x05 => Ok(Self::CheckpointBegin),
             0x06 => Ok(Self::CheckpointEnd),
+            0x10 => Ok(Self::NodeCreate),
+            0x11 => Ok(Self::NodeUpdate),
+            0x12 => Ok(Self::NodeDelete),
+            0x13 => Ok(Self::EdgeCreate),
             other => Err(Error::Corruption(format!(
                 "unknown WAL record kind: {other:#x}"
             ))),
@@ -60,6 +72,12 @@ impl WalRecordKind {
 }
 
 // ── Payload ──────────────────────────────────────────────────────────────────
+
+/// A (key, value) property pair serialised for WAL records.
+///
+/// The value is stored as raw bytes (currently the little-endian `u64`
+/// representation of `node_store::Value::to_u64()`).
+pub type WalProp = (String, Vec<u8>);
 
 /// Type-specific payload carried inside a WAL record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +98,112 @@ pub enum WalPayload {
     /// so the codec writes them verbatim.  The replayer decrypts them and
     /// calls `WalPayload::decode_raw()` to recover the structured payload.
     Raw(Vec<u8>),
+    /// Phase 7 — node was created.
+    NodeCreate {
+        node_id: u64,
+        label_id: u32,
+        props: Vec<WalProp>,
+    },
+    /// Phase 7 — a single property on a node was updated.
+    NodeUpdate {
+        node_id: u64,
+        key: String,
+        col_id: u32,
+        before: Vec<u8>,
+        after: Vec<u8>,
+    },
+    /// Phase 7 — a node was deleted.
+    NodeDelete { node_id: u64 },
+    /// Phase 7 — an edge was created.
+    EdgeCreate {
+        edge_id: u64,
+        src: u64,
+        dst: u64,
+        rel_type: String,
+        props: Vec<WalProp>,
+    },
+}
+
+// ── Payload encoding helpers ──────────────────────────────────────────────────
+
+/// Encode a `Vec<WalProp>` into a length-prefixed byte sequence.
+///
+/// Format: `[count: u32 LE]` followed by for each prop:
+///   `[key_len: u32 LE][key bytes][val_len: u32 LE][val bytes]`
+fn encode_props(props: &[WalProp]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(props.len() as u32).to_le_bytes());
+    for (key, val) in props {
+        let kb = key.as_bytes();
+        buf.extend_from_slice(&(kb.len() as u32).to_le_bytes());
+        buf.extend_from_slice(kb);
+        buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
+        buf.extend_from_slice(val);
+    }
+    buf
+}
+
+/// Decode a `Vec<WalProp>` from `bytes` starting at `offset`.
+///
+/// Returns `(props, bytes_consumed)`.
+fn decode_props(bytes: &[u8], offset: usize) -> Result<(Vec<WalProp>, usize)> {
+    let mut pos = offset;
+    if bytes.len() < pos + 4 {
+        return Err(Error::Corruption("props count truncated".into()));
+    }
+    let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let mut props = Vec::with_capacity(count);
+    for _ in 0..count {
+        if bytes.len() < pos + 4 {
+            return Err(Error::Corruption("prop key_len truncated".into()));
+        }
+        let key_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if bytes.len() < pos + key_len {
+            return Err(Error::Corruption("prop key truncated".into()));
+        }
+        let key = String::from_utf8(bytes[pos..pos + key_len].to_vec())
+            .map_err(|_| Error::Corruption("prop key not UTF-8".into()))?;
+        pos += key_len;
+        if bytes.len() < pos + 4 {
+            return Err(Error::Corruption("prop val_len truncated".into()));
+        }
+        let val_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if bytes.len() < pos + val_len {
+            return Err(Error::Corruption("prop val truncated".into()));
+        }
+        let val = bytes[pos..pos + val_len].to_vec();
+        pos += val_len;
+        props.push((key, val));
+    }
+    Ok((props, pos - offset))
+}
+
+/// Encode a length-prefixed string.
+fn encode_str(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut buf = Vec::with_capacity(4 + b.len());
+    buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    buf.extend_from_slice(b);
+    buf
+}
+
+/// Decode a length-prefixed string from `bytes[offset..]`.
+///
+/// Returns `(string, bytes_consumed)`.
+fn decode_str(bytes: &[u8], offset: usize) -> Result<(String, usize)> {
+    if bytes.len() < offset + 4 {
+        return Err(Error::Corruption("string length truncated".into()));
+    }
+    let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+    if bytes.len() < offset + 4 + len {
+        return Err(Error::Corruption("string data truncated".into()));
+    }
+    let s = String::from_utf8(bytes[offset + 4..offset + 4 + len].to_vec())
+        .map_err(|_| Error::Corruption("string not UTF-8".into()))?;
+    Ok((s, 4 + len))
 }
 
 impl WalPayload {
@@ -96,6 +220,50 @@ impl WalPayload {
             }
             // Raw bytes are already in their final on-disk form.
             WalPayload::Raw(bytes) => bytes.clone(),
+            WalPayload::NodeCreate {
+                node_id,
+                label_id,
+                props,
+            } => {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&node_id.to_le_bytes());
+                buf.extend_from_slice(&label_id.to_le_bytes());
+                buf.extend_from_slice(&encode_props(props));
+                buf
+            }
+            WalPayload::NodeUpdate {
+                node_id,
+                key,
+                col_id,
+                before,
+                after,
+            } => {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&node_id.to_le_bytes());
+                buf.extend_from_slice(&col_id.to_le_bytes());
+                buf.extend_from_slice(&encode_str(key));
+                buf.extend_from_slice(&(before.len() as u32).to_le_bytes());
+                buf.extend_from_slice(before);
+                buf.extend_from_slice(&(after.len() as u32).to_le_bytes());
+                buf.extend_from_slice(after);
+                buf
+            }
+            WalPayload::NodeDelete { node_id } => node_id.to_le_bytes().to_vec(),
+            WalPayload::EdgeCreate {
+                edge_id,
+                src,
+                dst,
+                rel_type,
+                props,
+            } => {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&edge_id.to_le_bytes());
+                buf.extend_from_slice(&src.to_le_bytes());
+                buf.extend_from_slice(&dst.to_le_bytes());
+                buf.extend_from_slice(&encode_str(rel_type));
+                buf.extend_from_slice(&encode_props(props));
+                buf
+            }
         }
     }
 
@@ -106,6 +274,8 @@ impl WalPayload {
     /// it returns `Empty`.  For Write records it returns `Raw(bytes)` so that
     /// the replayer can optionally decrypt the bytes first (P6-3) and then call
     /// [`decode_plaintext`] to get the structured `Write { page_id, image }`.
+    /// For mutation records (NodeCreate, NodeUpdate, NodeDelete, EdgeCreate) the
+    /// bytes are decoded inline and the structured variant is returned directly.
     pub fn decode(kind: WalRecordKind, bytes: &[u8]) -> Result<Self> {
         match kind {
             WalRecordKind::Begin
@@ -127,10 +297,15 @@ impl WalPayload {
                 // then call decode_plaintext to get the Write variant.
                 Ok(WalPayload::Raw(bytes.to_vec()))
             }
+            // Mutation records: decode inline (not encrypted).
+            WalRecordKind::NodeCreate
+            | WalRecordKind::NodeUpdate
+            | WalRecordKind::NodeDelete
+            | WalRecordKind::EdgeCreate => Self::decode_plaintext(kind, bytes),
         }
     }
 
-    /// Decode a plaintext Write payload from raw bytes.
+    /// Decode a plaintext payload from raw bytes.
     ///
     /// Called by the replayer after optional decryption.
     /// Returns `Err(Corruption)` if the bytes do not match the expected layout.
@@ -164,6 +339,83 @@ impl WalPayload {
                 }
                 let image = bytes[12..12 + image_len].to_vec();
                 Ok(WalPayload::Write { page_id, image })
+            }
+            WalRecordKind::NodeCreate => {
+                // node_id(8) + label_id(4) + props(variable)
+                if bytes.len() < 12 {
+                    return Err(Error::Corruption("NodeCreate payload too short".into()));
+                }
+                let node_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let label_id = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                let (props, _consumed) = decode_props(bytes, 12)?;
+                Ok(WalPayload::NodeCreate {
+                    node_id,
+                    label_id,
+                    props,
+                })
+            }
+            WalRecordKind::NodeUpdate => {
+                // node_id(8) + col_id(4) + key(variable) + before(variable) + after(variable)
+                if bytes.len() < 12 {
+                    return Err(Error::Corruption("NodeUpdate payload too short".into()));
+                }
+                let node_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let col_id = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                let (key, kconsumed) = decode_str(bytes, 12)?;
+                let mut pos = 12 + kconsumed;
+                if bytes.len() < pos + 4 {
+                    return Err(Error::Corruption("NodeUpdate before_len truncated".into()));
+                }
+                let before_len =
+                    u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                if bytes.len() < pos + before_len {
+                    return Err(Error::Corruption("NodeUpdate before truncated".into()));
+                }
+                let before = bytes[pos..pos + before_len].to_vec();
+                pos += before_len;
+                if bytes.len() < pos + 4 {
+                    return Err(Error::Corruption("NodeUpdate after_len truncated".into()));
+                }
+                let after_len =
+                    u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                if bytes.len() < pos + after_len {
+                    return Err(Error::Corruption("NodeUpdate after truncated".into()));
+                }
+                let after = bytes[pos..pos + after_len].to_vec();
+                Ok(WalPayload::NodeUpdate {
+                    node_id,
+                    key,
+                    col_id,
+                    before,
+                    after,
+                })
+            }
+            WalRecordKind::NodeDelete => {
+                if bytes.len() < 8 {
+                    return Err(Error::Corruption("NodeDelete payload too short".into()));
+                }
+                let node_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                Ok(WalPayload::NodeDelete { node_id })
+            }
+            WalRecordKind::EdgeCreate => {
+                // edge_id(8) + src(8) + dst(8) + rel_type(variable) + props(variable)
+                if bytes.len() < 24 {
+                    return Err(Error::Corruption("EdgeCreate payload too short".into()));
+                }
+                let edge_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let src = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                let dst = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+                let (rel_type, rconsumed) = decode_str(bytes, 24)?;
+                let (props, _pconsumed) = decode_props(bytes, 24 + rconsumed)?;
+                Ok(WalPayload::EdgeCreate {
+                    edge_id,
+                    src,
+                    dst,
+                    rel_type,
+                    props,
+                })
             }
         }
     }

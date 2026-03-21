@@ -39,6 +39,16 @@ pub enum Error {
     /// database was opened with the wrong encryption key (distinct from a
     /// generic checksum error so callers can present a clear "wrong key" message).
     EncryptionAuthFailed,
+    /// Two concurrent write transactions both modified the same node.
+    ///
+    /// The transaction that committed second is aborted to maintain consistency.
+    WriteWriteConflict {
+        node_id: u64,
+    },
+    /// The node has attached edges and cannot be deleted without removing them first.
+    NodeHasEdges {
+        node_id: u64,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -59,6 +69,14 @@ impl std::fmt::Display for Error {
             Error::EncryptionAuthFailed => write!(
                 f,
                 "encryption authentication failed: wrong key or corrupted ciphertext"
+            ),
+            Error::WriteWriteConflict { node_id } => write!(
+                f,
+                "write-write conflict on node {node_id}: another transaction modified this node"
+            ),
+            Error::NodeHasEdges { node_id } => write!(
+                f,
+                "node {node_id} has attached edges and cannot be deleted without removing them first"
             ),
         }
     }
