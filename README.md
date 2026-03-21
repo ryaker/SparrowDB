@@ -29,11 +29,11 @@ It runs Cypher queries over a durable on-disk graph using a factorized execution
 | 5 | SWMR transactions, snapshot isolation, CHECKPOINT/OPTIMIZE | ✅ Done |
 | 6 | XChaCha20-Poly1305 encryption, WAL payload encryption, golden fixtures | ✅ Done |
 | infra | Criterion benchmarks + deterministic fixture generator | ✅ Done |
-| 6 (cont.) | Spill-to-disk (sort + ASP-Join), Python bindings, CLI, MCP server | 🔄 In Progress |
-| 7 | Mutation Cypher: MERGE, SET, DELETE, CREATE edge, MVCC conflicts | 🔄 In Progress |
-| 8–11 | Full Cypher, UNWIND, paths, functions, LDBC SNB, publication | ⏳ Planned |
+| 6 (cont.) | Spill-to-disk (ORDER BY + ASP-Join), PyO3 Python bindings, CLI + MCP server | ✅ Done |
+| 7 | Mutation Cypher: MERGE, SET, DELETE, CREATE edge, WAL records, MVCC | 🔄 In Review |
+| 8–11 | UNWIND, variable paths, function library, LDBC SNB, Neo4j import, publication | ⏳ Planned |
 
-Acceptance checks passing: 1-hop scan, 2-hop ASP-Join, WAL crash recovery, CHECKPOINT/OPTIMIZE, snapshot isolation, encryption auth.
+Acceptance checks passing: 1-hop scan, 2-hop ASP-Join, WAL crash recovery, CHECKPOINT/OPTIMIZE, snapshot isolation, encryption auth, spill-to-disk sort + join, Python binding round-trip.
 
 ---
 
