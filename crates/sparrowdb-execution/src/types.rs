@@ -121,7 +121,13 @@ impl VectorGroup {
 
     /// Get value at row index from column `name`.
     pub fn get_value(&self, col: &str, row: usize) -> Option<Value> {
-        self.columns.get(col).map(|v| v.get(row))
+        self.columns.get(col).and_then(|v| {
+            if row < v.len() {
+                Some(v.get(row))
+            } else {
+                None
+            }
+        })
     }
 
     /// Logical row count (len * multiplicity).

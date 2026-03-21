@@ -201,6 +201,15 @@ impl Engine {
                     continue;
                 }
 
+                // Apply WHERE clause.
+                if let Some(ref where_expr) = m.where_clause {
+                    let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
+                    row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
+                    if !eval_where(where_expr, &row_vals) {
+                        continue;
+                    }
+                }
+
                 // Build result row.
                 let row = project_hop_row(
                     &src_props,
@@ -441,6 +450,12 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
                 BinOpKind::Eq => lv == rv,
                 BinOpKind::Neq => lv != rv,
                 BinOpKind::Contains => lv.contains(&rv),
+                BinOpKind::StartsWith => {
+                    matches!((&lv, &rv), (Value::String(l), Value::String(r)) if l.starts_with(r.as_str()))
+                }
+                BinOpKind::EndsWith => {
+                    matches!((&lv, &rv), (Value::String(l), Value::String(r)) if l.ends_with(r.as_str()))
+                }
                 BinOpKind::Lt => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => a < b,
                     _ => false,

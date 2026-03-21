@@ -364,11 +364,13 @@ impl<'a, O: Operator> Operator for Expand<'a, O> {
                             .map(|&nb_slot| NodeId((label_id << 32) | nb_slot))
                             .collect();
 
+                        let n = dst_nodes.len();
                         let mut new_group = VectorGroup::new(group.multiplicity);
-                        // Carry forward the src node as a single-element group.
+                        // Repeat the source node N times to match the destination vector length,
+                        // preserving the VectorGroup invariant that all columns have equal length.
                         new_group.add_column(
                             self.src_col.clone(),
-                            TypedVector::NodeRef(vec![*src_node]),
+                            TypedVector::NodeRef(vec![*src_node; n]),
                         );
                         new_group.add_column(self.dst_col.clone(), TypedVector::NodeRef(dst_nodes));
                         out.push_group(new_group);
