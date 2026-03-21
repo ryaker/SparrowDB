@@ -28,12 +28,15 @@
 //! ```
 
 use sparrowdb_catalog::catalog::Catalog;
-use sparrowdb_common::{Error, NodeId, Result, TxnId};
+use sparrowdb_common::{EdgeId, Error, NodeId, Result, TxnId};
 use sparrowdb_execution::{Engine, QueryResult};
 use sparrowdb_storage::csr::CsrForward;
+use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
 use sparrowdb_storage::maintenance::MaintenanceEngine;
 use sparrowdb_storage::node_store::{NodeStore, Value};
-use std::collections::HashMap;
+use sparrowdb_storage::wal::codec::{WalPayload, WalRecordKind};
+use sparrowdb_storage::wal::writer::WalWriter;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -114,6 +117,54 @@ struct WriteBuffer {
     updates: HashMap<VersionKey, StagedUpdate>,
 }
 
+// ── WAL mutation log entries ──────────────────────────────────────────────────
+
+/// A mutation staged in a `WriteTx` for WAL emission at commit time.
+enum WalMutation {
+    /// A node was created (SPA-123, SPA-127).
+    NodeCreate {
+        node_id: NodeId,
+        label_id: u32,
+        props: Vec<(u32, Value)>,
+    },
+    /// A named property was updated (SPA-124, SPA-127).
+    NodeUpdate {
+        node_id: NodeId,
+        key: String,
+        col_id: u32,
+        before: Vec<u8>,
+        after: Vec<u8>,
+    },
+    /// A node was deleted (SPA-125, SPA-127).
+    NodeDelete { node_id: NodeId },
+    /// An edge was created (SPA-126, SPA-127).
+    EdgeCreate {
+        edge_id: EdgeId,
+        src: NodeId,
+        dst: NodeId,
+        rel_type: String,
+    },
+}
+
+// ── Node version tracker (for MVCC conflict detection, SPA-128) ───────────────
+
+/// Tracks the `txn_id` of the last committed write to each node.
+#[derive(Default)]
+struct NodeVersions {
+    /// `node_id.0 → last_committed_txn_id`.
+    map: HashMap<u64, u64>,
+}
+
+impl NodeVersions {
+    fn set(&mut self, node_id: NodeId, txn_id: u64) {
+        self.map.insert(node_id.0, txn_id);
+    }
+
+    fn get(&self, node_id: NodeId) -> u64 {
+        self.map.get(&node_id.0).copied().unwrap_or(0)
+    }
+}
+
 // ── Shared inner state ────────────────────────────────────────────────────────
 
 struct DbInner {
@@ -125,6 +176,8 @@ struct DbInner {
     write_lock: Mutex<()>,
     /// MVCC version chains for property updates (snapshot-isolation support).
     versions: RwLock<VersionStore>,
+    /// Per-node last-committed txn_id (write-write conflict detection, SPA-128).
+    node_versions: RwLock<NodeVersions>,
 }
 
 // ── GraphDb ───────────────────────────────────────────────────────────────────
@@ -148,6 +201,7 @@ impl GraphDb {
                 current_txn_id: AtomicU64::new(0),
                 write_lock: Mutex::new(()),
                 versions: RwLock::new(VersionStore::default()),
+                node_versions: RwLock::new(NodeVersions::default()),
             }),
         })
     }
@@ -182,6 +236,7 @@ impl GraphDb {
             }
             Err(_) => return Err(Error::WriterBusy),
         };
+        let snapshot_txn_id = self.inner.current_txn_id.load(Ordering::Acquire);
         let store = NodeStore::open(&self.inner.path)?;
         let catalog = Catalog::open(&self.inner.path)?;
         Ok(WriteTx {
@@ -189,6 +244,9 @@ impl GraphDb {
             store,
             catalog,
             write_buf: WriteBuffer::default(),
+            wal_mutations: Vec::new(),
+            dirty_nodes: HashSet::new(),
+            snapshot_txn_id,
             _guard: guard,
             committed: false,
         })
@@ -299,17 +357,32 @@ pub struct WriteTx<'db> {
     catalog: Catalog,
     /// Staged property updates (not yet visible to readers).
     write_buf: WriteBuffer,
+    /// Staged WAL mutation records to emit on commit.
+    wal_mutations: Vec<WalMutation>,
+    /// Set of node IDs written by this transaction (for MVCC conflict detection).
+    dirty_nodes: HashSet<u64>,
+    /// The committed txn_id at the time this WriteTx was opened (MVCC snapshot).
+    snapshot_txn_id: u64,
     /// Held for the lifetime of this WriteTx; released on drop.
     _guard: MutexGuard<'db, ()>,
     committed: bool,
 }
 
 impl<'db> WriteTx<'db> {
+    // ── Core node/property API (pre-Phase 7) ─────────────────────────────────
+
     /// Create a new node under `label_id` with the given properties.
     ///
     /// Returns the packed [`NodeId`].
     pub fn create_node(&mut self, label_id: u32, props: &[(u32, Value)]) -> Result<NodeId> {
-        self.store.create_node(label_id, props)
+        let node_id = self.store.create_node(label_id, props)?;
+        self.dirty_nodes.insert(node_id.0);
+        self.wal_mutations.push(WalMutation::NodeCreate {
+            node_id,
+            label_id,
+            props: props.to_vec(),
+        });
+        Ok(node_id)
     }
 
     /// Stage a property update.
@@ -322,6 +395,8 @@ impl<'db> WriteTx<'db> {
     /// correct value after commit overwrites the column file.
     pub fn set_node_col(&mut self, node_id: NodeId, col_id: u32, value: Value) {
         let key = (node_id.0, col_id);
+        self.dirty_nodes.insert(node_id.0);
+
         if self.write_buf.updates.contains_key(&key) {
             // Already staged this key — just update the new_value.
             self.write_buf.updates.get_mut(&key).unwrap().new_value = value;
@@ -367,40 +442,238 @@ impl<'db> WriteTx<'db> {
         self.catalog.create_label(name)
     }
 
+    // ── Phase 7 mutation API (SPA-123 … SPA-126) ─────────────────────────────
+
+    /// SPA-123: Find or create a node matching `label` + `props`.
+    ///
+    /// Scans the node store for a slot whose columns match every key→value
+    /// pair in `props` (using [`fnv1a_col_id`] to derive column IDs from
+    /// key strings).  Returns the existing [`NodeId`] if found, or creates a
+    /// new node and returns the new id.
+    ///
+    /// The label is resolved (or created) in the catalog.
+    pub fn merge_node(&mut self, label: &str, props: HashMap<String, Value>) -> Result<NodeId> {
+        // Resolve / create label.
+        let label_id: u32 = match self.catalog.get_label(label)? {
+            Some(id) => id as u32,
+            None => self.catalog.create_label(label)? as u32,
+        };
+
+        // Build col list from props keys.
+        let col_kv: Vec<(String, u32, Value)> = props
+            .into_iter()
+            .map(|(k, v)| {
+                let col_id = fnv1a_col_id(&k);
+                (k, col_id, v)
+            })
+            .collect();
+        let col_ids: Vec<u32> = col_kv.iter().map(|&(_, col_id, _)| col_id).collect();
+
+        // Scan existing slots for a match.
+        let hwm = self.store.hwm_for_label(label_id)?;
+        for slot in 0..hwm {
+            let candidate = NodeId((label_id as u64) << 32 | slot);
+            if let Ok(stored) = self.store.get_node_raw(candidate, &col_ids) {
+                let matches = col_kv.iter().all(|(_, col_id, want_val)| {
+                    stored
+                        .iter()
+                        .find(|&&(c, _)| c == *col_id)
+                        .map(|&(_, raw)| raw == want_val.to_u64())
+                        .unwrap_or(false)
+                });
+                if matches {
+                    return Ok(candidate);
+                }
+            }
+        }
+
+        // Not found — create a new node.
+        let disk_props: Vec<(u32, Value)> = col_kv
+            .iter()
+            .map(|(_, col_id, v)| (*col_id, v.clone()))
+            .collect();
+        let node_id = self.store.create_node(label_id, &disk_props)?;
+        self.dirty_nodes.insert(node_id.0);
+        self.wal_mutations.push(WalMutation::NodeCreate {
+            node_id,
+            label_id,
+            props: disk_props,
+        });
+        Ok(node_id)
+    }
+
+    /// SPA-124: Update a named property on a node.
+    ///
+    /// Derives a stable column ID from `key` via [`fnv1a_col_id`], reads the
+    /// current on-disk value as the WAL before-image, then stages the update
+    /// through [`set_node_col`].  A `NodeUpdate` WAL record is queued for
+    /// emission at commit time.
+    pub fn set_property(&mut self, node_id: NodeId, key: &str, val: Value) -> Result<()> {
+        let col_id = fnv1a_col_id(key);
+        self.dirty_nodes.insert(node_id.0);
+
+        // Capture before-image for WAL (raw bytes).
+        let before_raw = self
+            .store
+            .get_node_raw(node_id, &[col_id])
+            .ok()
+            .and_then(|mut v| v.pop())
+            .map(|(_, raw)| raw)
+            .unwrap_or(0u64);
+        let before_bytes = before_raw.to_le_bytes().to_vec();
+        let after_bytes = val.to_u64().to_le_bytes().to_vec();
+
+        // Stage the update through the write buffer (handles version chain).
+        self.set_node_col(node_id, col_id, val);
+
+        // Queue WAL NodeUpdate record.
+        self.wal_mutations.push(WalMutation::NodeUpdate {
+            node_id,
+            key: key.to_string(),
+            col_id,
+            before: before_bytes,
+            after: after_bytes,
+        });
+
+        Ok(())
+    }
+
+    /// SPA-125: Delete a node, with edge-attachment check.
+    ///
+    /// Returns [`Error::NodeHasEdges`] if the node is referenced by any edge
+    /// in the delta log.  On success, tombstones col_0 of the node's slot
+    /// with `u64::MAX` (a sentinel that callers must treat as "deleted") and
+    /// queues a `NodeDelete` WAL record.
+    pub fn delete_node(&mut self, node_id: NodeId) -> Result<()> {
+        // Check delta log for attached edges.
+        let delta = EdgeStore::open(&self.inner.path, RelTableId(0))
+            .and_then(|s| s.read_delta())
+            .unwrap_or_default();
+        if delta.iter().any(|r| r.src == node_id || r.dst == node_id) {
+            return Err(Error::NodeHasEdges { node_id: node_id.0 });
+        }
+
+        // Tombstone col_0 with sentinel `u64::MAX`.
+        let label_id = (node_id.0 >> 32) as u32;
+        let slot = (node_id.0 & 0xFFFF_FFFF) as u32;
+        let col0 = self
+            .inner
+            .path
+            .join("nodes")
+            .join(label_id.to_string())
+            .join("col_0.bin");
+        if col0.exists() {
+            use std::io::{Seek, SeekFrom, Write};
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&col0) {
+                let _ = f.seek(SeekFrom::Start(slot as u64 * 8));
+                let _ = f.write_all(&u64::MAX.to_le_bytes());
+            }
+        }
+
+        self.dirty_nodes.insert(node_id.0);
+        self.wal_mutations.push(WalMutation::NodeDelete { node_id });
+        Ok(())
+    }
+
+    /// SPA-126: Create a directed edge `src → dst` with the given type.
+    ///
+    /// Appends to the edge delta log and queues an `EdgeCreate` WAL record.
+    /// Returns the new [`EdgeId`].
+    pub fn create_edge(
+        &mut self,
+        src: NodeId,
+        dst: NodeId,
+        rel_type: &str,
+        _props: HashMap<String, Value>,
+    ) -> Result<EdgeId> {
+        let mut es = EdgeStore::open(&self.inner.path, RelTableId(0))?;
+        let edge_id = es.create_edge(src, RelTableId(0), dst)?;
+        self.wal_mutations.push(WalMutation::EdgeCreate {
+            edge_id,
+            src,
+            dst,
+            rel_type: rel_type.to_string(),
+        });
+        Ok(edge_id)
+    }
+
+    // ── MVCC conflict detection (SPA-128) ────────────────────────────────────
+
+    /// Check for write-write conflicts before committing.
+    ///
+    /// A conflict is detected when another `WriteTx` has committed a change
+    /// to a node that this transaction also dirtied, at a `txn_id` greater
+    /// than our snapshot.
+    fn detect_conflicts(&self) -> Result<()> {
+        let nv = self.inner.node_versions.read().expect("node_versions lock");
+        for &raw in &self.dirty_nodes {
+            let last_write = nv.get(NodeId(raw));
+            if last_write > self.snapshot_txn_id {
+                return Err(Error::WriteWriteConflict { node_id: raw });
+            }
+        }
+        Ok(())
+    }
+
+    // ── Commit ───────────────────────────────────────────────────────────────
+
     /// Commit the transaction.
     ///
-    /// 1. Flushes all staged `set_node_col` updates to disk.
-    /// 2. Records before-images (if any) in the version chain at the previous
-    ///    `txn_id`, preserving snapshot access for currently-open readers.
-    /// 3. Atomically increments the global `current_txn_id`.
-    /// 4. Records the new values in the version chain at the new `txn_id`.
+    /// 1. Detects write-write conflicts (SPA-128).
+    /// 2. Flushes all staged `set_node_col` updates to disk.
+    /// 3. Records before-images in the version chain at the previous `txn_id`,
+    ///    preserving snapshot access for currently-open readers.
+    /// 4. Atomically increments the global `current_txn_id`.
+    /// 5. Records the new values in the version chain at the new `txn_id`.
+    /// 6. Updates per-node version table for future conflict detection.
+    /// 7. Appends WAL records for all mutations (SPA-127).
     pub fn commit(mut self) -> Result<TxnId> {
+        // Step 1: MVCC conflict abort (SPA-128).
+        self.detect_conflicts()?;
+
         // Drain staged updates.
         let updates: Vec<((u64, u32), StagedUpdate)> = self.write_buf.updates.drain().collect();
 
-        // 1. Flush updates to disk.
+        // Step 2: Flush updates to disk.
+        // Use `upsert_node_col` so that columns added by `set_property` (which
+        // may not have been initialised during `create_node`) are created and
+        // zero-padded automatically.
         for ((node_raw, col_id), ref staged) in &updates {
             self.store
-                .set_node_col(NodeId(*node_raw), *col_id, &staged.new_value)?;
+                .upsert_node_col(NodeId(*node_raw), *col_id, &staged.new_value)?;
         }
 
-        // 2 & 3. Increment txn_id with Release ordering.
+        // Step 3+4: Increment txn_id with Release ordering.
         let new_id = self.inner.current_txn_id.fetch_add(1, Ordering::Release) + 1;
 
-        // 4. Publish versions.
+        // Step 5: Publish versions.
         {
             let mut vs = self.inner.versions.write().expect("version lock poisoned");
-            for ((node_raw, col_id), staged) in updates {
-                // Publish before-image at the previous txn_id so that
-                // readers pinned at that snapshot (or earlier) continue to
-                // see the correct value even though the disk file is updated.
-                if let Some((prev_txn_id, before_val)) = staged.before_image {
-                    vs.insert(NodeId(node_raw), col_id, prev_txn_id, before_val);
+            for ((node_raw, col_id), ref staged) in &updates {
+                // Publish before-image at the previous txn_id so that readers
+                // pinned at that snapshot continue to see the correct value.
+                if let Some((prev_txn_id, ref before_val)) = staged.before_image {
+                    vs.insert(NodeId(*node_raw), *col_id, prev_txn_id, before_val.clone());
                 }
                 // Publish new value at the current txn_id.
-                vs.insert(NodeId(node_raw), col_id, new_id, staged.new_value);
+                vs.insert(NodeId(*node_raw), *col_id, new_id, staged.new_value.clone());
             }
         }
+
+        // Step 6: Advance per-node version table.
+        {
+            let mut nv = self
+                .inner
+                .node_versions
+                .write()
+                .expect("node_versions lock");
+            for &raw in &self.dirty_nodes {
+                nv.set(NodeId(raw), new_id);
+            }
+        }
+
+        // Step 7: Append WAL mutation records (SPA-127).
+        write_mutation_wal(&self.inner.path, new_id, &updates, &self.wal_mutations)?;
 
         self.committed = true;
         Ok(TxnId(new_id))
@@ -415,6 +688,144 @@ impl<'db> Drop for WriteTx<'db> {
     }
 }
 
+// ── WAL mutation emission (SPA-127) ───────────────────────────────────────────
+
+/// Append mutation WAL records for a committed transaction.
+///
+/// Opens (or continues) the WAL writer in `{db_root}/wal/` and emits:
+/// - `Begin`
+/// - `NodeUpdate` for each staged property change in `updates`
+/// - `NodeCreate` / `NodeUpdate` / `NodeDelete` / `EdgeCreate` for each structural mutation
+/// - `Commit`
+/// - fsync
+fn write_mutation_wal(
+    db_root: &Path,
+    txn_id: u64,
+    updates: &[((u64, u32), StagedUpdate)],
+    mutations: &[WalMutation],
+) -> Result<()> {
+    // Nothing to record if there were no mutations or property updates.
+    if updates.is_empty() && mutations.is_empty() {
+        return Ok(());
+    }
+
+    let wal_dir = db_root.join("wal");
+    let mut wal = WalWriter::open(&wal_dir)?;
+    let txn = TxnId(txn_id);
+
+    wal.append(WalRecordKind::Begin, txn, WalPayload::Empty)?;
+
+    // NodeUpdate records for each property change in the write buffer.
+    for ((node_raw, col_id), staged) in updates {
+        let before_bytes = staged
+            .before_image
+            .as_ref()
+            .map(|(_, v)| v.to_u64().to_le_bytes().to_vec())
+            .unwrap_or_else(|| 0u64.to_le_bytes().to_vec());
+        let after_bytes = staged.new_value.to_u64().to_le_bytes().to_vec();
+        wal.append(
+            WalRecordKind::NodeUpdate,
+            txn,
+            WalPayload::NodeUpdate {
+                node_id: *node_raw,
+                key: format!("col_{col_id}"),
+                col_id: *col_id,
+                before: before_bytes,
+                after: after_bytes,
+            },
+        )?;
+    }
+
+    // Structural mutations.
+    for m in mutations {
+        match m {
+            WalMutation::NodeCreate {
+                node_id,
+                label_id,
+                props,
+            } => {
+                let wal_props: Vec<(String, Vec<u8>)> = props
+                    .iter()
+                    .map(|(col_id, v)| (format!("col_{col_id}"), v.to_u64().to_le_bytes().to_vec()))
+                    .collect();
+                wal.append(
+                    WalRecordKind::NodeCreate,
+                    txn,
+                    WalPayload::NodeCreate {
+                        node_id: node_id.0,
+                        label_id: *label_id,
+                        props: wal_props,
+                    },
+                )?;
+            }
+            WalMutation::NodeUpdate {
+                node_id,
+                key,
+                col_id,
+                before,
+                after,
+            } => {
+                wal.append(
+                    WalRecordKind::NodeUpdate,
+                    txn,
+                    WalPayload::NodeUpdate {
+                        node_id: node_id.0,
+                        key: key.clone(),
+                        col_id: *col_id,
+                        before: before.clone(),
+                        after: after.clone(),
+                    },
+                )?;
+            }
+            WalMutation::NodeDelete { node_id } => {
+                wal.append(
+                    WalRecordKind::NodeDelete,
+                    txn,
+                    WalPayload::NodeDelete { node_id: node_id.0 },
+                )?;
+            }
+            WalMutation::EdgeCreate {
+                edge_id,
+                src,
+                dst,
+                rel_type,
+            } => {
+                wal.append(
+                    WalRecordKind::EdgeCreate,
+                    txn,
+                    WalPayload::EdgeCreate {
+                        edge_id: edge_id.0,
+                        src: src.0,
+                        dst: dst.0,
+                        rel_type: rel_type.clone(),
+                        props: vec![],
+                    },
+                )?;
+            }
+        }
+    }
+
+    wal.append(WalRecordKind::Commit, txn, WalPayload::Empty)?;
+    wal.fsync()?;
+    Ok(())
+}
+
+// ── FNV-1a col_id derivation ─────────────────────────────────────────────────
+
+/// Derive a stable `u32` column ID from a property key name.
+///
+/// Uses FNV-1a 32-bit hash for deterministic, catalog-free mapping.
+pub fn fnv1a_col_id(key: &str) -> u32 {
+    const FNV_PRIME: u32 = 16_777_619;
+    const OFFSET_BASIS: u32 = 2_166_136_261;
+    let mut hash = OFFSET_BASIS;
+    for byte in key.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 fn collect_maintenance_params(
@@ -422,8 +833,6 @@ fn collect_maintenance_params(
     node_store: &NodeStore,
     db_root: &Path,
 ) -> (Vec<u32>, u64) {
-    use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
-
     let rel_table_ids = vec![0u32]; // default table; extend for multi-rel-table support
 
     // n_nodes must cover the highest node-store HWM AND the highest node ID
@@ -459,7 +868,6 @@ fn collect_maintenance_params(
 }
 
 fn open_csr_forward(path: &Path) -> CsrForward {
-    use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
     // Try to open the CSR forward file; fall back to an empty CSR.
     match EdgeStore::open(path, RelTableId(0)).and_then(|s| s.open_fwd()) {
         Ok(csr) => csr,
