@@ -81,7 +81,13 @@ impl EncryptionContext {
 
         let aad = page_id.to_le_bytes();
         let ciphertext = cipher
-            .encrypt(&nonce, Payload { msg: plaintext, aad: &aad })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| Error::Corruption("XChaCha20-Poly1305 encrypt failed".into()))?;
 
         // Prepend the nonce so the on-disk page is self-describing.
@@ -121,7 +127,13 @@ impl EncryptionContext {
         let nonce = XNonce::from_slice(&encrypted[..24]);
         let aad = page_id.to_le_bytes();
         let plaintext = cipher
-            .decrypt(nonce, Payload { msg: &encrypted[24..], aad: &aad })
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &encrypted[24..],
+                    aad: &aad,
+                },
+            )
             .map_err(|_| Error::DecryptionFailed)?;
 
         Ok(plaintext)
@@ -141,7 +153,8 @@ mod unit_tests {
         let ct1 = ctx.encrypt_page(0, &pt).unwrap();
         // The first 24 bytes are the nonces — they must differ.
         assert_ne!(
-            &ct0[..24], &ct1[..24],
+            &ct0[..24],
+            &ct1[..24],
             "nonces must be random, not deterministic"
         );
     }
