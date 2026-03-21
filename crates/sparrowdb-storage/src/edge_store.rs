@@ -25,7 +25,7 @@
 //! ```
 
 use std::fs;
-use std::io::Write as IoWrite;
+use std::io::{self, Write as IoWrite};
 use std::path::{Path, PathBuf};
 
 use sparrowdb_common::{EdgeId, Error, NodeId, Result};
@@ -221,19 +221,21 @@ impl EdgeStore {
     fn build_sorted_edges(&self, n_nodes: u64) -> Result<Vec<(u64, u64)>> {
         // ── 1. Load existing CSR base edges (may not exist on first checkpoint). ──
         let mut edges: Vec<(u64, u64)> = Vec::new();
-        if self.fwd_path().exists() {
-            match CsrForward::open(&self.fwd_path()) {
-                Ok(fwd) => {
-                    for src in 0..fwd.n_nodes() {
-                        for &dst in fwd.neighbors(src) {
-                            edges.push((src, dst));
-                        }
+        match CsrForward::open(&self.fwd_path()) {
+            Ok(fwd) => {
+                for src in 0..fwd.n_nodes() {
+                    for &dst in fwd.neighbors(src) {
+                        edges.push((src, dst));
                     }
                 }
-                Err(_) => {
-                    // Corrupt or truncated base file — ignore; delta is the source of truth.
-                }
             }
+            // File does not exist yet — normal on the first checkpoint.
+            Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::NotFound => {}
+            // Any other failure (permission denied, I/O error, corruption) must
+            // not be silently ignored: proceeding with an empty base would fold
+            // only the delta into the new CSR, permanently discarding all edges
+            // that were written during previous checkpoints.
+            Err(e) => return Err(e),
         }
 
         // ── 2. Apply delta records (insert-only for now). ─────────────────────
