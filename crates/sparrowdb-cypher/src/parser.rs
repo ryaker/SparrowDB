@@ -483,11 +483,17 @@ impl Parser {
     fn parse_not_expr(&mut self) -> Result<Expr> {
         if matches!(self.peek(), Token::Not) {
             self.advance();
-            // NOT (a)-[:R]->(b) — existence predicate
+            // NOT (a)-[:R]->(b) — existence predicate, or NOT (expr) — parenthesized expr
             if matches!(self.peek(), Token::LParen) {
-                // Try to parse as EXISTS pattern
-                let path = self.parse_path_pattern()?;
-                return Ok(Expr::NotExists(Box::new(ExistsPattern { path })));
+                // Try existence pattern first; fall back to parenthesized expr
+                let saved_pos = self.pos;
+                match self.parse_path_pattern() {
+                    Ok(path) => return Ok(Expr::NotExists(Box::new(ExistsPattern { path }))),
+                    Err(_) => {
+                        self.pos = saved_pos; // restore position
+                        // fall through to parse as normal NOT expr
+                    }
+                }
             }
             let inner = self.parse_comparison()?;
             return Ok(Expr::Not(Box::new(inner)));

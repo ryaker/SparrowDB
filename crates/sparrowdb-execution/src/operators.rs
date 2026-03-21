@@ -72,10 +72,8 @@ impl<'a> Operator for LabelScan<'a> {
             let mut vals = Vec::with_capacity(n);
             for slot in 0..hwm as u32 {
                 let node_id = NodeId(((self.label_id as u64) << 32) | (slot as u64));
-                match self.store.get_node_raw(node_id, &[col_id]) {
-                    Ok(raw) => vals.push(raw[0].1 as i64),
-                    Err(_) => vals.push(0),
-                }
+                let raw = self.store.get_node_raw(node_id, &[col_id])?;
+                vals.push(if raw.is_empty() { 0 } else { raw[0].1 as i64 });
             }
             col_vecs.insert(format!("col_{col_id}"), vals);
         }

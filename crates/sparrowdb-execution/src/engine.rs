@@ -141,7 +141,10 @@ impl Engine {
         let pat = &m.pattern[0];
         let src_node_pat = &pat.nodes[0];
         let dst_node_pat = &pat.nodes[1];
-        let _rel_pat = &pat.rels[0];
+        let rel_pat = &pat.rels[0];
+        if rel_pat.dir != sparrowdb_cypher::ast::EdgeDir::Outgoing {
+            return Err(sparrowdb_common::Error::Unimplemented);
+        }
 
         let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
         let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
@@ -263,7 +266,18 @@ impl Engine {
             .ok_or(sparrowdb_common::Error::NotFound)? as u32;
 
         let hwm_src = self.store.hwm_for_label(src_label_id)?;
-        let col_ids_fof = collect_col_ids_for_var(&fof_node_pat.var, column_names, fof_label_id);
+
+        // Collect col_ids for fof: projected columns plus any columns referenced by prop filters.
+        let col_ids_fof = {
+            let mut ids = collect_col_ids_for_var(&fof_node_pat.var, column_names, fof_label_id);
+            for p in &fof_node_pat.props {
+                let col_id = prop_name_to_col_id(&p.key);
+                if !ids.contains(&col_id) {
+                    ids.push(col_id);
+                }
+            }
+            ids
+        };
 
         let join = AspJoin::new(&self.csr);
         let mut rows = Vec::new();
@@ -303,6 +317,11 @@ impl Engine {
                 } else {
                     vec![]
                 };
+
+                // Apply fof inline prop filter.
+                if !self.matches_prop_filter(&fof_props, &fof_node_pat.props) {
+                    continue;
+                }
 
                 let row = project_fof_row(&fof_props, column_names, &fof_node_pat.var);
                 rows.push(row);
@@ -482,7 +501,7 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
             Literal::Bool(b) => *b,
             _ => false,
         },
-        _ => true, // Unknown expr — pass through.
+        _ => false, // unsupported expression — reject row rather than silently pass
     }
 }
 
