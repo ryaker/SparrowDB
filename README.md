@@ -165,6 +165,44 @@ Full install guide: [docs/getting-started.md](docs/getting-started.md)
 
 ---
 
+## Python Bindings
+
+Install via maturin (requires Rust):
+
+```bash
+cd crates/sparrowdb-python
+pip install maturin
+maturin develop
+```
+
+Usage:
+
+```python
+import sparrowdb
+
+# Open or create a database
+db = sparrowdb.GraphDb("/tmp/my.db")
+
+# Execute Cypher — returns list of dicts
+rows = db.execute("MATCH (n:Person) RETURN n.name LIMIT 5")
+for row in rows:
+    print(row)
+
+# Transactions
+with db.begin_write() as tx:
+    tx.commit()
+
+txn_id = db.begin_read().snapshot_txn_id
+
+# Maintenance
+db.checkpoint()
+db.optimize()
+```
+
+Python 3.9+ supported via stable ABI wheel (`abi3`).
+
+---
+
 ## Development
 
 ```bash
