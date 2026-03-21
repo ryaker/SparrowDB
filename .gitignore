@@ -35,3 +35,10 @@ venv/
 # Benchmarks output
 benches/output/
 criterion/
+
+# Large generated fixtures (generated on demand via gen-fixtures binary)
+# Only small fixtures (social_small.json, deps_small.json) are committed.
+tests/fixtures/social_10k.json
+tests/fixtures/social_100k.json
+tests/fixtures/deps_500.json
+tests/fixtures/concepts_1k.json

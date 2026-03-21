@@ -1,11 +1,11 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use sparrowdb_common::TxnId;
 use sparrowdb_storage::{
     crc32_of, crc32_zeroed_at,
     csr::CsrForward,
     metapage::Metapage,
     wal::{WalPayload, WalRecordKind, WalWriter},
 };
-use sparrowdb_common::TxnId;
 use tempfile::TempDir;
 
 // ── WAL benchmarks ─────────────────────────────────────────────────────────
@@ -183,10 +183,6 @@ criterion_group!(
     bench_csr_neighbors_medium,
 );
 
-criterion_group!(
-    crc32_benches,
-    bench_crc32_4kb_page,
-    bench_crc32_zeroed_at,
-);
+criterion_group!(crc32_benches, bench_crc32_4kb_page, bench_crc32_zeroed_at,);
 
 criterion_main!(wal_benches, metapage_benches, csr_benches, crc32_benches);
