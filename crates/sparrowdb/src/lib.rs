@@ -202,7 +202,8 @@ impl GraphDb {
         let _guard = self.inner.write_lock.lock().unwrap();
         let catalog = Catalog::open(&self.inner.path)?;
         let node_store = NodeStore::open(&self.inner.path)?;
-        let (rel_table_ids, n_nodes) = collect_maintenance_params(&catalog, &node_store);
+        let (rel_table_ids, n_nodes) =
+            collect_maintenance_params(&catalog, &node_store, &self.inner.path);
         let engine = MaintenanceEngine::new(&self.inner.path);
         engine.checkpoint(&rel_table_ids, n_nodes)
     }
@@ -215,7 +216,8 @@ impl GraphDb {
         let _guard = self.inner.write_lock.lock().unwrap();
         let catalog = Catalog::open(&self.inner.path)?;
         let node_store = NodeStore::open(&self.inner.path)?;
-        let (rel_table_ids, n_nodes) = collect_maintenance_params(&catalog, &node_store);
+        let (rel_table_ids, n_nodes) =
+            collect_maintenance_params(&catalog, &node_store, &self.inner.path);
         let engine = MaintenanceEngine::new(&self.inner.path);
         engine.optimize(&rel_table_ids, n_nodes)
     }
@@ -415,40 +417,43 @@ impl<'db> Drop for WriteTx<'db> {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-fn collect_maintenance_params(catalog: &Catalog, node_store: &NodeStore) -> (Vec<u32>, u64) {
-    // Collect all known rel_table_ids from the catalog.
-    let rel_table_ids: Vec<u32> = catalog
-        .list_rel_tables()
-        .unwrap_or_default()
-        .iter()
-        .map(|(src_label, dst_label, _name)| {
-            // Encode (src_label_id, dst_label_id) → rel_table_id u32.
-            // This mirrors the encoding in edge_store: RelTableId(0) for the
-            // default rel table.  In Phase 5 we use the catalog's rel_table_id
-            // directly as a u32 (truncated from u64 for the storage layer API).
-            let _ = (src_label, dst_label);
-            0u32 // default table; extend when multi-rel-table support lands
-        })
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
+fn collect_maintenance_params(
+    catalog: &Catalog,
+    node_store: &NodeStore,
+    db_root: &Path,
+) -> (Vec<u32>, u64) {
+    use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
 
-    // If no rel tables registered yet, still run against table 0
-    // (the implicit default table used by early phases).
-    let rel_table_ids = if rel_table_ids.is_empty() {
-        vec![0u32]
-    } else {
-        rel_table_ids
-    };
+    let rel_table_ids = vec![0u32]; // default table; extend for multi-rel-table support
 
-    // n_nodes: sum of hwm across all labels.
-    let n_nodes: u64 = catalog
+    // n_nodes must cover the highest node-store HWM AND the highest node ID
+    // present in any delta record, so that the CSR bounds check passes even
+    // when edges were inserted without going through the node-store API.
+    let hwm_n_nodes: u64 = catalog
         .list_labels()
         .unwrap_or_default()
         .iter()
         .map(|(label_id, _name)| node_store.hwm_for_label(*label_id as u32).unwrap_or(0))
-        .sum::<u64>()
-        .max(1); // at least 1 to avoid divide-by-zero in CSR
+        .sum::<u64>();
+
+    // Also scan delta records for the maximum node ID used.
+    let delta_max: u64 = rel_table_ids
+        .iter()
+        .filter_map(|&rel_id| {
+            EdgeStore::open(db_root, RelTableId(rel_id))
+                .ok()
+                .and_then(|s| s.read_delta().ok())
+        })
+        .flat_map(|records| {
+            records
+                .into_iter()
+                .flat_map(|r| [r.src.0, r.dst.0].into_iter())
+        })
+        .max()
+        .map(|max_id| max_id + 1)
+        .unwrap_or(0);
+
+    let n_nodes = hwm_n_nodes.max(delta_max).max(1);
 
     (rel_table_ids, n_nodes)
 }

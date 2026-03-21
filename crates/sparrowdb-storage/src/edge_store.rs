@@ -212,16 +212,43 @@ impl EdgeStore {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Read delta records, convert to `(src, dst)` pairs, validate bounds,
-    /// and return them sorted by `(src, dst)`.
+    /// Read the current CSR base (if any) plus all delta records, merge them,
+    /// validate bounds, and return a deduplicated sorted `(src, dst)` edge list.
+    ///
+    /// This implements the "fold base + delta → fresh base" semantics: the new
+    /// CSR captures every edge that was previously checkpointed AND every edge
+    /// added since the last checkpoint.
     fn build_sorted_edges(&self, n_nodes: u64) -> Result<Vec<(u64, u64)>> {
+        // ── 1. Load existing CSR base edges (may not exist on first checkpoint). ──
+        let mut edges: Vec<(u64, u64)> = Vec::new();
+        if self.fwd_path().exists() {
+            match CsrForward::open(&self.fwd_path()) {
+                Ok(fwd) => {
+                    for src in 0..fwd.n_nodes() {
+                        for &dst in fwd.neighbors(src) {
+                            edges.push((src, dst));
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Corrupt or truncated base file — ignore; delta is the source of truth.
+                }
+            }
+        }
+
+        // ── 2. Apply delta records (insert-only for now). ─────────────────────
         let records = self.read_delta()?;
+        for r in &records {
+            edges.push((r.src.0, r.dst.0));
+        }
 
-        let mut edges: Vec<(u64, u64)> = records.iter().map(|r| (r.src.0, r.dst.0)).collect();
+        // ── 3. Sort and deduplicate. ──────────────────────────────────────────
         edges.sort_unstable_by_key(|&(src, dst)| (src, dst));
+        edges.dedup();
 
-        // Validate that all node IDs are within bounds.  The CSR builder indexes
-        // its degree/cursor arrays by node ID, so any out-of-range ID would panic.
+        // ── 4. Validate bounds. ───────────────────────────────────────────────
+        // The CSR builder indexes its degree/cursor arrays by node ID, so any
+        // out-of-range ID would panic.
         for &(src, dst) in &edges {
             if src >= n_nodes {
                 return Err(Error::InvalidArgument(format!(
