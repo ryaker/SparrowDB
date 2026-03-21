@@ -904,7 +904,7 @@ impl Engine {
             }
         }
 
-        let use_agg = has_collect_in_return(&m.return_clause.items);
+        let use_agg = has_aggregate_in_return(&m.return_clause.items);
         if use_agg {
             // Aggregate expressions reference properties not captured by
             // column_names (e.g. collect(p.name) -> column "collect(p.name)").
@@ -1007,9 +1007,9 @@ impl Engine {
         let mut col_ids_dst =
             collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
 
-        let use_agg = has_collect_in_return(&m.return_clause.items);
+        let use_agg = has_aggregate_in_return(&m.return_clause.items);
         if use_agg {
-            // Collect col_ids referenced inside collect() argument expressions.
+            // Collect col_ids referenced inside aggregate argument expressions.
             for item in &m.return_clause.items {
                 collect_col_ids_from_expr(&item.expr, &mut col_ids_src);
                 collect_col_ids_from_expr(&item.expr, &mut col_ids_dst);
@@ -1646,6 +1646,7 @@ fn extract_return_column_names(items: &[ReturnItem]) -> Vec<String> {
             None => match &item.expr {
                 Expr::PropAccess { var, prop } => format!("{var}.{prop}"),
                 Expr::Var(v) => v.clone(),
+                Expr::CountStar => "count(*)".to_string(),
                 Expr::FnCall { name, args } => {
                     let arg_str = args
                         .first()
@@ -2121,43 +2122,83 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
-// ── collect() aggregation ─────────────────────────────────────────────────────
+// ── aggregation (COUNT/SUM/AVG/MIN/MAX/collect) ───────────────────────────────
 
-/// Returns `true` if any RETURN item contains a `collect()` aggregate call.
-fn has_collect_in_return(items: &[ReturnItem]) -> bool {
-    items.iter().any(|item| expr_has_collect(&item.expr))
+/// Returns `true` if `expr` is any aggregate call.
+fn is_aggregate_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::CountStar => true,
+        Expr::FnCall { name, .. } => matches!(
+            name.to_lowercase().as_str(),
+            "count" | "sum" | "avg" | "min" | "max" | "collect"
+        ),
+        _ => false,
+    }
 }
 
-fn expr_has_collect(expr: &Expr) -> bool {
-    matches!(expr, Expr::FnCall { name, .. } if name.to_lowercase() == "collect")
+/// Returns `true` if any RETURN item is an aggregate expression.
+fn has_aggregate_in_return(items: &[ReturnItem]) -> bool {
+    items.iter().any(|item| is_aggregate_expr(&item.expr))
+}
+
+/// The aggregation kind for a single RETURN item.
+#[derive(Debug, Clone, PartialEq)]
+enum AggKind {
+    /// Non-aggregate — used as a grouping key.
+    Key,
+    CountStar,
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Collect,
+}
+
+fn agg_kind(expr: &Expr) -> AggKind {
+    match expr {
+        Expr::CountStar => AggKind::CountStar,
+        Expr::FnCall { name, .. } => match name.to_lowercase().as_str() {
+            "count" => AggKind::Count,
+            "sum" => AggKind::Sum,
+            "avg" => AggKind::Avg,
+            "min" => AggKind::Min,
+            "max" => AggKind::Max,
+            "collect" => AggKind::Collect,
+            _ => AggKind::Key,
+        },
+        _ => AggKind::Key,
+    }
 }
 
 /// Aggregate a set of flat `HashMap<String, Value>` rows by evaluating RETURN
-/// items that contain `collect()`.
+/// items that contain aggregate calls (COUNT(*), COUNT, SUM, AVG, MIN, MAX, collect).
 ///
-/// Non-aggregate RETURN items become the group key; `collect()` items accumulate
-/// a `Value::List` per group.  Returns one output `Vec<Value>` per unique key
-/// in the same column order as `return_items`.
+/// Non-aggregate RETURN items become the group key.  Returns one output
+/// `Vec<Value>` per unique key in the same column order as `return_items`.
 fn aggregate_rows(
     rows: &[HashMap<String, Value>],
     return_items: &[ReturnItem],
 ) -> Vec<Vec<Value>> {
-    let key_indices: Vec<usize> = return_items
+    // Classify each return item.
+    let kinds: Vec<AggKind> = return_items.iter().map(|item| agg_kind(&item.expr)).collect();
+
+    let key_indices: Vec<usize> = kinds
         .iter()
         .enumerate()
-        .filter(|(_, item)| !expr_has_collect(&item.expr))
+        .filter(|(_, k)| **k == AggKind::Key)
         .map(|(i, _)| i)
         .collect();
 
-    let collect_indices: Vec<usize> = return_items
+    let agg_indices: Vec<usize> = kinds
         .iter()
         .enumerate()
-        .filter(|(_, item)| expr_has_collect(&item.expr))
+        .filter(|(_, k)| **k != AggKind::Key)
         .map(|(i, _)| i)
         .collect();
 
-    // No collect() items — fall through to plain projection.
-    if collect_indices.is_empty() {
+    // No aggregate items — fall through to plain projection.
+    if agg_indices.is_empty() {
         return rows
             .iter()
             .map(|row_vals| {
@@ -2171,8 +2212,8 @@ fn aggregate_rows(
 
     // Build groups preserving insertion order.
     let mut group_keys: Vec<Vec<Value>> = Vec::new();
-    // [group_idx][collect_col_idx] → accumulated values
-    let mut group_collects: Vec<Vec<Vec<Value>>> = Vec::new();
+    // [group_idx][agg_col_pos] → accumulated raw values
+    let mut group_accum: Vec<Vec<Vec<Value>>> = Vec::new();
 
     for row_vals in rows {
         let key: Vec<Value> = key_indices
@@ -2184,48 +2225,152 @@ fn aggregate_rows(
             pos
         } else {
             group_keys.push(key);
-            group_collects.push(vec![vec![]; collect_indices.len()]);
+            group_accum.push(vec![vec![]; agg_indices.len()]);
             group_keys.len() - 1
         };
 
-        for (ci, &ri) in collect_indices.iter().enumerate() {
-            let collect_arg_val = match &return_items[ri].expr {
-                Expr::FnCall { args, .. } if !args.is_empty() => eval_expr(&args[0], row_vals),
-                _ => Value::Null,
-            };
-            // Standard Cypher: collect() ignores nulls.
-            if !matches!(collect_arg_val, Value::Null) {
-                group_collects[group_idx][ci].push(collect_arg_val);
+        for (ai, &ri) in agg_indices.iter().enumerate() {
+            match &kinds[ri] {
+                AggKind::CountStar => {
+                    // Sentinel: count the number of sentinels after grouping.
+                    group_accum[group_idx][ai].push(Value::Int64(1));
+                }
+                AggKind::Count | AggKind::Sum | AggKind::Avg | AggKind::Min | AggKind::Max
+                | AggKind::Collect => {
+                    let arg_val = match &return_items[ri].expr {
+                        Expr::FnCall { args, .. } if !args.is_empty() => {
+                            eval_expr(&args[0], row_vals)
+                        }
+                        _ => Value::Null,
+                    };
+                    // All aggregates ignore NULLs (standard Cypher semantics).
+                    if !matches!(arg_val, Value::Null) {
+                        group_accum[group_idx][ai].push(arg_val);
+                    }
+                }
+                AggKind::Key => unreachable!(),
             }
         }
     }
 
-    // No rows and only collect() columns → one row with an empty list.
+    // No grouping keys and no rows → one result row of zero/empty aggregates.
     if group_keys.is_empty() && key_indices.is_empty() {
-        return vec![return_items.iter().map(|_| Value::List(vec![])).collect()];
+        let row: Vec<Value> = kinds
+            .iter()
+            .map(|k| match k {
+                AggKind::CountStar | AggKind::Count | AggKind::Sum => Value::Int64(0),
+                AggKind::Avg | AggKind::Min | AggKind::Max => Value::Null,
+                AggKind::Collect => Value::List(vec![]),
+                AggKind::Key => Value::Null,
+            })
+            .collect();
+        return vec![row];
     }
 
-    // No rows and there are grouping keys → no output rows.
+    // There are grouping keys but no rows → no output rows.
     if group_keys.is_empty() {
         return vec![];
     }
 
-    // Assemble output rows — one per group.
+    // Finalize and assemble output rows — one per group.
     let mut out: Vec<Vec<Value>> = Vec::with_capacity(group_keys.len());
     for (gi, key_vals) in group_keys.into_iter().enumerate() {
         let mut output_row: Vec<Value> = Vec::with_capacity(return_items.len());
         let mut ki = 0usize;
-        let mut ci = 0usize;
-        for item in return_items.iter() {
-            if expr_has_collect(&item.expr) {
-                output_row.push(Value::List(group_collects[gi][ci].clone()));
-                ci += 1;
-            } else {
+        let mut ai = 0usize;
+        for col_idx in 0..return_items.len() {
+            if kinds[col_idx] == AggKind::Key {
                 output_row.push(key_vals[ki].clone());
                 ki += 1;
+            } else {
+                let result = finalize_aggregate(&kinds[col_idx], &group_accum[gi][ai]);
+                output_row.push(result);
+                ai += 1;
             }
         }
         out.push(output_row);
     }
     out
+}
+
+/// Reduce accumulated values for a single aggregate column into a final `Value`.
+fn finalize_aggregate(kind: &AggKind, vals: &[Value]) -> Value {
+    match kind {
+        AggKind::CountStar | AggKind::Count => Value::Int64(vals.len() as i64),
+        AggKind::Sum => {
+            let mut sum_i: i64 = 0;
+            let mut sum_f: f64 = 0.0;
+            let mut is_float = false;
+            for v in vals {
+                match v {
+                    Value::Int64(n) => sum_i += n,
+                    Value::Float64(f) => {
+                        is_float = true;
+                        sum_f += f;
+                    }
+                    _ => {}
+                }
+            }
+            if is_float {
+                Value::Float64(sum_f + sum_i as f64)
+            } else {
+                Value::Int64(sum_i)
+            }
+        }
+        AggKind::Avg => {
+            if vals.is_empty() {
+                return Value::Null;
+            }
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+            for v in vals {
+                match v {
+                    Value::Int64(n) => {
+                        sum += *n as f64;
+                        count += 1;
+                    }
+                    Value::Float64(f) => {
+                        sum += f;
+                        count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if count == 0 {
+                Value::Null
+            } else {
+                Value::Float64(sum / count as f64)
+            }
+        }
+        AggKind::Min => vals
+            .iter()
+            .fold(None::<Value>, |acc, v| match (acc, v) {
+                (None, v) => Some(v.clone()),
+                (Some(Value::Int64(a)), Value::Int64(b)) => Some(Value::Int64(a.min(*b))),
+                (Some(Value::Float64(a)), Value::Float64(b)) => {
+                    Some(Value::Float64(a.min(*b)))
+                }
+                (Some(Value::String(a)), Value::String(b)) => {
+                    Some(Value::String(if a <= *b { a } else { b.clone() }))
+                }
+                (Some(a), _) => Some(a),
+            })
+            .unwrap_or(Value::Null),
+        AggKind::Max => vals
+            .iter()
+            .fold(None::<Value>, |acc, v| match (acc, v) {
+                (None, v) => Some(v.clone()),
+                (Some(Value::Int64(a)), Value::Int64(b)) => Some(Value::Int64(a.max(*b))),
+                (Some(Value::Float64(a)), Value::Float64(b)) => {
+                    Some(Value::Float64(a.max(*b)))
+                }
+                (Some(Value::String(a)), Value::String(b)) => {
+                    Some(Value::String(if a >= *b { a } else { b.clone() }))
+                }
+                (Some(a), _) => Some(a),
+            })
+            .unwrap_or(Value::Null),
+        AggKind::Collect => Value::List(vals.to_vec()),
+        AggKind::Key => Value::Null,
+    }
 }
