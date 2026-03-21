@@ -1,4 +1,4 @@
-use sparrowdb_common::Result;
+use sparrowdb_common::{Error, Result};
 
 /// Top-level Cypher statement variants — AST stub.
 #[derive(Debug)]
@@ -23,7 +23,7 @@ impl Parser {
 
     /// Parse a Cypher string into a `Statement`.
     pub fn parse(&self, _input: &str) -> Result<Statement> {
-        unimplemented!("Parser::parse — implemented in Phase 4a")
+        Err(Error::Unimplemented)
     }
 }
 

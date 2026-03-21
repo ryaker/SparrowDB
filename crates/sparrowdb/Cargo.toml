@@ -13,4 +13,4 @@ sparrowdb-cypher    = { workspace = true }
 sparrowdb-execution = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }

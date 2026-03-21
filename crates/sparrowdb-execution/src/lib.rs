@@ -1,4 +1,4 @@
-use sparrowdb_common::Result;
+use sparrowdb_common::{Error, Result};
 
 /// Stub query executor — full implementation in Phase 4b+.
 pub struct Executor;
@@ -11,7 +11,7 @@ impl Executor {
 
     /// Execute a bound plan and return raw rows (stub).
     pub fn execute(&self) -> Result<Vec<Vec<u8>>> {
-        unimplemented!("Executor::execute — implemented in Phase 4b")
+        Err(Error::Unimplemented)
     }
 }
 

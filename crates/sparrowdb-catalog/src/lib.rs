@@ -1,4 +1,4 @@
-use sparrowdb_common::Result;
+use sparrowdb_common::{Error, Result};
 
 /// Stub catalog — full TLV implementation in Phase 2.
 pub struct Catalog;
@@ -6,7 +6,7 @@ pub struct Catalog;
 impl Catalog {
     /// Load (or initialise) the catalog from the database directory.
     pub fn open(_path: &std::path::Path) -> Result<Self> {
-        unimplemented!("Catalog::open — implemented in Phase 2")
+        Err(Error::Unimplemented)
     }
 }
 
@@ -17,5 +17,11 @@ mod tests {
     #[test]
     fn catalog_type_exists() {
         let _: fn(&std::path::Path) -> Result<Catalog> = Catalog::open;
+    }
+
+    #[test]
+    fn catalog_open_returns_unimplemented() {
+        let result = Catalog::open(std::path::Path::new("dummy"));
+        assert!(matches!(result, Err(Error::Unimplemented)));
     }
 }

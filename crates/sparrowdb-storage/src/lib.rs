@@ -1,4 +1,4 @@
-use sparrowdb_common::{PageId, Result};
+use sparrowdb_common::{Error, PageId, Result};
 
 /// Stub page store — full implementation in Phase 1+.
 pub struct PageStore;
@@ -6,17 +6,17 @@ pub struct PageStore;
 impl PageStore {
     /// Open (or create) a page store rooted at `path`.
     pub fn open(_path: &std::path::Path) -> Result<Self> {
-        unimplemented!("PageStore::open — implemented in Phase 1")
+        Err(Error::Unimplemented)
     }
 
     /// Read a page by ID into the provided buffer.
     pub fn read_page(&self, _id: PageId, _buf: &mut [u8]) -> Result<()> {
-        unimplemented!("PageStore::read_page — implemented in Phase 1")
+        Err(Error::Unimplemented)
     }
 
     /// Write a page by ID from the provided buffer.
     pub fn write_page(&self, _id: PageId, _buf: &[u8]) -> Result<()> {
-        unimplemented!("PageStore::write_page — implemented in Phase 1")
+        Err(Error::Unimplemented)
     }
 }
 

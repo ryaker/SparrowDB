@@ -139,8 +139,8 @@ jobs:
       - name: Build and test Python bindings
         # Skips cleanly if sparrowdb-python crate doesn't exist yet
         run: |
-          if [ -d "sparrowdb-python" ]; then
-            cd sparrowdb-python
+          if [ -d "crates/sparrowdb-python" ]; then
+            cd crates/sparrowdb-python
             maturin develop
             pytest tests/python/ -v
           else
