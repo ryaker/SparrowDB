@@ -3,6 +3,15 @@ pub mod metapage;
 /// WAL subsystem — codec, writer, and replay.
 pub mod wal;
 
+/// CSR (Compressed Sparse Row) forward and backward edge files.
+pub mod csr;
+
+/// Node property column storage.
+pub mod node_store;
+
+/// Edge delta log and CSR rebuild on checkpoint.
+pub mod edge_store;
+
 use sparrowdb_common::{PageId, Result};
 
 /// Compute CRC32C (Castagnoli) of the entire buffer.
