@@ -21,15 +21,22 @@ fn encrypt_decrypt_roundtrip() {
     let ctx = EncryptionContext::with_key(KEY_42);
     let plaintext = make_plaintext(0xAB);
 
-    let ciphertext = ctx.encrypt_page(0, &plaintext).expect("encrypt_page should succeed");
+    let ciphertext = ctx
+        .encrypt_page(0, &plaintext)
+        .expect("encrypt_page should succeed");
     assert_eq!(
         ciphertext.len(),
         ENCRYPTED_STRIDE,
         "encrypted output must be page_size + 40 bytes"
     );
 
-    let recovered = ctx.decrypt_page(0, &ciphertext).expect("decrypt_page should succeed");
-    assert_eq!(recovered, plaintext, "decrypted plaintext must match original");
+    let recovered = ctx
+        .decrypt_page(0, &ciphertext)
+        .expect("decrypt_page should succeed");
+    assert_eq!(
+        recovered, plaintext,
+        "decrypted plaintext must match original"
+    );
 }
 
 // ── test 2: wrong key → DecryptionFailed ────────────────────────────────────
@@ -58,13 +65,17 @@ fn passthrough_mode_no_change() {
     let ctx = EncryptionContext::none();
     let plaintext = make_plaintext(0xCD);
 
-    let encrypted = ctx.encrypt_page(0, &plaintext).expect("passthrough encrypt should succeed");
+    let encrypted = ctx
+        .encrypt_page(0, &plaintext)
+        .expect("passthrough encrypt should succeed");
     assert_eq!(
         encrypted, plaintext,
         "passthrough encrypt must return plaintext unchanged"
     );
 
-    let decrypted = ctx.decrypt_page(0, &plaintext).expect("passthrough decrypt should succeed");
+    let decrypted = ctx
+        .decrypt_page(0, &plaintext)
+        .expect("passthrough decrypt should succeed");
     assert_eq!(
         decrypted, plaintext,
         "passthrough decrypt must return data unchanged"
@@ -82,7 +93,9 @@ fn golden_fixture_encrypt() {
     let plaintext = make_plaintext(0xAB);
 
     // Encrypt with fixed page_id = 0; nonce is deterministic (page_id LE padded)
-    let ciphertext = ctx.encrypt_page(0, &plaintext).expect("encrypt_page should succeed");
+    let ciphertext = ctx
+        .encrypt_page(0, &plaintext)
+        .expect("encrypt_page should succeed");
 
     let fixture_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -105,7 +118,9 @@ fn golden_fixture_decrypt() {
     );
     let fixture = std::fs::read(fixture_path).expect("golden fixture must exist");
 
-    let plaintext = ctx.decrypt_page(0, &fixture).expect("decrypt of golden fixture should succeed");
+    let plaintext = ctx
+        .decrypt_page(0, &fixture)
+        .expect("decrypt of golden fixture should succeed");
     assert_eq!(
         plaintext,
         make_plaintext(0xAB),
@@ -162,8 +177,14 @@ fn uc5_acceptance_check() {
         for (j, b) in plain.iter_mut().enumerate() {
             *b = ((page_id as usize + j) % 256) as u8;
         }
-        let ct = ctx.encrypt_page(page_id, &plain).expect("encrypt must succeed");
-        assert_eq!(ct.len(), ENCRYPTED_STRIDE, "encrypted stride must be page_size+40");
+        let ct = ctx
+            .encrypt_page(page_id, &plain)
+            .expect("encrypt must succeed");
+        assert_eq!(
+            ct.len(),
+            ENCRYPTED_STRIDE,
+            "encrypted stride must be page_size+40"
+        );
         plaintexts.push(plain);
         ciphertexts.push(ct);
     }
