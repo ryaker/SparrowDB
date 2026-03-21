@@ -168,11 +168,11 @@ impl WalReplayer {
 
 /// Collect all segment numbers in `wal_dir`, sorted ascending.
 ///
-/// Returns an I/O error if `wal_dir` cannot be read (missing, bad permissions,
-/// etc.) rather than silently treating that as an empty WAL.
+/// Returns an error if `wal_dir` cannot be read, so that callers are not
+/// silently handed an empty segment list when the directory is inaccessible.
 fn collect_segments(wal_dir: &Path) -> Result<Vec<u64>> {
     let mut segments = Vec::new();
-    let entries = std::fs::read_dir(wal_dir)?;
+    let entries = std::fs::read_dir(wal_dir).map_err(Error::Io)?;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy().to_string();

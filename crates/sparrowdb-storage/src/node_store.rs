@@ -173,9 +173,40 @@ impl NodeStore {
 
         let slot = hwm as u32;
 
-        // Write each property column.
-        for &(col_id, ref val) in props {
-            self.append_col(label_id, col_id, val.to_u64())?;
+        // Snapshot the original size of each column file so we can roll back on
+        // partial failure.  A column that does not yet exist has size 0.
+        let original_sizes: Vec<(u32, u64)> = props
+            .iter()
+            .map(|&(col_id, _)| {
+                let path = self.col_path(label_id, col_id);
+                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                (col_id, size)
+            })
+            .collect();
+
+        // Write each property column.  On failure, roll back all columns that
+        // were already written to avoid slot misalignment.
+        let write_result = (|| {
+            for &(col_id, ref val) in props {
+                self.append_col(label_id, col_id, val.to_u64())?;
+            }
+            Ok::<(), sparrowdb_common::Error>(())
+        })();
+
+        if let Err(e) = write_result {
+            // Truncate each column back to its original size.
+            for (col_id, original_size) in &original_sizes {
+                let path = self.col_path(label_id, *col_id);
+                if path.exists() {
+                    // Best-effort truncation: ignore secondary errors to surface
+                    // the original error to the caller.
+                    let _ = fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .and_then(|f| f.set_len(*original_size));
+                }
+            }
+            return Err(e);
         }
 
         // Update hwm.

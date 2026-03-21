@@ -85,6 +85,8 @@ impl DeltaRecord {
 /// files from the full delta log and truncates (replaces) the log.
 pub struct EdgeStore {
     rel_dir: PathBuf,
+    /// The relationship table this store manages.  Used to validate callers.
+    rel_table_id: RelTableId,
     /// Monotonically increasing edge ID counter.
     next_edge_id: u64,
 }
@@ -106,6 +108,7 @@ impl EdgeStore {
 
         Ok(EdgeStore {
             rel_dir,
+            rel_table_id,
             next_edge_id,
         })
     }
@@ -125,7 +128,15 @@ impl EdgeStore {
     /// Append a new directed edge `src → dst` to the delta log.
     ///
     /// Returns the new [`EdgeId`] (monotonic index into the delta log).
+    /// Returns [`Error::InvalidInput`] if `rel_id` does not match this store's
+    /// relationship table.
     pub fn create_edge(&mut self, src: NodeId, rel_id: RelTableId, dst: NodeId) -> Result<EdgeId> {
+        if rel_id != self.rel_table_id {
+            return Err(Error::InvalidArgument(format!(
+                "rel_id mismatch: store owns {:?} but caller passed {:?}",
+                self.rel_table_id, rel_id
+            )));
+        }
         let record = DeltaRecord { src, dst, rel_id };
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -166,17 +177,52 @@ impl EdgeStore {
     ///
     /// `n_nodes` is the total number of nodes across both endpoint labels.
     /// Caller must supply this from the metapage / node-store high-water marks.
-    pub fn checkpoint(&self, n_nodes: u64) -> Result<()> {
+    ///
+    /// Returns [`Error::InvalidArgument`] if any node ID in the delta is >= `n_nodes`.
+    ///
+    /// After writing the CSR files the delta log is truncated to zero so that
+    /// subsequent checkpoints do not re-process stale records.
+    pub fn checkpoint(&mut self, n_nodes: u64) -> Result<()> {
         let records = self.read_delta()?;
 
         // Build edge list as raw node IDs (the CSR works over packed u64).
-        let edges: Vec<(u64, u64)> = records.iter().map(|r| (r.src.0, r.dst.0)).collect();
+        // Sort by src so the CSR builder receives edges in node order, which is
+        // the documented precondition for correct neighbor placement.
+        let mut edges: Vec<(u64, u64)> = records.iter().map(|r| (r.src.0, r.dst.0)).collect();
+        edges.sort_unstable_by_key(|&(src, dst)| (src, dst));
+
+        // Validate that all node IDs are within bounds.  The CSR builder indexes
+        // its degree/cursor arrays by node ID, so any out-of-range ID would panic.
+        for &(src, dst) in &edges {
+            if src >= n_nodes {
+                return Err(Error::InvalidArgument(format!(
+                    "src node id {src} >= n_nodes {n_nodes}"
+                )));
+            }
+            if dst >= n_nodes {
+                return Err(Error::InvalidArgument(format!(
+                    "dst node id {dst} >= n_nodes {n_nodes}"
+                )));
+            }
+        }
 
         let fwd = CsrForward::build(n_nodes, &edges);
         let bwd = CsrBackward::build(n_nodes, &edges);
 
         fwd.write(&self.fwd_path())?;
         bwd.write(&self.bwd_path())?;
+
+        // Truncate the delta log so it does not grow unboundedly and future
+        // checkpoints do not re-process already-checkpointed edges.
+        let delta = self.delta_path();
+        if delta.exists() {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&delta)
+                .and_then(|f| f.set_len(0))
+                .map_err(Error::Io)?;
+        }
+        self.next_edge_id = 0;
 
         Ok(())
     }
@@ -283,5 +329,55 @@ mod tests {
         assert_eq!(encoded.len(), DELTA_RECORD_SIZE);
         let decoded = DeltaRecord::decode(&encoded).unwrap();
         assert_eq!(decoded, rec);
+    }
+
+    #[test]
+    fn test_create_edge_wrong_rel_id_rejected() {
+        let dir = tempdir().unwrap();
+        let mut store = EdgeStore::open(dir.path(), REL).unwrap();
+        let wrong_rel = RelTableId(99);
+        let result = store.create_edge(nid(0), wrong_rel, nid(1));
+        assert!(
+            result.is_err(),
+            "create_edge with wrong rel_id must return an error"
+        );
+        match result.unwrap_err() {
+            sparrowdb_common::Error::InvalidArgument(_) => {}
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_truncates_delta_log() {
+        let dir = tempdir().unwrap();
+        let mut store = EdgeStore::open(dir.path(), REL).unwrap();
+
+        store.create_edge(nid(0), REL, nid(1)).unwrap();
+        store.create_edge(nid(1), REL, nid(2)).unwrap();
+
+        store.checkpoint(4).unwrap();
+
+        // Delta log must be empty after checkpoint.
+        let records = store.read_delta().unwrap();
+        assert_eq!(records.len(), 0, "delta log must be empty after checkpoint");
+    }
+
+    #[test]
+    fn test_checkpoint_rejects_out_of_bounds_node_id() {
+        let dir = tempdir().unwrap();
+        let mut store = EdgeStore::open(dir.path(), REL).unwrap();
+
+        // Node ID 5 is out of bounds for n_nodes=4.
+        store.create_edge(nid(0), REL, nid(5)).unwrap();
+
+        let result = store.checkpoint(4);
+        assert!(
+            result.is_err(),
+            "checkpoint with out-of-bounds node ID must fail"
+        );
+        match result.unwrap_err() {
+            sparrowdb_common::Error::InvalidArgument(_) => {}
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 }
