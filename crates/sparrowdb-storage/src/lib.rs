@@ -1,5 +1,8 @@
 pub mod metapage;
 
+/// WAL subsystem — codec, writer, and replay.
+pub mod wal;
+
 use sparrowdb_common::{PageId, Result};
 
 /// Compute CRC32C (Castagnoli) of the entire buffer.
