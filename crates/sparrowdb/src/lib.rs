@@ -53,7 +53,10 @@ impl VersionStore {
     /// Record a committed property update.
     fn insert(&mut self, node_id: NodeId, col_id: u32, committed_at: u64, value: Value) {
         let versions = self.map.entry((node_id.0, col_id)).or_default();
-        versions.push(Version { committed_at, value });
+        versions.push(Version {
+            committed_at,
+            value,
+        });
         // Keep sorted — writers are serialized so this is always appended in
         // order, but sort to be safe.
         versions.sort_by_key(|v| v.committed_at);
@@ -210,9 +213,7 @@ impl ReadTx {
             .into_iter()
             .map(|(col_id, raw_val)| {
                 // Check version chain first.
-                if let Some(v) =
-                    versions.get_at(node_id, col_id, self.snapshot_txn_id)
-                {
+                if let Some(v) = versions.get_at(node_id, col_id, self.snapshot_txn_id) {
                     (col_id, v)
                 } else {
                     (col_id, Value::int64_from_u64(raw_val))
@@ -318,8 +319,7 @@ impl<'db> WriteTx<'db> {
     /// 4. Records the new values in the version chain at the new `txn_id`.
     pub fn commit(mut self) -> Result<TxnId> {
         // Drain staged updates.
-        let updates: Vec<((u64, u32), StagedUpdate)> =
-            self.write_buf.updates.drain().collect();
+        let updates: Vec<((u64, u32), StagedUpdate)> = self.write_buf.updates.drain().collect();
 
         // 1. Flush updates to disk.
         for ((node_raw, col_id), ref staged) in &updates {
@@ -328,8 +328,7 @@ impl<'db> WriteTx<'db> {
         }
 
         // 2 & 3. Increment txn_id with Release ordering.
-        let new_id =
-            self.inner.current_txn_id.fetch_add(1, Ordering::Release) + 1;
+        let new_id = self.inner.current_txn_id.fetch_add(1, Ordering::Release) + 1;
 
         // 4. Publish versions.
         {
