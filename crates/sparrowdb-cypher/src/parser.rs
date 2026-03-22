@@ -706,11 +706,16 @@ impl Parser {
 
             if matches!(self.peek(), Token::Dash | Token::Arrow | Token::LeftArrow) {
                 // Edge pattern: (a)-[:R]->(b)
+                // src node is always emitted if it carries labels or props so
+                // the executor can create it; anonymous/bare refs are skipped.
+                if !node.labels.is_empty() || !node.props.is_empty() {
+                    nodes.push(node);
+                }
                 let rel = self.parse_rel_pattern()?;
                 let dst_node = self.parse_node_pattern()?;
                 let dst_var = dst_node.var.clone();
                 edges.push((node_var, rel, dst_var));
-                // dst node may be referenced but not re-created
+                // dst node is likewise emitted if it carries labels or props.
                 if !dst_node.labels.is_empty() || !dst_node.props.is_empty() {
                     nodes.push(dst_node);
                 }
