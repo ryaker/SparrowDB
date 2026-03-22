@@ -1,8 +1,9 @@
 //! Regression tests for SPA-198: unlabeled relationship endpoint should match any node.
 //!
 //! When one endpoint in a MATCH pattern has a label and the other doesn't,
-//! the unlabeled endpoint `(b)` must match any node reachable via the edge,
-//! regardless of its label.
+//! the unlabeled endpoint must match any node reachable via the edge,
+//! regardless of its label.  Currently supported: unlabeled destination `(b)`.
+//! Unlabeled source traversal (scanning all labels) is tracked as a follow-up.
 
 use sparrowdb::open;
 use sparrowdb_execution::types::Value as ExecValue;
@@ -54,12 +55,12 @@ fn spa198_unlabeled_dst_matches_any_node() {
     );
 }
 
-/// `MATCH (a)-[r]->(b:Knowledge) RETURN a.name` — unlabeled source.
+/// `MATCH (a:Person)-[r]->(b:Knowledge) RETURN a.name` — both endpoints labeled.
 ///
-/// Creates a Person→Knowledge edge and expects the Person node's `name`
-/// property to be returned when the source is unlabeled.
+/// Creates a Person→Knowledge edge and verifies that the fix does not regress
+/// the basic labeled-src + labeled-dst traversal path.
 #[test]
-fn spa198_unlabeled_src_matches_any_node() {
+fn spa198_labeled_src_and_dst_still_works() {
     let dir = db_dir();
     let db = open(dir.path()).expect("open db");
 
@@ -70,7 +71,7 @@ fn spa198_unlabeled_src_matches_any_node() {
     db.execute("MATCH (a:Person {name:\"Alice\"}),(b:Knowledge) CREATE (a)-[:KNOWS]->(b)")
         .expect("CREATE edge");
 
-    // Query with unlabeled source — should return the Person node's name.
+    // Query with both endpoints labeled — regression guard for the labeled path.
     let result = db
         .execute("MATCH (a:Person)-[r]->(b:Knowledge) RETURN a.name")
         .expect("execute");
