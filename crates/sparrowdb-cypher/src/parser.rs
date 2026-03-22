@@ -165,6 +165,7 @@ impl Parser {
             where_clause: None,
             return_clause: ReturnClause { items },
             order_by: vec![],
+            skip: None,
             limit: None,
             distinct,
         }))
@@ -254,9 +255,12 @@ impl Parser {
                 // MATCH … WITH … RETURN pipeline
                 self.parse_with_pipeline(patterns, None)
             }
-            Token::Return | Token::Order | Token::Limit | Token::Eof | Token::Semicolon => {
-                self.finish_match_return(patterns, None)
-            }
+            Token::Return
+            | Token::Order
+            | Token::Skip
+            | Token::Limit
+            | Token::Eof
+            | Token::Semicolon => self.finish_match_return(patterns, None),
             Token::Optional => {
                 // MATCH … OPTIONAL MATCH … RETURN
                 self.parse_match_optional_match_tail(patterns, None)
@@ -305,6 +309,27 @@ impl Parser {
             vec![]
         };
 
+        // SKIP
+        let skip = if matches!(self.peek(), Token::Skip) {
+            self.advance();
+            match self.advance().clone() {
+                Token::Integer(n) => {
+                    if n < 0 {
+                        return Err(Error::InvalidArgument("SKIP must be non-negative".into()));
+                    }
+                    Some(n as u64)
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected integer after SKIP, got {:?}",
+                        other
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
         // LIMIT
         let limit = if matches!(self.peek(), Token::Limit) {
             self.advance();
@@ -331,6 +356,7 @@ impl Parser {
             where_clause,
             return_clause,
             order_by,
+            skip,
             limit,
             distinct,
         }))
@@ -380,6 +406,27 @@ impl Parser {
             vec![]
         };
 
+        // SKIP
+        let skip = if matches!(self.peek(), Token::Skip) {
+            self.advance();
+            match self.advance().clone() {
+                Token::Integer(n) => {
+                    if n < 0 {
+                        return Err(Error::InvalidArgument("SKIP must be non-negative".into()));
+                    }
+                    Some(n as u64)
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected integer after SKIP, got {:?}",
+                        other
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
         // LIMIT
         let limit = if matches!(self.peek(), Token::Limit) {
             self.advance();
@@ -408,6 +455,7 @@ impl Parser {
             optional_where,
             return_clause,
             order_by,
+            skip,
             limit,
             distinct,
         }))
@@ -447,6 +495,27 @@ impl Parser {
             vec![]
         };
 
+        // SKIP
+        let skip = if matches!(self.peek(), Token::Skip) {
+            self.advance();
+            match self.advance().clone() {
+                Token::Integer(n) => {
+                    if n < 0 {
+                        return Err(Error::InvalidArgument("SKIP must be non-negative".into()));
+                    }
+                    Some(n as u64)
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected integer after SKIP, got {:?}",
+                        other
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
         // LIMIT
         let limit = if matches!(self.peek(), Token::Limit) {
             self.advance();
@@ -473,6 +542,7 @@ impl Parser {
             where_clause,
             return_clause,
             order_by,
+            skip,
             limit,
             distinct,
         }))
@@ -540,6 +610,27 @@ impl Parser {
             vec![]
         };
 
+        // SKIP
+        let skip = if matches!(self.peek(), Token::Skip) {
+            self.advance();
+            match self.advance().clone() {
+                Token::Integer(n) => {
+                    if n < 0 {
+                        return Err(Error::InvalidArgument("SKIP must be non-negative".into()));
+                    }
+                    Some(n as u64)
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected integer after SKIP, got {:?}",
+                        other
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
         // LIMIT
         let limit = if matches!(self.peek(), Token::Limit) {
             self.advance();
@@ -567,6 +658,7 @@ impl Parser {
             with_clause,
             return_clause,
             order_by,
+            skip,
             limit,
             distinct,
         }))
