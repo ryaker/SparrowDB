@@ -142,6 +142,7 @@ Tools: `execute_cypher`, `checkpoint`, `info`.
 | `OPTIONAL MATCH` | ✅ |
 | `UNION` / `UNION ALL` | ✅ |
 | `CALL db.index.fulltext.queryNodes` | ✅ |
+| `CALL db.schema()` | Schema introspection — labels, rel types, property keys | ✅ |
 | Reserved label prefix `__SO_` protection | ✅ |
 | Subqueries, `WITH` chaining | ⚠️ Partial |
 | `UNION` across complex multi-clause queries | ⚠️ Partial |
@@ -162,6 +163,7 @@ crates/
   sparrowdb/            # Public Rust API (GraphDb entry point)
   sparrowdb-python/     # PyO3 bindings (maturin wheel)
   sparrowdb-node/       # napi-rs Node.js/TypeScript bindings
+  sparrowdb-ruby/       # Magnus native gem (Ruby bindings)
   sparrowdb-cli/        # `sparrowdb` CLI binary (query/checkpoint/info)
   sparrowdb-mcp/        # JSON-RPC 2.0 MCP server over stdio
 
@@ -285,6 +287,28 @@ db.checkpoint()
 ```
 
 TypeScript types are included. Value types map as: `null`, `number`, `boolean`, `string`, and structured objects `{ $type: "node" | "edge", id: string }` for graph elements.
+
+---
+
+## Ruby Bindings
+
+Build via Magnus (requires Rust):
+
+```bash
+cd crates/sparrowdb-ruby
+bundle install
+bundle exec rake compile
+```
+
+Usage:
+
+```ruby
+# Ruby (Magnus native gem)
+require 'sparrowdb'
+db = SparrowDB::GraphDb.new('/tmp/my.db')
+rows = db.execute('MATCH (n:Person) RETURN n.name')
+# => [{"n.name" => "Alice"}]
+```
 
 ---
 
