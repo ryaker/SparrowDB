@@ -207,7 +207,7 @@ impl Engine {
                 .items
                 .iter()
                 .map(|item| eval_call_expr(&item.expr, &env, &self.store))
-                .collect();
+                .collect::<sparrowdb_common::Result<Vec<_>>>()?;
             out_rows.push(projected);
         }
         Ok((out_cols, out_rows))
@@ -2912,15 +2912,23 @@ fn expr_to_col_name(expr: &Expr) -> String {
 /// The environment maps YIELD column names → values (e.g. `"node"` →
 /// `Value::NodeRef`).  For `PropAccess` on a NodeRef the property is looked up
 /// from the node store.
-fn eval_call_expr(expr: &Expr, env: &HashMap<String, Value>, store: &NodeStore) -> Value {
-    match expr {
+///
+/// Returns `Err` if a storage I/O error occurs so that real backend failures
+/// are not silently masked as `Value::Null`.
+fn eval_call_expr(
+    expr: &Expr,
+    env: &HashMap<String, Value>,
+    store: &NodeStore,
+) -> sparrowdb_common::Result<Value> {
+    let val = match expr {
         Expr::Var(v) => env.get(v.as_str()).cloned().unwrap_or(Value::Null),
         Expr::PropAccess { var, prop } => match env.get(var.as_str()) {
             Some(Value::NodeRef(node_id)) => {
                 let col_id = prop_name_to_col_id(prop);
-                read_node_props(store, *node_id, &[col_id])
-                    .ok()
-                    .and_then(|pairs| pairs.into_iter().find(|(c, _)| *c == col_id))
+                let pairs = read_node_props(store, *node_id, &[col_id])?;
+                pairs
+                    .into_iter()
+                    .find(|(c, _)| *c == col_id)
                     .map(|(_, raw)| decode_raw_val(raw))
                     .unwrap_or(Value::Null)
             }
@@ -2935,5 +2943,6 @@ fn eval_call_expr(expr: &Expr, env: &HashMap<String, Value>, store: &NodeStore) 
             _ => Value::Null,
         },
         _ => Value::Null,
-    }
+    };
+    Ok(val)
 }
