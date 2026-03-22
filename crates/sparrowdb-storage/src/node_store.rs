@@ -282,6 +282,127 @@ impl NodeStore {
         Ok(ids)
     }
 
+    /// Return the **on-disk** high-water mark for a label, bypassing any
+    /// in-memory advances made by `peek_next_slot`.
+    ///
+    /// Used by [`WriteTx::merge_node`] to limit the disk scan to only slots
+    /// that have actually been persisted.
+    pub fn disk_hwm_for_label(&self, label_id: u32) -> Result<u64> {
+        self.load_hwm(label_id)
+    }
+
+    /// Reserve the slot index that the *next* `create_node` call will use for
+    /// `label_id`, advancing the in-memory HWM so that the slot is not
+    /// assigned again within the same [`NodeStore`] instance.
+    ///
+    /// This is used by [`WriteTx::create_node`] to pre-compute a [`NodeId`]
+    /// before the actual disk write, so the ID can be returned to the caller
+    /// while the write is deferred until commit (SPA-181).
+    ///
+    /// The on-disk HWM is **not** updated here; it is updated when the
+    /// buffered `NodeCreate` operation is applied in `commit()`.
+    pub fn peek_next_slot(&mut self, label_id: u32) -> Result<u32> {
+        // Load from disk if not cached yet.
+        if !self.hwm.contains_key(&label_id) {
+            let h = self.load_hwm(label_id)?;
+            self.hwm.insert(label_id, h);
+        }
+        let h = *self.hwm.get(&label_id).unwrap();
+        // Advance the in-memory HWM so a subsequent peek returns the next slot.
+        self.hwm.insert(label_id, h + 1);
+        Ok(h as u32)
+    }
+
+    /// Write a node at a pre-reserved `slot` (SPA-181 commit path).
+    ///
+    /// Like [`create_node`] but uses the caller-specified `slot` index instead
+    /// of deriving it from the HWM.  Used by [`WriteTx::commit`] to flush
+    /// buffered node-create operations in the exact order they were issued,
+    /// with slots that were already pre-allocated by [`peek_next_slot`].
+    ///
+    /// Advances the on-disk HWM to `slot + 1` (or higher if already past that).
+    pub fn create_node_at_slot(
+        &mut self,
+        label_id: u32,
+        slot: u32,
+        props: &[(u32, Value)],
+    ) -> Result<NodeId> {
+        // Snapshot original column sizes for rollback on partial failure.
+        let original_sizes: Vec<(u32, u64)> = props
+            .iter()
+            .map(|&(col_id, _)| {
+                let path = self.col_path(label_id, col_id);
+                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                (col_id, size)
+            })
+            .collect();
+
+        let write_result = (|| {
+            for &(col_id, ref val) in props {
+                self.append_col(label_id, col_id, slot, val.to_u64())?;
+            }
+            Ok::<(), sparrowdb_common::Error>(())
+        })();
+
+        if let Err(e) = write_result {
+            for (col_id, original_size) in &original_sizes {
+                let path = self.col_path(label_id, *col_id);
+                if path.exists() {
+                    if let Err(rollback_err) = fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .and_then(|f| f.set_len(*original_size))
+                    {
+                        eprintln!(
+                            "CRITICAL: Failed to roll back column file {} to size {}: {}. Data may be corrupt.",
+                            path.display(),
+                            original_size,
+                            rollback_err
+                        );
+                    }
+                }
+            }
+            return Err(e);
+        }
+
+        // Advance the on-disk HWM to at least slot + 1.
+        // Always write to disk; in-memory HWM may have been speculatively
+        // advanced by peek_next_slot but the disk HWM may be lower.
+        let new_hwm = slot as u64 + 1;
+        let disk_hwm = self.load_hwm(label_id)?;
+        if new_hwm > disk_hwm {
+            if let Err(e) = self.save_hwm(label_id, new_hwm) {
+                // Column bytes were already written; roll them back to preserve
+                // the atomicity guarantee (SPA-181).
+                for (col_id, original_size) in &original_sizes {
+                    let path = self.col_path(label_id, *col_id);
+                    if path.exists() {
+                        if let Err(rollback_err) = fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path)
+                            .and_then(|f| f.set_len(*original_size))
+                        {
+                            eprintln!(
+                                "CRITICAL: Failed to roll back column file {} to size {}: {}. Data may be corrupt.",
+                                path.display(),
+                                original_size,
+                                rollback_err
+                            );
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        }
+        // Keep in-memory HWM at least as high as new_hwm.
+        let mem_hwm = self.hwm.get(&label_id).copied().unwrap_or(0);
+        if new_hwm > mem_hwm {
+            self.hwm.insert(label_id, new_hwm);
+        }
+
+        Ok(NodeId((label_id as u64) << 32 | slot as u64))
+    }
+
     /// Create a new node in `label_id` with the given properties.
     ///
     /// Returns the new [`NodeId`] packed as `(label_id << 32) | slot`.
@@ -362,12 +483,18 @@ impl NodeStore {
             for (col_id, original_size) in &original_sizes {
                 let path = self.col_path(label_id, *col_id);
                 if path.exists() {
-                    // Best-effort truncation: ignore secondary errors to surface
-                    // the original error to the caller.
-                    let _ = fs::OpenOptions::new()
+                    if let Err(rollback_err) = fs::OpenOptions::new()
                         .write(true)
                         .open(&path)
-                        .and_then(|f| f.set_len(*original_size));
+                        .and_then(|f| f.set_len(*original_size))
+                    {
+                        eprintln!(
+                            "CRITICAL: Failed to roll back column file {} to size {}: {}. Data may be corrupt.",
+                            path.display(),
+                            original_size,
+                            rollback_err
+                        );
+                    }
                 }
             }
             return Err(e);
@@ -381,6 +508,47 @@ impl NodeStore {
         // Pack node ID.
         let node_id = ((label_id as u64) << 32) | (slot as u64);
         Ok(NodeId(node_id))
+    }
+
+    /// Write a deletion tombstone (`u64::MAX`) into `col_0.bin` for `node_id`.
+    ///
+    /// Creates `col_0.bin` (and its parent directory) if it does not exist,
+    /// zero-padding all preceding slots.  This ensures that nodes which were
+    /// created without any `col_0` property are still properly marked as deleted
+    /// and become invisible to subsequent scans.
+    ///
+    /// Called from [`WriteTx::commit`] when flushing a buffered `NodeDelete`.
+    pub fn tombstone_node(&self, node_id: NodeId) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let label_id = (node_id.0 >> 32) as u32;
+        let slot = (node_id.0 & 0xFFFF_FFFF) as u32;
+        let col0 = self.col_path(label_id, 0);
+
+        // Ensure the parent directory exists.
+        if let Some(parent) = col0.parent() {
+            fs::create_dir_all(parent).map_err(Error::Io)?;
+        }
+
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&col0)
+            .map_err(Error::Io)?;
+
+        // Zero-pad any slots before `slot` that are not yet in the file.
+        let needed_len = (slot as u64 + 1) * 8;
+        let existing_len = f.seek(SeekFrom::End(0)).map_err(Error::Io)?;
+        if existing_len < needed_len {
+            let zeros = vec![0u8; (needed_len - existing_len) as usize];
+            f.write_all(&zeros).map_err(Error::Io)?;
+        }
+
+        // Seek to the slot and write the tombstone value.
+        f.seek(SeekFrom::Start(slot as u64 * 8))
+            .map_err(Error::Io)?;
+        f.write_all(&u64::MAX.to_le_bytes()).map_err(Error::Io)
     }
 
     /// Overwrite the value of a single column for an existing node.
