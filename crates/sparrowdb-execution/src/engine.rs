@@ -312,7 +312,12 @@ impl Engine {
     ///
     /// Property names are collected by scanning committed WAL records so the
     /// caller does not need to have created any nodes yet for labels to appear.
-    fn call_db_schema(&self, _c: &CallStatement) -> Result<QueryResult> {
+    fn call_db_schema(&self, c: &CallStatement) -> Result<QueryResult> {
+        if !c.args.is_empty() {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "db.schema requires exactly 0 arguments".into(),
+            ));
+        }
         let columns = vec![
             "type".to_owned(),
             "name".to_owned(),

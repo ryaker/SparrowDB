@@ -208,13 +208,19 @@ impl QueryResult {
     /// missing values are absent from the map (they are never `Null`-padded).
     pub fn row_as_map(&self, idx: usize) -> Option<HashMap<String, Value>> {
         let row = self.rows.get(idx)?;
-        Some(
-            self.columns
-                .iter()
-                .zip(row.iter())
-                .map(|(col, val)| (col.clone(), val.clone()))
-                .collect(),
-        )
+        let mut out: HashMap<String, Value> = HashMap::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for (col, val) in self.columns.iter().zip(row.iter()) {
+            let count = seen.entry(col.clone()).or_insert(0);
+            *count += 1;
+            let key = if *count == 1 {
+                col.clone()
+            } else {
+                format!("{col}#{count}")
+            };
+            out.insert(key, val.clone());
+        }
+        Some(out)
     }
 }
 
