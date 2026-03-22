@@ -260,9 +260,17 @@ impl EdgeStore {
         }
 
         // ── 2. Apply delta records (insert-only for now). ─────────────────────
+        // NodeIds encode `(label_id << 32) | slot`.  The CSR is indexed purely
+        // by slot (0..n_nodes), so we must strip the upper label bits before
+        // inserting into the edge list.  Keeping the label bits would cause the
+        // CSR builder to use full-NodeId values as array indices, producing a
+        // structure that is indexed by slot but contains wrong (label-shifted)
+        // neighbor values — exactly the mismatch described in SPA-186.
         let records = self.read_delta()?;
         for r in &records {
-            edges.push((r.src.0, r.dst.0));
+            let src_slot = r.src.0 & 0xFFFF_FFFF;
+            let dst_slot = r.dst.0 & 0xFFFF_FFFF;
+            edges.push((src_slot, dst_slot));
         }
 
         // ── 3. Sort and deduplicate. ──────────────────────────────────────────
