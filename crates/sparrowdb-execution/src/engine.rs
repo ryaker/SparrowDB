@@ -1669,10 +1669,9 @@ impl Engine {
         // Read the full delta log once (used for both forward and backward
         // neighbor resolution when direction is Both).
         let delta_records: Vec<sparrowdb_storage::edge_store::DeltaRecord> =
-            match EdgeStore::open(&self.db_root, RelTableId(0)).and_then(|s| s.read_delta()) {
-                Ok(r) => r,
-                Err(_) => vec![],
-            };
+            EdgeStore::open(&self.db_root, RelTableId(0))
+                .and_then(|s| s.read_delta())
+                .unwrap_or_default();
 
         // ── Forward pass (Outgoing or Both) ──────────────────────────────────
         // Scan nodes matching scan_src_pat and follow their outgoing edges.
