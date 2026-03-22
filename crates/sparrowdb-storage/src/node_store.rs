@@ -257,26 +257,29 @@ impl NodeStore {
     /// Scans the label directory for `col_{id}.bin` files and returns the
     /// parsed `col_id` values.  Used by `create_node` to zero-pad columns
     /// that are not supplied for a new node (SPA-187).
-    fn existing_col_ids(&self, label_id: u32) -> Vec<u32> {
+    ///
+    /// Returns `Err` when the directory exists but cannot be read (e.g.
+    /// permissions failure or I/O error).  A missing directory is not an
+    /// error — it simply means no nodes of this label have been created yet.
+    fn existing_col_ids(&self, label_id: u32) -> Result<Vec<u32>> {
         let dir = self.label_dir(label_id);
         let read_dir = match fs::read_dir(&dir) {
             Ok(rd) => rd,
-            Err(_) => return Vec::new(),
+            // Directory does not exist yet → no columns on disk.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(Error::Io(e)),
         };
-        let mut ids = Vec::new();
-        for entry in read_dir.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            // Match "col_{col_id}.bin" filenames.
-            if let Some(rest) = name_str.strip_prefix("col_") {
-                if let Some(id_str) = rest.strip_suffix(".bin") {
-                    if let Ok(col_id) = id_str.parse::<u32>() {
-                        ids.push(col_id);
-                    }
-                }
-            }
-        }
-        ids
+        let ids = read_dir
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy().into_owned();
+                // Match "col_{col_id}.bin" filenames.
+                let id_str = name_str.strip_prefix("col_")?.strip_suffix(".bin")?;
+                id_str.parse::<u32>().ok()
+            })
+            .collect();
+        Ok(ids)
     }
 
     /// Create a new node in `label_id` with the given properties.
@@ -310,16 +313,22 @@ impl NodeStore {
         // Discover all columns already on disk for this label.  Any that are
         // NOT in `supplied_col_ids` must be zero-padded so their slot count
         // stays in sync with the HWM (SPA-187).
-        let all_existing_col_ids = self.existing_col_ids(label_id);
+        let existing_col_ids = self.existing_col_ids(label_id)?;
+
+        // Columns that need zero-padding: exist on disk but not in this node's props.
+        let cols_to_zero_pad: Vec<u32> = existing_col_ids
+            .iter()
+            .copied()
+            .filter(|col_id| !supplied_col_ids.contains(col_id))
+            .collect();
 
         // Build the full list of columns to touch for rollback tracking:
-        // supplied columns + existing columns that need zero-padding.
-        let mut all_col_ids_to_touch: Vec<u32> = supplied_col_ids.iter().copied().collect();
-        for col_id in &all_existing_col_ids {
-            if !supplied_col_ids.contains(col_id) {
-                all_col_ids_to_touch.push(*col_id);
-            }
-        }
+        // supplied columns + columns that need zero-padding.
+        let all_col_ids_to_touch: Vec<u32> = supplied_col_ids
+            .iter()
+            .copied()
+            .chain(cols_to_zero_pad.iter().copied())
+            .collect();
 
         // Snapshot the original size of each column file so we can roll back
         // on partial failure.  A column that does not yet exist has size 0.
@@ -342,10 +351,8 @@ impl NodeStore {
                 self.append_col(label_id, col_id, slot, val.to_u64())?;
             }
             // Zero-pad existing columns that were NOT supplied for this node.
-            for col_id in &all_existing_col_ids {
-                if !supplied_col_ids.contains(col_id) {
-                    self.append_col(label_id, *col_id, slot, 0u64)?;
-                }
+            for &col_id in &cols_to_zero_pad {
+                self.append_col(label_id, col_id, slot, 0u64)?;
             }
             Ok::<(), sparrowdb_common::Error>(())
         })();
