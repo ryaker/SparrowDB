@@ -1716,7 +1716,6 @@ impl Engine {
 
         let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
         let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
-<<<<<<< HEAD
         // Resolve src/dst label IDs.  Either may be absent (unlabeled pattern node).
         let src_label_id_opt: Option<u32> = if src_label.is_empty() {
             None
@@ -1751,24 +1750,6 @@ impl Engine {
             })
             .map(|(catalog_id, sid, did, rt)| (catalog_id, sid as u32, did as u32, rt))
             .collect();
-=======
-        let src_label_id = self
-            .catalog
-            .get_label(&src_label)?
-            .ok_or(sparrowdb_common::Error::NotFound)? as u32;
-        let dst_label_id = self
-            .catalog
-            .get_label(&dst_label)?
-            .ok_or(sparrowdb_common::Error::NotFound)? as u32;
-
-        let hwm_src = self.store.hwm_for_label(src_label_id)?;
-        tracing::debug!(src_label = %src_label, dst_label = %dst_label, hwm_src = hwm_src, "one-hop traversal start");
-
-        let mut col_ids_src =
-            collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
-        let mut col_ids_dst =
-            collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
->>>>>>> a55e845 (fix(rebase): remove SPA-198 unlabeled-dst code superseded by SPA-185 refactor)
 
         let use_agg = has_aggregate_in_return(&m.return_clause.items);
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
@@ -1851,7 +1832,6 @@ impl Engine {
                 edge_store.and_then(|s| s.read_delta()).unwrap_or_default()
             };
 
-<<<<<<< HEAD
             // Scan source nodes for this label.
             for src_slot in 0..hwm_src {
                 let src_node = NodeId(((effective_src_label_id as u64) << 32) | src_slot);
@@ -1870,31 +1850,12 @@ impl Engine {
                 } else {
                     vec![]
                 };
-=======
-            // Traverse CSR (SPA-185: use per-type CSR).
-            let csr_neighbors = match rel_lookup {
-                RelTableLookup::Found(rtid) => self.csr_neighbors(rtid, src_slot),
-                _ => self.csr_neighbors_all(src_slot),
-            };
-            let all_neighbors: Vec<u64> = csr_neighbors
-                .into_iter()
-                .chain(delta_neighbors.into_iter())
-                .collect();
-            let mut seen_neighbors: HashSet<u64> = HashSet::new();
-            for &dst_slot in &all_neighbors {
-                if !seen_neighbors.insert(dst_slot) {
-                    continue;
-                }
-                let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
-                let dst_props = read_node_props(&self.store, dst_node, &col_ids_dst)?;
->>>>>>> a55e845 (fix(rebase): remove SPA-198 unlabeled-dst code superseded by SPA-185 refactor)
 
                 // Apply src inline prop filter.
                 if !self.matches_prop_filter(&src_props, &src_node_pat.props) {
                     continue;
                 }
 
-<<<<<<< HEAD
                 // SPA-163 / SPA-195: read delta edges for this src node from
                 // the correct per-rel-table delta log (no longer hardcoded to 0).
                 let delta_neighbors: Vec<u64> = delta_records_all
@@ -1911,7 +1872,10 @@ impl Engine {
                 // snapshot is built exclusively for that table.  Using it for any
                 // other table would mix in neighbors from the wrong edge set.
                 let csr_neighbors: &[u64] = if *catalog_rel_id == 0 {
-                    self.csrs.get(&0).map(|c| c.neighbors(src_slot)).unwrap_or(&[])
+                    self.csrs
+                        .get(&0)
+                        .map(|c| c.neighbors(src_slot))
+                        .unwrap_or(&[])
                 } else {
                     &[]
                 };
@@ -2295,103 +2259,6 @@ impl Engine {
                             rows.push(row);
                         }
                     }
-=======
-                // Apply WHERE clause.
-                if let Some(ref where_expr) = m.where_clause {
-                    let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
-                    row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
-                    // Inject relationship metadata so type(r) works in WHERE.
-                    if !rel_pat.var.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__type__", rel_pat.var),
-                            Value::String(rel_pat.rel_type.clone()),
-                        );
-                    }
-                    // Inject node label metadata so labels(n) works in WHERE.
-                    if !src_node_pat.var.is_empty() && !src_label.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__labels__", src_node_pat.var),
-                            Value::List(vec![Value::String(src_label.clone())]),
-                        );
-                    }
-                    if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__labels__", dst_node_pat.var),
-                            Value::List(vec![Value::String(dst_label.clone())]),
-                        );
-                    }
-                    // SPA-196: inject NodeRef so id(src)/id(dst) work in WHERE.
-                    if !src_node_pat.var.is_empty() {
-                        row_vals.insert(src_node_pat.var.clone(), Value::NodeRef(src_node));
-                    }
-                    if !dst_node_pat.var.is_empty() {
-                        row_vals.insert(dst_node_pat.var.clone(), Value::NodeRef(dst_node));
-                    }
-                    if !eval_where(where_expr, &row_vals) {
-                        continue;
-                    }
-                }
-
-                if use_eval_path {
-                    let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
-                    row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
-                    // Inject relationship and label metadata for aggregate / id() path.
-                    if !rel_pat.var.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__type__", rel_pat.var),
-                            Value::String(rel_pat.rel_type.clone()),
-                        );
-                    }
-                    if !src_node_pat.var.is_empty() && !src_label.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__labels__", src_node_pat.var),
-                            Value::List(vec![Value::String(src_label.clone())]),
-                        );
-                    }
-                    if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__labels__", dst_node_pat.var),
-                            Value::List(vec![Value::String(dst_label.clone())]),
-                        );
-                    }
-                    if !src_node_pat.var.is_empty() {
-                        row_vals.insert(src_node_pat.var.clone(), Value::NodeRef(src_node));
-                    }
-                    if !dst_node_pat.var.is_empty() {
-                        row_vals.insert(dst_node_pat.var.clone(), Value::NodeRef(dst_node));
-                    }
-                    raw_rows.push(row_vals);
-                } else {
-                    // Build result row.
-                    // For the fast-path projection, pass rel type and node labels
-                    // so columns like type(r) and labels(n) can be resolved.
-                    let rel_var_type = if !rel_pat.var.is_empty() {
-                        Some((rel_pat.var.as_str(), rel_pat.rel_type.as_str()))
-                    } else {
-                        None
-                    };
-                    let src_label_meta = if !src_node_pat.var.is_empty() && !src_label.is_empty() {
-                        Some((src_node_pat.var.as_str(), src_label.as_str()))
-                    } else {
-                        None
-                    };
-                    let dst_label_meta = if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
-                        Some((dst_node_pat.var.as_str(), dst_label.as_str()))
-                    } else {
-                        None
-                    };
-                    let row = project_hop_row(
-                        &src_props,
-                        &dst_props,
-                        column_names,
-                        &src_node_pat.var,
-                        &dst_node_pat.var,
-                        rel_var_type,
-                        src_label_meta,
-                        dst_label_meta,
-                    );
-                    rows.push(row);
->>>>>>> a55e845 (fix(rebase): remove SPA-198 unlabeled-dst code superseded by SPA-185 refactor)
                 }
             }
         }
