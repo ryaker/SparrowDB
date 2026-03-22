@@ -1187,24 +1187,43 @@ impl WriteTx {
 
     /// Commit the transaction.
     ///
+    /// WAL-first protocol (SPA-184):
+    ///
     /// 1. Detects write-write conflicts (SPA-128).
-    /// 2. Applies all buffered structural operations to storage (SPA-181):
-    ///    node creates, node deletes, edge creates, label creates.
-    /// 3. Flushes all staged `set_node_col` updates to disk.
-    /// 4. Records before-images in the version chain at the previous `txn_id`,
+    /// 2. Drains staged property updates (does NOT apply to disk yet).
+    /// 3. Atomically increments the global `current_txn_id` to obtain the new
+    ///    transaction ID that will label all WAL records.
+    /// 4. **Writes WAL records and fsyncs** (Begin + all structural mutations +
+    ///    all property updates + Commit) so that the intent is durable before
+    ///    any data page is touched (SPA-184).
+    /// 5. Applies all buffered structural operations to storage (SPA-181):
+    ///    node creates, node deletes, edge creates.
+    /// 6. Flushes all staged `set_node_col` updates to disk.
+    /// 7. Records before-images in the version chain at the previous `txn_id`,
     ///    preserving snapshot access for currently-open readers.
-    /// 5. Atomically increments the global `current_txn_id`.
-    /// 6. Records the new values in the version chain at the new `txn_id`.
-    /// 7. Updates per-node version table for future conflict detection.
-    /// 8. Appends WAL records for all mutations (SPA-127).
+    /// 8. Records the new values in the version chain at the new `txn_id`.
+    /// 9. Updates per-node version table for future conflict detection.
     #[must_use = "check the Result; a failed commit means nothing was written"]
     pub fn commit(mut self) -> Result<TxnId> {
         // Step 1: MVCC conflict abort (SPA-128).
         self.detect_conflicts()?;
 
-        // Step 2: Flush buffered structural operations to disk (SPA-181).
-        // These were previously written immediately; now they are deferred to
-        // here so that a transaction that errors mid-way leaves no partial state.
+        // Step 2: Drain staged property updates — collect but do NOT write to
+        // disk yet.  We need them in hand to emit WAL records before touching
+        // any data page.
+        let updates: Vec<((u64, u32), StagedUpdate)> = self.write_buf.updates.drain().collect();
+
+        // Step 3: Increment txn_id with Release ordering.  We need the ID now
+        // so that WAL records (emitted next) carry the correct txn_id.
+        let new_id = self.inner.current_txn_id.fetch_add(1, Ordering::Release) + 1;
+
+        // Step 4: WAL-first — write all mutation records and fsync before
+        // touching any data page (SPA-184).  A crash between here and the end
+        // of Step 6 is recoverable: WAL replay will re-apply the ops.
+        write_mutation_wal(&self.inner.path, new_id, &updates, &self.wal_mutations)?;
+
+        // Step 5: Apply buffered structural operations to disk (SPA-181).
+        // WAL is already durable at this point; a crash here is safe.
         for op in self.pending_ops.drain(..) {
             match op {
                 PendingOp::NodeCreate {
@@ -1228,10 +1247,7 @@ impl WriteTx {
             }
         }
 
-        // Drain staged updates.
-        let updates: Vec<((u64, u32), StagedUpdate)> = self.write_buf.updates.drain().collect();
-
-        // Step 2: Flush updates to disk.
+        // Step 6: Flush property updates to disk.
         // Use `upsert_node_col` so that columns added by `set_property` (which
         // may not have been initialised during `create_node`) are created and
         // zero-padded automatically.
@@ -1240,10 +1256,7 @@ impl WriteTx {
                 .upsert_node_col(NodeId(*node_raw), *col_id, &staged.new_value)?;
         }
 
-        // Step 3+4: Increment txn_id with Release ordering.
-        let new_id = self.inner.current_txn_id.fetch_add(1, Ordering::Release) + 1;
-
-        // Step 5: Publish versions.
+        // Step 7+8: Publish versions.
         {
             let mut vs = self.inner.versions.write().expect("version lock poisoned");
             for ((node_raw, col_id), ref staged) in &updates {
@@ -1257,7 +1270,7 @@ impl WriteTx {
             }
         }
 
-        // Step 6: Advance per-node version table.
+        // Step 9: Advance per-node version table.
         {
             let mut nv = self
                 .inner
@@ -1269,10 +1282,7 @@ impl WriteTx {
             }
         }
 
-        // Step 7: Append WAL mutation records (SPA-127).
-        write_mutation_wal(&self.inner.path, new_id, &updates, &self.wal_mutations)?;
-
-        // Step 8: Flush any pending fulltext index updates.
+        // Step 10: Flush any pending fulltext index updates.
         // The primary DB mutations above are already durable (WAL written,
         // txn_id advanced).  A flush failure here must NOT return Err and
         // cause the caller to retry an already-committed transaction.  Log the
