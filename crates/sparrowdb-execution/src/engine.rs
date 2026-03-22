@@ -1389,6 +1389,7 @@ impl Engine {
         tracing::debug!(src_label = %src_label, fof_label = %fof_label, hwm_src = hwm_src, "two-hop traversal start");
 
         // Collect col_ids for fof: projected columns plus any columns referenced by prop filters.
+        // Also include any columns referenced by the WHERE clause.
         let col_ids_fof = {
             let mut ids = collect_col_ids_for_var(&fof_node_pat.var, column_names, fof_label_id);
             for p in &fof_node_pat.props {
@@ -1396,6 +1397,18 @@ impl Engine {
                 if !ids.contains(&col_id) {
                     ids.push(col_id);
                 }
+            }
+            if let Some(ref where_expr) = m.where_clause {
+                collect_col_ids_from_expr(where_expr, &mut ids);
+            }
+            ids
+        };
+
+        // Collect col_ids for src that are referenced by the WHERE clause.
+        let col_ids_src_where: Vec<u32> = {
+            let mut ids = Vec::new();
+            if let Some(ref where_expr) = m.where_clause {
+                collect_col_ids_from_expr(where_expr, &mut ids);
             }
             ids
         };
@@ -1431,6 +1444,11 @@ impl Engine {
                 let mut v = vec![];
                 for p in &src_node_pat.props {
                     let col_id = prop_name_to_col_id(&p.key);
+                    if !v.contains(&col_id) {
+                        v.push(col_id);
+                    }
+                }
+                for &col_id in &col_ids_src_where {
                     if !v.contains(&col_id) {
                         v.push(col_id);
                     }
@@ -1490,6 +1508,33 @@ impl Engine {
                 // Apply fof inline prop filter.
                 if !self.matches_prop_filter(&fof_props, &fof_node_pat.props) {
                     continue;
+                }
+
+                // Apply WHERE clause predicate.
+                if let Some(ref where_expr) = m.where_clause {
+                    let mut row_vals =
+                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src_where);
+                    row_vals.extend(build_row_vals(
+                        &fof_props,
+                        &fof_node_pat.var,
+                        &col_ids_fof,
+                    ));
+                    // Inject label metadata so labels(n) works in WHERE.
+                    if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", src_node_pat.var),
+                            Value::List(vec![Value::String(src_label.clone())]),
+                        );
+                    }
+                    if !fof_node_pat.var.is_empty() && !fof_label.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", fof_node_pat.var),
+                            Value::List(vec![Value::String(fof_label.clone())]),
+                        );
+                    }
+                    if !eval_where(where_expr, &row_vals) {
+                        continue;
+                    }
                 }
 
                 let row = project_fof_row(&fof_props, column_names, &fof_node_pat.var);
