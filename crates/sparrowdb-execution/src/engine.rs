@@ -1106,6 +1106,9 @@ impl Engine {
                         Value::List(vec![Value::String(label.clone())]),
                     );
                 }
+                if !var_name.is_empty() {
+                    row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+                }
                 raw_rows.push(row_vals);
             } else {
                 // Project RETURN columns directly (fast path).
@@ -1117,6 +1120,10 @@ impl Engine {
         if use_agg {
             rows = aggregate_rows(&raw_rows, &m.return_clause.items);
         } else {
+            if m.distinct {
+                deduplicate_rows(&mut rows);
+            }
+
             // ORDER BY
             apply_order_by(&mut rows, m, column_names);
 
@@ -1291,6 +1298,12 @@ impl Engine {
                             format!("{}.__labels__", dst_node_pat.var),
                             Value::List(vec![Value::String(dst_label.clone())]),
                         );
+                    }
+                    if !src_node_pat.var.is_empty() {
+                        row_vals.insert(src_node_pat.var.clone(), Value::NodeRef(src_node));
+                    }
+                    if !dst_node_pat.var.is_empty() {
+                        row_vals.insert(dst_node_pat.var.clone(), Value::NodeRef(dst_node));
                     }
                     raw_rows.push(row_vals);
                 } else {
@@ -2469,16 +2482,15 @@ fn project_fof_row(
 }
 
 fn deduplicate_rows(rows: &mut Vec<Vec<Value>>) {
-    // Deduplicate by converting to a string key.
-    let mut seen: HashSet<String> = HashSet::new();
-    rows.retain(|row| {
-        let key: String = row
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("|");
-        seen.insert(key)
-    });
+    // Deduplicate using structural row equality to avoid false collisions from
+    // string-key approaches (e.g. ["a|", "b"] vs ["a", "|b"] would hash equal).
+    let mut unique: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        if !unique.iter().any(|existing| existing == &row) {
+            unique.push(row);
+        }
+    }
+    *rows = unique;
 }
 
 fn apply_order_by(rows: &mut [Vec<Value>], m: &MatchStatement, column_names: &[String]) {
