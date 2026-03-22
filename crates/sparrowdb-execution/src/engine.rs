@@ -1710,6 +1710,12 @@ impl Engine {
                         );
                         row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
                     }
+                    if !src_node_pat.var.is_empty() {
+                        row_vals.insert(src_node_pat.var.clone(), Value::NodeRef(src_node));
+                    }
+                    if !dst_node_pat.var.is_empty() {
+                        row_vals.insert(dst_node_pat.var.clone(), Value::NodeRef(dst_node));
+                    }
                     raw_rows.push(row_vals);
                 } else {
                     let row = project_row(&props, column_names, &all_col_ids, var_name, label_name);
