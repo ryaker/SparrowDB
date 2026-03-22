@@ -49,7 +49,10 @@ impl Drop for TmpDir {
 #[command(about = "Generate a v1.0 on-disk compatibility fixture for SparrowDB")]
 struct Args {
     /// Output path for the resulting tar archive.
-    #[arg(long, default_value = "tests/fixtures/compatibility/v1.0/social_compat.tar")]
+    #[arg(
+        long,
+        default_value = "tests/fixtures/compatibility/v1.0/social_compat.tar"
+    )]
     out: PathBuf,
 }
 
@@ -72,25 +75,34 @@ fn main() {
         let db = GraphDb::open(&db_path).expect("open db");
 
         // Create Person nodes
-        db.execute("CREATE (n:Person {name: 'Alice', age: 30})").expect("Alice");
-        db.execute("CREATE (n:Person {name: 'Bob', age: 25})").expect("Bob");
-        db.execute("CREATE (n:Person {name: 'Carol', age: 35})").expect("Carol");
-        db.execute("CREATE (n:Person {name: 'Dave', age: 28})").expect("Dave");
+        db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+            .expect("Alice");
+        db.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+            .expect("Bob");
+        db.execute("CREATE (n:Person {name: 'Carol', age: 35})")
+            .expect("Carol");
+        db.execute("CREATE (n:Person {name: 'Dave', age: 28})")
+            .expect("Dave");
 
         // Create Company nodes
-        db.execute("CREATE (n:Company {name: 'Acme', founded: 1999})").expect("Acme");
-        db.execute("CREATE (n:Company {name: 'Initech', founded: 2001})").expect("Initech");
+        db.execute("CREATE (n:Company {name: 'Acme', founded: 1999})")
+            .expect("Acme");
+        db.execute("CREATE (n:Company {name: 'Initech', founded: 2001})")
+            .expect("Initech");
 
         // Create KNOWS edges (1-hop)
         db.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
-        ).expect("Alice KNOWS Bob");
+        )
+        .expect("Alice KNOWS Bob");
         db.execute(
             "MATCH (a:Person {name: 'Bob'}), (b:Person {name: 'Carol'}) CREATE (a)-[:KNOWS]->(b)",
-        ).expect("Bob KNOWS Carol");
+        )
+        .expect("Bob KNOWS Carol");
         db.execute(
             "MATCH (a:Person {name: 'Carol'}), (b:Person {name: 'Dave'}) CREATE (a)-[:KNOWS]->(b)",
-        ).expect("Carol KNOWS Dave");
+        )
+        .expect("Carol KNOWS Dave");
 
         // Create WORKS_AT edges
         db.execute(
@@ -111,7 +123,9 @@ fn main() {
     {
         let db = GraphDb::open(&db_path).expect("reopen for sanity check");
 
-        let r = db.execute("MATCH (p:Person) RETURN p.name").expect("sanity MATCH");
+        let r = db
+            .execute("MATCH (p:Person) RETURN p.name")
+            .expect("sanity MATCH");
         println!("  Person count = {}", r.rows.len());
         assert_eq!(r.rows.len(), 4, "expected 4 Person nodes");
 
@@ -151,7 +165,10 @@ fn main() {
         .status()
         .expect("tar command failed to start");
 
-    assert!(status.success(), "tar exited with non-zero status: {status}");
+    assert!(
+        status.success(),
+        "tar exited with non-zero status: {status}"
+    );
 
     println!("  wrote {}", args.out.display());
     println!("Done. Commit {} to the repository.", args.out.display());
