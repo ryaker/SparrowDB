@@ -290,7 +290,13 @@ impl WalReplayer {
             }
         }
 
-        // Pass 3 — collect property names from committed NodeCreate / EdgeCreate.
+        // Pass 3 — collect property names from committed NodeCreate / NodeUpdate / EdgeCreate.
+        //
+        // NodeCreate gives us the initial property set.  NodeUpdate records
+        // (written by set_property()) extend the known schema for each label:
+        // we build a node_id → label_id index from NodeCreate so that
+        // NodeUpdate can be attributed to the correct label.
+        let mut node_label: HashMap<u64, u32> = HashMap::new();
         let mut schema = WalSchema {
             node_props: HashMap::new(),
             rel_props: HashMap::new(),
@@ -301,11 +307,27 @@ impl WalReplayer {
             }
             match &rec.payload {
                 WalPayload::NodeCreate {
-                    label_id, props, ..
+                    node_id,
+                    label_id,
+                    props,
                 } => {
+                    node_label.insert(*node_id, *label_id);
                     let entry = schema.node_props.entry(*label_id).or_default();
                     for (name, _) in props {
                         entry.insert(name.clone());
+                    }
+                }
+                WalPayload::NodeUpdate { node_id, key, .. } => {
+                    // Only include non-empty keys (guard against low-level
+                    // col_id-only paths that may not record a human-readable name).
+                    if !key.is_empty() {
+                        if let Some(&label_id) = node_label.get(node_id) {
+                            schema
+                                .node_props
+                                .entry(label_id)
+                                .or_default()
+                                .insert(key.clone());
+                        }
                     }
                 }
                 WalPayload::EdgeCreate {
