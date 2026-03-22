@@ -486,12 +486,18 @@ impl NodeStore {
             for (col_id, original_size) in &original_sizes {
                 let path = self.col_path(label_id, *col_id);
                 if path.exists() {
-                    // Best-effort truncation: ignore secondary errors to surface
-                    // the original error to the caller.
-                    let _ = fs::OpenOptions::new()
+                    if let Err(rollback_err) = fs::OpenOptions::new()
                         .write(true)
                         .open(&path)
-                        .and_then(|f| f.set_len(*original_size));
+                        .and_then(|f| f.set_len(*original_size))
+                    {
+                        eprintln!(
+                            "CRITICAL: Failed to roll back column file {} to size {}: {}. Data may be corrupt.",
+                            path.display(),
+                            original_size,
+                            rollback_err
+                        );
+                    }
                 }
             }
             return Err(e);
@@ -505,6 +511,46 @@ impl NodeStore {
         // Pack node ID.
         let node_id = ((label_id as u64) << 32) | (slot as u64);
         Ok(NodeId(node_id))
+    }
+
+    /// Write a deletion tombstone (`u64::MAX`) into `col_0.bin` for `node_id`.
+    ///
+    /// Creates `col_0.bin` (and its parent directory) if it does not exist,
+    /// zero-padding all preceding slots.  This ensures that nodes which were
+    /// created without any `col_0` property are still properly marked as deleted
+    /// and become invisible to subsequent scans.
+    ///
+    /// Called from [`WriteTx::commit`] when flushing a buffered `NodeDelete`.
+    pub fn tombstone_node(&self, node_id: NodeId) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let label_id = (node_id.0 >> 32) as u32;
+        let slot = (node_id.0 & 0xFFFF_FFFF) as u32;
+        let col0 = self.col_path(label_id, 0);
+
+        // Ensure the parent directory exists.
+        if let Some(parent) = col0.parent() {
+            fs::create_dir_all(parent).map_err(Error::Io)?;
+        }
+
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&col0)
+            .map_err(Error::Io)?;
+
+        // Zero-pad any slots before `slot` that are not yet in the file.
+        let needed_len = (slot as u64 + 1) * 8;
+        let existing_len = f.seek(SeekFrom::End(0)).map_err(Error::Io)?;
+        if existing_len < needed_len {
+            let zeros = vec![0u8; (needed_len - existing_len) as usize];
+            f.write_all(&zeros).map_err(Error::Io)?;
+        }
+
+        // Seek to the slot and write the tombstone value.
+        f.seek(SeekFrom::Start(slot as u64 * 8)).map_err(Error::Io)?;
+        f.write_all(&u64::MAX.to_le_bytes()).map_err(Error::Io)
     }
 
     /// Overwrite the value of a single column for an existing node.

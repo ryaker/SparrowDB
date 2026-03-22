@@ -866,7 +866,7 @@ impl WriteTx {
                         op_props
                             .iter()
                             .find(|&&(c, _)| c == *col_id)
-                            .map(|&(_, ref v)| v.to_u64() == want_val.to_u64())
+                            .map(|(_, v)| v.to_u64() == want_val.to_u64())
                             .unwrap_or(false)
                     });
                     if matches {
@@ -945,11 +945,21 @@ impl WriteTx {
     ///
     /// [`commit`]: WriteTx::commit
     pub fn delete_node(&mut self, node_id: NodeId) -> Result<()> {
-        // Check delta log for attached edges.
+        // Check the persisted delta log for attached edges.
         let delta = EdgeStore::open(&self.inner.path, RelTableId(0))
             .and_then(|s| s.read_delta())
             .unwrap_or_default();
         if delta.iter().any(|r| r.src == node_id || r.dst == node_id) {
+            return Err(Error::NodeHasEdges { node_id: node_id.0 });
+        }
+
+        // Also check buffered (not-yet-committed) edge creates in this
+        // transaction — a node that has already been connected in the current
+        // transaction cannot be deleted before commit.
+        let has_buffered_edge = self.pending_ops.iter().any(|op| {
+            matches!(op, PendingOp::EdgeCreate { src, dst, .. } if *src == node_id || *dst == node_id)
+        });
+        if has_buffered_edge {
             return Err(Error::NodeHasEdges { node_id: node_id.0 });
         }
 
@@ -983,17 +993,33 @@ impl WriteTx {
         let dst_label_id = (dst.0 >> 32) as u16;
 
         // Register (or retrieve) the rel type in the catalog.
-        // Catalog mutation is also deferred — we update the in-memory catalog
-        // so the rel type is visible within this transaction, and queue the
-        // catalog persist in pending_ops.
+        // Catalog mutation is immediate and not transactional. This is acceptable
+        // for now as rel type creation is idempotent. Full schema-change
+        // atomicity is deferred to a future phase.
         let catalog_rel_id =
             self.catalog
                 .get_or_create_rel_type_id(src_label_id, dst_label_id, rel_type)?;
         let rel_table_id = RelTableId(catalog_rel_id as u32);
 
-        // Compute the edge ID from the current on-disk delta log size (without
-        // writing yet).  EdgeStore::peek_next_edge_id reads the file length.
-        let edge_id = EdgeStore::peek_next_edge_id(&self.inner.path, rel_table_id)?;
+        // Compute the edge ID from the on-disk delta log size, offset by the
+        // number of edges already buffered in this transaction for the same
+        // rel_table_id.  Without this offset, multiple create_edge calls in the
+        // same transaction would all derive the same on-disk base and collide.
+        let base_edge_id = EdgeStore::peek_next_edge_id(&self.inner.path, rel_table_id)?;
+        let buffered_count = self
+            .pending_ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PendingOp::EdgeCreate {
+                        rel_table_id: pending_rel_table_id,
+                        ..
+                    } if *pending_rel_table_id == rel_table_id
+                )
+            })
+            .count() as u64;
+        let edge_id = EdgeId(base_edge_id.0 + buffered_count);
 
         // Buffer the edge append — do NOT write to disk yet.
         self.pending_ops.push(PendingOp::EdgeCreate {
@@ -1100,24 +1126,7 @@ impl WriteTx {
                     self.store.create_node_at_slot(label_id, slot, &props)?;
                 }
                 PendingOp::NodeDelete { node_id } => {
-                    let label_id = (node_id.0 >> 32) as u32;
-                    let slot = (node_id.0 & 0xFFFF_FFFF) as u32;
-                    let col0 = self
-                        .inner
-                        .path
-                        .join("nodes")
-                        .join(label_id.to_string())
-                        .join("col_0.bin");
-                    if col0.exists() {
-                        use std::io::{Seek, SeekFrom, Write};
-                        let mut f = std::fs::OpenOptions::new()
-                            .write(true)
-                            .open(&col0)
-                            .map_err(Error::Io)?;
-                        f.seek(SeekFrom::Start(slot as u64 * 8))
-                            .map_err(Error::Io)?;
-                        f.write_all(&u64::MAX.to_le_bytes()).map_err(Error::Io)?;
-                    }
+                    self.store.tombstone_node(node_id)?;
                 }
                 PendingOp::EdgeCreate {
                     src,
