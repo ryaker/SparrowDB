@@ -187,7 +187,9 @@ fn kms_q02_create_knowledge_node() {
     .expect("CREATE Knowledge must succeed");
 
     let result = db
-        .execute("MATCH (k:Knowledge {id: 'kms-test-001'}) RETURN k.id, k.contentType, k.confidence")
+        .execute(
+            "MATCH (k:Knowledge {id: 'kms-test-001'}) RETURN k.id, k.contentType, k.confidence",
+        )
         .expect("MATCH Knowledge by id must succeed");
 
     assert_eq!(result.rows.len(), 1, "should find exactly 1 Knowledge node");
@@ -360,9 +362,7 @@ fn kms_q08_content_type_distribution() {
     setup_kms_graph(&db);
 
     let result = db
-        .execute(
-            "MATCH (n:Knowledge) RETURN n.contentType, count(n) ORDER BY n.contentType",
-        )
+        .execute("MATCH (n:Knowledge) RETURN n.contentType, count(n) ORDER BY n.contentType")
         .expect("content type distribution must succeed");
 
     // We have: insight(1), relationship(1), fact(1) — 3 distinct types, 3 rows.
@@ -424,9 +424,7 @@ fn kms_q10_match_related_to_outgoing() {
     setup_kms_graph(&db);
 
     let result = db
-        .execute(
-            "MATCH (a:Knowledge {id: 'know-001'})-[:RELATED_TO]->(b:Knowledge) RETURN b.id",
-        )
+        .execute("MATCH (a:Knowledge {id: 'know-001'})-[:RELATED_TO]->(b:Knowledge) RETURN b.id")
         .expect("RELATED_TO outgoing match must succeed");
 
     assert_eq!(result.rows.len(), 1, "know-001 has 1 outgoing RELATED_TO");
@@ -444,9 +442,7 @@ fn kms_q11_match_related_to_incoming() {
     setup_kms_graph(&db);
 
     let result = db
-        .execute(
-            "MATCH (b:Knowledge)-[:RELATED_TO]->(a:Knowledge {id: 'know-002'}) RETURN b.id",
-        )
+        .execute("MATCH (b:Knowledge)-[:RELATED_TO]->(a:Knowledge {id: 'know-002'}) RETURN b.id")
         .expect("RELATED_TO incoming match must succeed");
 
     assert_eq!(result.rows.len(), 1, "know-002 has 1 incoming RELATED_TO");
@@ -476,14 +472,8 @@ fn kms_q12_about_relationship_to_person() {
         "know-001 has ABOUT → alice: {:?}",
         result.rows
     );
-    assert_eq!(
-        result.rows[0][0],
-        Value::String("person-alice".to_string())
-    );
-    assert_eq!(
-        result.rows[0][1],
-        Value::String("Alice Yaker".to_string())
-    );
+    assert_eq!(result.rows[0][0], Value::String("person-alice".to_string()));
+    assert_eq!(result.rows[0][1], Value::String("Alice Yaker".to_string()));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -551,14 +541,8 @@ fn kms_q14_get_entity_summary_person() {
         .expect("entity summary MATCH must succeed");
 
     assert_eq!(result.rows.len(), 1, "should find alice");
-    assert_eq!(
-        result.rows[0][0],
-        Value::String("person-alice".to_string())
-    );
-    assert_eq!(
-        result.rows[0][1],
-        Value::String("Alice Yaker".to_string())
-    );
+    assert_eq!(result.rows[0][0], Value::String("person-alice".to_string()));
+    assert_eq!(result.rows[0][1], Value::String("Alice Yaker".to_string()));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -692,7 +676,10 @@ fn kms_q18_fulltext_search_call_procedure() {
     let node_id = tx
         .create_node_named(
             label_id,
-            &[("name".to_string(), sparrowdb::Value::Bytes("Alice Yaker".as_bytes().to_vec()))],
+            &[(
+                "name".to_string(),
+                sparrowdb::Value::Bytes("Alice Yaker".as_bytes().to_vec()),
+            )],
         )
         .expect("create_node_named");
     tx.add_to_fulltext_index("knowledge_search", node_id, "Alice Yaker")
@@ -708,7 +695,11 @@ fn kms_q18_fulltext_search_call_procedure() {
         )
         .expect("CALL fulltext with score YIELD must succeed (ignored test documents gap)");
 
-    assert_eq!(result.rows.len(), 1, "Alice should be found in fulltext index");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "Alice should be found in fulltext index"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -728,7 +719,10 @@ fn kms_q18b_fulltext_search_yield_node_only() {
     let node_id = tx
         .create_node_named(
             label_id,
-            &[("name".to_string(), sparrowdb::Value::Bytes("Alice Yaker".as_bytes().to_vec()))],
+            &[(
+                "name".to_string(),
+                sparrowdb::Value::Bytes("Alice Yaker".as_bytes().to_vec()),
+            )],
         )
         .expect("create_node_named");
     tx.add_to_fulltext_index("knowledge_search", node_id, "Alice Yaker")
@@ -743,7 +737,11 @@ fn kms_q18b_fulltext_search_yield_node_only() {
         )
         .expect("CALL fulltext YIELD node must succeed");
 
-    assert_eq!(result.rows.len(), 1, "Alice should be found in fulltext index");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "Alice should be found in fulltext index"
+    );
     assert!(
         matches!(&result.rows[0][0], Value::NodeRef(_)),
         "YIELD node should produce a NodeRef"
@@ -979,9 +977,7 @@ fn kms_q26_order_by_property_desc() {
     setup_kms_graph(&db);
 
     let result = db
-        .execute(
-            "MATCH (n:Knowledge) RETURN n.id, n.contentType ORDER BY n.id DESC",
-        )
+        .execute("MATCH (n:Knowledge) RETURN n.id, n.contentType ORDER BY n.id DESC")
         .expect("ORDER BY DESC must succeed");
 
     assert_eq!(result.rows.len(), 3, "expected 3 Knowledge nodes");
@@ -1089,7 +1085,9 @@ fn kms_q28_labels_function_in_return() {
     match &result.rows[0][0] {
         Value::List(labels) => {
             assert!(
-                labels.iter().any(|l| *l == Value::String("Person".to_string())),
+                labels
+                    .iter()
+                    .any(|l| *l == Value::String("Person".to_string())),
                 "labels should contain 'Person', got {labels:?}"
             );
         }
@@ -1380,14 +1378,8 @@ fn kms_q36b_unwind_literal_list_return_only() {
         .expect("UNWIND + RETURN must succeed");
 
     assert_eq!(result.rows.len(), 2, "UNWIND should produce 2 rows");
-    assert_eq!(
-        result.rows[0][0],
-        Value::String("person-alice".to_string())
-    );
-    assert_eq!(
-        result.rows[1][0],
-        Value::String("person-bob".to_string())
-    );
+    assert_eq!(result.rows[0][0], Value::String("person-alice".to_string()));
+    assert_eq!(result.rows[1][0], Value::String("person-bob".to_string()));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1419,10 +1411,7 @@ fn kms_q37_optional_match_for_entity_summary() {
         "should have at least 1 row for alice: {:?}",
         result.rows
     );
-    assert_eq!(
-        result.rows[0][0],
-        Value::String("person-alice".to_string())
-    );
+    assert_eq!(result.rows[0][0], Value::String("person-alice".to_string()));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1447,10 +1436,7 @@ fn kms_q38_unlabeled_match_by_id() {
         "should find alice without label filter: {:?}",
         result.rows
     );
-    assert_eq!(
-        result.rows[0][0],
-        Value::String("person-alice".to_string())
-    );
+    assert_eq!(result.rows[0][0], Value::String("person-alice".to_string()));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1480,13 +1466,23 @@ fn kms_q39_null_propagation_from_optional_match() {
     assert_eq!(result.rows.len(), 3, "one row per Knowledge node");
 
     // know-001 → alice: p.id and p.name should be non-null.
-    let alice_row = result.rows.iter().find(|r| r[0] == Value::String("know-001".to_string()));
+    let alice_row = result
+        .rows
+        .iter()
+        .find(|r| r[0] == Value::String("know-001".to_string()));
     assert!(alice_row.is_some(), "know-001 row must exist");
     let alice_row = alice_row.unwrap();
-    assert_ne!(alice_row[1], Value::Null, "know-001 should have p.id from alice");
+    assert_ne!(
+        alice_row[1],
+        Value::Null,
+        "know-001 should have p.id from alice"
+    );
 
     // know-003 has no ABOUT → Person: p.id and p.name should be NULL.
-    let k003_row = result.rows.iter().find(|r| r[0] == Value::String("know-003".to_string()));
+    let k003_row = result
+        .rows
+        .iter()
+        .find(|r| r[0] == Value::String("know-003".to_string()));
     assert!(k003_row.is_some(), "know-003 row must exist");
     let k003_row = k003_row.unwrap();
     assert_eq!(k003_row[1], Value::Null, "know-003 should have NULL p.id");
