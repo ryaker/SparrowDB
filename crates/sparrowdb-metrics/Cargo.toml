@@ -1,0 +1,17 @@
+[package]
+name = "sparrowdb-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Prometheus metrics exporter for SparrowDB runtime"
+publish = false
+
+[dependencies]
+sparrowdb = { workspace = true }
+tiny_http  = "0.12"
+tracing    = { workspace = true }
+
+[dev-dependencies]
+tempfile   = { workspace = true }
