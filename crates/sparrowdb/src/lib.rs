@@ -395,10 +395,16 @@ impl GraphDb {
                 .iter()
                 .map(|entry| {
                     let col_id = col_id_of(&entry.key);
-                    let val = expr_to_value(&entry.value);
-                    (col_id, val)
+                    match &entry.value {
+                        sparrowdb_cypher::ast::Expr::Literal(lit) => {
+                            Ok((col_id, literal_to_value(lit)))
+                        }
+                        _ => Err(sparrowdb_common::Error::InvalidArgument(
+                            "CREATE with relationship edges currently supports only literal node properties".into(),
+                        )),
+                    }
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             let node_id = tx.create_node(label_id, &props)?;
 

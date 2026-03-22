@@ -232,9 +232,10 @@ impl Engine {
     pub fn is_mutation(stmt: &Statement) -> bool {
         match stmt {
             Statement::Merge(_) | Statement::MatchMutate(_) | Statement::MatchCreate(_) => true,
-            // A standalone CREATE that contains edges must go through the
-            // write-transaction path so the executor can call create_edge.
-            Statement::Create(c) => !c.edges.is_empty(),
+            // All standalone CREATE statements must go through the
+            // write-transaction path to ensure WAL durability and correct
+            // single-writer semantics, regardless of whether edges are present.
+            Statement::Create(_) => true,
             _ => false,
         }
     }
