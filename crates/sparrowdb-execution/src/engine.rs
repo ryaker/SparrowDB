@@ -2237,7 +2237,7 @@ impl Engine {
                 // type's checkpointed edges are found under its own key.
                 let csr_neighbors: &[u64] = self
                     .csrs
-                    .get(&(*catalog_rel_id as u32))
+                    .get(&u32::try_from(*catalog_rel_id).expect("rel_table_id overflowed u32"))
                     .map(|c| c.neighbors(src_slot))
                     .unwrap_or(&[]);
                 let all_neighbors: Vec<u64> = csr_neighbors
