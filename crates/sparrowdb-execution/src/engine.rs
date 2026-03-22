@@ -2758,9 +2758,9 @@ fn has_aggregate_in_return(items: &[ReturnItem]) -> bool {
 /// `Value::NodeRef` under the variable key) instead of the fast `project_row`
 /// path (which only stores individual property columns).
 fn needs_node_ref_in_return(items: &[ReturnItem]) -> bool {
-    items.iter().any(|item| {
-        matches!(&item.expr, Expr::FnCall { name, .. } if name.to_lowercase() == "id")
-    })
+    items
+        .iter()
+        .any(|item| matches!(&item.expr, Expr::FnCall { name, .. } if name.to_lowercase() == "id"))
 }
 
 /// The aggregation kind for a single RETURN item.

@@ -72,12 +72,7 @@ fn id_values_are_distinct() {
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(
-        sorted.len(),
-        3,
-        "node IDs must be unique, got: {:?}",
-        ids
-    );
+    assert_eq!(sorted.len(), 3, "node IDs must be unique, got: {:?}", ids);
 }
 
 // ── WHERE id(n) works as a filter ────────────────────────────────────────────
@@ -114,7 +109,11 @@ fn id_in_where_filters_by_id() {
             Value::Int64(v) => v,
             ref other => panic!("id must be Int64, got {:?}", other),
         };
-        assert!(nid >= 0, "internal node ID must be non-negative, got {}", nid);
+        assert!(
+            nid >= 0,
+            "internal node ID must be non-negative, got {}",
+            nid
+        );
     }
 
     // Confirm the target_id is present among the returned IDs.
@@ -153,5 +152,49 @@ fn id_with_alias_returns_correct_column() {
         matches!(result.rows[0][0], Value::Int64(_)),
         "nid column must be Int64, got {:?}",
         result.rows[0][0]
+    );
+}
+
+// ── WHERE id(n) = X actually filters by the id ───────────────────────────────
+
+/// Verify that `WHERE id(n) = <literal>` actually filters rows to a single node.
+#[test]
+fn id_in_where_actually_filters() {
+    let (_dir, db) = make_db();
+
+    db.execute("CREATE (n:Fruit {name: 'apple'})").unwrap();
+    db.execute("CREATE (n:Fruit {name: 'banana'})").unwrap();
+    db.execute("CREATE (n:Fruit {name: 'cherry'})").unwrap();
+
+    // Get all IDs.
+    let all = db
+        .execute("MATCH (n:Fruit) RETURN id(n) as nid, n.name as nm")
+        .expect("initial scan must succeed");
+    assert_eq!(all.rows.len(), 3);
+
+    // Pick one specific ID to filter by.
+    let (target_id, target_name) = match (&all.rows[1][0], &all.rows[1][1]) {
+        (Value::Int64(id), Value::String(name)) => (*id, name.clone()),
+        other => panic!("unexpected row values: {:?}", other),
+    };
+
+    // Execute WHERE id(n) = <literal> and verify exactly one row is returned.
+    let query = format!("MATCH (n:Fruit) WHERE id(n) = {} RETURN n.name", target_id);
+    let result = db.execute(&query).expect("WHERE id(n) = X must not error");
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "WHERE id(n) = {} should return exactly 1 row, got {} rows. Query: {}",
+        target_id,
+        result.rows.len(),
+        query,
+    );
+    assert_eq!(
+        result.rows[0][0],
+        Value::String(target_name.clone()),
+        "filtered row must have name '{}', got {:?}",
+        target_name,
+        result.rows[0][0],
     );
 }
