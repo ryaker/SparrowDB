@@ -89,13 +89,10 @@ impl SparrowDB {
     /// throws `WriterBusy` if another writer is already open.
     #[napi]
     pub fn begin_write(&self) -> napi::Result<WriteTx> {
-        // Safety: same transmute as in the PyO3 bindings.  WriteTx<'db> only
-        // holds a MutexGuard whose lifetime is constrained to the GraphDb.
-        // SparrowDB wraps GraphDb directly (not behind a shared reference that
-        // could be dropped independently), so the guard lives as long as this
-        // SparrowDB object, which napi-rs keeps alive while JS holds the handle.
-        let tx: ::sparrowdb::WriteTx<'static> =
-            unsafe { std::mem::transmute(self.inner.begin_write().map_err(to_napi)?) };
+        // SPA-181: WriteTx no longer carries a lifetime parameter — the write
+        // lock is managed internally by an AtomicBool WriteGuard, so no unsafe
+        // transmute is required here.
+        let tx = self.inner.begin_write().map_err(to_napi)?;
         Ok(WriteTx { inner: Some(tx) })
     }
 }
@@ -145,11 +142,11 @@ impl ReadTx {
 #[napi]
 pub struct WriteTx {
     /// `None` after commit or rollback so use-after-commit is detected.
-    inner: Option<::sparrowdb::WriteTx<'static>>,
+    inner: Option<::sparrowdb::WriteTx>,
 }
 
-// SAFETY: napi-rs requires Send on all #[napi] types.  WriteTx<'static> wraps a
-// MutexGuard whose lock was acquired on the JS main thread.  We uphold safety by
+// SAFETY: napi-rs requires Send on all #[napi] types.  WriteTx wraps an
+// Arc<DbInner> + WriteGuard (AtomicBool-backed).  We uphold safety by
 // documenting that WriteTx MUST NOT be transferred to a napi worker thread (e.g.
 // via AsyncTask); it is only safe to use from the same thread that opened it.
 // napi-rs currently does not guarantee single-threaded access for object methods

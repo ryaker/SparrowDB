@@ -125,6 +125,27 @@ impl EdgeStore {
         self.rel_dir.join("base.bwd.csr")
     }
 
+    /// Return the [`EdgeId`] that the *next* `create_edge` call would assign,
+    /// without modifying any state.
+    ///
+    /// Used by [`WriteTx::create_edge`] to pre-compute an [`EdgeId`] before
+    /// the actual delta-log append, so the ID can be returned to the caller
+    /// while the write is deferred until commit (SPA-181).
+    ///
+    /// This is a free function (no `&self` or `&mut self`) so the caller does
+    /// not need to open an [`EdgeStore`] just to peek the next ID.
+    pub fn peek_next_edge_id(db_root: &Path, rel_table_id: RelTableId) -> Result<EdgeId> {
+        let rel_dir = db_root.join("edges").join(rel_table_id.0.to_string());
+        let delta_path = rel_dir.join("delta.log");
+        let next_id = if delta_path.exists() {
+            let meta = fs::metadata(&delta_path).map_err(Error::Io)?;
+            meta.len() / DELTA_RECORD_SIZE as u64
+        } else {
+            0
+        };
+        Ok(EdgeId(next_id))
+    }
+
     /// Append a new directed edge `src → dst` to the delta log.
     ///
     /// Returns the new [`EdgeId`] (monotonic index into the delta log).

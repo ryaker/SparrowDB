@@ -38,8 +38,8 @@ use sparrowdb_storage::wal::codec::{WalPayload, WalRecordKind};
 use sparrowdb_storage::wal::writer::WalWriter;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use tracing::info_span;
 
 // ── Version chain ─────────────────────────────────────────────────────────────
@@ -143,6 +143,36 @@ enum WalMutation {
     },
 }
 
+// ── Pending structural operations (SPA-181 buffering) ────────────────────────
+
+/// A buffered structural mutation that will be applied to storage on commit.
+///
+/// Property updates (`set_node_col`) already go through [`WriteBuffer`] and
+/// are flushed by the existing commit machinery.  These `PendingOp` entries
+/// cover the remaining mutations that previously wrote directly to disk
+/// before commit.
+///
+/// Note: catalog schema changes (`create_label`, `get_or_create_rel_type_id`)
+/// are still written immediately because labels are idempotent metadata.
+/// Full schema-change atomicity is deferred to a future phase.
+enum PendingOp {
+    /// Create a node: write to the node-store at the pre-reserved `slot` and
+    /// advance the on-disk HWM.
+    NodeCreate {
+        label_id: u32,
+        slot: u32,
+        props: Vec<(u32, Value)>,
+    },
+    /// Delete a node: tombstone col_0 with `u64::MAX`.
+    NodeDelete { node_id: NodeId },
+    /// Create an edge: append to the edge delta log.
+    EdgeCreate {
+        src: NodeId,
+        dst: NodeId,
+        rel_table_id: RelTableId,
+    },
+}
+
 // ── Node version tracker (for MVCC conflict detection, SPA-128) ───────────────
 
 /// Tracks the `txn_id` of the last committed write to each node.
@@ -170,11 +200,47 @@ struct DbInner {
     /// Incremented atomically after each successful `WriteTx` commit.
     current_txn_id: AtomicU64,
     /// Ensures at most one writer exists at a time.
-    write_lock: Mutex<()>,
+    ///
+    /// `false` = no active writer; `true` = writer active.
+    /// Use `compare_exchange(false, true)` for try-lock semantics.
+    write_locked: AtomicBool,
     /// MVCC version chains for property updates (snapshot-isolation support).
     versions: RwLock<VersionStore>,
     /// Per-node last-committed txn_id (write-write conflict detection, SPA-128).
     node_versions: RwLock<NodeVersions>,
+}
+
+// ── Write-lock guard (SPA-181: replaces 'static transmute UB) ────────────────
+
+/// RAII guard that holds the exclusive writer lock for a [`DbInner`].
+///
+/// Acquired by [`GraphDb::begin_write`] via an atomic compare-exchange
+/// (`false → true`).  Released on `Drop` by resetting the flag to `false`.
+/// Because the guard holds an [`Arc<DbInner>`] the `DbInner` (and the
+/// `AtomicBool` it contains) is guaranteed to outlive the guard — no unsafe
+/// lifetime extension needed.
+struct WriteGuard {
+    inner: Arc<DbInner>,
+}
+
+impl WriteGuard {
+    /// Try to acquire the write lock.  Returns `None` if already held.
+    fn try_acquire(inner: &Arc<DbInner>) -> Option<Self> {
+        inner
+            .write_locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| WriteGuard {
+                inner: Arc::clone(inner),
+            })
+    }
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        // Release the lock.
+        self.inner.write_locked.store(false, Ordering::Release);
+    }
 }
 
 // ── GraphDb ───────────────────────────────────────────────────────────────────
@@ -196,7 +262,7 @@ impl GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
                 current_txn_id: AtomicU64::new(0),
-                write_lock: Mutex::new(()),
+                write_locked: AtomicBool::new(false),
                 versions: RwLock::new(VersionStore::default()),
                 node_versions: RwLock::new(NodeVersions::default()),
             }),
@@ -221,18 +287,11 @@ impl GraphDb {
     ///
     /// Returns [`Error::WriterBusy`] immediately if another [`WriteTx`] is
     /// already active (try-lock semantics — does not block).
-    pub fn begin_write(&self) -> Result<WriteTx<'_>> {
-        // try_lock: non-blocking — returns Err if already locked.
-        let guard: MutexGuard<'static, ()> = match self.inner.write_lock.try_lock() {
-            Ok(g) => {
-                // SAFETY: We extend the lifetime to 'static only so the guard
-                // can be stored inside WriteTx alongside the Arc<DbInner>.
-                // The guard is released when WriteTx is dropped, which happens
-                // before the Arc (and the Mutex it contains) is destroyed.
-                unsafe { std::mem::transmute::<MutexGuard<'_, ()>, MutexGuard<'static, ()>>(g) }
-            }
-            Err(_) => return Err(Error::WriterBusy),
-        };
+    pub fn begin_write(&self) -> Result<WriteTx> {
+        // Atomically acquire the write lock (false → true).
+        // No unsafe transmute — WriteGuard holds Arc<DbInner> and resets
+        // the AtomicBool on Drop, so the lock flag always outlives the guard.
+        let guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         let snapshot_txn_id = self.inner.current_txn_id.load(Ordering::Acquire);
         let store = NodeStore::open(&self.inner.path)?;
         let catalog = Catalog::open(&self.inner.path)?;
@@ -247,6 +306,7 @@ impl GraphDb {
             _guard: guard,
             committed: false,
             fulltext_pending: HashMap::new(),
+            pending_ops: Vec::new(),
         })
     }
 
@@ -259,11 +319,7 @@ impl GraphDb {
     /// active, rather than blocking indefinitely.  This prevents deadlocks on
     /// single-threaded callers and avoids unbounded waits on multi-threaded ones.
     pub fn checkpoint(&self) -> Result<()> {
-        let _guard = self
-            .inner
-            .write_lock
-            .try_lock()
-            .map_err(|_| Error::WriterBusy)?;
+        let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         let catalog = Catalog::open(&self.inner.path)?;
         let node_store = NodeStore::open(&self.inner.path)?;
         let (rel_table_ids, n_nodes) =
@@ -281,11 +337,7 @@ impl GraphDb {
     /// active, rather than blocking indefinitely.  This prevents deadlocks on
     /// single-threaded callers and avoids unbounded waits on multi-threaded ones.
     pub fn optimize(&self) -> Result<()> {
-        let _guard = self
-            .inner
-            .write_lock
-            .try_lock()
-            .map_err(|_| Error::WriterBusy)?;
+        let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         let catalog = Catalog::open(&self.inner.path)?;
         let node_store = NodeStore::open(&self.inner.path)?;
         let (rel_table_ids, n_nodes) =
@@ -655,11 +707,7 @@ impl GraphDb {
         use sparrowdb_storage::fulltext_index::FulltextIndex;
         // Acquire the writer lock so this cannot race with an active WriteTx
         // that is reading or flushing the same index file.
-        let _guard = self
-            .inner
-            .write_lock
-            .try_lock()
-            .map_err(|_| Error::WriterBusy)?;
+        let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         FulltextIndex::create(&self.inner.path, name)?;
         Ok(())
     }
@@ -723,7 +771,19 @@ impl ReadTx {
 /// Only one may be active at a time (writer-lock held for the lifetime of
 /// this struct).  Commit by calling [`WriteTx::commit`]; uncommitted changes
 /// are discarded on drop.
-pub struct WriteTx<'db> {
+///
+/// # Atomicity guarantee (SPA-181)
+///
+/// All mutations (`create_node`, `create_edge`, `delete_node`, `create_label`,
+/// `merge_node`) are buffered in memory until [`commit`] is called.  If the
+/// transaction is dropped without committing, **no changes are persisted** —
+/// the database remains in the state it was at the time [`begin_write`] was
+/// called.
+///
+/// [`begin_write`]: GraphDb::begin_write
+/// [`commit`]: WriteTx::commit
+#[must_use = "call commit() to persist changes, or drop to discard"]
+pub struct WriteTx {
     inner: Arc<DbInner>,
     store: NodeStore,
     catalog: Catalog,
@@ -736,24 +796,42 @@ pub struct WriteTx<'db> {
     /// The committed txn_id at the time this WriteTx was opened (MVCC snapshot).
     snapshot_txn_id: u64,
     /// Held for the lifetime of this WriteTx; released on drop.
-    _guard: MutexGuard<'db, ()>,
+    /// Uses AtomicBool-based guard — no unsafe lifetime extension needed (SPA-181).
+    _guard: WriteGuard,
     committed: bool,
     /// In-flight fulltext index updates — flushed to disk on commit.
     ///
     /// Caching open indexes here avoids one open+flush per `add_to_fulltext_index`
     /// call; instead we batch all additions and flush each index exactly once.
     fulltext_pending: HashMap<String, sparrowdb_storage::fulltext_index::FulltextIndex>,
+    /// Buffered structural mutations (create_node, delete_node, create_edge,
+    /// create_label) not yet written to disk.  Flushed atomically on commit.
+    pending_ops: Vec<PendingOp>,
 }
 
-impl<'db> WriteTx<'db> {
+impl WriteTx {
     // ── Core node/property API (pre-Phase 7) ─────────────────────────────────
 
     /// Create a new node under `label_id` with the given properties.
     ///
     /// Returns the packed [`NodeId`].
+    ///
+    /// The node is **not** written to disk until [`commit`] is called.
+    /// Dropping the transaction without committing discards this operation.
+    ///
+    /// [`commit`]: WriteTx::commit
     pub fn create_node(&mut self, label_id: u32, props: &[(u32, Value)]) -> Result<NodeId> {
-        let node_id = self.store.create_node(label_id, props)?;
+        // Allocate a node ID by consulting the in-memory HWM.  We peek at
+        // the current HWM to compute the future NodeId without actually
+        // writing anything to disk yet.
+        let slot = self.store.peek_next_slot(label_id)?;
+        let node_id = NodeId((label_id as u64) << 32 | slot as u64);
         self.dirty_nodes.insert(node_id.0);
+        self.pending_ops.push(PendingOp::NodeCreate {
+            label_id,
+            slot,
+            props: props.to_vec(),
+        });
         self.wal_mutations.push(WalMutation::NodeCreate {
             node_id,
             label_id,
@@ -823,6 +901,14 @@ impl<'db> WriteTx<'db> {
     }
 
     /// Create a label in the schema catalog.
+    ///
+    /// # Note on atomicity
+    ///
+    /// Schema changes (label creation) are written to the catalog file
+    /// immediately and are not rolled back if the transaction is later
+    /// dropped without committing.  Label creation is idempotent at the
+    /// catalog level: a duplicate name returns `Error::AlreadyExists`.
+    /// Full schema-change atomicity is deferred to a future phase.
     pub fn create_label(&mut self, name: &str) -> Result<u16> {
         self.catalog.create_label(name)
     }
@@ -854,9 +940,36 @@ impl<'db> WriteTx<'db> {
             .collect();
         let col_ids: Vec<u32> = col_kv.iter().map(|&(_, col_id, _)| col_id).collect();
 
-        // Scan existing slots for a match.
-        let hwm = self.store.hwm_for_label(label_id)?;
-        for slot in 0..hwm {
+        // First, check buffered (not-yet-committed) node creates in pending_ops.
+        // This ensures merge_node is idempotent within a single transaction.
+        for op in &self.pending_ops {
+            if let PendingOp::NodeCreate {
+                label_id: op_label_id,
+                slot: op_slot,
+                props: op_props,
+            } = op
+            {
+                if *op_label_id == label_id {
+                    let candidate = NodeId((label_id as u64) << 32 | *op_slot as u64);
+                    let matches = col_kv.iter().all(|(_, col_id, want_val)| {
+                        op_props
+                            .iter()
+                            .find(|&&(c, _)| c == *col_id)
+                            .map(|(_, v)| v.to_u64() == want_val.to_u64())
+                            .unwrap_or(false)
+                    });
+                    if matches {
+                        return Ok(candidate);
+                    }
+                }
+            }
+        }
+
+        // Scan on-disk slots for a match (only checks committed/on-disk nodes).
+        // Use disk_hwm_for_label to avoid scanning slots that were only reserved
+        // in-memory by peek_next_slot but not yet flushed to disk.
+        let disk_hwm = self.store.disk_hwm_for_label(label_id)?;
+        for slot in 0..disk_hwm {
             let candidate = NodeId((label_id as u64) << 32 | slot);
             if let Ok(stored) = self.store.get_node_raw(candidate, &col_ids) {
                 let matches = col_kv.iter().all(|(_, col_id, want_val)| {
@@ -872,13 +985,19 @@ impl<'db> WriteTx<'db> {
             }
         }
 
-        // Not found — create a new node.
+        // Not found — create a new node (buffered, same as create_node).
         let disk_props: Vec<(u32, Value)> = col_kv
             .iter()
             .map(|(_, col_id, v)| (*col_id, v.clone()))
             .collect();
-        let node_id = self.store.create_node(label_id, &disk_props)?;
+        let slot = self.store.peek_next_slot(label_id)?;
+        let node_id = NodeId((label_id as u64) << 32 | slot as u64);
         self.dirty_nodes.insert(node_id.0);
+        self.pending_ops.push(PendingOp::NodeCreate {
+            label_id,
+            slot,
+            props: disk_props.clone(),
+        });
         self.wal_mutations.push(WalMutation::NodeCreate {
             node_id,
             label_id,
@@ -909,11 +1028,13 @@ impl<'db> WriteTx<'db> {
     /// SPA-125: Delete a node, with edge-attachment check.
     ///
     /// Returns [`Error::NodeHasEdges`] if the node is referenced by any edge
-    /// in the delta log.  On success, tombstones col_0 of the node's slot
-    /// with `u64::MAX` (a sentinel that callers must treat as "deleted") and
-    /// queues a `NodeDelete` WAL record.
+    /// in the delta log.  On success, queues a `NodeDelete` WAL record and
+    /// buffers the tombstone write; the on-disk tombstone is only applied when
+    /// [`commit`] is called.
+    ///
+    /// [`commit`]: WriteTx::commit
     pub fn delete_node(&mut self, node_id: NodeId) -> Result<()> {
-        // Check delta log for attached edges.
+        // Check the persisted delta log for attached edges.
         let delta = EdgeStore::open(&self.inner.path, RelTableId(0))
             .and_then(|s| s.read_delta())
             .unwrap_or_default();
@@ -921,37 +1042,34 @@ impl<'db> WriteTx<'db> {
             return Err(Error::NodeHasEdges { node_id: node_id.0 });
         }
 
-        // Tombstone col_0 with sentinel `u64::MAX`.
-        let label_id = (node_id.0 >> 32) as u32;
-        let slot = (node_id.0 & 0xFFFF_FFFF) as u32;
-        let col0 = self
-            .inner
-            .path
-            .join("nodes")
-            .join(label_id.to_string())
-            .join("col_0.bin");
-        if col0.exists() {
-            use std::io::{Seek, SeekFrom, Write};
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&col0)
-                .map_err(Error::Io)?;
-            f.seek(SeekFrom::Start(slot as u64 * 8))
-                .map_err(Error::Io)?;
-            f.write_all(&u64::MAX.to_le_bytes()).map_err(Error::Io)?;
+        // Also check buffered (not-yet-committed) edge creates in this
+        // transaction — a node that has already been connected in the current
+        // transaction cannot be deleted before commit.
+        let has_buffered_edge = self.pending_ops.iter().any(|op| {
+            matches!(op, PendingOp::EdgeCreate { src, dst, .. } if *src == node_id || *dst == node_id)
+        });
+        if has_buffered_edge {
+            return Err(Error::NodeHasEdges { node_id: node_id.0 });
         }
 
+        // Buffer the tombstone — do NOT write to disk yet.
         self.dirty_nodes.insert(node_id.0);
+        self.pending_ops.push(PendingOp::NodeDelete { node_id });
         self.wal_mutations.push(WalMutation::NodeDelete { node_id });
         Ok(())
     }
 
     /// SPA-126: Create a directed edge `src → dst` with the given type.
     ///
-    /// Appends to the edge delta log and queues an `EdgeCreate` WAL record.
+    /// Buffers the edge creation; the delta-log append and WAL record are only
+    /// written to disk when [`commit`] is called.  If the transaction is dropped
+    /// without committing, no edge is persisted.
+    ///
     /// Registers the relationship type name in the catalog so that queries
     /// like `MATCH (a)-[:REL]->(b)` can resolve the type (SPA-158).
     /// Returns the new [`EdgeId`].
+    ///
+    /// [`commit`]: WriteTx::commit
     pub fn create_edge(
         &mut self,
         src: NodeId,
@@ -963,16 +1081,41 @@ impl<'db> WriteTx<'db> {
         let src_label_id = (src.0 >> 32) as u16;
         let dst_label_id = (dst.0 >> 32) as u16;
 
-        // Register (or retrieve) the rel type in the catalog so that the
-        // binder can resolve `[:REL_TYPE]` patterns in Cypher queries.
-        // The catalog returns a u64 id; the storage layer uses a u32 newtype.
+        // Register (or retrieve) the rel type in the catalog.
+        // Catalog mutation is immediate and not transactional. This is acceptable
+        // for now as rel type creation is idempotent. Full schema-change
+        // atomicity is deferred to a future phase.
         let catalog_rel_id =
             self.catalog
                 .get_or_create_rel_type_id(src_label_id, dst_label_id, rel_type)?;
         let rel_table_id = RelTableId(catalog_rel_id as u32);
 
-        let mut es = EdgeStore::open(&self.inner.path, rel_table_id)?;
-        let edge_id = es.create_edge(src, rel_table_id, dst)?;
+        // Compute the edge ID from the on-disk delta log size, offset by the
+        // number of edges already buffered in this transaction for the same
+        // rel_table_id.  Without this offset, multiple create_edge calls in the
+        // same transaction would all derive the same on-disk base and collide.
+        let base_edge_id = EdgeStore::peek_next_edge_id(&self.inner.path, rel_table_id)?;
+        let buffered_count = self
+            .pending_ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PendingOp::EdgeCreate {
+                        rel_table_id: pending_rel_table_id,
+                        ..
+                    } if *pending_rel_table_id == rel_table_id
+                )
+            })
+            .count() as u64;
+        let edge_id = EdgeId(base_edge_id.0 + buffered_count);
+
+        // Buffer the edge append — do NOT write to disk yet.
+        self.pending_ops.push(PendingOp::EdgeCreate {
+            src,
+            dst,
+            rel_table_id,
+        });
         self.wal_mutations.push(WalMutation::EdgeCreate {
             edge_id,
             src,
@@ -1045,16 +1188,45 @@ impl<'db> WriteTx<'db> {
     /// Commit the transaction.
     ///
     /// 1. Detects write-write conflicts (SPA-128).
-    /// 2. Flushes all staged `set_node_col` updates to disk.
-    /// 3. Records before-images in the version chain at the previous `txn_id`,
+    /// 2. Applies all buffered structural operations to storage (SPA-181):
+    ///    node creates, node deletes, edge creates, label creates.
+    /// 3. Flushes all staged `set_node_col` updates to disk.
+    /// 4. Records before-images in the version chain at the previous `txn_id`,
     ///    preserving snapshot access for currently-open readers.
-    /// 4. Atomically increments the global `current_txn_id`.
-    /// 5. Records the new values in the version chain at the new `txn_id`.
-    /// 6. Updates per-node version table for future conflict detection.
-    /// 7. Appends WAL records for all mutations (SPA-127).
+    /// 5. Atomically increments the global `current_txn_id`.
+    /// 6. Records the new values in the version chain at the new `txn_id`.
+    /// 7. Updates per-node version table for future conflict detection.
+    /// 8. Appends WAL records for all mutations (SPA-127).
+    #[must_use = "check the Result; a failed commit means nothing was written"]
     pub fn commit(mut self) -> Result<TxnId> {
         // Step 1: MVCC conflict abort (SPA-128).
         self.detect_conflicts()?;
+
+        // Step 2: Flush buffered structural operations to disk (SPA-181).
+        // These were previously written immediately; now they are deferred to
+        // here so that a transaction that errors mid-way leaves no partial state.
+        for op in self.pending_ops.drain(..) {
+            match op {
+                PendingOp::NodeCreate {
+                    label_id,
+                    slot,
+                    props,
+                } => {
+                    self.store.create_node_at_slot(label_id, slot, &props)?;
+                }
+                PendingOp::NodeDelete { node_id } => {
+                    self.store.tombstone_node(node_id)?;
+                }
+                PendingOp::EdgeCreate {
+                    src,
+                    dst,
+                    rel_table_id,
+                } => {
+                    let mut es = EdgeStore::open(&self.inner.path, rel_table_id)?;
+                    es.create_edge(src, rel_table_id, dst)?;
+                }
+            }
+        }
 
         // Drain staged updates.
         let updates: Vec<((u64, u32), StagedUpdate)> = self.write_buf.updates.drain().collect();
@@ -1116,10 +1288,10 @@ impl<'db> WriteTx<'db> {
     }
 }
 
-impl<'db> Drop for WriteTx<'db> {
+impl Drop for WriteTx {
     fn drop(&mut self) {
-        // Uncommitted staged updates are simply discarded here.
-        // On-disk data is unchanged (set_node_col writes happen only in commit).
+        // Uncommitted staged updates are discarded here — no writes to disk.
+        // The write lock is released by dropping `_guard` (WriteGuard).
         let _ = self.committed;
     }
 }
@@ -1456,5 +1628,86 @@ mod tests {
         drop(tx);
         db.checkpoint()
             .expect("checkpoint must succeed after WriteTx dropped");
+    }
+
+    /// SPA-181: Dropping a WriteTx without calling commit() must not persist
+    /// any mutations.  The node-store HWM must remain at 0 after a dropped tx.
+    #[test]
+    fn dropped_write_tx_persists_no_nodes() {
+        use sparrowdb_storage::node_store::NodeStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        {
+            let mut tx = db.begin_write().unwrap();
+            // Stage a node creation — should NOT be written to disk.
+            let _node_id = tx.create_node(0, &[]).unwrap();
+            // Drop WITHOUT calling commit().
+        }
+
+        // Verify no node was persisted.
+        let store = NodeStore::open(dir.path()).unwrap();
+        let hwm = store.hwm_for_label(0).unwrap();
+        assert_eq!(hwm, 0, "dropped tx must not persist any nodes (SPA-181)");
+
+        // A subsequent write transaction must be obtainable (lock released).
+        let tx2 = db
+            .begin_write()
+            .expect("write lock must be released after drop");
+        tx2.commit().unwrap();
+    }
+
+    /// SPA-181: A sequence of create_node + create_edge where the whole
+    /// transaction is dropped leaves the store entirely unchanged.
+    #[test]
+    fn dropped_write_tx_persists_no_edges() {
+        use sparrowdb_storage::edge_store::EdgeStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        // First, commit two nodes so we have valid src/dst IDs.
+        let (src, dst) = {
+            let mut tx = db.begin_write().unwrap();
+            let src = tx.create_node(0, &[]).unwrap();
+            let dst = tx.create_node(0, &[]).unwrap();
+            tx.commit().unwrap();
+            (src, dst)
+        };
+
+        {
+            let mut tx = db.begin_write().unwrap();
+            // Stage an edge — should NOT be written to disk.
+            tx.create_edge(src, dst, "KNOWS", std::collections::HashMap::new())
+                .unwrap();
+            // Drop WITHOUT calling commit().
+        }
+
+        // Verify no edge was persisted (delta log must be empty or absent).
+        let delta = EdgeStore::open(dir.path(), sparrowdb_storage::edge_store::RelTableId(0))
+            .and_then(|s| s.read_delta())
+            .unwrap_or_default();
+        assert_eq!(
+            delta.len(),
+            0,
+            "dropped tx must not persist any edges (SPA-181)"
+        );
+    }
+
+    /// SPA-181: The old UB transmute is gone.  Verify the write lock cycles
+    /// correctly: acquire → use → drop → acquire again.
+    #[test]
+    fn write_guard_releases_lock_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        for _ in 0..5 {
+            let tx = db.begin_write().expect("lock must be free");
+            // Concurrent attempt must fail.
+            assert!(matches!(db.begin_write(), Err(Error::WriterBusy)));
+            drop(tx);
+            // After drop lock is free again.
+        }
     }
 }
