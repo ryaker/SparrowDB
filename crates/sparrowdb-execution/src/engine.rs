@@ -1609,10 +1609,7 @@ impl Engine {
                     }
                     // Always store NodeRef under __node_id__ so id(n) works even when
                     // the var itself is a Map (SPA-213).
-                    row_vals.insert(
-                        format!("{}.__node_id__", var_name),
-                        Value::NodeRef(node_id),
-                    );
+                    row_vals.insert(format!("{}.__node_id__", var_name), Value::NodeRef(node_id));
                 }
                 raw_rows.push(row_vals);
             } else {
@@ -1767,10 +1764,8 @@ impl Engine {
                         } else {
                             row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
                         }
-                        row_vals.insert(
-                            format!("{}.__node_id__", var_name),
-                            Value::NodeRef(node_id),
-                        );
+                        row_vals
+                            .insert(format!("{}.__node_id__", var_name), Value::NodeRef(node_id));
                     }
                     raw_rows.push(row_vals);
                 } else {
