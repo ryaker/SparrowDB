@@ -21,7 +21,9 @@ fn cli_checkpoint_creates_db() {
 }
 
 #[test]
-fn cli_query_not_implemented() {
+fn cli_query_unlabeled_empty_db() {
+    // MATCH (n) RETURN n on an empty database (no labels registered) must
+    // succeed and return an empty result set — not an error or "NotImplemented".
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let output = Command::new(env!("CARGO_BIN_EXE_sparrowdb"))
@@ -39,9 +41,10 @@ fn cli_query_not_implemented() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Must not contain an error — just an empty rows array is acceptable.
     assert!(
-        stdout.contains("NotImplemented"),
-        "expected 'NotImplemented' in stdout, got: {stdout}"
+        !stdout.contains("NotImplemented") && !stdout.contains("error"),
+        "expected empty result, got: {stdout}"
     );
 }
 
