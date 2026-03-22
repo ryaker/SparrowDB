@@ -17,7 +17,8 @@ fn match_without_label_returns_all_nodes() {
     let (_dir, db) = make_db();
 
     db.execute("CREATE (n:Person {name: 'Alice'})").unwrap();
-    db.execute("CREATE (n:Knowledge {title: 'GraphDB'})").unwrap();
+    db.execute("CREATE (n:Knowledge {title: 'GraphDB'})")
+        .unwrap();
     db.execute("CREATE (n:Person {name: 'Bob'})").unwrap();
 
     let result = db
@@ -40,7 +41,8 @@ fn match_without_label_with_limit() {
     let (_dir, db) = make_db();
 
     db.execute("CREATE (n:Person {name: 'Alice'})").unwrap();
-    db.execute("CREATE (n:Knowledge {title: 'GraphDB'})").unwrap();
+    db.execute("CREATE (n:Knowledge {title: 'GraphDB'})")
+        .unwrap();
     db.execute("CREATE (n:Person {name: 'Bob'})").unwrap();
     db.execute("CREATE (n:Animal {species: 'Cat'})").unwrap();
 
@@ -88,7 +90,11 @@ fn match_without_label_count_star() {
         .execute("MATCH (n) RETURN COUNT(*)")
         .expect("MATCH (n) RETURN COUNT(*) must not throw");
 
-    assert_eq!(result.rows.len(), 1, "COUNT(*) must produce exactly one row");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "COUNT(*) must produce exactly one row"
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Int64(3),
