@@ -216,10 +216,14 @@ pub struct UnwindStatement {
 /// `MERGE (:Label {prop: val, ...})`
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeStatement {
+    /// Variable name bound to the merged node (may be empty for anonymous MERGE).
+    pub var: String,
     /// The primary label to merge on.
     pub label: String,
     /// Identity properties used to locate or create the node.
     pub props: Vec<PropEntry>,
+    /// Optional RETURN clause projecting properties of the merged node.
+    pub return_clause: Option<ReturnClause>,
 }
 
 /// A mutation clause appended after a MATCH: SET or DELETE.

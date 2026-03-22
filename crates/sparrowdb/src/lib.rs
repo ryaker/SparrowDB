@@ -589,8 +589,51 @@ impl GraphDb {
             .map(|pe| (pe.key.clone(), expr_to_value(&pe.value)))
             .collect();
         let mut tx = self.begin_write()?;
-        tx.merge_node(&m.label, props)?;
+        tx.merge_node(&m.label, props.clone())?;
         tx.commit()?;
+
+        // If the statement has a RETURN clause, project the merged node's properties.
+        if let Some(ref ret) = m.return_clause {
+            use sparrowdb_cypher::ast::Expr;
+            // Use the execution-layer Value type for building QueryResult rows.
+            type ExecValue = sparrowdb_execution::Value;
+
+            let var = if m.var.is_empty() { "n" } else { m.var.as_str() };
+
+            // Build an eval map: "{var}.{prop_name}" -> ExecValue.
+            // Convert storage Value (Int64/Bytes) to execution Value (Int64/String).
+            let mut row_vals: HashMap<String, ExecValue> = HashMap::new();
+            for (key, val) in &props {
+                let exec_val = storage_value_to_exec(val);
+                row_vals.insert(format!("{var}.{key}"), exec_val);
+            }
+
+            // Derive column names from the RETURN items.
+            let columns: Vec<String> = ret
+                .items
+                .iter()
+                .map(|item| {
+                    item.alias.clone().unwrap_or_else(|| match &item.expr {
+                        Expr::PropAccess { var: v, prop } => format!("{v}.{prop}"),
+                        Expr::Var(v) => v.clone(),
+                        _ => "?".to_string(),
+                    })
+                })
+                .collect();
+
+            // Evaluate each RETURN expression using the prop map.
+            let row: Vec<ExecValue> = ret
+                .items
+                .iter()
+                .map(|item| eval_expr_merge(&item.expr, &row_vals))
+                .collect();
+
+            return Ok(QueryResult {
+                columns,
+                rows: vec![row],
+            });
+        }
+
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1496,6 +1539,44 @@ fn expr_to_value(expr: &sparrowdb_cypher::ast::Expr) -> Value {
     match expr {
         Expr::Literal(lit) => literal_to_value(lit),
         _ => Value::Int64(0),
+    }
+}
+
+/// Convert a storage-layer `Value` (Int64 / Bytes) to the execution-layer
+/// `Value` (Int64 / String / Null / …) used in `QueryResult` rows.
+fn storage_value_to_exec(val: &Value) -> sparrowdb_execution::Value {
+    match val {
+        Value::Int64(n) => sparrowdb_execution::Value::Int64(*n),
+        Value::Bytes(b) => sparrowdb_execution::Value::String(
+            String::from_utf8_lossy(b).into_owned(),
+        ),
+    }
+}
+
+/// Evaluate a RETURN expression against a simple name→ExecValue map built
+/// from the merged node's properties.  Used exclusively by `execute_merge`.
+///
+/// Supports `PropAccess` (e.g. `n.name`) and `Literal`; everything else
+/// falls back to `Null`.
+fn eval_expr_merge(
+    expr: &sparrowdb_cypher::ast::Expr,
+    vals: &HashMap<String, sparrowdb_execution::Value>,
+) -> sparrowdb_execution::Value {
+    use sparrowdb_cypher::ast::{Expr, Literal};
+    match expr {
+        Expr::PropAccess { var, prop } => {
+            let key = format!("{var}.{prop}");
+            vals.get(&key).cloned().unwrap_or(sparrowdb_execution::Value::Null)
+        }
+        Expr::Literal(lit) => match lit {
+            Literal::Int(n) => sparrowdb_execution::Value::Int64(*n),
+            Literal::Float(f) => sparrowdb_execution::Value::Float64(*f),
+            Literal::Bool(b) => sparrowdb_execution::Value::Bool(*b),
+            Literal::String(s) => sparrowdb_execution::Value::String(s.clone()),
+            Literal::Null | Literal::Param(_) => sparrowdb_execution::Value::Null,
+        },
+        Expr::Var(v) => vals.get(v.as_str()).cloned().unwrap_or(sparrowdb_execution::Value::Null),
+        _ => sparrowdb_execution::Value::Null,
     }
 }
 
