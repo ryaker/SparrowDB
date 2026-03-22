@@ -453,7 +453,6 @@ impl GraphDb {
         cypher: &str,
         params: HashMap<String, sparrowdb_execution::Value>,
     ) -> Result<QueryResult> {
-        use sparrowdb_cypher::ast::Statement;
         use sparrowdb_cypher::{bind, parse};
 
         let stmt = parse(cypher)?;
@@ -461,13 +460,15 @@ impl GraphDb {
         let bound = bind(stmt, &catalog_snap)?;
 
         if Engine::is_mutation(&bound.inner) {
-            // Mutation paths do not support runtime parameters today.
-            match bound.inner {
-                Statement::Merge(ref m) => self.execute_merge(m),
-                Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
-                Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
-                _ => unreachable!(),
-            }
+            // Mutation executors (execute_merge, execute_match_mutate, execute_match_create)
+            // call expr_to_value which maps Literal::Param(_) → Int64(0), so any $param
+            // in a MERGE/SET/CREATE would be silently written as 0/null rather than the
+            // supplied value.  Fail fast until mutation parameter binding is implemented.
+            return Err(Error::InvalidArgument(
+                "execute_with_params does not support mutation statements (MERGE/SET/CREATE); \
+                 use execute() for mutations without parameters"
+                    .into(),
+            ));
         } else {
             let _span = info_span!("sparrowdb.query_with_params").entered();
 
