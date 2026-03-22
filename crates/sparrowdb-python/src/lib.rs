@@ -29,6 +29,14 @@ fn value_to_py(py: Python<'_>, v: &sparrowdb_execution::Value) -> PyObject {
         // NodeRef / EdgeRef: expose the packed u64 id to Python.
         Value::NodeRef(n) => n.0.into_py(py),
         Value::EdgeRef(e) => e.0.into_py(py),
+        // List: produced by collect() aggregation — convert to a Python list.
+        Value::List(items) => {
+            let py_list = PyList::empty_bound(py);
+            for item in items {
+                py_list.append(value_to_py(py, item)).unwrap();
+            }
+            py_list.into()
+        }
     }
 }
 
