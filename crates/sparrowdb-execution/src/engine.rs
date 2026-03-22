@@ -30,6 +30,8 @@ pub struct Engine {
     pub catalog: Catalog,
     pub csr: CsrForward,
     pub db_root: std::path::PathBuf,
+    /// Runtime query parameters supplied by the caller (e.g. `$name` → Value).
+    pub params: HashMap<String, Value>,
 }
 
 impl Engine {
@@ -39,7 +41,17 @@ impl Engine {
             catalog,
             csr,
             db_root: db_root.to_path_buf(),
+            params: HashMap::new(),
         }
+    }
+
+    /// Attach runtime query parameters to this engine instance.
+    ///
+    /// Parameters are looked up when evaluating `$name` expressions (e.g. in
+    /// `UNWIND $items AS x`).
+    pub fn with_params(mut self, params: HashMap<String, Value>) -> Self {
+        self.params = params;
+        self
     }
 
     /// Parse, bind, plan, and execute a Cypher query.
@@ -397,7 +409,7 @@ impl Engine {
         use crate::operators::{Operator, UnwindOperator};
 
         // Evaluate the list expression to a Vec<Value>.
-        let values = eval_list_expr(&u.expr)?;
+        let values = eval_list_expr(&u.expr, &self.params)?;
 
         // Determine the output column name from the RETURN clause.
         let column_names = extract_return_column_names(&u.return_clause.items);
@@ -1866,9 +1878,9 @@ fn matches_prop_filter_static(
 ///
 /// Supports:
 /// - `Expr::List([...])` — list literal
-/// - `Expr::Literal(Param(_))` — parameter (returns empty list; callers supply params separately)
+/// - `Expr::Literal(Param(name))` — looks up `name` in `params`; expects `Value::List`
 /// - `Expr::FnCall { name: "range", args }` — integer range expansion
-fn eval_list_expr(expr: &Expr) -> Result<Vec<Value>> {
+fn eval_list_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Vec<Value>> {
     match expr {
         Expr::List(elems) => {
             let mut values = Vec::with_capacity(elems.len());
@@ -1877,10 +1889,20 @@ fn eval_list_expr(expr: &Expr) -> Result<Vec<Value>> {
             }
             Ok(values)
         }
-        Expr::Literal(Literal::Param(_)) => {
-            // Parameters are not resolved by the read-only engine stub.
-            // Callers that need param support should bind params before calling execute().
-            Ok(vec![])
+        Expr::Literal(Literal::Param(name)) => {
+            // Look up the parameter in the runtime params map.
+            match params.get(name) {
+                Some(Value::List(items)) => Ok(items.clone()),
+                Some(other) => {
+                    // Non-list value: wrap as a single-element list so the
+                    // caller can still iterate (matches Neo4j behaviour).
+                    Ok(vec![other.clone()])
+                }
+                None => {
+                    // Parameter not supplied — produce an empty list (no rows).
+                    Ok(vec![])
+                }
+            }
         }
         Expr::FnCall { name, args } => {
             // Expand function calls that produce lists.
