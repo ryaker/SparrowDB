@@ -1554,7 +1554,9 @@ mod tests {
         assert_eq!(hwm, 0, "dropped tx must not persist any nodes (SPA-181)");
 
         // A subsequent write transaction must be obtainable (lock released).
-        let tx2 = db.begin_write().expect("write lock must be released after drop");
+        let tx2 = db
+            .begin_write()
+            .expect("write lock must be released after drop");
         tx2.commit().unwrap();
     }
 

@@ -360,10 +360,18 @@ impl NodeStore {
             for (col_id, original_size) in &original_sizes {
                 let path = self.col_path(label_id, *col_id);
                 if path.exists() {
-                    let _ = fs::OpenOptions::new()
+                    if let Err(rollback_err) = fs::OpenOptions::new()
                         .write(true)
                         .open(&path)
-                        .and_then(|f| f.set_len(*original_size));
+                        .and_then(|f| f.set_len(*original_size))
+                    {
+                        eprintln!(
+                            "CRITICAL: Failed to roll back column file {} to size {}: {}. Data may be corrupt.",
+                            path.display(),
+                            original_size,
+                            rollback_err
+                        );
+                    }
                 }
             }
             return Err(e);
@@ -375,7 +383,28 @@ impl NodeStore {
         let new_hwm = slot as u64 + 1;
         let disk_hwm = self.load_hwm(label_id)?;
         if new_hwm > disk_hwm {
-            self.save_hwm(label_id, new_hwm)?;
+            if let Err(e) = self.save_hwm(label_id, new_hwm) {
+                // Column bytes were already written; roll them back to preserve
+                // the atomicity guarantee (SPA-181).
+                for (col_id, original_size) in &original_sizes {
+                    let path = self.col_path(label_id, *col_id);
+                    if path.exists() {
+                        if let Err(rollback_err) = fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path)
+                            .and_then(|f| f.set_len(*original_size))
+                        {
+                            eprintln!(
+                                "CRITICAL: Failed to roll back column file {} to size {}: {}. Data may be corrupt.",
+                                path.display(),
+                                original_size,
+                                rollback_err
+                            );
+                        }
+                    }
+                }
+                return Err(e);
+            }
         }
         // Keep in-memory HWM at least as high as new_hwm.
         let mem_hwm = self.hwm.get(&label_id).copied().unwrap_or(0);
