@@ -26,10 +26,8 @@ fn spa198_unlabeled_dst_matches_any_node() {
     // Use a short string (≤7 bytes) to fit within the inline storage limit.
     db.execute("CREATE (b:Knowledge {content:\"factA\"})")
         .expect("CREATE Knowledge");
-    db.execute(
-        "MATCH (a:Person {name:\"Alice\"}),(b:Knowledge) CREATE (a)-[:KNOWS]->(b)",
-    )
-    .expect("CREATE edge");
+    db.execute("MATCH (a:Person {name:\"Alice\"}),(b:Knowledge) CREATE (a)-[:KNOWS]->(b)")
+        .expect("CREATE edge");
 
     // Query with unlabeled destination — should return the Knowledge node.
     let result = db
@@ -69,10 +67,8 @@ fn spa198_unlabeled_src_matches_any_node() {
         .expect("CREATE Person");
     db.execute("CREATE (b:Knowledge {content:\"factA\"})")
         .expect("CREATE Knowledge");
-    db.execute(
-        "MATCH (a:Person {name:\"Alice\"}),(b:Knowledge) CREATE (a)-[:KNOWS]->(b)",
-    )
-    .expect("CREATE edge");
+    db.execute("MATCH (a:Person {name:\"Alice\"}),(b:Knowledge) CREATE (a)-[:KNOWS]->(b)")
+        .expect("CREATE edge");
 
     // Query with unlabeled source — should return the Person node's name.
     let result = db
