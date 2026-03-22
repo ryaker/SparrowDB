@@ -95,21 +95,13 @@ impl PyGraphDb {
     /// Raises ``RuntimeError`` if another write transaction is already active
     /// (single-writer semantics).
     fn begin_write(&self) -> PyResult<PyWriteTx> {
-        // Safety: we transmute WriteTx<'_> to WriteTx<'static> so it can be
-        // stored in a PyO3 class.  This is safe because:
-        // 1. The `'db` lifetime on WriteTx only constrains the MutexGuard,
-        //    which holds the write-lock on `inner.write_lock`.
-        // 2. `PyGraphDb` holds `inner: GraphDb` which contains the Arc<DbInner>
-        //    keeping the Mutex alive for the whole program lifetime of the db.
-        // 3. PyWriteTx will be dropped (releasing the guard) before `inner`
-        //    is dropped, enforced by Python's GC reference counting.
-        let tx: ::sparrowdb::WriteTx<'static> = unsafe {
-            std::mem::transmute(
-                self.inner
-                    .begin_write()
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?,
-            )
-        };
+        // SPA-181: WriteTx no longer carries a lifetime parameter — the write
+        // lock is managed internally by an AtomicBool WriteGuard, so no unsafe
+        // transmute is required here.
+        let tx = self
+            .inner
+            .begin_write()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(PyWriteTx { inner: Some(tx) })
     }
 
@@ -187,7 +179,7 @@ impl PyReadTx {
 #[pyclass(unsendable, name = "WriteTx")]
 struct PyWriteTx {
     /// `None` after commit/rollback so use-after-commit is detected.
-    inner: Option<::sparrowdb::WriteTx<'static>>,
+    inner: Option<::sparrowdb::WriteTx>,
 }
 
 #[cfg(feature = "python")]
