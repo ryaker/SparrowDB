@@ -101,9 +101,6 @@ fn cmd_query(db_path: &std::path::Path, cypher: &str) -> Result<(), Box<dyn std:
             let json = query_result_to_json(&result);
             println!("{}", serde_json::to_string_pretty(&json)?);
         }
-        Err(e) if e.to_string().contains("not yet implemented") => {
-            println!("NotImplemented: Cypher query execution not yet available");
-        }
         Err(e) => return Err(e.into()),
     }
     Ok(())

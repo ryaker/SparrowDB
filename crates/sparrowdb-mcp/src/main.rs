@@ -162,9 +162,6 @@ fn handle_tool_call(params: Option<Value>) -> Result<Value, Value> {
                 Ok(result) => Ok(json!({
                     "content": [{"type": "text", "text": format!("{result:?}")}]
                 })),
-                Err(e) if e.to_string().contains("not yet implemented") => Ok(json!({
-                    "content": [{"type": "text", "text": "Cypher execution not yet implemented"}]
-                })),
                 Err(e) => Err(json!({"code": -32000, "message": e.to_string()})),
             }
         }
