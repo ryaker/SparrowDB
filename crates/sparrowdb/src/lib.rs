@@ -405,14 +405,15 @@ impl GraphDb {
     /// Internal: execute a `MATCH … CREATE (a)-[:R]->(b)` statement.
     ///
     /// 1. Acquires the write lock (preventing concurrent writes).
-    /// 2. Opens a read-capable Engine to scan MATCH patterns and resolve
-    ///    variable bindings (`var → Vec<NodeId>`).
-    /// 3. For each `(src, dst)` combination, calls `WriteTx::create_edge`
-    ///    which registers the rel type in the catalog and appends to the WAL.
+    /// 2. Opens a read-capable Engine to execute the MATCH clause, producing
+    ///    one correlated binding row per match result (`var → NodeId`).
+    /// 3. For each result row, calls `WriteTx::create_edge` using the exact
+    ///    node IDs bound by that row — never re-scans or builds a Cartesian
+    ///    product across all node candidates (SPA-183).
     /// 4. Commits the write transaction.
     ///
-    /// If the MATCH finds no nodes for any variable the CREATE is a no-op
-    /// (no edges created, no error — SPA-168).
+    /// If the MATCH finds no rows the CREATE is a no-op (no edges created,
+    /// no error — SPA-168).
     fn execute_match_create(
         &self,
         mc: &sparrowdb_cypher::ast::MatchCreateStatement,
@@ -430,25 +431,31 @@ impl GraphDb {
             &self.inner.path,
         );
 
-        // Resolve MATCH variable bindings.
-        let var_candidates = engine.scan_match_create(mc)?;
+        // Execute the MATCH clause to get correlated binding rows.
+        // Each row is a HashMap<variable_name, NodeId> representing one
+        // matched combination.  This replaces the old `scan_match_create`
+        // approach which collected candidates per variable independently and
+        // then took a full Cartesian product — causing N² edge creation when
+        // multiple nodes of the same label existed (SPA-183).
+        let matched_rows = engine.scan_match_create_rows(mc)?;
 
-        // For each edge in the CREATE clause, create it for every matching
-        // (src, dst) pair.
-        for (left_var, rel_pat, right_var) in &mc.create.edges {
-            let src_candidates = match var_candidates.get(left_var) {
-                Some(v) if !v.is_empty() => v.clone(),
-                _ => return Ok(QueryResult::empty(vec![])),
-            };
-            let dst_candidates = match var_candidates.get(right_var) {
-                Some(v) if !v.is_empty() => v.clone(),
-                _ => return Ok(QueryResult::empty(vec![])),
-            };
+        if matched_rows.is_empty() {
+            return Ok(QueryResult::empty(vec![]));
+        }
 
-            for &src in &src_candidates {
-                for &dst in &dst_candidates {
-                    tx.create_edge(src, dst, &rel_pat.rel_type, HashMap::new())?;
-                }
+        // For each matched row, create every edge declared in the CREATE clause
+        // using the NodeIds bound in that specific row.
+        for row in &matched_rows {
+            for (left_var, rel_pat, right_var) in &mc.create.edges {
+                let src = match row.get(left_var) {
+                    Some(&id) => id,
+                    None => continue, // variable not bound in this row
+                };
+                let dst = match row.get(right_var) {
+                    Some(&id) => id,
+                    None => continue,
+                };
+                tx.create_edge(src, dst, &rel_pat.rel_type, HashMap::new())?;
             }
         }
 

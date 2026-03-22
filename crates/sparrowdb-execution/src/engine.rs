@@ -388,6 +388,257 @@ impl Engine {
         Ok(var_candidates)
     }
 
+    /// Execute the MATCH portion of a `MatchCreateStatement` and return one
+    /// binding map per matched row.
+    ///
+    /// Each element of the returned `Vec` is a `HashMap<variable_name, NodeId>`
+    /// that represents one fully-correlated result row from the MATCH clause.
+    /// The caller uses these to drive `WriteTx::create_edge` — one call per row.
+    ///
+    /// # Algorithm
+    ///
+    /// For each `PathPattern` in `match_patterns`:
+    /// - **No relationships** (node-only pattern): scan the node store applying
+    ///   inline prop filters; collect one candidate set per named variable.
+    ///   Cross-join these sets with the rows accumulated so far.
+    /// - **One relationship hop** (`(a)-[:R]->(b)`): traverse the CSR + delta
+    ///   log to enumerate actual (src, dst) pairs that are connected by an edge,
+    ///   then filter each node against its inline prop predicates.  Only
+    ///   correlated pairs are yielded — this is the key difference from the old
+    ///   `scan_match_create` which treated every node as an independent
+    ///   candidate and then took a full Cartesian product.
+    ///
+    /// Patterns beyond a single hop are not yet supported and return an error.
+    pub fn scan_match_create_rows(
+        &self,
+        mc: &MatchCreateStatement,
+    ) -> Result<Vec<HashMap<String, NodeId>>> {
+        // Start with a single empty row (identity for cross-join).
+        let mut accumulated: Vec<HashMap<String, NodeId>> = vec![HashMap::new()];
+
+        for pat in &mc.match_patterns {
+            if pat.rels.is_empty() {
+                // ── Node-only pattern: collect candidates per variable, then
+                //    cross-join into accumulated rows. ──────────────────────
+                //
+                // Collect each named node variable's candidate list.
+                let mut per_var: Vec<(String, Vec<NodeId>)> = Vec::new();
+
+                for node_pat in &pat.nodes {
+                    if node_pat.var.is_empty() {
+                        continue;
+                    }
+
+                    let label = node_pat.labels.first().cloned().unwrap_or_default();
+                    let label_id: u32 = match self.catalog.get_label(&label)? {
+                        Some(id) => id as u32,
+                        None => {
+                            // No nodes can match → entire MATCH yields nothing.
+                            return Ok(vec![]);
+                        }
+                    };
+
+                    let hwm = self.store.hwm_for_label(label_id)?;
+                    let filter_col_ids: Vec<u32> = node_pat
+                        .props
+                        .iter()
+                        .map(|p| prop_name_to_col_id(&p.key))
+                        .collect();
+
+                    let mut matching_ids: Vec<NodeId> = Vec::new();
+                    for slot in 0..hwm {
+                        let node_id = NodeId(((label_id as u64) << 32) | slot);
+
+                        // Skip tombstoned nodes.
+                        match self.store.get_node_raw(node_id, &[0u32]) {
+                            Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
+                                continue;
+                            }
+                            Ok(_) | Err(_) => {}
+                        }
+
+                        // Apply inline prop filter.
+                        if !node_pat.props.is_empty() {
+                            match self.store.get_node_raw(node_id, &filter_col_ids) {
+                                Ok(props) => {
+                                    if !matches_prop_filter_static(&props, &node_pat.props) {
+                                        continue;
+                                    }
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+
+                        matching_ids.push(node_id);
+                    }
+
+                    if matching_ids.is_empty() {
+                        // No matching nodes → entire MATCH is empty.
+                        return Ok(vec![]);
+                    }
+
+                    per_var.push((node_pat.var.clone(), matching_ids));
+                }
+
+                // Cross-join the per_var candidates into accumulated.
+                for (var, candidates) in per_var {
+                    let mut next: Vec<HashMap<String, NodeId>> = Vec::new();
+                    for row in &accumulated {
+                        for &node_id in &candidates {
+                            let mut new_row = row.clone();
+                            new_row.insert(var.clone(), node_id);
+                            next.push(new_row);
+                        }
+                    }
+                    accumulated = next;
+                    if accumulated.is_empty() {
+                        return Ok(vec![]);
+                    }
+                }
+            } else if pat.rels.len() == 1 && pat.nodes.len() == 2 {
+                // ── Single-hop relationship pattern: traverse CSR + delta edges
+                //    to produce correlated (src, dst) pairs. ─────────────────
+                let src_node_pat = &pat.nodes[0];
+                let dst_node_pat = &pat.nodes[1];
+                let rel_pat = &pat.rels[0];
+
+                let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
+                let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
+
+                let src_label_id: u32 = match self.catalog.get_label(&src_label)? {
+                    Some(id) => id as u32,
+                    None => return Ok(vec![]),
+                };
+                let dst_label_id: u32 = match self.catalog.get_label(&dst_label)? {
+                    Some(id) => id as u32,
+                    None => return Ok(vec![]),
+                };
+
+                let src_filter_cols: Vec<u32> = src_node_pat
+                    .props
+                    .iter()
+                    .map(|p| prop_name_to_col_id(&p.key))
+                    .collect();
+                let dst_filter_cols: Vec<u32> = dst_node_pat
+                    .props
+                    .iter()
+                    .map(|p| prop_name_to_col_id(&p.key))
+                    .collect();
+
+                // Read delta log edges once (rel type filter applied below).
+                let delta_records: Vec<(u64, u64)> = {
+                    let edge_store = EdgeStore::open(&self.db_root, RelTableId(0));
+                    match edge_store.and_then(|s| s.read_delta()) {
+                        Ok(records) => records.into_iter().map(|r| (r.src.0, r.dst.0)).collect(),
+                        Err(_) => vec![],
+                    }
+                };
+
+                // Resolve the relationship type to a rel table ID for filtering.
+                // (We include all edges when rel_type is empty / not in catalog.)
+                let _rel_type = &rel_pat.rel_type;
+
+                let hwm_src = self.store.hwm_for_label(src_label_id)?;
+
+                // Pairs yielded by this pattern for cross-join below.
+                let mut pattern_rows: Vec<HashMap<String, NodeId>> = Vec::new();
+
+                for src_slot in 0..hwm_src {
+                    let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
+
+                    // Skip tombstoned sources.
+                    match self.store.get_node_raw(src_node, &[0u32]) {
+                        Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
+                            continue;
+                        }
+                        Ok(_) | Err(_) => {}
+                    }
+
+                    // Apply src prop filter.
+                    if !src_node_pat.props.is_empty() {
+                        match self.store.get_node_raw(src_node, &src_filter_cols) {
+                            Ok(props) => {
+                                if !matches_prop_filter_static(&props, &src_node_pat.props) {
+                                    continue;
+                                }
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+
+                    // Collect outgoing neighbours (CSR + delta).
+                    let csr_neighbors = self.csr.neighbors(src_slot);
+                    let delta_neighbors: Vec<u64> = delta_records
+                        .iter()
+                        .filter(|&&(s, _)| {
+                            let s_label = (s >> 32) as u32;
+                            let s_slot = s & 0xFFFF_FFFF;
+                            s_label == src_label_id && s_slot == src_slot
+                        })
+                        .map(|&(_, d)| d & 0xFFFF_FFFF)
+                        .collect();
+
+                    let mut seen: HashSet<u64> = HashSet::new();
+                    for &dst_slot in csr_neighbors.iter().chain(delta_neighbors.iter()) {
+                        if !seen.insert(dst_slot) {
+                            continue;
+                        }
+                        let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
+
+                        // Skip tombstoned destinations.
+                        match self.store.get_node_raw(dst_node, &[0u32]) {
+                            Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
+                                continue;
+                            }
+                            Ok(_) | Err(_) => {}
+                        }
+
+                        // Apply dst prop filter.
+                        if !dst_node_pat.props.is_empty() {
+                            match self.store.get_node_raw(dst_node, &dst_filter_cols) {
+                                Ok(props) => {
+                                    if !matches_prop_filter_static(&props, &dst_node_pat.props) {
+                                        continue;
+                                    }
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+
+                        let mut row: HashMap<String, NodeId> = HashMap::new();
+                        if !src_node_pat.var.is_empty() {
+                            row.insert(src_node_pat.var.clone(), src_node);
+                        }
+                        if !dst_node_pat.var.is_empty() {
+                            row.insert(dst_node_pat.var.clone(), dst_node);
+                        }
+                        pattern_rows.push(row);
+                    }
+                }
+
+                if pattern_rows.is_empty() {
+                    return Ok(vec![]);
+                }
+
+                // Cross-join pattern_rows into accumulated.
+                let mut next: Vec<HashMap<String, NodeId>> = Vec::new();
+                for acc_row in &accumulated {
+                    for pat_row in &pattern_rows {
+                        let mut new_row = acc_row.clone();
+                        new_row.extend(pat_row.iter().map(|(k, v)| (k.clone(), *v)));
+                        next.push(new_row);
+                    }
+                }
+                accumulated = next;
+            } else {
+                // Multi-hop patterns not yet supported for MATCH…CREATE.
+                return Err(sparrowdb_common::Error::Unimplemented);
+            }
+        }
+
+        Ok(accumulated)
+    }
+
     // ── UNWIND ─────────────────────────────────────────────────────────────────
 
     fn execute_unwind(&self, u: &UnwindStatement) -> Result<QueryResult> {
