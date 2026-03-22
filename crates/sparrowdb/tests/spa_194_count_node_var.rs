@@ -101,8 +101,7 @@ fn count_node_var_grouped_by_property() {
     );
 
     // Build a map of name → count for order-independent checking.
-    let mut name_counts: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut name_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for row in &result.rows {
         let name = match &row[0] {
             Value::String(s) => s.clone(),

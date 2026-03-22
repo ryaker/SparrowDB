@@ -1202,8 +1202,7 @@ impl Engine {
                     continue;
                 }
 
-                let nullable_props =
-                    self.store.get_node_raw_nullable(node_id, &all_col_ids)?;
+                let nullable_props = self.store.get_node_raw_nullable(node_id, &all_col_ids)?;
                 let props: Vec<(u32, u64)> = nullable_props
                     .iter()
                     .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
@@ -1239,8 +1238,7 @@ impl Engine {
                     }
                     raw_rows.push(row_vals);
                 } else {
-                    let row =
-                        project_row(&props, column_names, &all_col_ids, var_name, label_name);
+                    let row = project_row(&props, column_names, &all_col_ids, var_name, label_name);
                     rows.push(row);
                 }
             }
