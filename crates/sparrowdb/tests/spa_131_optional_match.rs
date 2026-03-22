@@ -230,3 +230,105 @@ fn optional_match_column_names() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], Value::Null);
 }
+
+// ── Test 7: node exists with no matching rel yields null for rel-side var ─────
+
+#[test]
+fn optional_match_no_rel_yields_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    // Alice exists but has no KNOWS relationships.
+    db.execute("CREATE (:Person {name: 'Alice'})").unwrap();
+
+    let result = db
+        .execute("MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) RETURN a.name, b.name")
+        .expect("optional match must succeed");
+
+    assert_eq!(result.rows.len(), 1, "one row for Alice: {:?}", result.rows);
+    assert_eq!(
+        result.rows[0][0],
+        Value::String("Alice".to_string()),
+        "a.name should be Alice"
+    );
+    assert_eq!(
+        result.rows[0][1],
+        Value::Null,
+        "b.name should be null (no KNOWS rel)"
+    );
+}
+
+// ── Test 8: node exists with matching rel yields real value ───────────────────
+
+#[test]
+fn optional_match_with_rel_yields_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _alice_id, _bob_id, _carol_id) = setup_person_graph_with_edge(dir.path());
+
+    let result = db
+        .execute(
+            "MATCH (a:Person {name: 'Alice'}) OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) RETURN a.name, b.name",
+        )
+        .expect("optional match with rel must succeed");
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "one row for Alice→Bob: {:?}",
+        result.rows
+    );
+    assert_eq!(
+        result.rows[0][0],
+        Value::String("Alice".to_string()),
+        "a.name should be Alice"
+    );
+    assert_eq!(
+        result.rows[0][1],
+        Value::String("Bob".to_string()),
+        "b.name should be Bob (KNOWS rel exists)"
+    );
+}
+
+// ── Test 9: MATCH + OPTIONAL MATCH chained ────────────────────────────────────
+
+#[test]
+fn optional_match_chained() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    db.execute("CREATE (:Person {name: 'Alice'})").unwrap();
+    db.execute("CREATE (:Person {name: 'Bob'})").unwrap();
+
+    // MATCH all persons, OPTIONAL MATCH non-existent LIKES relationship.
+    let result = db
+        .execute("MATCH (a:Person) OPTIONAL MATCH (a)-[:LIKES]->(b:Person) RETURN a.name, b.name")
+        .expect("chained optional match must succeed");
+
+    // Both Alice and Bob should appear; b.name is null for both.
+    assert_eq!(result.rows.len(), 2, "expected 2 rows: {:?}", result.rows);
+    for row in &result.rows {
+        assert_ne!(row[0], Value::Null, "a.name should not be null");
+        assert_eq!(row[1], Value::Null, "b.name should be null (no LIKES rel)");
+    }
+}
+
+// ── Test 10: base MATCH finds nothing → 0 rows (not a null row) ──────────────
+
+#[test]
+fn optional_match_no_base_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    // No Person nodes at all — the leading MATCH produces 0 rows.
+    let result = db
+        .execute("MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) RETURN a.name, b.name")
+        .expect("query must not error even with no base match");
+
+    // With 0 leading rows the result should also be 0 rows — NOT one null row.
+    assert_eq!(
+        result.rows.len(),
+        0,
+        "expected 0 rows when MATCH produces nothing, got {:?}",
+        result.rows
+    );
+}

@@ -129,13 +129,12 @@ fn ensure_rel_type(rel_type: &str, catalog: &Catalog) -> Result<()> {
     }
 }
 
-fn bind_match_optional_match(mom: &MatchOptionalMatchStatement, catalog: &Catalog) -> Result<()> {
-    // The leading MATCH patterns must reference existing labels/rel-types.
-    for pat in &mom.match_patterns {
-        bind_path_pattern(pat, catalog)?;
-    }
-    // The OPTIONAL MATCH patterns may reference labels/rel-types that don't
-    // exist yet — that is the NULL-row scenario.  Skip existence checks.
+fn bind_match_optional_match(_mom: &MatchOptionalMatchStatement, _catalog: &Catalog) -> Result<()> {
+    // Both the leading MATCH and OPTIONAL MATCH patterns skip strict existence
+    // checks: if a label doesn't exist in the catalog the engine returns 0 rows
+    // for the leading MATCH (Cypher semantics — no error) and NULL rows for the
+    // OPTIONAL MATCH.  Suppressing the binder check here avoids a premature
+    // "unknown label" error before the engine has a chance to handle it cleanly.
     Ok(())
 }
 

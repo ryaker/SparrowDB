@@ -1253,10 +1253,10 @@ impl Engine {
         let lead_label_id = match self.catalog.get_label(&lead_label)? {
             Some(id) => id as u32,
             None => {
-                let null_row = vec![Value::Null; column_names.len()];
+                // The leading MATCH is non-optional: unknown label → 0 rows (not null).
                 return Ok(QueryResult {
                     columns: column_names,
-                    rows: vec![null_row],
+                    rows: vec![],
                 });
             }
         };
