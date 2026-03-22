@@ -1468,7 +1468,12 @@ fn collect_maintenance_params(
         .map(|(label_id, _name)| node_store.hwm_for_label(*label_id as u32).unwrap_or(0))
         .sum::<u64>();
 
-    // Also scan delta records for the maximum node ID used.
+    // Also scan delta records for the maximum *slot* index used.
+    // NodeIds encode `(label_id << 32) | slot`; the CSR is indexed by slot,
+    // so we must strip the label bits before computing n_nodes.  Using the
+    // full NodeId here would inflate n_nodes into the billions (e.g. label_id=1
+    // → slot 0 appears as 0x0000_0001_0000_0000) and the CSR would be built
+    // with nonsensical degree arrays — the SPA-186 root cause.
     let delta_max: u64 = rel_table_ids
         .iter()
         .filter_map(|&rel_id| {
@@ -1477,12 +1482,15 @@ fn collect_maintenance_params(
                 .and_then(|s| s.read_delta().ok())
         })
         .flat_map(|records| {
-            records
-                .into_iter()
-                .flat_map(|r| [r.src.0, r.dst.0].into_iter())
+            records.into_iter().flat_map(|r| {
+                // Strip label bits — CSR needs slot indices only.
+                let src_slot = r.src.0 & 0xFFFF_FFFF;
+                let dst_slot = r.dst.0 & 0xFFFF_FFFF;
+                [src_slot, dst_slot].into_iter()
+            })
         })
         .max()
-        .map(|max_id| max_id + 1)
+        .map(|max_slot| max_slot + 1)
         .unwrap_or(0);
 
     let n_nodes = hwm_n_nodes.max(delta_max).max(1);
