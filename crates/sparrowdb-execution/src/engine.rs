@@ -1514,11 +1514,7 @@ impl Engine {
                 if let Some(ref where_expr) = m.where_clause {
                     let mut row_vals =
                         build_row_vals(&src_props, &src_node_pat.var, &col_ids_src_where);
-                    row_vals.extend(build_row_vals(
-                        &fof_props,
-                        &fof_node_pat.var,
-                        &col_ids_fof,
-                    ));
+                    row_vals.extend(build_row_vals(&fof_props, &fof_node_pat.var, &col_ids_fof));
                     // Inject label metadata so labels(n) works in WHERE.
                     if !src_node_pat.var.is_empty() && !src_label.is_empty() {
                         row_vals.insert(

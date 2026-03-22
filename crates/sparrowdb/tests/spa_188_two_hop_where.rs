@@ -32,10 +32,14 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 fn two_hop_where_filters_fof_by_name() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (:Person {name: 'Bob'})").expect("CREATE Bob");
-    db.execute("CREATE (:Person {name: 'Charlie'})").expect("CREATE Charlie");
-    db.execute("CREATE (:Person {name: 'Dave'})").expect("CREATE Dave");
+    db.execute("CREATE (:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
+    db.execute("CREATE (:Person {name: 'Charlie'})")
+        .expect("CREATE Charlie");
+    db.execute("CREATE (:Person {name: 'Dave'})")
+        .expect("CREATE Dave");
 
     // Alice -> Bob
     db.execute(
@@ -83,9 +87,12 @@ fn two_hop_where_filters_fof_by_name() {
 fn two_hop_where_no_match_returns_empty() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (:Person {name: 'Bob'})").expect("CREATE Bob");
-    db.execute("CREATE (:Person {name: 'Charlie'})").expect("CREATE Charlie");
+    db.execute("CREATE (:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
+    db.execute("CREATE (:Person {name: 'Charlie'})")
+        .expect("CREATE Charlie");
 
     db.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
@@ -116,10 +123,14 @@ fn two_hop_where_no_match_returns_empty() {
 fn two_hop_without_where_returns_all_paths() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (:Person {name: 'Bob'})").expect("CREATE Bob");
-    db.execute("CREATE (:Person {name: 'Charlie'})").expect("CREATE Charlie");
-    db.execute("CREATE (:Person {name: 'Dave'})").expect("CREATE Dave");
+    db.execute("CREATE (:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
+    db.execute("CREATE (:Person {name: 'Charlie'})")
+        .expect("CREATE Charlie");
+    db.execute("CREATE (:Person {name: 'Dave'})")
+        .expect("CREATE Dave");
 
     db.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
@@ -135,9 +146,7 @@ fn two_hop_without_where_returns_all_paths() {
     .expect("edge Bob->Dave");
 
     let result = db
-        .execute(
-            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN c.name",
-        )
+        .execute("MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN c.name")
         .expect("two-hop no-WHERE query");
 
     assert_eq!(
