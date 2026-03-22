@@ -216,9 +216,7 @@ impl MetricsRegistry {
     }
 
     fn render_query_duration(&self, out: &mut String) {
-        out.push_str(
-            "# HELP sparrowdb_query_duration_seconds Query execution time in seconds\n",
-        );
+        out.push_str("# HELP sparrowdb_query_duration_seconds Query execution time in seconds\n");
         out.push_str("# TYPE sparrowdb_query_duration_seconds histogram\n");
         for (i, op) in ALL_OPS.iter().enumerate() {
             let hist = &self.query_duration[i];
@@ -260,9 +258,7 @@ impl MetricsRegistry {
             out.push_str("# TYPE sparrowdb_node_count gauge\n");
             out.push_str(&format!("sparrowdb_node_count {}\n", node_count));
 
-            out.push_str(
-                "# HELP sparrowdb_edge_count Total edge count (all rel types)\n",
-            );
+            out.push_str("# HELP sparrowdb_edge_count Total edge count (all rel types)\n");
             out.push_str("# TYPE sparrowdb_edge_count gauge\n");
             out.push_str(&format!("sparrowdb_edge_count {}\n", edge_count));
         }
@@ -301,8 +297,8 @@ pub struct MetricsServer {
 impl MetricsServer {
     /// Bind the server to `addr` (e.g. `"127.0.0.1:9091"`).
     pub fn new(registry: Arc<MetricsRegistry>, addr: &str) -> std::io::Result<Self> {
-        let server = tiny_http::Server::http(addr)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let server =
+            tiny_http::Server::http(addr).map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(MetricsServer { registry, server })
     }
 
@@ -341,9 +337,8 @@ impl MetricsServer {
                                 tracing::warn!("sparrowdb-metrics: response error: {e}");
                             }
                         } else {
-                            let response =
-                                tiny_http::Response::from_string("404 not found\n")
-                                    .with_status_code(404);
+                            let response = tiny_http::Response::from_string("404 not found\n")
+                                .with_status_code(404);
                             let _ = req.respond(response);
                         }
                     }
