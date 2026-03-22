@@ -282,7 +282,7 @@ fn cmd_import(
             id_map.insert(neo_id, node_id);
             node_count += 1;
 
-            if node_count % 1000 == 0 {
+            if node_count.is_multiple_of(1000) {
                 eprintln!("  nodes: {node_count} processed");
             }
         }
@@ -364,7 +364,7 @@ fn cmd_import(
 
             edge_count += 1;
 
-            if edge_count % 1000 == 0 {
+            if edge_count.is_multiple_of(1000) {
                 eprintln!("  edges: {edge_count} processed");
             }
         }
