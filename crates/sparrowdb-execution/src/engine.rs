@@ -1338,8 +1338,13 @@ impl Engine {
         }
 
         let use_agg = has_aggregate_in_return(&m.return_clause.items);
-        if use_agg {
-            // Aggregate expressions reference properties not captured by
+        // SPA-196: id(n) requires a NodeRef in the row map.  The fast
+        // project_row path only stores individual property columns, so it
+        // cannot evaluate id().  Force the eval path whenever id() appears in
+        // any RETURN item, even when no aggregation is requested.
+        let use_eval_path = use_agg || needs_node_ref_in_return(&m.return_clause.items);
+        if use_eval_path {
+            // Aggregate / eval expressions reference properties not captured by
             // column_names (e.g. collect(p.name) -> column "collect(p.name)").
             // Extract col_ids from every RETURN expression so the scan reads
             // all necessary columns.
@@ -1390,13 +1395,17 @@ impl Engine {
                         Value::List(vec![Value::String(label.clone())]),
                     );
                 }
+                // SPA-196: inject NodeRef so id(n) works in WHERE clauses.
+                if !var_name.is_empty() {
+                    row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+                }
                 if !eval_where(where_expr, &row_vals) {
                     continue;
                 }
             }
 
-            if use_agg {
-                // Build eval_expr-compatible map for aggregation path.
+            if use_eval_path {
+                // Build eval_expr-compatible map for aggregation / id() path.
                 let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
                 // Inject label metadata for aggregation.
                 if !var_name.is_empty() && !label.is_empty() {
@@ -1416,7 +1425,7 @@ impl Engine {
             }
         }
 
-        if use_agg {
+        if use_eval_path {
             rows = aggregate_rows(&raw_rows, &m.return_clause.items);
         } else {
             if m.distinct {
@@ -1587,8 +1596,10 @@ impl Engine {
             collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
 
         let use_agg = has_aggregate_in_return(&m.return_clause.items);
-        if use_agg {
-            // Collect col_ids referenced inside aggregate argument expressions.
+        // SPA-196: also use eval path when id() appears in RETURN.
+        let use_eval_path = use_agg || needs_node_ref_in_return(&m.return_clause.items);
+        if use_eval_path {
+            // Collect col_ids referenced inside aggregate / eval expressions.
             for item in &m.return_clause.items {
                 collect_col_ids_from_expr(&item.expr, &mut col_ids_src);
                 collect_col_ids_from_expr(&item.expr, &mut col_ids_dst);
@@ -1682,15 +1693,22 @@ impl Engine {
                             Value::List(vec![Value::String(dst_label.clone())]),
                         );
                     }
+                    // SPA-196: inject NodeRef so id(src)/id(dst) work in WHERE.
+                    if !src_node_pat.var.is_empty() {
+                        row_vals.insert(src_node_pat.var.clone(), Value::NodeRef(src_node));
+                    }
+                    if !dst_node_pat.var.is_empty() {
+                        row_vals.insert(dst_node_pat.var.clone(), Value::NodeRef(dst_node));
+                    }
                     if !eval_where(where_expr, &row_vals) {
                         continue;
                     }
                 }
 
-                if use_agg {
+                if use_eval_path {
                     let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
                     row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
-                    // Inject relationship and label metadata for aggregate path.
+                    // Inject relationship and label metadata for aggregate / id() path.
                     if !rel_pat.var.is_empty() {
                         row_vals.insert(
                             format!("{}.__type__", rel_pat.var),
@@ -1750,7 +1768,7 @@ impl Engine {
             }
         }
 
-        if use_agg {
+        if use_eval_path {
             rows = aggregate_rows(&raw_rows, &m.return_clause.items);
         } else {
             // DISTINCT
@@ -3156,6 +3174,20 @@ fn evaluate_aggregate_expr(
 /// Returns `true` if any RETURN item is an aggregate expression.
 fn has_aggregate_in_return(items: &[ReturnItem]) -> bool {
     items.iter().any(|item| is_aggregate_expr(&item.expr))
+}
+
+/// Returns `true` if any RETURN item requires a `NodeRef` / `EdgeRef` value to
+/// be present in the row map in order to evaluate correctly.
+///
+/// Currently this covers `id(var)` — a scalar (non-aggregate) function that
+/// receives the whole node/relationship reference rather than a scalar property.
+/// When this returns `true`, the scan must use the eval path (which inserts
+/// `Value::NodeRef` under the variable key) instead of the fast `project_row`
+/// path (which only stores individual property columns).
+fn needs_node_ref_in_return(items: &[ReturnItem]) -> bool {
+    items
+        .iter()
+        .any(|item| matches!(&item.expr, Expr::FnCall { name, .. } if name.to_lowercase() == "id"))
 }
 
 /// The aggregation kind for a single RETURN item.
