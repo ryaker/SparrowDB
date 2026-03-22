@@ -1,0 +1,15 @@
+# Linker configuration for the sparrowdb-ruby native extension.
+#
+# On macOS, Ruby symbols (rb_*, Ruby_*, etc.) are provided at runtime by the
+# Ruby interpreter that loads the extension.  The `-undefined dynamic_lookup`
+# flag tells the macOS static linker to defer resolution of unknown symbols
+# until load time rather than failing at link time.
+#
+# On Linux, undefined symbols are allowed in shared libraries by default so
+# no flag is needed there.
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

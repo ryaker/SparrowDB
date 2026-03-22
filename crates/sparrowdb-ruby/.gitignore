@@ -1,0 +1,6 @@
+target/
+Gemfile.lock
+*.bundle
+*.so
+*.dylib
+Makefile
