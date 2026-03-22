@@ -1582,18 +1582,29 @@ impl Engine {
             .catalog
             .get_label(&src_label)?
             .ok_or(sparrowdb_common::Error::NotFound)? as u32;
-        let dst_label_id = self
-            .catalog
-            .get_label(&dst_label)?
-            .ok_or(sparrowdb_common::Error::NotFound)? as u32;
+        // SPA-198: destination label is optional — an unlabeled endpoint `(b)`
+        // should match any node at the other end of the edge.  Only resolve
+        // the label ID when a label constraint was actually specified.
+        let dst_label_id: Option<u32> = if dst_node_pat.labels.is_empty() {
+            None
+        } else {
+            Some(
+                self.catalog
+                    .get_label(&dst_label)?
+                    .ok_or(sparrowdb_common::Error::NotFound)? as u32,
+            )
+        };
 
         let hwm_src = self.store.hwm_for_label(src_label_id)?;
         tracing::debug!(src_label = %src_label, dst_label = %dst_label, hwm_src = hwm_src, "one-hop traversal start");
 
         let mut col_ids_src =
             collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
+        // For the dst column ID collection, use label_id 0 as a placeholder
+        // when the destination is unlabeled — col IDs are derived from property
+        // names only and do not depend on the label.
         let mut col_ids_dst =
-            collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
+            collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id.unwrap_or(0));
 
         let use_agg = has_aggregate_in_return(&m.return_clause.items);
         // SPA-196: also use eval path when id() appears in RETURN.
@@ -1605,6 +1616,21 @@ impl Engine {
                 collect_col_ids_from_expr(&item.expr, &mut col_ids_dst);
             }
         }
+        // SPA-198: when the destination is unlabeled, build a label-id→name map
+        // so that labels(dst) metadata can be populated from the actual NodeId
+        // bits, enabling WHERE/RETURN expressions referencing labels(b) to work.
+        let label_id_to_name: std::collections::HashMap<u32, String> =
+            if dst_node_pat.labels.is_empty() {
+                self.catalog
+                    .list_labels()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(id, name)| (id as u32, name))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
@@ -1633,6 +1659,8 @@ impl Engine {
 
             // SPA-163: read delta log edges for this source node and merge
             // with CSR neighbors so edges are visible before a checkpoint.
+            // SPA-198: keep the full dst NodeId (label encoded in upper 32 bits)
+            // so that unlabeled destination endpoints can be resolved correctly.
             let delta_neighbors: Vec<u64> = {
                 let edge_store = EdgeStore::open(&self.db_root, RelTableId(0));
                 match edge_store.and_then(|s| s.read_delta()) {
@@ -1641,33 +1669,93 @@ impl Engine {
                         .filter(|r| {
                             let r_src_label = (r.src.0 >> 32) as u32;
                             let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                            r_src_label == src_label_id && r_src_slot == src_slot
+                            if r_src_label != src_label_id || r_src_slot != src_slot {
+                                return false;
+                            }
+                            // If a dst label filter is specified, apply it.
+                            if let Some(required_dst_label) = dst_label_id {
+                                let r_dst_label = (r.dst.0 >> 32) as u32;
+                                r_dst_label == required_dst_label
+                            } else {
+                                true
+                            }
                         })
-                        .map(|r| r.dst.0 & 0xFFFF_FFFF)
+                        .map(|r| r.dst.0) // full NodeId — label in upper 32 bits
                         .collect(),
                     Err(_) => vec![],
                 }
             };
 
-            // Traverse CSR.
-            let csr_neighbors = self.csr.neighbors(src_slot);
-            let all_neighbors: Vec<u64> = csr_neighbors
+            // Traverse CSR.  The CSR is indexed by plain src slot (0..hwm_src).
+            // Neighbors are stored as plain dst slot indices; we re-encode them
+            // as full NodeIds below using dst_label_id (or, for unlabeled dst,
+            // the dst label encoded in the neighbor slot via delta-log full ids).
+            let csr_neighbors_raw = self.csr.neighbors(src_slot);
+            // For labeled dst: filter CSR slots by dst_label_id and re-encode as
+            // full NodeIds.  For unlabeled dst: include all CSR slots and set
+            // the dst label to 0 (unknown at CSR read time; unlabeled dst queries
+            // rely on delta-log neighbors which carry the full NodeId).
+            let csr_neighbors: Vec<u64> = csr_neighbors_raw
                 .iter()
                 .copied()
+                .filter_map(|dst_slot| {
+                    if let Some(required) = dst_label_id {
+                        // Labeled dst: include only neighbors matching the label.
+                        if dst_slot >> 32 == 0 {
+                            // CSR slot (legacy format): re-encode with known label.
+                            Some((required as u64) << 32 | dst_slot)
+                        } else {
+                            // Already a full NodeId stored in CSR.
+                            if (dst_slot >> 32) as u32 == required {
+                                Some(dst_slot)
+                            } else {
+                                None
+                            }
+                        }
+                    } else {
+                        // Unlabeled dst: include CSR slots as-is.
+                        // If stored as plain slot, label bits are 0 — a valid
+                        // sentinel that get_node_raw handles gracefully, but
+                        // metadata (labels()) will be absent.  Full coverage
+                        // for unlabeled dst relies on the delta-log path above.
+                        Some(dst_slot)
+                    }
+                })
+                .collect();
+            let all_neighbors: Vec<u64> = csr_neighbors
+                .into_iter()
                 .chain(delta_neighbors.into_iter())
                 .collect();
             let mut seen_neighbors: HashSet<u64> = HashSet::new();
-            for &dst_slot in &all_neighbors {
-                if !seen_neighbors.insert(dst_slot) {
+            for &dst_full_id in &all_neighbors {
+                if !seen_neighbors.insert(dst_full_id) {
                     continue;
                 }
-                let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
-                let dst_props = read_node_props(&self.store, dst_node, &col_ids_dst)?;
+                // Reconstruct the dst NodeId from the full encoded value.
+                let dst_node = NodeId(dst_full_id);
+                let dst_props = if !col_ids_dst.is_empty() {
+                    self.store.get_node_raw(dst_node, &col_ids_dst)?
+                } else {
+                    vec![]
+                };
 
                 // Apply dst inline prop filter.
                 if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
                     continue;
                 }
+
+                // SPA-198: for unlabeled dst, derive the actual label name from
+                // the high 32 bits of the full NodeId so that labels(b) metadata
+                // is populated correctly in WHERE and RETURN expressions.
+                let effective_dst_label: &str = if dst_label.is_empty() {
+                    let dst_label_id_bits = (dst_full_id >> 32) as u32;
+                    label_id_to_name
+                        .get(&dst_label_id_bits)
+                        .map(|s| s.as_str())
+                        .unwrap_or("")
+                } else {
+                    dst_label.as_str()
+                };
 
                 // Apply WHERE clause.
                 if let Some(ref where_expr) = m.where_clause {
@@ -1687,10 +1775,10 @@ impl Engine {
                             Value::List(vec![Value::String(src_label.clone())]),
                         );
                     }
-                    if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
+                    if !dst_node_pat.var.is_empty() && !effective_dst_label.is_empty() {
                         row_vals.insert(
                             format!("{}.__labels__", dst_node_pat.var),
-                            Value::List(vec![Value::String(dst_label.clone())]),
+                            Value::List(vec![Value::String(effective_dst_label.to_string())]),
                         );
                     }
                     // SPA-196: inject NodeRef so id(src)/id(dst) work in WHERE.
@@ -1721,10 +1809,10 @@ impl Engine {
                             Value::List(vec![Value::String(src_label.clone())]),
                         );
                     }
-                    if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
+                    if !dst_node_pat.var.is_empty() && !effective_dst_label.is_empty() {
                         row_vals.insert(
                             format!("{}.__labels__", dst_node_pat.var),
-                            Value::List(vec![Value::String(dst_label.clone())]),
+                            Value::List(vec![Value::String(effective_dst_label.to_string())]),
                         );
                     }
                     if !src_node_pat.var.is_empty() {
@@ -1748,11 +1836,12 @@ impl Engine {
                     } else {
                         None
                     };
-                    let dst_label_meta = if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
-                        Some((dst_node_pat.var.as_str(), dst_label.as_str()))
-                    } else {
-                        None
-                    };
+                    let dst_label_meta =
+                        if !dst_node_pat.var.is_empty() && !effective_dst_label.is_empty() {
+                            Some((dst_node_pat.var.as_str(), effective_dst_label))
+                        } else {
+                            None
+                        };
                     let row = project_hop_row(
                         &src_props,
                         &dst_props,
