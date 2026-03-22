@@ -352,6 +352,7 @@ impl GraphDb {
     /// point-in-time snapshot.  Mutation statements (`MERGE`, `MATCH … SET`,
     /// `MATCH … DELETE`) open a write transaction internally and commit on
     /// success.  `CREATE` statements auto-register labels and write nodes (SPA-156).
+    /// `CHECKPOINT` and `OPTIMIZE` delegate to the maintenance engine (SPA-189).
     pub fn execute(&self, cypher: &str) -> Result<QueryResult> {
         use sparrowdb_cypher::ast::Statement;
         use sparrowdb_cypher::{bind, parse};
@@ -359,6 +360,20 @@ impl GraphDb {
         let stmt = parse(cypher)?;
         let catalog_snap = Catalog::open(&self.inner.path)?;
         let bound = bind(stmt, &catalog_snap)?;
+
+        // SPA-189: wire CHECKPOINT and OPTIMIZE to their real implementations
+        // before entering the mutation / read-only dispatch below.
+        match &bound.inner {
+            Statement::Checkpoint => {
+                self.checkpoint()?;
+                return Ok(QueryResult::empty(vec![]));
+            }
+            Statement::Optimize => {
+                self.optimize()?;
+                return Ok(QueryResult::empty(vec![]));
+            }
+            _ => {}
+        }
 
         if Engine::is_mutation(&bound.inner) {
             match bound.inner {
@@ -1601,6 +1616,34 @@ fn write_mutation_wal(
 /// FNV-1a implementation shared by storage and execution (SPA-160).
 pub fn fnv1a_col_id(key: &str) -> u32 {
     col_id_of(key)
+}
+
+// ── Cypher string utilities ────────────────────────────────────────────────────
+
+/// Escape a Rust `&str` so it can be safely interpolated inside a single-quoted
+/// Cypher string literal.
+///
+/// Two characters require escaping inside Cypher single-quoted strings:
+/// * `\` → `\\`  (backslash must be doubled first to avoid misinterpreting
+///                the subsequent escape sequence)
+/// * `'` → `\'`  (prevents premature termination of the string literal)
+///
+/// # Example
+///
+/// ```
+/// use sparrowdb::cypher_escape_string;
+/// let safe = cypher_escape_string("O'Reilly");
+/// let cypher = format!("MATCH (n {{name: '{safe}'}}) RETURN n");
+/// assert_eq!(cypher, "MATCH (n {name: 'O\\'Reilly'}) RETURN n");
+/// ```
+///
+/// **Prefer parameterized queries** (`execute_with_params`) over string
+/// interpolation whenever possible — this function is provided for the cases
+/// where dynamic query construction cannot be avoided (SPA-218).
+pub fn cypher_escape_string(s: &str) -> String {
+    // Process backslash first so that the apostrophe replacement below does
+    // not accidentally double-escape newly-inserted backslashes.
+    s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 // ── Mutation value helpers ─────────────────────────────────────────────────────
