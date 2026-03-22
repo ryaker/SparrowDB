@@ -1405,8 +1405,10 @@ impl Parser {
                     };
                     Ok(Expr::PropAccess { var, prop })
                 } else if matches!(next2, Token::LParen) {
-                    // Special-case shortestPath(…) — SPA-136.
-                    if var.to_lowercase() == "shortestpath" {
+                    // Special-case shortestPath(…) and allShortestPaths(…) — SPA-136.
+                    if var.to_lowercase() == "shortestpath"
+                        || var.to_lowercase() == "allshortestpaths"
+                    {
                         self.advance(); // consume function name
                         return self.parse_shortest_path_fn();
                     }
@@ -1503,20 +1505,45 @@ impl Parser {
                 self.advance(); // consume CASE
                 let mut branches: Vec<(Expr, Expr)> = Vec::new();
                 let mut else_expr: Option<Box<Expr>> = None;
+                let mut seen_when = false;
+                let mut seen_else = false;
                 loop {
                     match self.peek().clone() {
                         Token::When => {
+                            if seen_else {
+                                return Err(Error::InvalidArgument(
+                                    "WHEN cannot follow ELSE in CASE expression".to_string(),
+                                ));
+                            }
                             self.advance(); // consume WHEN
                             let cond = self.parse_expr()?;
                             self.expect_tok(&Token::Then)?;
                             let val = self.parse_expr()?;
                             branches.push((cond, val));
+                            seen_when = true;
                         }
                         Token::Else => {
+                            if !seen_when {
+                                return Err(Error::InvalidArgument(
+                                    "ELSE requires at least one WHEN branch in CASE expression"
+                                        .to_string(),
+                                ));
+                            }
+                            if seen_else {
+                                return Err(Error::InvalidArgument(
+                                    "duplicate ELSE in CASE expression".to_string(),
+                                ));
+                            }
                             self.advance(); // consume ELSE
                             else_expr = Some(Box::new(self.parse_expr()?));
+                            seen_else = true;
                         }
                         Token::End => {
+                            if !seen_when {
+                                return Err(Error::InvalidArgument(
+                                    "CASE expression requires at least one WHEN branch".to_string(),
+                                ));
+                            }
                             self.advance(); // consume END
                             break;
                         }

@@ -1601,6 +1601,9 @@ impl Engine {
         let mut per_var: Vec<(String, u32, Vec<NodeId>)> = Vec::new(); // (var, label_id, candidates)
 
         for pat in &m.pattern {
+            if pat.nodes.is_empty() {
+                continue;
+            }
             let node = &pat.nodes[0];
             if node.var.is_empty() {
                 continue;
@@ -3295,7 +3298,18 @@ impl Engine {
             .filter(|r| {
                 let r_src_label = (r.src.0 >> 32) as u32;
                 let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                r_src_label == src_label_id && r_src_slot == src_slot
+                if r_src_label != src_label_id || r_src_slot != src_slot {
+                    return false;
+                }
+                // When a destination label is known, only keep edges that point
+                // to nodes of that label — slots are label-relative so mixing
+                // labels causes false positive matches.
+                if let Some(dst_lid) = dst_label_id_opt {
+                    let r_dst_label = (r.dst.0 >> 32) as u32;
+                    r_dst_label == dst_lid
+                } else {
+                    true
+                }
             })
             .map(|r| r.dst.0 & 0xFFFF_FFFF)
             .collect();
@@ -3417,6 +3431,13 @@ impl Engine {
     }
 
     /// BFS from `src_slot` to `dst_slot`, returning the hop count or None.
+    ///
+    /// `src_label_id` is used to look up edges in the WAL delta for every hop.
+    /// When all nodes in the shortest path share the same label (the typical
+    /// single-label homogeneous graph), this is correct.  Heterogeneous graphs
+    /// with intermediate nodes of a different label will still find paths via
+    /// the CSR (`csr_neighbors_all`), which is label-agnostic; only in-flight
+    /// WAL edges from intermediate nodes of a different label may be missed.
     fn bfs_shortest_path(
         &self,
         src_slot: u64,
@@ -4524,22 +4545,7 @@ fn needs_node_ref_in_return(items: &[ReturnItem]) -> bool {
         matches!(&item.expr, Expr::FnCall { name, .. } if name.to_lowercase() == "id")
             || matches!(&item.expr, Expr::Var(_))
             || expr_needs_graph(&item.expr)
-            || has_case_when_or_fn(&item.expr)
     })
-}
-
-/// Returns true if the expression contains a CASE WHEN or complex sub-expression
-/// that requires eval_expr (rather than the fast project_row column lookup).
-fn has_case_when_or_fn(expr: &Expr) -> bool {
-    match expr {
-        Expr::CaseWhen { .. } | Expr::ShortestPath(_) | Expr::ExistsSubquery(_) => true,
-        Expr::BinOp { left, right, .. } => has_case_when_or_fn(left) || has_case_when_or_fn(right),
-        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            has_case_when_or_fn(inner)
-        }
-        Expr::And(l, r) | Expr::Or(l, r) => has_case_when_or_fn(l) || has_case_when_or_fn(r),
-        _ => false,
-    }
 }
 
 /// Collect the variable names that appear as bare `Expr::Var` in a RETURN clause (SPA-213).
@@ -4608,21 +4614,15 @@ fn agg_kind(expr: &Expr) -> AggKind {
 ///
 /// Non-aggregate RETURN items become the group key.  Returns one output
 /// `Vec<Value>` per unique key in the same column order as `return_items`.
+/// Returns `true` if the expression contains a `CASE WHEN`, `shortestPath`,
+/// or `EXISTS` sub-expression that requires the graph-aware eval path
+/// (rather than the fast `project_row` column lookup).
 fn expr_needs_graph(expr: &Expr) -> bool {
     match expr {
-        Expr::ShortestPath(_) | Expr::ExistsSubquery(_) => true,
+        Expr::ShortestPath(_) | Expr::ExistsSubquery(_) | Expr::CaseWhen { .. } => true,
         Expr::And(l, r) | Expr::Or(l, r) => expr_needs_graph(l) || expr_needs_graph(r),
         Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => expr_needs_graph(inner),
         Expr::BinOp { left, right, .. } => expr_needs_graph(left) || expr_needs_graph(right),
-        Expr::CaseWhen {
-            branches,
-            else_expr,
-        } => {
-            branches
-                .iter()
-                .any(|(c, v)| expr_needs_graph(c) || expr_needs_graph(v))
-                || else_expr.as_ref().is_some_and(|e| expr_needs_graph(e))
-        }
         _ => false,
     }
 }
