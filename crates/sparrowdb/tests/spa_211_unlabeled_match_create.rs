@@ -7,7 +7,6 @@
 //! the regular labelled MATCH path.
 
 use sparrowdb::open;
-use sparrowdb_common;
 
 fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
     let dir = tempfile::tempdir().expect("tempdir");
