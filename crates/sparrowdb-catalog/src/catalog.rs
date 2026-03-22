@@ -322,6 +322,20 @@ mod tests {
             // labels still present
             assert!(catalog.get_label("Person").unwrap().is_some());
             assert!(catalog.get_label("Movie").unwrap().is_some());
+            // rel table must also survive reopen — SPA-191
+            let rel_tables = catalog.list_rel_tables().expect("list_rel_tables");
+            assert_eq!(rel_tables.len(), 1, "rel table must survive reopen");
+            assert_eq!(
+                rel_tables[0].2, "ACTED_IN",
+                "rel type name must survive reopen"
+            );
+            let p_id = catalog.get_label("Person").unwrap().unwrap();
+            let m_id = catalog.get_label("Movie").unwrap().unwrap();
+            let recovered = catalog
+                .get_rel_table(p_id, m_id, "ACTED_IN")
+                .expect("get_rel_table must not error")
+                .expect("ACTED_IN rel table must be present after reopen");
+            assert_eq!(recovered, 0, "rel_table_id must be stable across reopen");
         }
     }
 
