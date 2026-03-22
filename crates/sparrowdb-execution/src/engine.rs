@@ -1600,9 +1600,7 @@ impl Engine {
         let scan_dst_label_id: Option<u32> = if scan_dst_label.is_empty() {
             None
         } else {
-            self.catalog
-                .get_label(scan_dst_label)?
-                .map(|id| id as u32)
+            self.catalog.get_label(scan_dst_label)?.map(|id| id as u32)
         };
 
         // We also need the original label ids for the column projection.
