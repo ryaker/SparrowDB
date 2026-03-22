@@ -31,14 +31,10 @@ fn db_counts_reflects_created_nodes_and_edges() {
     assert_eq!(edge_count, 0, "no edges created yet");
 
     // Create 2 edges.
-    db.execute(
-        "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)",
-    )
-    .expect("create Alice->Bob KNOWS");
-    db.execute(
-        "MATCH (a:Person {name:'Bob'}),(b:Person {name:'Carol'}) CREATE (a)-[:KNOWS]->(b)",
-    )
-    .expect("create Bob->Carol KNOWS");
+    db.execute("MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)")
+        .expect("create Alice->Bob KNOWS");
+    db.execute("MATCH (a:Person {name:'Bob'}),(b:Person {name:'Carol'}) CREATE (a)-[:KNOWS]->(b)")
+        .expect("create Bob->Carol KNOWS");
 
     let (node_count, edge_count) = db.db_counts().expect("db_counts after edges");
     assert_eq!(node_count, 3, "node count should still be 3");

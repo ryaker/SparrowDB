@@ -787,10 +787,7 @@ impl GraphDb {
                 let Ok(store) = EdgeStore::open(path, RelTableId(id as u32)) else {
                     return 0;
                 };
-                let csr_edges = store
-                    .open_fwd()
-                    .map(|csr| csr.n_edges())
-                    .unwrap_or(0);
+                let csr_edges = store.open_fwd().map(|csr| csr.n_edges()).unwrap_or(0);
                 // Re-open to read delta (EdgeStore::open is cheap — no lock held).
                 let delta_edges = EdgeStore::open(path, RelTableId(id as u32))
                     .and_then(|s| s.read_delta())
