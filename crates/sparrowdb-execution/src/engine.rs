@@ -509,7 +509,7 @@ impl Engine {
             if let Some(ref where_expr) = mm.where_clause {
                 let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
                 row_vals.extend(self.dollar_params());
-                if !eval_where(where_expr, &row_vals) {
+                if !self.eval_where_graph(where_expr, &row_vals) {
                     continue;
                 }
             }
@@ -1103,7 +1103,7 @@ impl Engine {
             if let Some(ref where_expr) = m.with_clause.where_clause {
                 let mut with_vals_p = with_vals.clone();
                 with_vals_p.extend(self.dollar_params());
-                if !eval_where(where_expr, &with_vals_p) {
+                if !self.eval_where_graph(where_expr, &with_vals_p) {
                     continue;
                 }
             }
@@ -1200,7 +1200,7 @@ impl Engine {
                 if let Some(wexpr) = &where_clause {
                     let mut row_vals_p = row_vals.clone();
                     row_vals_p.extend(self.dollar_params());
-                    if !eval_where(wexpr, &row_vals_p) {
+                    if !self.eval_where_graph(wexpr, &row_vals_p) {
                         continue;
                     }
                 }
@@ -1239,12 +1239,18 @@ impl Engine {
 
         let column_names = extract_return_column_names(&m.return_clause.items);
 
+        // SPA-136: multi-node-pattern MATCH (e.g. MATCH (a), (b) RETURN shortestPath(...))
+        // requires a cross-product join across all patterns.
+        let is_multi_pattern = m.pattern.len() > 1 && m.pattern.iter().all(|p| p.rels.is_empty());
+
         if is_var_len {
             self.execute_variable_length(m, &column_names)
         } else if is_two_hop {
             self.execute_two_hop(m, &column_names)
         } else if is_one_hop {
             self.execute_one_hop(m, &column_names)
+        } else if is_multi_pattern {
+            self.execute_multi_pattern_scan(m, &column_names)
         } else if m.pattern[0].rels.is_empty() {
             self.execute_scan(m, &column_names)
         } else {
@@ -1385,7 +1391,7 @@ impl Engine {
             if let Some(ref wexpr) = mom.match_where {
                 let mut row_vals = build_row_vals(&props, lead_var, &lead_all_col_ids, &self.store);
                 row_vals.extend(self.dollar_params());
-                if !eval_where(wexpr, &row_vals) {
+                if !self.eval_where_graph(wexpr, &row_vals) {
                     continue;
                 }
             }
@@ -1580,6 +1586,119 @@ impl Engine {
 
     // ── Node-only scan (no relationships) ─────────────────────────────────────
 
+    /// Execute a multi-pattern node-only MATCH by cross-joining each pattern's candidates.
+    ///
+    /// `MATCH (a:Person {name:'Alice'}), (b:Person {name:'Bob'}) RETURN shortestPath(...)`
+    /// produces one merged row per combination of matching nodes.  Each row contains both
+    /// `"{var}" → Value::NodeRef(node_id)` (for `resolve_node_id_from_var`) and
+    /// `"{var}.col_{hash}" → Value` entries (for property access via `eval_expr`).
+    fn execute_multi_pattern_scan(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<QueryResult> {
+        // Collect candidate NodeIds per variable across all patterns.
+        let mut per_var: Vec<(String, u32, Vec<NodeId>)> = Vec::new(); // (var, label_id, candidates)
+
+        for pat in &m.pattern {
+            let node = &pat.nodes[0];
+            if node.var.is_empty() {
+                continue;
+            }
+            let label = node.labels.first().cloned().unwrap_or_default();
+            let label_id = match self.catalog.get_label(&label)? {
+                Some(id) => id as u32,
+                None => return Ok(QueryResult::empty(column_names.to_vec())),
+            };
+            let filter_col_ids: Vec<u32> = node
+                .props
+                .iter()
+                .map(|p| prop_name_to_col_id(&p.key))
+                .collect();
+            let params = self.dollar_params();
+            let hwm = self.store.hwm_for_label(label_id)?;
+            let mut candidates: Vec<NodeId> = Vec::new();
+            for slot in 0..hwm {
+                let node_id = NodeId(((label_id as u64) << 32) | slot);
+                if self.is_node_tombstoned(node_id) {
+                    continue;
+                }
+                if filter_col_ids.is_empty() {
+                    candidates.push(node_id);
+                } else if let Ok(raw_props) = self.store.get_node_raw(node_id, &filter_col_ids) {
+                    if matches_prop_filter_static(&raw_props, &node.props, &params, &self.store) {
+                        candidates.push(node_id);
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                return Ok(QueryResult::empty(column_names.to_vec()));
+            }
+            per_var.push((node.var.clone(), label_id, candidates));
+        }
+
+        // Cross-product all candidates into row_vals maps.
+        let mut accumulated: Vec<HashMap<String, Value>> = vec![HashMap::new()];
+        for (var, _label_id, candidates) in &per_var {
+            let mut next: Vec<HashMap<String, Value>> = Vec::new();
+            for base_row in &accumulated {
+                for &node_id in candidates {
+                    let mut row = base_row.clone();
+                    // Bind var as NodeRef (needed by resolve_node_id_from_var for shortestPath).
+                    row.insert(var.clone(), Value::NodeRef(node_id));
+                    row.insert(format!("{var}.__node_id__"), Value::NodeRef(node_id));
+                    // Also store properties under "var.col_N" keys for eval_expr PropAccess.
+                    let label_id = (node_id.0 >> 32) as u32;
+                    let label_col_ids = self.store.col_ids_for_label(label_id).unwrap_or_default();
+                    let nullable = self
+                        .store
+                        .get_node_raw_nullable(node_id, &label_col_ids)
+                        .unwrap_or_default();
+                    for &(col_id, opt_raw) in &nullable {
+                        if let Some(raw) = opt_raw {
+                            row.insert(
+                                format!("{var}.col_{col_id}"),
+                                decode_raw_val(raw, &self.store),
+                            );
+                        }
+                    }
+                    next.push(row);
+                }
+            }
+            accumulated = next;
+        }
+
+        // Apply WHERE clause.
+        if let Some(ref where_expr) = m.where_clause {
+            accumulated.retain(|row| self.eval_where_graph(where_expr, row));
+        }
+
+        // Inject runtime params into each row before projection.
+        let dollar_params = self.dollar_params();
+        if !dollar_params.is_empty() {
+            for row in &mut accumulated {
+                row.extend(dollar_params.clone());
+            }
+        }
+
+        let mut rows = self.aggregate_rows_graph(&accumulated, &m.return_clause.items);
+
+        // ORDER BY / LIMIT / SKIP.
+        apply_order_by(&mut rows, m, column_names);
+        if let Some(skip) = m.skip {
+            let skip = (skip as usize).min(rows.len());
+            rows.drain(0..skip);
+        }
+        if let Some(limit) = m.limit {
+            rows.truncate(limit as usize);
+        }
+
+        Ok(QueryResult {
+            columns: column_names.to_vec(),
+            rows,
+        })
+    }
+
     fn execute_scan(&self, m: &MatchStatement, column_names: &[String]) -> Result<QueryResult> {
         let pat = &m.pattern[0];
         let node = &pat.nodes[0];
@@ -1694,7 +1813,7 @@ impl Engine {
                 }
                 // Inject runtime params so $param references in WHERE work.
                 row_vals.extend(self.dollar_params());
-                if !eval_where(where_expr, &row_vals) {
+                if !self.eval_where_graph(where_expr, &row_vals) {
                     continue;
                 }
             }
@@ -1748,7 +1867,7 @@ impl Engine {
         }
 
         if use_eval_path {
-            rows = aggregate_rows(&raw_rows, &m.return_clause.items);
+            rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
         } else {
             if m.distinct {
                 deduplicate_rows(&mut rows);
@@ -1867,7 +1986,7 @@ impl Engine {
                         row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
                     }
                     row_vals.extend(self.dollar_params());
-                    if !eval_where(where_expr, &row_vals) {
+                    if !self.eval_where_graph(where_expr, &row_vals) {
                         continue;
                     }
                 }
@@ -1916,7 +2035,7 @@ impl Engine {
         }
 
         if use_eval_path_all {
-            rows = aggregate_rows(&raw_rows, &m.return_clause.items);
+            rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
         }
 
         // DISTINCT / ORDER BY / SKIP / LIMIT apply regardless of which path
@@ -2199,7 +2318,7 @@ impl Engine {
                             );
                         }
                         row_vals.extend(self.dollar_params());
-                        if !eval_where(where_expr, &row_vals) {
+                        if !self.eval_where_graph(where_expr, &row_vals) {
                             continue;
                         }
                     }
@@ -2444,7 +2563,7 @@ impl Engine {
                                 );
                             }
                             row_vals.extend(self.dollar_params());
-                            if !eval_where(where_expr, &row_vals) {
+                            if !self.eval_where_graph(where_expr, &row_vals) {
                                 continue;
                             }
                         }
@@ -2530,7 +2649,7 @@ impl Engine {
         }
 
         if use_agg {
-            rows = aggregate_rows(&raw_rows, &m.return_clause.items);
+            rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
         } else {
             // DISTINCT
             if m.distinct {
@@ -2757,7 +2876,7 @@ impl Engine {
                         );
                     }
                     row_vals.extend(self.dollar_params());
-                    if !eval_where(where_expr, &row_vals) {
+                    if !self.eval_where_graph(where_expr, &row_vals) {
                         continue;
                     }
                 }
@@ -2990,7 +3109,7 @@ impl Engine {
                         );
                     }
                     row_vals.extend(self.dollar_params());
-                    if !eval_where(where_expr, &row_vals) {
+                    if !self.eval_where_graph(where_expr, &row_vals) {
                         continue;
                     }
                 }
@@ -3075,6 +3194,284 @@ impl Engine {
         self.params
             .iter()
             .map(|(k, v)| (format!("${k}"), v.clone()))
+            .collect()
+    }
+
+    // ── Graph-aware expression evaluation (SPA-136, SPA-137, SPA-138) ────────
+
+    /// Evaluate an expression that may require graph access (EXISTS, ShortestPath).
+    fn eval_expr_graph(&self, expr: &Expr, vals: &HashMap<String, Value>) -> Value {
+        match expr {
+            Expr::ExistsSubquery(ep) => Value::Bool(self.eval_exists_subquery(ep, vals)),
+            Expr::ShortestPath(sp) => self.eval_shortest_path_expr(sp, vals),
+            Expr::CaseWhen {
+                branches,
+                else_expr,
+            } => {
+                for (cond, then_val) in branches {
+                    if let Value::Bool(true) = self.eval_expr_graph(cond, vals) {
+                        return self.eval_expr_graph(then_val, vals);
+                    }
+                }
+                else_expr
+                    .as_ref()
+                    .map(|e| self.eval_expr_graph(e, vals))
+                    .unwrap_or(Value::Null)
+            }
+            Expr::And(l, r) => {
+                match (self.eval_expr_graph(l, vals), self.eval_expr_graph(r, vals)) {
+                    (Value::Bool(a), Value::Bool(b)) => Value::Bool(a && b),
+                    _ => Value::Null,
+                }
+            }
+            Expr::Or(l, r) => {
+                match (self.eval_expr_graph(l, vals), self.eval_expr_graph(r, vals)) {
+                    (Value::Bool(a), Value::Bool(b)) => Value::Bool(a || b),
+                    _ => Value::Null,
+                }
+            }
+            Expr::Not(inner) => match self.eval_expr_graph(inner, vals) {
+                Value::Bool(b) => Value::Bool(!b),
+                _ => Value::Null,
+            },
+            _ => eval_expr(expr, vals),
+        }
+    }
+
+    /// Graph-aware WHERE evaluation — falls back to eval_where for pure expressions.
+    fn eval_where_graph(&self, expr: &Expr, vals: &HashMap<String, Value>) -> bool {
+        match self.eval_expr_graph(expr, vals) {
+            Value::Bool(b) => b,
+            _ => eval_where(expr, vals),
+        }
+    }
+
+    /// Evaluate `EXISTS { (n)-[:REL]->(:DstLabel) }` — SPA-137.
+    fn eval_exists_subquery(
+        &self,
+        ep: &sparrowdb_cypher::ast::ExistsPattern,
+        vals: &HashMap<String, Value>,
+    ) -> bool {
+        let path = &ep.path;
+        if path.nodes.len() < 2 || path.rels.is_empty() {
+            return false;
+        }
+        let src_pat = &path.nodes[0];
+        let dst_pat = &path.nodes[1];
+        let rel_pat = &path.rels[0];
+
+        let src_node_id = match self.resolve_node_id_from_var(&src_pat.var, vals) {
+            Some(id) => id,
+            None => return false,
+        };
+        let src_slot = src_node_id.0 & 0xFFFF_FFFF;
+        let src_label_id = (src_node_id.0 >> 32) as u32;
+
+        let dst_label = dst_pat.labels.first().map(String::as_str).unwrap_or("");
+        let dst_label_id_opt: Option<u32> = if dst_label.is_empty() {
+            None
+        } else {
+            self.catalog
+                .get_label(dst_label)
+                .ok()
+                .flatten()
+                .map(|id| id as u32)
+        };
+
+        let rel_lookup = if let Some(dst_lid) = dst_label_id_opt {
+            self.resolve_rel_table_id(src_label_id, dst_lid, &rel_pat.rel_type)
+        } else {
+            RelTableLookup::All
+        };
+
+        let csr_nb: Vec<u64> = match rel_lookup {
+            RelTableLookup::Found(rtid) => self.csr_neighbors(rtid, src_slot),
+            RelTableLookup::NotFound => return false,
+            RelTableLookup::All => self.csr_neighbors_all(src_slot),
+        };
+        let delta_nb: Vec<u64> = self
+            .read_delta_all()
+            .into_iter()
+            .filter(|r| {
+                let r_src_label = (r.src.0 >> 32) as u32;
+                let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                r_src_label == src_label_id && r_src_slot == src_slot
+            })
+            .map(|r| r.dst.0 & 0xFFFF_FFFF)
+            .collect();
+
+        let all_nb: std::collections::HashSet<u64> = csr_nb.into_iter().chain(delta_nb).collect();
+
+        for dst_slot in all_nb {
+            if let Some(did) = dst_label_id_opt {
+                let probe_id = NodeId(((did as u64) << 32) | dst_slot);
+                if self.store.get_node_raw(probe_id, &[]).is_err() {
+                    continue;
+                }
+                if !dst_pat.props.is_empty() {
+                    let col_ids: Vec<u32> = dst_pat
+                        .props
+                        .iter()
+                        .map(|p| prop_name_to_col_id(&p.key))
+                        .collect();
+                    match self.store.get_node_raw(probe_id, &col_ids) {
+                        Ok(props) => {
+                            let params = self.dollar_params();
+                            if !matches_prop_filter_static(
+                                &props,
+                                &dst_pat.props,
+                                &params,
+                                &self.store,
+                            ) {
+                                continue;
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Resolve a NodeId from `vals` for a variable name.
+    fn resolve_node_id_from_var(&self, var: &str, vals: &HashMap<String, Value>) -> Option<NodeId> {
+        let id_key = format!("{var}.__node_id__");
+        if let Some(Value::NodeRef(nid)) = vals.get(&id_key) {
+            return Some(*nid);
+        }
+        if let Some(Value::NodeRef(nid)) = vals.get(var) {
+            return Some(*nid);
+        }
+        None
+    }
+
+    /// Evaluate `shortestPath((src)-[:REL*]->(dst))` — SPA-136.
+    fn eval_shortest_path_expr(
+        &self,
+        sp: &sparrowdb_cypher::ast::ShortestPathExpr,
+        vals: &HashMap<String, Value>,
+    ) -> Value {
+        // Resolve src: if the variable is already bound as a NodeRef, extract
+        // label_id and slot from the NodeId directly (high 32 bits = label_id,
+        // low 32 bits = slot). This handles the case where shortestPath((a)-...)
+        // refers to a variable bound in the outer MATCH without repeating its label.
+        let (src_label_id, src_slot) =
+            if let Some(nid) = self.resolve_node_id_from_var(&sp.src_var, vals) {
+                let label_id = (nid.0 >> 32) as u32;
+                let slot = nid.0 & 0xFFFF_FFFF;
+                (label_id, slot)
+            } else {
+                // Fall back to label lookup + property scan.
+                let label_id = match self.catalog.get_label(&sp.src_label) {
+                    Ok(Some(id)) => id as u32,
+                    _ => return Value::Null,
+                };
+                match self.find_node_by_props(label_id, &sp.src_props) {
+                    Some(slot) => (label_id, slot),
+                    None => return Value::Null,
+                }
+            };
+
+        let dst_slot = if let Some(nid) = self.resolve_node_id_from_var(&sp.dst_var, vals) {
+            nid.0 & 0xFFFF_FFFF
+        } else {
+            let dst_label_id = match self.catalog.get_label(&sp.dst_label) {
+                Ok(Some(id)) => id as u32,
+                _ => return Value::Null,
+            };
+            match self.find_node_by_props(dst_label_id, &sp.dst_props) {
+                Some(slot) => slot,
+                None => return Value::Null,
+            }
+        };
+
+        match self.bfs_shortest_path(src_slot, src_label_id, dst_slot, 10) {
+            Some(hops) => Value::Int64(hops as i64),
+            None => Value::Null,
+        }
+    }
+
+    /// Scan a label for the first node matching all property filters.
+    fn find_node_by_props(
+        &self,
+        label_id: u32,
+        props: &[sparrowdb_cypher::ast::PropEntry],
+    ) -> Option<u64> {
+        if props.is_empty() {
+            return None;
+        }
+        let hwm = self.store.hwm_for_label(label_id).ok()?;
+        let col_ids: Vec<u32> = props.iter().map(|p| prop_name_to_col_id(&p.key)).collect();
+        let params = self.dollar_params();
+        for slot in 0..hwm {
+            let node_id = NodeId(((label_id as u64) << 32) | slot);
+            if let Ok(raw_props) = self.store.get_node_raw(node_id, &col_ids) {
+                if matches_prop_filter_static(&raw_props, props, &params, &self.store) {
+                    return Some(slot);
+                }
+            }
+        }
+        None
+    }
+
+    /// BFS from `src_slot` to `dst_slot`, returning the hop count or None.
+    fn bfs_shortest_path(
+        &self,
+        src_slot: u64,
+        src_label_id: u32,
+        dst_slot: u64,
+        max_hops: u32,
+    ) -> Option<u32> {
+        if src_slot == dst_slot {
+            return Some(0);
+        }
+        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        visited.insert(src_slot);
+        let mut frontier: Vec<u64> = vec![src_slot];
+
+        for depth in 1..=max_hops {
+            let mut next_frontier: Vec<u64> = Vec::new();
+            for &node_slot in &frontier {
+                let neighbors = self.get_node_neighbors_by_slot(node_slot, src_label_id);
+                for nb in neighbors {
+                    if nb == dst_slot {
+                        return Some(depth);
+                    }
+                    if visited.insert(nb) {
+                        next_frontier.push(nb);
+                    }
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+        None
+    }
+
+    /// Engine-aware aggregate_rows: evaluates graph-dependent RETURN expressions
+    /// (ShortestPath, EXISTS) via self before delegating to the standalone helper.
+    fn aggregate_rows_graph(
+        &self,
+        rows: &[HashMap<String, Value>],
+        return_items: &[ReturnItem],
+    ) -> Vec<Vec<Value>> {
+        // Check if any return item needs graph access.
+        let needs_graph = return_items.iter().any(|item| expr_needs_graph(&item.expr));
+        if !needs_graph {
+            return aggregate_rows(rows, return_items);
+        }
+        // For graph-dependent items, project each row using eval_expr_graph.
+        rows.iter()
+            .map(|row_vals| {
+                return_items
+                    .iter()
+                    .map(|item| self.eval_expr_graph(&item.expr, row_vals))
+                    .collect()
+            })
             .collect()
     }
 }
@@ -3299,6 +3696,19 @@ fn collect_col_ids_from_expr_for_var(expr: &Expr, target_var: &str, out: &mut Ve
             collect_col_ids_from_expr_for_var(list_expr, target_var, out);
             collect_col_ids_from_expr_for_var(predicate, target_var, out);
         }
+        // SPA-138: CASE WHEN branches may reference property accesses.
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
+            for (cond, then_val) in branches {
+                collect_col_ids_from_expr_for_var(cond, target_var, out);
+                collect_col_ids_from_expr_for_var(then_val, target_var, out);
+            }
+            if let Some(e) = else_expr {
+                collect_col_ids_from_expr_for_var(e, target_var, out);
+            }
+        }
         _ => {}
     }
 }
@@ -3352,6 +3762,19 @@ fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
         }
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
             collect_col_ids_from_expr(inner, out);
+        }
+        // SPA-138: CASE WHEN branches may reference property accesses.
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
+            for (cond, then_val) in branches {
+                collect_col_ids_from_expr(cond, out);
+                collect_col_ids_from_expr(then_val, out);
+            }
+            if let Some(e) = else_expr {
+                collect_col_ids_from_expr(e, out);
+            }
         }
         _ => {}
     }
@@ -3618,6 +4041,13 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
         }
         Expr::IsNull(inner) => matches!(eval_expr(inner, vals), Value::Null),
         Expr::IsNotNull(inner) => !matches!(eval_expr(inner, vals), Value::Null),
+        // CASE WHEN — evaluate via eval_expr.
+        Expr::CaseWhen { .. } => matches!(eval_expr(expr, vals), Value::Bool(true)),
+        // EXISTS subquery and ShortestPath require graph access.
+        // Engine::eval_where_graph handles them; standalone eval_where returns false.
+        Expr::ExistsSubquery(_) | Expr::ShortestPath(_) | Expr::NotExists(_) | Expr::CountStar => {
+            false
+        }
         _ => false, // unsupported expression — reject row rather than silently pass
     }
 }
@@ -3793,9 +4223,27 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             };
             Value::Bool(result)
         }
-        Expr::NotExists(_) | Expr::CountStar => Value::Null,
         Expr::IsNull(inner) => Value::Bool(matches!(eval_expr(inner, vals), Value::Null)),
         Expr::IsNotNull(inner) => Value::Bool(!matches!(eval_expr(inner, vals), Value::Null)),
+        // CASE WHEN cond THEN val ... [ELSE val] END (SPA-138).
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
+            for (cond, then_val) in branches {
+                if let Value::Bool(true) = eval_expr(cond, vals) {
+                    return eval_expr(then_val, vals);
+                }
+            }
+            else_expr
+                .as_ref()
+                .map(|e| eval_expr(e, vals))
+                .unwrap_or(Value::Null)
+        }
+        // Graph-dependent expressions — return Null without engine context.
+        Expr::ExistsSubquery(_) | Expr::ShortestPath(_) | Expr::NotExists(_) | Expr::CountStar => {
+            Value::Null
+        }
     }
 }
 
@@ -4075,7 +4523,23 @@ fn needs_node_ref_in_return(items: &[ReturnItem]) -> bool {
     items.iter().any(|item| {
         matches!(&item.expr, Expr::FnCall { name, .. } if name.to_lowercase() == "id")
             || matches!(&item.expr, Expr::Var(_))
+            || expr_needs_graph(&item.expr)
+            || has_case_when_or_fn(&item.expr)
     })
+}
+
+/// Returns true if the expression contains a CASE WHEN or complex sub-expression
+/// that requires eval_expr (rather than the fast project_row column lookup).
+fn has_case_when_or_fn(expr: &Expr) -> bool {
+    match expr {
+        Expr::CaseWhen { .. } | Expr::ShortestPath(_) | Expr::ExistsSubquery(_) => true,
+        Expr::BinOp { left, right, .. } => has_case_when_or_fn(left) || has_case_when_or_fn(right),
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            has_case_when_or_fn(inner)
+        }
+        Expr::And(l, r) | Expr::Or(l, r) => has_case_when_or_fn(l) || has_case_when_or_fn(r),
+        _ => false,
+    }
 }
 
 /// Collect the variable names that appear as bare `Expr::Var` in a RETURN clause (SPA-213).
@@ -4144,6 +4608,25 @@ fn agg_kind(expr: &Expr) -> AggKind {
 ///
 /// Non-aggregate RETURN items become the group key.  Returns one output
 /// `Vec<Value>` per unique key in the same column order as `return_items`.
+fn expr_needs_graph(expr: &Expr) -> bool {
+    match expr {
+        Expr::ShortestPath(_) | Expr::ExistsSubquery(_) => true,
+        Expr::And(l, r) | Expr::Or(l, r) => expr_needs_graph(l) || expr_needs_graph(r),
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => expr_needs_graph(inner),
+        Expr::BinOp { left, right, .. } => expr_needs_graph(left) || expr_needs_graph(right),
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
+            branches
+                .iter()
+                .any(|(c, v)| expr_needs_graph(c) || expr_needs_graph(v))
+                || else_expr.as_ref().is_some_and(|e| expr_needs_graph(e))
+        }
+        _ => false,
+    }
+}
+
 fn aggregate_rows(rows: &[HashMap<String, Value>], return_items: &[ReturnItem]) -> Vec<Vec<Value>> {
     // Classify each return item.
     let kinds: Vec<AggKind> = return_items
