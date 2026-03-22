@@ -437,6 +437,13 @@ impl GraphDb {
         // approach which collected candidates per variable independently and
         // then took a full Cartesian product — causing N² edge creation when
         // multiple nodes of the same label existed (SPA-183).
+        // MATCH…CREATE only supports edge creation from matched bindings.
+        // Node creation in the CREATE body is not yet implemented — reject early
+        // to avoid silently dropping the requested node writes.
+        if !mc.create.nodes.is_empty() {
+            return Err(Error::Unimplemented);
+        }
+
         let matched_rows = engine.scan_match_create_rows(mc)?;
 
         if matched_rows.is_empty() {
@@ -447,14 +454,16 @@ impl GraphDb {
         // using the NodeIds bound in that specific row.
         for row in &matched_rows {
             for (left_var, rel_pat, right_var) in &mc.create.edges {
-                let src = match row.get(left_var) {
-                    Some(&id) => id,
-                    None => continue, // variable not bound in this row
-                };
-                let dst = match row.get(right_var) {
-                    Some(&id) => id,
-                    None => continue,
-                };
+                let src = row.get(left_var).copied().ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "CREATE references unbound variable: {left_var}"
+                    ))
+                })?;
+                let dst = row.get(right_var).copied().ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "CREATE references unbound variable: {right_var}"
+                    ))
+                })?;
                 tx.create_edge(src, dst, &rel_pat.rel_type, HashMap::new())?;
             }
         }

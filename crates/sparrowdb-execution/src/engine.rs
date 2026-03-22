@@ -502,6 +502,8 @@ impl Engine {
                 }
 
                 // Cross-join the per_var candidates into accumulated.
+                // `candidates` is guaranteed non-empty (checked above), so the result
+                // will be non-empty as long as `accumulated` is non-empty.
                 for (var, candidates) in per_var {
                     let mut next: Vec<HashMap<String, NodeId>> = Vec::new();
                     for row in &accumulated {
@@ -512,9 +514,6 @@ impl Engine {
                         }
                     }
                     accumulated = next;
-                    if accumulated.is_empty() {
-                        return Ok(vec![]);
-                    }
                 }
             } else if pat.rels.len() == 1 && pat.nodes.len() == 2 {
                 // ── Single-hop relationship pattern: traverse CSR + delta edges
@@ -522,6 +521,11 @@ impl Engine {
                 let src_node_pat = &pat.nodes[0];
                 let dst_node_pat = &pat.nodes[1];
                 let rel_pat = &pat.rels[0];
+
+                // Only outgoing direction is supported for MATCH…CREATE traversal.
+                if rel_pat.dir != sparrowdb_cypher::ast::EdgeDir::Outgoing {
+                    return Err(sparrowdb_common::Error::Unimplemented);
+                }
 
                 let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
                 let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
@@ -546,18 +550,27 @@ impl Engine {
                     .map(|p| prop_name_to_col_id(&p.key))
                     .collect();
 
-                // Read delta log edges once (rel type filter applied below).
-                let delta_records: Vec<(u64, u64)> = {
+                // Build a src_slot → Vec<dst_slot> adjacency map from the delta log once,
+                // filtering by src_label to avoid O(N*M) scanning inside the outer loop.
+                // TODO: filter by rel_pat.rel_type when multi-rel-table support lands.
+                let delta_adj: HashMap<u64, Vec<u64>> = {
                     let edge_store = EdgeStore::open(&self.db_root, RelTableId(0));
                     match edge_store.and_then(|s| s.read_delta()) {
-                        Ok(records) => records.into_iter().map(|r| (r.src.0, r.dst.0)).collect(),
-                        Err(_) => vec![],
+                        Ok(records) => {
+                            let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+                            for r in records {
+                                let s = r.src.0;
+                                let s_label = (s >> 32) as u32;
+                                if s_label == src_label_id {
+                                    let s_slot = s & 0xFFFF_FFFF;
+                                    adj.entry(s_slot).or_default().push(r.dst.0 & 0xFFFF_FFFF);
+                                }
+                            }
+                            adj
+                        }
+                        Err(_) => HashMap::new(),
                     }
                 };
-
-                // TODO: filter edges by relationship type (rel_pat.rel_type).
-                // For now we traverse all edges in the default rel table (RelTableId(0)).
-                let _ = &rel_pat;
 
                 let hwm_src = self.store.hwm_for_label(src_label_id)?;
 
@@ -574,17 +587,10 @@ impl Engine {
                         continue;
                     }
 
-                    // Collect outgoing neighbours (CSR + delta).
+                    // Collect outgoing neighbours (CSR + delta adjacency map).
                     let csr_neighbors = self.csr.neighbors(src_slot);
-                    let delta_neighbors: Vec<u64> = delta_records
-                        .iter()
-                        .filter(|&&(s, _)| {
-                            let s_label = (s >> 32) as u32;
-                            let s_slot = s & 0xFFFF_FFFF;
-                            s_label == src_label_id && s_slot == src_slot
-                        })
-                        .map(|&(_, d)| d & 0xFFFF_FFFF)
-                        .collect();
+                    let empty: Vec<u64> = Vec::new();
+                    let delta_neighbors: &[u64] = delta_adj.get(&src_slot).map_or(&empty, |v| v.as_slice());
 
                     let mut seen: HashSet<u64> = HashSet::new();
                     for &dst_slot in csr_neighbors.iter().chain(delta_neighbors.iter()) {
@@ -601,11 +607,24 @@ impl Engine {
                         }
 
                         let mut row: HashMap<String, NodeId> = HashMap::new();
-                        if !src_node_pat.var.is_empty() {
+
+                        // When src and dst use the same variable (self-loop pattern),
+                        // the edge must actually be a self-loop (src == dst).
+                        if !src_node_pat.var.is_empty()
+                            && !dst_node_pat.var.is_empty()
+                            && src_node_pat.var == dst_node_pat.var
+                        {
+                            if src_node != dst_node {
+                                continue;
+                            }
                             row.insert(src_node_pat.var.clone(), src_node);
-                        }
-                        if !dst_node_pat.var.is_empty() {
-                            row.insert(dst_node_pat.var.clone(), dst_node);
+                        } else {
+                            if !src_node_pat.var.is_empty() {
+                                row.insert(src_node_pat.var.clone(), src_node);
+                            }
+                            if !dst_node_pat.var.is_empty() {
+                                row.insert(dst_node_pat.var.clone(), dst_node);
+                            }
                         }
                         pattern_rows.push(row);
                     }
@@ -615,10 +634,20 @@ impl Engine {
                     return Ok(vec![]);
                 }
 
-                // Cross-join pattern_rows into accumulated.
+                // Cross-join pattern_rows into accumulated, enforcing shared-variable
+                // constraints: if a variable appears in both acc_row and pat_row, only
+                // keep combinations where they agree on the same NodeId.
                 let mut next: Vec<HashMap<String, NodeId>> = Vec::new();
                 for acc_row in &accumulated {
-                    for pat_row in &pattern_rows {
+                    'outer: for pat_row in &pattern_rows {
+                        // Reject combinations where shared variables disagree.
+                        for (k, v) in pat_row {
+                            if let Some(existing) = acc_row.get(k) {
+                                if existing != v {
+                                    continue 'outer;
+                                }
+                            }
+                        }
                         let mut new_row = acc_row.clone();
                         new_row.extend(pat_row.iter().map(|(k, v)| (k.clone(), *v)));
                         next.push(new_row);
