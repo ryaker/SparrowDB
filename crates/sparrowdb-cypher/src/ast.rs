@@ -190,6 +190,7 @@ pub struct MatchStatement {
     pub where_clause: Option<Expr>,
     pub return_clause: ReturnClause,
     pub order_by: Vec<(Expr, SortDir)>,
+    pub skip: Option<u64>,
     pub limit: Option<u64>,
     pub distinct: bool,
 }
@@ -267,6 +268,7 @@ pub struct MatchWithStatement {
     pub with_clause: WithClause,
     pub return_clause: ReturnClause,
     pub order_by: Vec<(Expr, SortDir)>,
+    pub skip: Option<u64>,
     pub limit: Option<u64>,
     pub distinct: bool,
 }
@@ -281,6 +283,7 @@ pub struct OptionalMatchStatement {
     pub where_clause: Option<Expr>,
     pub return_clause: ReturnClause,
     pub order_by: Vec<(Expr, SortDir)>,
+    pub skip: Option<u64>,
     pub limit: Option<u64>,
     pub distinct: bool,
 }
@@ -301,6 +304,7 @@ pub struct MatchOptionalMatchStatement {
     /// Combined RETURN clause evaluated over both MATCH and OPTIONAL MATCH variables.
     pub return_clause: ReturnClause,
     pub order_by: Vec<(Expr, SortDir)>,
+    pub skip: Option<u64>,
     pub limit: Option<u64>,
     pub distinct: bool,
 }
