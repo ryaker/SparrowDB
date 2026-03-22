@@ -759,6 +759,11 @@ impl GraphDb {
     ///
     /// Both counts reflect committed storage state; in-flight write
     /// transactions are not visible.
+    ///
+    /// **Note:** `node_count` is based on per-label high-water marks and
+    /// therefore includes soft-deleted nodes whose slots have not yet been
+    /// reclaimed.  The count will converge to the true live-node count once
+    /// compaction / GC is implemented.
     pub fn db_counts(&self) -> Result<(u64, u64)> {
         let path = &self.inner.path;
         let catalog = Catalog::open(path)?;
@@ -788,9 +793,8 @@ impl GraphDb {
                     return 0;
                 };
                 let csr_edges = store.open_fwd().map(|csr| csr.n_edges()).unwrap_or(0);
-                // Re-open to read delta (EdgeStore::open is cheap — no lock held).
-                let delta_edges = EdgeStore::open(path, RelTableId(id as u32))
-                    .and_then(|s| s.read_delta())
+                let delta_edges = store
+                    .read_delta()
                     .map(|records| records.len() as u64)
                     .unwrap_or(0);
                 csr_edges + delta_edges
