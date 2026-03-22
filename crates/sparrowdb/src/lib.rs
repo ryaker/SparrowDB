@@ -313,6 +313,9 @@ impl GraphDb {
                 Statement::Merge(ref m) => self.execute_merge(m),
                 Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
                 Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
+                // Standalone CREATE with edges — must go through WriteTx so
+                // create_edge can register the rel type and write the WAL.
+                Statement::Create(ref c) => self.execute_create_standalone(c),
                 _ => unreachable!(),
             }
         } else {
@@ -337,6 +340,91 @@ impl GraphDb {
             tracing::debug!(rows = result.rows.len(), "query complete");
             Ok(result)
         }
+    }
+
+    /// Internal: execute a standalone `CREATE (a)-[:R]->(b)` statement.
+    ///
+    /// Creates all declared nodes, then for each edge in the pattern looks up
+    /// the freshly-created node IDs by variable name and calls
+    /// `WriteTx::create_edge`.  This is needed when the CREATE clause contains
+    /// relationship patterns, because edge creation must be routed through a
+    /// write transaction so the relationship type is registered in the catalog
+    /// and the edge is appended to the WAL (SPA-182).
+    fn execute_create_standalone(
+        &self,
+        create: &sparrowdb_cypher::ast::CreateStatement,
+    ) -> Result<QueryResult> {
+        // Pre-flight: verify that every variable referenced by an edge is
+        // declared as a named node in this CREATE clause.  Doing this before
+        // opening the write transaction ensures that a malformed CREATE fails
+        // cleanly without leaving orphaned nodes on disk.
+        let declared_vars: HashSet<&str> = create
+            .nodes
+            .iter()
+            .filter(|n| !n.var.is_empty())
+            .map(|n| n.var.as_str())
+            .collect();
+
+        for (left_var, _, right_var) in &create.edges {
+            if !left_var.is_empty() && !declared_vars.contains(left_var.as_str()) {
+                return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                    "CREATE edge references undeclared variable '{left_var}'"
+                )));
+            }
+            if !right_var.is_empty() && !declared_vars.contains(right_var.as_str()) {
+                return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                    "CREATE edge references undeclared variable '{right_var}'"
+                )));
+            }
+        }
+
+        let mut tx = self.begin_write()?;
+
+        // Map variable name → NodeId for all newly created nodes.
+        let mut var_to_node: HashMap<String, NodeId> = HashMap::new();
+
+        for node in &create.nodes {
+            let label = node.labels.first().cloned().unwrap_or_default();
+            let label_id: u32 = match tx.catalog.get_label(&label)? {
+                Some(id) => id as u32,
+                None => tx.catalog.create_label(&label)? as u32,
+            };
+
+            let props: Vec<(u32, Value)> = node
+                .props
+                .iter()
+                .map(|entry| {
+                    let col_id = col_id_of(&entry.key);
+                    let val = expr_to_value(&entry.value);
+                    (col_id, val)
+                })
+                .collect();
+
+            let node_id = tx.create_node(label_id, &props)?;
+
+            // Record the binding so edge patterns can resolve (src_var, dst_var).
+            if !node.var.is_empty() {
+                var_to_node.insert(node.var.clone(), node_id);
+            }
+        }
+
+        // Create edges between the freshly-created nodes.
+        for (left_var, rel_pat, right_var) in &create.edges {
+            let src = var_to_node.get(left_var).copied().ok_or_else(|| {
+                sparrowdb_common::Error::InvalidArgument(format!(
+                    "CREATE edge references unresolved variable '{left_var}'"
+                ))
+            })?;
+            let dst = var_to_node.get(right_var).copied().ok_or_else(|| {
+                sparrowdb_common::Error::InvalidArgument(format!(
+                    "CREATE edge references unresolved variable '{right_var}'"
+                ))
+            })?;
+            tx.create_edge(src, dst, &rel_pat.rel_type, HashMap::new())?;
+        }
+
+        tx.commit()?;
+        Ok(QueryResult::empty(vec![]))
     }
 
     /// Internal: execute a MERGE statement by opening a write transaction.
