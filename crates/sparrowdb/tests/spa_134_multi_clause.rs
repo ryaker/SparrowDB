@@ -305,7 +305,11 @@ fn spa134_match_with_collect_unwind_return() {
 
     // Should fan-out the 3 collected names back into 3 rows.
     assert_eq!(result.columns, vec!["item"]);
-    assert_eq!(result.rows.len(), 3, "collect then unwind should yield 3 rows");
+    assert_eq!(
+        result.rows.len(),
+        3,
+        "collect then unwind should yield 3 rows"
+    );
 
     let mut items: Vec<String> = result
         .rows
@@ -462,10 +466,7 @@ fn spa134_exists_subquery_where_in_with_clause() {
         })
         .collect();
     names.sort_unstable();
-    assert_eq!(
-        names,
-        vec!["Alice".to_string(), "Bob".to_string()],
-    );
+    assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()],);
 }
 
 // ── Additional covered patterns ────────────────────────────────────────────────
@@ -559,10 +560,10 @@ fn spa134_match_with_count_no_filter_return() {
         )
         .expect("MATCH … WITH count(*) AS c RETURN c must succeed");
 
-    assert_eq!(result.rows.len(), 1, "aggregate always returns exactly 1 row");
     assert_eq!(
-        result.rows[0][0],
-        Value::Int64(3),
-        "3 persons in the graph"
+        result.rows.len(),
+        1,
+        "aggregate always returns exactly 1 row"
     );
+    assert_eq!(result.rows[0][0], Value::Int64(3), "3 persons in the graph");
 }
