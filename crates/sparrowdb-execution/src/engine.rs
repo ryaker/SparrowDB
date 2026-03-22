@@ -1305,7 +1305,7 @@ impl Engine {
         let pat = &m.pattern[0];
         let node = &pat.nodes[0];
 
-        // SPA-194: when no label is specified, scan ALL known labels and union
+        // SPA-192/SPA-194: when no label is specified, scan ALL known labels and union
         // the results.  Delegate to the per-label helper for each label.
         if node.labels.is_empty() {
             return self.execute_scan_all_labels(m, column_names);
@@ -1448,7 +1448,7 @@ impl Engine {
         })
     }
 
-    // ── Label-less full scan: MATCH (n) RETURN … — SPA-194 ───────────────────
+    // ── Label-less full scan: MATCH (n) RETURN … — SPA-192/SPA-194 ─────────
     //
     // When the node pattern carries no label filter we must scan every label
     // that is registered in the catalog and union the results.  Aggregation,
