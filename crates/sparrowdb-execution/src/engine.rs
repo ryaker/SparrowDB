@@ -2373,8 +2373,7 @@ impl Engine {
                                 ((*catalog_rel_id as u64) << 32)
                                     | (src_slot ^ dst_slot) & 0xFFFF_FFFF,
                             );
-                            row_vals
-                                .insert(rel_pat.var.clone(), Value::EdgeRef(edge_id));
+                            row_vals.insert(rel_pat.var.clone(), Value::EdgeRef(edge_id));
                         }
                         raw_rows.push(row_vals);
                     } else {
@@ -2631,8 +2630,7 @@ impl Engine {
                                     ((*catalog_rel_id as u64) << 32)
                                         | (b_slot ^ a_slot) & 0xFFFF_FFFF,
                                 );
-                                row_vals
-                                    .insert(rel_pat.var.clone(), Value::EdgeRef(edge_id));
+                                row_vals.insert(rel_pat.var.clone(), Value::EdgeRef(edge_id));
                             }
                             raw_rows.push(row_vals);
                         } else {

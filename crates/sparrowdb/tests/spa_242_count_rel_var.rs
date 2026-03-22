@@ -58,9 +58,12 @@ fn count_rel_var_returns_edge_count() {
 fn count_rel_var_with_filter() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (a:Person {name: 'Alice', age: 30})").unwrap();
-    db.execute("CREATE (b:Person {name: 'Bob', age: 20})").unwrap();
-    db.execute("CREATE (c:Person {name: 'Carol', age: 25})").unwrap();
+    db.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        .unwrap();
+    db.execute("CREATE (b:Person {name: 'Bob', age: 20})")
+        .unwrap();
+    db.execute("CREATE (c:Person {name: 'Carol', age: 25})")
+        .unwrap();
 
     // Alice→Bob, Alice→Carol
     db.execute(
@@ -101,8 +104,10 @@ fn count_rel_var_with_filter() {
 fn count_rel_var_zero_when_no_edges_match_filter() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (a:Person {name: 'Alice', age: 30})").unwrap();
-    db.execute("CREATE (b:Person {name: 'Bob', age: 20})").unwrap();
+    db.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        .unwrap();
+    db.execute("CREATE (b:Person {name: 'Bob', age: 20})")
+        .unwrap();
 
     // Create one KNOWS edge: Alice→Bob
     db.execute(
@@ -120,7 +125,11 @@ fn count_rel_var_zero_when_no_edges_match_filter() {
         )
         .expect("COUNT(r) with all-eliminating WHERE must not error");
 
-    assert_eq!(result.rows.len(), 1, "must return one aggregated row (the zero-row case)");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "must return one aggregated row (the zero-row case)"
+    );
     assert_eq!(
         result.rows[0][0],
         Value::Int64(0),
