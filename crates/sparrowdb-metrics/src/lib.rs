@@ -356,21 +356,24 @@ impl MetricsServer {
 
 /// Classify a Cypher query string into an [`Operation`] variant.
 ///
-/// Inspects the first non-whitespace keyword only — O(n) scan, no allocation.
+/// Inspects the first non-whitespace keyword only (e.g. `MATCH … DELETE` is
+/// classified as `Match`).  O(n) scan with no heap allocation.
 pub fn classify_query(cypher: &str) -> Operation {
     let s = cypher.trim_start();
-    // Case-insensitive prefix matching without allocation.
-    let first_word: String = s
-        .chars()
-        .take_while(|c| c.is_alphabetic())
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
-    match first_word.as_str() {
-        "MATCH" => Operation::Match,
-        "CREATE" => Operation::Create,
-        "MERGE" => Operation::Merge,
-        "DELETE" | "DETACH" => Operation::Delete,
-        _ => Operation::Other,
+    // Slice off the first alphabetic run, then compare case-insensitively.
+    let end = s.find(|c: char| !c.is_alphabetic()).unwrap_or(s.len());
+    let first_word = &s[..end];
+    if first_word.eq_ignore_ascii_case("MATCH") {
+        Operation::Match
+    } else if first_word.eq_ignore_ascii_case("CREATE") {
+        Operation::Create
+    } else if first_word.eq_ignore_ascii_case("MERGE") {
+        Operation::Merge
+    } else if first_word.eq_ignore_ascii_case("DELETE") || first_word.eq_ignore_ascii_case("DETACH")
+    {
+        Operation::Delete
+    } else {
+        Operation::Other
     }
 }
 
@@ -405,6 +408,7 @@ fn dir_size(dir: &Path) -> u64 {
         .flatten()
         .map(|e| {
             let Ok(meta) = e.metadata() else {
+                tracing::warn!(entry = ?e.path(), "sparrowdb-metrics: failed to read metadata in dir_size");
                 return 0;
             };
             if meta.is_dir() {
