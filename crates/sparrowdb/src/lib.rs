@@ -469,29 +469,29 @@ impl GraphDb {
                  use execute() for mutations without parameters"
                     .into(),
             ));
-        } else {
-            let _span = info_span!("sparrowdb.query_with_params").entered();
-
-            let mut engine = {
-                let _open_span = info_span!("sparrowdb.open_engine").entered();
-                let csr = open_csr_forward(&self.inner.path);
-                Engine::new(
-                    NodeStore::open(&self.inner.path)?,
-                    catalog_snap,
-                    csr,
-                    &self.inner.path,
-                )
-                .with_params(params)
-            };
-
-            let result = {
-                let _exec_span = info_span!("sparrowdb.execute").entered();
-                engine.execute_statement(bound.inner)?
-            };
-
-            tracing::debug!(rows = result.rows.len(), "query_with_params complete");
-            Ok(result)
         }
+
+        let _span = info_span!("sparrowdb.query_with_params").entered();
+
+        let mut engine = {
+            let _open_span = info_span!("sparrowdb.open_engine").entered();
+            let csr = open_csr_forward(&self.inner.path);
+            Engine::new(
+                NodeStore::open(&self.inner.path)?,
+                catalog_snap,
+                csr,
+                &self.inner.path,
+            )
+            .with_params(params)
+        };
+
+        let result = {
+            let _exec_span = info_span!("sparrowdb.execute").entered();
+            engine.execute_statement(bound.inner)?
+        };
+
+        tracing::debug!(rows = result.rows.len(), "query_with_params complete");
+        Ok(result)
     }
 
     /// Internal: execute a MERGE statement by opening a write transaction.
