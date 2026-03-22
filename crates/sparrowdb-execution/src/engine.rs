@@ -595,16 +595,26 @@ impl Engine {
                         continue;
                     }
 
-                    let label = node_pat.labels.first().cloned().unwrap_or_default();
-                    let label_id: u32 = match self.catalog.get_label(&label)? {
-                        Some(id) => id as u32,
-                        None => {
-                            // No nodes can match → entire MATCH yields nothing.
-                            return Ok(vec![]);
+                    // SPA-211: when no label is specified, scan all registered
+                    // labels so that unlabeled MATCH patterns find nodes of
+                    // any type (instead of silently returning empty).
+                    let scan_label_ids: Vec<u32> = if node_pat.labels.is_empty() {
+                        self.catalog
+                            .list_labels()?
+                            .into_iter()
+                            .map(|(id, _)| id as u32)
+                            .collect()
+                    } else {
+                        let label = node_pat.labels.first().cloned().unwrap_or_default();
+                        match self.catalog.get_label(&label)? {
+                            Some(id) => vec![id as u32],
+                            None => {
+                                // No nodes can match → entire MATCH yields nothing.
+                                return Ok(vec![]);
+                            }
                         }
                     };
 
-                    let hwm = self.store.hwm_for_label(label_id)?;
                     let filter_col_ids: Vec<u32> = node_pat
                         .props
                         .iter()
@@ -612,18 +622,24 @@ impl Engine {
                         .collect();
 
                     let mut matching_ids: Vec<NodeId> = Vec::new();
-                    for slot in 0..hwm {
-                        let node_id = NodeId(((label_id as u64) << 32) | slot);
+                    for label_id in scan_label_ids {
+                        let hwm = self.store.hwm_for_label(label_id)?;
+                        for slot in 0..hwm {
+                            let node_id = NodeId(((label_id as u64) << 32) | slot);
 
-                        if self.is_node_tombstoned(node_id) {
-                            continue;
-                        }
-                        if !self.node_matches_prop_filter(node_id, &filter_col_ids, &node_pat.props)
-                        {
-                            continue;
-                        }
+                            if self.is_node_tombstoned(node_id) {
+                                continue;
+                            }
+                            if !self.node_matches_prop_filter(
+                                node_id,
+                                &filter_col_ids,
+                                &node_pat.props,
+                            ) {
+                                continue;
+                            }
 
-                        matching_ids.push(node_id);
+                            matching_ids.push(node_id);
+                        }
                     }
 
                     if matching_ids.is_empty() {
