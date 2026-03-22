@@ -416,6 +416,13 @@ impl Engine {
 
         for slot in 0..hwm {
             let node_id = NodeId(((label_id as u64) << 32) | slot);
+
+            // SPA-216: skip tombstoned nodes so that already-deleted nodes are
+            // not re-deleted and are not matched by SET mutations either.
+            if self.is_node_tombstoned(node_id) {
+                continue;
+            }
+
             let props = read_node_props(&self.store, node_id, &all_col_ids)?;
 
             if !matches_prop_filter_static(
@@ -451,12 +458,22 @@ impl Engine {
 
     /// Returns `true` if the given node has been tombstoned (col 0 == u64::MAX).
     ///
-    /// A read error is treated as "not tombstoned" so that missing-file errors
-    /// during a fresh scan do not suppress valid nodes.
+    /// `NotFound` is expected for new/sparse nodes where col_0 has not been
+    /// written yet and is treated as "not tombstoned".  All other errors are
+    /// logged as warnings and also treated as "not tombstoned" so that
+    /// transient storage issues do not suppress valid nodes during a scan.
     fn is_node_tombstoned(&self, node_id: NodeId) -> bool {
         match self.store.get_node_raw(node_id, &[0u32]) {
             Ok(col0) => col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX),
-            Err(_) => false,
+            Err(sparrowdb_common::Error::NotFound) => false,
+            Err(e) => {
+                tracing::warn!(
+                    node_id = node_id.0,
+                    error = ?e,
+                    "tombstone check failed; treating node as not tombstoned"
+                );
+                false
+            }
         }
     }
 
@@ -1098,8 +1115,9 @@ impl Engine {
             let mut result: Vec<HashMap<String, Value>> = Vec::new();
             for slot in 0..hwm {
                 let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
-                let col0_check = self.store.get_node_raw(node_id, &[0u32])?;
-                if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                // SPA-216: use is_node_tombstoned() to avoid spurious NotFound
+                // when tombstone_node() wrote col_0 only for the deleted slot.
+                if self.is_node_tombstoned(node_id) {
                     continue;
                 }
                 let props = read_node_props(&self.store, node_id, &all_col_ids)?;
@@ -1283,8 +1301,9 @@ impl Engine {
         let mut lead_rows: Vec<(u64, Vec<(u32, u64)>)> = Vec::new();
         for slot in 0..lead_hwm {
             let node_id = NodeId(((lead_label_id as u64) << 32) | slot);
-            let col0_check = self.store.get_node_raw(node_id, &[0u32])?;
-            if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+            // SPA-216: use is_node_tombstoned() to avoid spurious NotFound
+            // when tombstone_node() wrote col_0 only for the deleted slot.
+            if self.is_node_tombstoned(node_id) {
                 continue;
             }
             let props = read_node_props(&self.store, node_id, &lead_all_col_ids)?;
@@ -1560,11 +1579,14 @@ impl Engine {
                 tracing::trace!(slot = slot, node_id = node_id.0, "scan emit");
             }
 
-            // SPA-164: skip tombstoned nodes.  delete_node writes u64::MAX into
-            // col_0 as the deletion sentinel; nodes in that state must not
-            // appear in scan results.
-            let col0_check = self.store.get_node_raw(node_id, &[0u32])?;
-            if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+            // SPA-164/SPA-216: skip tombstoned nodes.  delete_node writes
+            // u64::MAX into col_0 as the deletion sentinel; nodes in that state
+            // must not appear in scan results.  Use is_node_tombstoned() rather
+            // than a raw `get_node_raw(...)?` so that a short col_0 file (e.g.
+            // when tombstone_node only wrote the deleted slot and did not
+            // zero-pad up to the HWM) does not propagate a spurious NotFound
+            // error for un-deleted nodes whose slots are beyond the file end.
+            if self.is_node_tombstoned(node_id) {
                 continue;
             }
 
@@ -1744,9 +1766,10 @@ impl Engine {
             for slot in 0..hwm {
                 let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
 
-                // Skip tombstoned nodes (SPA-164).
-                let col0_check = self.store.get_node_raw(node_id, &[0u32])?;
-                if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                // Skip tombstoned nodes (SPA-164/SPA-216): use
+                // is_node_tombstoned() to avoid spurious NotFound when
+                // tombstone_node() wrote col_0 only for the deleted slot.
+                if self.is_node_tombstoned(node_id) {
                     continue;
                 }
 
