@@ -2370,7 +2370,7 @@ impl Engine {
                             // we mix it in via XOR to keep uniqueness within the
                             // same rel table.
                             let edge_id = sparrowdb_common::EdgeId(
-                                ((*catalog_rel_id as u64) << 32)
+                                (*catalog_rel_id << 32)
                                     | (src_slot ^ dst_slot) & 0xFFFF_FFFF,
                             );
                             row_vals.insert(rel_pat.var.clone(), Value::EdgeRef(edge_id));
@@ -2627,7 +2627,7 @@ impl Engine {
                             // EdgeRef so COUNT(r) counts matched edges correctly.
                             if !rel_pat.var.is_empty() {
                                 let edge_id = sparrowdb_common::EdgeId(
-                                    ((*catalog_rel_id as u64) << 32)
+                                    (*catalog_rel_id << 32)
                                         | (b_slot ^ a_slot) & 0xFFFF_FFFF,
                                 );
                                 row_vals.insert(rel_pat.var.clone(), Value::EdgeRef(edge_id));
