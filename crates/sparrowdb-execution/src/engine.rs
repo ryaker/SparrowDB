@@ -296,11 +296,7 @@ impl Engine {
 
         for slot in 0..hwm {
             let node_id = NodeId(((label_id as u64) << 32) | slot);
-            let props = if !all_col_ids.is_empty() {
-                self.store.get_node_raw(node_id, &all_col_ids)?
-            } else {
-                vec![]
-            };
+            let props = read_node_props(&self.store, node_id, &all_col_ids)?;
 
             if !matches_prop_filter_static(&props, &node_pat.props) {
                 continue;
@@ -648,7 +644,7 @@ impl Engine {
                 if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
                     continue;
                 }
-                let props = self.store.get_node_raw(node_id, &all_col_ids)?;
+                let props = read_node_props(&self.store, node_id, &all_col_ids)?;
                 if !self.matches_prop_filter(&props, &node.props) {
                     continue;
                 }
@@ -830,7 +826,7 @@ impl Engine {
             if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
                 continue;
             }
-            let props = self.store.get_node_raw(node_id, &lead_all_col_ids)?;
+            let props = read_node_props(&self.store, node_id, &lead_all_col_ids)?;
             if !self.matches_prop_filter(&props, &lead_node_pat.props) {
                 continue;
             }
@@ -1007,11 +1003,7 @@ impl Engine {
                 continue;
             }
             let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
-            let dst_props = if !col_ids_dst.is_empty() {
-                self.store.get_node_raw(dst_node, &col_ids_dst)?
-            } else {
-                vec![]
-            };
+            let dst_props = read_node_props(&self.store, dst_node, &col_ids_dst)?;
             if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
                 continue;
             }
@@ -1200,7 +1192,7 @@ impl Engine {
         // Scan source nodes.
         for src_slot in 0..hwm_src {
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
-            let src_props = if !col_ids_src.is_empty() || !src_node_pat.props.is_empty() {
+            let src_props = {
                 let all_needed: Vec<u32> = {
                     let mut v = col_ids_src.clone();
                     // Add prop filter cols
@@ -1212,9 +1204,7 @@ impl Engine {
                     }
                     v
                 };
-                self.store.get_node_raw(src_node, &all_needed)?
-            } else {
-                vec![]
+                read_node_props(&self.store, src_node, &all_needed)?
             };
 
             // Apply src inline prop filter.
@@ -1253,11 +1243,7 @@ impl Engine {
                     continue;
                 }
                 let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
-                let dst_props = if !col_ids_dst.is_empty() {
-                    self.store.get_node_raw(dst_node, &col_ids_dst)?
-                } else {
-                    vec![]
-                };
+                let dst_props = read_node_props(&self.store, dst_node, &col_ids_dst)?;
 
                 // Apply dst inline prop filter.
                 if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
@@ -1474,11 +1460,7 @@ impl Engine {
                 v
             };
 
-            let src_props = if !src_needed.is_empty() {
-                self.store.get_node_raw(src_node, &src_needed)?
-            } else {
-                vec![]
-            };
+            let src_props = read_node_props(&self.store, src_node, &src_needed)?;
 
             // Apply src inline prop filter.
             if !self.matches_prop_filter(&src_props, &src_node_pat.props) {
@@ -1517,11 +1499,7 @@ impl Engine {
 
             for fof_slot in fof_slots {
                 let fof_node = NodeId(((fof_label_id as u64) << 32) | fof_slot);
-                let fof_props = if !col_ids_fof.is_empty() {
-                    self.store.get_node_raw(fof_node, &col_ids_fof)?
-                } else {
-                    vec![]
-                };
+                let fof_props = read_node_props(&self.store, fof_node, &col_ids_fof)?;
 
                 // Apply fof inline prop filter.
                 if !self.matches_prop_filter(&fof_props, &fof_node_pat.props) {
@@ -1716,11 +1694,7 @@ impl Engine {
                 }
                 v
             };
-            let src_props = if !src_all_col_ids.is_empty() {
-                self.store.get_node_raw(src_node, &src_all_col_ids)?
-            } else {
-                vec![]
-            };
+            let src_props = read_node_props(&self.store, src_node, &src_all_col_ids)?;
 
             if !self.matches_prop_filter(&src_props, &src_node_pat.props) {
                 continue;
@@ -1735,11 +1709,7 @@ impl Engine {
                 }
 
                 let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
-                let dst_props = if !col_ids_dst.is_empty() {
-                    self.store.get_node_raw(dst_node, &col_ids_dst)?
-                } else {
-                    vec![]
-                };
+                let dst_props = read_node_props(&self.store, dst_node, &col_ids_dst)?;
 
                 if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
                     continue;
@@ -2205,6 +2175,32 @@ fn collect_col_ids_for_var(var: &str, column_names: &[String], _label_id: u32) -
         ids.push(0);
     }
     ids
+}
+
+/// Read node properties using the nullable store path (SPA-197).
+///
+/// Calls `get_node_raw_nullable` so that columns that were never written for
+/// this node are returned as `None` (absent) rather than `0u64`.  The result
+/// is a `Vec<(col_id, raw_u64)>` containing only the columns that have a real
+/// stored value; callers that iterate over `col_ids` but don't find a column
+/// in the result will receive `Value::Null` (e.g. via `project_row`).
+///
+/// This is the correct read path for any code that eventually projects
+/// property values into query results.  Use `get_node_raw` only for
+/// tombstone checks (col 0 == u64::MAX) where the raw sentinel is meaningful.
+fn read_node_props(
+    store: &NodeStore,
+    node_id: NodeId,
+    col_ids: &[u32],
+) -> sparrowdb_common::Result<Vec<(u32, u64)>> {
+    if col_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let nullable = store.get_node_raw_nullable(node_id, col_ids)?;
+    Ok(nullable
+        .into_iter()
+        .filter_map(|(col_id, opt): (u32, Option<u64>)| opt.map(|v| (col_id, v)))
+        .collect())
 }
 
 /// Decode a raw `u64` column value (as returned by `get_node_raw`) into the
@@ -3054,8 +3050,7 @@ fn eval_call_expr(expr: &Expr, env: &HashMap<String, Value>, store: &NodeStore) 
         Expr::PropAccess { var, prop } => match env.get(var.as_str()) {
             Some(Value::NodeRef(node_id)) => {
                 let col_id = prop_name_to_col_id(prop);
-                store
-                    .get_node_raw(*node_id, &[col_id])
+                read_node_props(store, *node_id, &[col_id])
                     .ok()
                     .and_then(|pairs| pairs.into_iter().find(|(c, _)| *c == col_id))
                     .map(|(_, raw)| decode_raw_val(raw))
