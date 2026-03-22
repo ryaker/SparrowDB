@@ -136,15 +136,15 @@ fn committed_node_has_wal_node_create_before_commit() {
 
     // Scan WAL for a NodeCreate record that precedes a Commit record.
     let wal_dir = db_path.join("wal");
-    assert!(wal_dir.exists(), "WAL directory must be created after commit");
+    assert!(
+        wal_dir.exists(),
+        "WAL directory must be created after commit"
+    );
 
     let mut all_kinds: Vec<WalRecordKind> = Vec::new();
     let mut node_id_in_wal: Option<u64> = None;
 
-    for entry in std::fs::read_dir(&wal_dir)
-        .expect("read wal dir")
-        .flatten()
-    {
+    for entry in std::fs::read_dir(&wal_dir).expect("read wal dir").flatten() {
         if !entry.file_name().to_string_lossy().ends_with(".wal") {
             continue;
         }
