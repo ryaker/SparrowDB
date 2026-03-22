@@ -197,6 +197,12 @@ impl Default for FactorizedChunk {
 /// Final materialized query result.
 #[derive(Debug, Clone)]
 pub struct QueryResult {
+    /// Named column headers, in the same order as values within each row.
+    ///
+    /// For `RETURN` queries these are the projected aliases (or expression
+    /// text when no alias is given).  For `CALL` procedures these are the
+    /// output column names declared by the procedure (e.g. `["type", "name",
+    /// "properties"]` for `CALL db.schema()`).
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
 }
@@ -207,6 +213,29 @@ impl QueryResult {
             columns,
             rows: Vec::new(),
         }
+    }
+
+    /// Return row `idx` as a `HashMap<column_name, Value>`.
+    ///
+    /// Returns `None` if `idx` is out of bounds.  Column names come from
+    /// `self.columns`; if the columns list is shorter than the row, extra
+    /// values are dropped.  If the columns list is longer than the row,
+    /// missing values are absent from the map (they are never `Null`-padded).
+    pub fn row_as_map(&self, idx: usize) -> Option<HashMap<String, Value>> {
+        let row = self.rows.get(idx)?;
+        let mut out: HashMap<String, Value> = HashMap::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for (col, val) in self.columns.iter().zip(row.iter()) {
+            let count = seen.entry(col.clone()).or_insert(0);
+            *count += 1;
+            let key = if *count == 1 {
+                col.clone()
+            } else {
+                format!("{col}#{count}")
+            };
+            out.insert(key, val.clone());
+        }
+        Some(out)
     }
 }
 

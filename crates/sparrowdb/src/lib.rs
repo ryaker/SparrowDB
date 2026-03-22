@@ -130,7 +130,15 @@ enum WalMutation {
     NodeCreate {
         node_id: NodeId,
         label_id: u32,
+        /// Property data as `(col_id, value)` pairs used for on-disk writes.
         props: Vec<(u32, Value)>,
+        /// Human-readable property names parallel to `props`.
+        ///
+        /// When property names are available (e.g. from a Cypher literal) they
+        /// are recorded here so the WAL can store them for schema introspection
+        /// (`CALL db.schema()`).  Empty when names are not known (e.g. low-level
+        /// `create_node` calls that only have col_ids).
+        prop_names: Vec<String>,
     },
     /// A node was deleted (SPA-125, SPA-127).
     NodeDelete { node_id: NodeId },
@@ -473,12 +481,11 @@ impl GraphDb {
                 None => tx.catalog.create_label(&label)? as u32,
             };
 
-            let props: Vec<(u32, Value)> = node
+            let named_props: Vec<(String, Value)> = node
                 .props
                 .iter()
                 .map(|entry| {
-                    let col_id = col_id_of(&entry.key);
-                    match &entry.value {
+                    let val = match &entry.value {
                         sparrowdb_cypher::ast::Expr::Literal(
                             sparrowdb_cypher::ast::Literal::Null,
                         ) => Err(sparrowdb_common::Error::InvalidArgument(format!(
@@ -492,17 +499,18 @@ impl GraphDb {
                             entry.key
                         ))),
                         sparrowdb_cypher::ast::Expr::Literal(lit) => {
-                            Ok((col_id, literal_to_value(lit)))
+                            Ok(literal_to_value(lit))
                         }
                         _ => Err(sparrowdb_common::Error::InvalidArgument(format!(
                             "CREATE property '{}' must be a literal value (int, float, bool, or string)",
                             entry.key
                         ))),
-                    }
+                    }?;
+                    Ok((entry.key.clone(), val))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            let node_id = tx.create_node(label_id, &props)?;
+            let node_id = tx.create_node_named(label_id, &named_props)?;
 
             // Record the binding so edge patterns can resolve (src_var, dst_var).
             if !node.var.is_empty() {
@@ -1017,6 +1025,40 @@ impl WriteTx {
             node_id,
             label_id,
             props: props.to_vec(),
+            // Low-level create_node: no property names available.
+            prop_names: Vec::new(),
+        });
+        Ok(node_id)
+    }
+
+    /// Create a new node with named properties, recording names in the WAL.
+    ///
+    /// Like [`create_node`] but accepts `(name, value)` pairs so that the
+    /// property names are preserved in the WAL record for schema introspection
+    /// (`CALL db.schema()`).  Col-ids are derived via [`col_id_of`].
+    pub fn create_node_named(
+        &mut self,
+        label_id: u32,
+        named_props: &[(String, Value)],
+    ) -> Result<NodeId> {
+        let props: Vec<(u32, Value)> = named_props
+            .iter()
+            .map(|(name, v)| (col_id_of(name), v.clone()))
+            .collect();
+        let prop_names: Vec<String> = named_props.iter().map(|(n, _)| n.clone()).collect();
+        let slot = self.store.peek_next_slot(label_id)?;
+        let node_id = NodeId((label_id as u64) << 32 | slot as u64);
+        self.dirty_nodes.insert(node_id.0);
+        self.pending_ops.push(PendingOp::NodeCreate {
+            label_id,
+            slot,
+            props: props.clone(),
+        });
+        self.wal_mutations.push(WalMutation::NodeCreate {
+            node_id,
+            label_id,
+            props,
+            prop_names,
         });
         Ok(node_id)
     }
@@ -1177,6 +1219,8 @@ impl WriteTx {
             .iter()
             .map(|(_, col_id, v)| (*col_id, v.clone()))
             .collect();
+        // Preserve property names from the col_kv tuples (key, col_id, value).
+        let disk_prop_names: Vec<String> = col_kv.iter().map(|(k, _, _)| k.clone()).collect();
         let slot = self.store.peek_next_slot(label_id)?;
         let node_id = NodeId((label_id as u64) << 32 | slot as u64);
         self.dirty_nodes.insert(node_id.0);
@@ -1189,6 +1233,7 @@ impl WriteTx {
             node_id,
             label_id,
             props: disk_props,
+            prop_names: disk_prop_names,
         });
         Ok(node_id)
     }
@@ -1560,10 +1605,21 @@ fn write_mutation_wal(
                 node_id,
                 label_id,
                 props,
+                prop_names,
             } => {
+                // Use human-readable names when available; fall back to
+                // "col_{hash}" when only the col_id is known (low-level API).
                 let wal_props: Vec<(String, Vec<u8>)> = props
                     .iter()
-                    .map(|(col_id, v)| (format!("col_{col_id}"), v.to_u64().to_le_bytes().to_vec()))
+                    .enumerate()
+                    .map(|(i, (col_id, v))| {
+                        let name = prop_names
+                            .get(i)
+                            .filter(|n| !n.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| format!("col_{col_id}"));
+                        (name, v.to_u64().to_le_bytes().to_vec())
+                    })
                     .collect();
                 wal.append(
                     WalRecordKind::NodeCreate,

@@ -21,6 +21,7 @@ use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{DeltaRecord, EdgeStore, RelTableId};
 use sparrowdb_storage::fulltext_index::FulltextIndex;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
+use sparrowdb_storage::wal::WalReplayer;
 
 use crate::types::{QueryResult, Value};
 
@@ -234,6 +235,7 @@ impl Engine {
     fn execute_call(&self, c: &CallStatement) -> Result<QueryResult> {
         match c.procedure.as_str() {
             "db.index.fulltext.queryNodes" => self.call_fulltext_query_nodes(c),
+            "db.schema" => self.call_db_schema(c),
             other => Err(sparrowdb_common::Error::InvalidArgument(format!(
                 "unknown procedure: {other}"
             ))),
@@ -296,6 +298,76 @@ impl Engine {
         } else {
             (yield_cols, rows)
         };
+
+        Ok(QueryResult { columns, rows })
+    }
+
+    /// Implementation of `CALL db.schema()`.
+    ///
+    /// Returns one row per node label and one row per relationship type with
+    /// columns `["type", "name", "properties"]` where:
+    ///   - `type` is `"node"` or `"relationship"`
+    ///   - `name` is the label or rel-type string
+    ///   - `properties` is a `List` of property name strings (sorted, may be empty)
+    ///
+    /// Property names are collected by scanning committed WAL records so the
+    /// caller does not need to have created any nodes yet for labels to appear.
+    fn call_db_schema(&self, c: &CallStatement) -> Result<QueryResult> {
+        if !c.args.is_empty() {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "db.schema requires exactly 0 arguments".into(),
+            ));
+        }
+        let columns = vec![
+            "type".to_owned(),
+            "name".to_owned(),
+            "properties".to_owned(),
+        ];
+
+        // Collect property names per label_id and rel_type from the WAL.
+        let wal_dir = self.db_root.join("wal");
+        let schema = WalReplayer::scan_schema(&wal_dir)?;
+
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+
+        // Node labels — from catalog.
+        let labels = self.catalog.list_labels()?;
+        for (label_id, label_name) in &labels {
+            let mut prop_names: Vec<String> = schema
+                .node_props
+                .get(&(*label_id as u32))
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default();
+            prop_names.sort();
+            let props_value = Value::List(prop_names.into_iter().map(Value::String).collect());
+            rows.push(vec![
+                Value::String("node".to_owned()),
+                Value::String(label_name.clone()),
+                props_value,
+            ]);
+        }
+
+        // Relationship types — from catalog.
+        let rel_tables = self.catalog.list_rel_tables()?;
+        // Deduplicate by rel_type name since the same type can appear across multiple src/dst pairs.
+        let mut seen_rel_types: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for (_, _, rel_type) in &rel_tables {
+            if seen_rel_types.insert(rel_type.clone()) {
+                let mut prop_names: Vec<String> = schema
+                    .rel_props
+                    .get(rel_type)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
+                prop_names.sort();
+                let props_value = Value::List(prop_names.into_iter().map(Value::String).collect());
+                rows.push(vec![
+                    Value::String("relationship".to_owned()),
+                    Value::String(rel_type.clone()),
+                    props_value,
+                ]);
+            }
+        }
 
         Ok(QueryResult { columns, rows })
     }

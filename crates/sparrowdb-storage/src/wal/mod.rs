@@ -14,5 +14,5 @@ pub mod replay;
 pub mod writer;
 
 pub use codec::{WalPayload, WalRecord, WalRecordKind};
-pub use replay::WalReplayer;
+pub use replay::{WalReplayer, WalSchema};
 pub use writer::WalWriter;

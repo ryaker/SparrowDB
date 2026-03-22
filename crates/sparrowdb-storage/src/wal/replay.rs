@@ -213,6 +213,139 @@ impl WalReplayer {
     }
 }
 
+/// Schema information extracted from the WAL.
+///
+/// Maps `label_id → set of property names` for nodes, and
+/// `rel_type → set of property names` for edges.
+pub struct WalSchema {
+    /// Node property names keyed by label_id.
+    pub node_props: HashMap<u32, HashSet<String>>,
+    /// Relationship property names keyed by rel_type name.
+    pub rel_props: HashMap<String, HashSet<String>>,
+}
+
+impl WalReplayer {
+    /// Scan committed WAL records and collect schema information.
+    ///
+    /// Reads all `NodeCreate` and `EdgeCreate` records from committed
+    /// transactions and returns the union of all property names seen for each
+    /// label / relationship type.  This is the data source for
+    /// `CALL db.schema()`.
+    ///
+    /// If the WAL directory does not exist (empty DB), returns an empty schema.
+    pub fn scan_schema(wal_dir: &Path) -> Result<WalSchema> {
+        let segments = match collect_segments(wal_dir) {
+            Ok(s) => s,
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(WalSchema {
+                    node_props: HashMap::new(),
+                    rel_props: HashMap::new(),
+                })
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Pass 1 — collect all records, stop at first CRC failure.
+        let mut all_records: BTreeMap<u64, WalRecord> = BTreeMap::new();
+        'outer: for seg_no in &segments {
+            let path = segment_path(wal_dir, *seg_no);
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::Io(e)),
+            };
+            let mut offset = 0usize;
+            while offset < data.len() {
+                if data[offset..].iter().all(|&b| b == 0) {
+                    break;
+                }
+                match WalRecord::decode(&data[offset..]) {
+                    Ok((rec, consumed)) => {
+                        all_records.insert(rec.lsn.0, rec);
+                        offset += consumed;
+                    }
+                    Err(Error::ChecksumMismatch) | Err(Error::Corruption(_)) => break 'outer,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // Pass 2 — identify committed transactions.
+        let mut begun: HashSet<u64> = HashSet::new();
+        let mut committed: HashSet<u64> = HashSet::new();
+        for rec in all_records.values() {
+            match rec.kind {
+                WalRecordKind::Begin => {
+                    begun.insert(rec.txn_id.0);
+                }
+                WalRecordKind::Commit => {
+                    if begun.contains(&rec.txn_id.0) {
+                        committed.insert(rec.txn_id.0);
+                    }
+                }
+                WalRecordKind::Abort => {
+                    begun.remove(&rec.txn_id.0);
+                }
+                _ => {}
+            }
+        }
+
+        // Pass 3 — collect property names from committed NodeCreate / NodeUpdate / EdgeCreate.
+        //
+        // NodeCreate gives us the initial property set.  NodeUpdate records
+        // (written by set_property()) extend the known schema for each label:
+        // we build a node_id → label_id index from NodeCreate so that
+        // NodeUpdate can be attributed to the correct label.
+        let mut node_label: HashMap<u64, u32> = HashMap::new();
+        let mut schema = WalSchema {
+            node_props: HashMap::new(),
+            rel_props: HashMap::new(),
+        };
+        for rec in all_records.values() {
+            if !committed.contains(&rec.txn_id.0) {
+                continue;
+            }
+            match &rec.payload {
+                WalPayload::NodeCreate {
+                    node_id,
+                    label_id,
+                    props,
+                } => {
+                    node_label.insert(*node_id, *label_id);
+                    let entry = schema.node_props.entry(*label_id).or_default();
+                    for (name, _) in props {
+                        entry.insert(name.clone());
+                    }
+                }
+                WalPayload::NodeUpdate { node_id, key, .. } => {
+                    // Only include non-empty keys (guard against low-level
+                    // col_id-only paths that may not record a human-readable name).
+                    if !key.is_empty() {
+                        if let Some(&label_id) = node_label.get(node_id) {
+                            schema
+                                .node_props
+                                .entry(label_id)
+                                .or_default()
+                                .insert(key.clone());
+                        }
+                    }
+                }
+                WalPayload::EdgeCreate {
+                    rel_type, props, ..
+                } => {
+                    let entry = schema.rel_props.entry(rel_type.clone()).or_default();
+                    for (name, _) in props {
+                        entry.insert(name.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(schema)
+    }
+}
+
 /// Collect all segment numbers in `wal_dir`, sorted ascending.
 ///
 /// Returns an error if `wal_dir` cannot be read, so that callers are not
