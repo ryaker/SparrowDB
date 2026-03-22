@@ -53,6 +53,42 @@ fn merge_return_upsert_returns_name() {
     );
 }
 
+/// Bug regression (CodeAnt / SPA-215): when a node already exists with extra
+/// properties that are NOT part of the MERGE pattern, RETURN must reflect the
+/// actual on-disk node state rather than only the pattern props.
+#[test]
+fn merge_return_reflects_extra_stored_properties() {
+    let (_dir, db) = make_db();
+
+    // Step 1: create the node via MERGE.
+    db.execute("MERGE (n:Person {name: 'Alice'})")
+        .expect("initial MERGE must succeed");
+
+    // Step 2: add an extra property via MATCH … SET that is NOT in the merge pattern.
+    db.execute("MATCH (n:Person) SET n.score = 99")
+        .expect("MATCH SET must succeed");
+
+    // Step 3: MERGE on the same pattern (finds existing node), RETURN both props.
+    // Without the fix, n.score would be Null because the old code only projected
+    // from the input pattern props (which only contained `name`).
+    let result = db
+        .execute("MERGE (n:Person {name: 'Alice'}) RETURN n.name, n.score")
+        .expect("MERGE...RETURN with extra props must not fail");
+
+    assert_eq!(result.columns, vec!["n.name", "n.score"]);
+    assert_eq!(result.rows.len(), 1, "should return exactly one row");
+    assert_eq!(
+        result.rows[0][0],
+        Value::String("Alice".to_string()),
+        "n.name must be Alice"
+    );
+    assert_eq!(
+        result.rows[0][1],
+        Value::Int64(99),
+        "n.score must reflect the on-disk value set via MATCH SET, not Null"
+    );
+}
+
 /// MERGE without RETURN should still work (backward-compatibility).
 #[test]
 fn merge_without_return_still_works() {

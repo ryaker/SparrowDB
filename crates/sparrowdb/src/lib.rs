@@ -589,7 +589,7 @@ impl GraphDb {
             .map(|pe| (pe.key.clone(), expr_to_value(&pe.value)))
             .collect();
         let mut tx = self.begin_write()?;
-        tx.merge_node(&m.label, props.clone())?;
+        let node_id = tx.merge_node(&m.label, props.clone())?;
         tx.commit()?;
 
         // If the statement has a RETURN clause, project the merged node's properties.
@@ -604,12 +604,39 @@ impl GraphDb {
                 m.var.as_str()
             };
 
-            // Build an eval map: "{var}.{prop_name}" -> ExecValue.
-            // Convert storage Value (Int64/Bytes) to execution Value (Int64/String).
+            // Collect all property names referenced in the RETURN clause so we
+            // can look them up by col_id from the actual on-disk node state.
+            // This is correct even when the node already existed with extra
+            // properties not present in the merge pattern (SPA-215 / CodeAnt bug).
+            let return_props: Vec<String> = ret
+                .items
+                .iter()
+                .filter_map(|item| match &item.expr {
+                    Expr::PropAccess { var: v, prop } if v.as_str() == var => Some(prop.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            // Derive col_ids for every property name referenced in RETURN.
+            let return_col_ids: Vec<u32> =
+                return_props.iter().map(|name| fnv1a_col_id(name)).collect();
+
+            // Read the actual on-disk node state via NodeStore::get_node, which
+            // uses Value::from_u64 (type-tag-aware decoding) to correctly
+            // reconstruct Bytes/String values rather than misinterpreting them as
+            // raw integers.  We open a fresh NodeStore after the write committed
+            // so we see the fully-merged node state.
+            let store = NodeStore::open(&self.inner.path)?;
+            let stored = store.get_node(node_id, &return_col_ids).unwrap_or_default();
+
+            // Build an eval map: "{var}.{prop_name}" -> ExecValue from the
+            // actual stored values rather than the input pattern props.
             let mut row_vals: HashMap<String, ExecValue> = HashMap::new();
-            for (key, val) in &props {
-                let exec_val = storage_value_to_exec(val);
-                row_vals.insert(format!("{var}.{key}"), exec_val);
+            for (prop_name, col_id) in return_props.iter().zip(return_col_ids.iter()) {
+                if let Some((_, val)) = stored.iter().find(|(c, _)| c == col_id) {
+                    let exec_val = storage_value_to_exec(val);
+                    row_vals.insert(format!("{var}.{prop_name}"), exec_val);
+                }
             }
 
             // Derive column names from the RETURN items.
@@ -625,7 +652,7 @@ impl GraphDb {
                 })
                 .collect();
 
-            // Evaluate each RETURN expression using the prop map.
+            // Evaluate each RETURN expression using the actual-state prop map.
             let row: Vec<ExecValue> = ret
                 .items
                 .iter()
