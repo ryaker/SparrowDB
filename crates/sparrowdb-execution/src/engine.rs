@@ -1686,15 +1686,17 @@ impl Engine {
                     collect_col_ids_from_expr(&item.expr, &mut col_ids_dst);
                 }
             }
+            // Ensure WHERE-only columns are fetched so predicates can evaluate them.
+            if let Some(ref where_expr) = m.where_clause {
+                collect_col_ids_from_expr(where_expr, &mut col_ids_src);
+                collect_col_ids_from_expr(where_expr, &mut col_ids_dst);
+            }
 
             // Read ALL delta records for this specific rel table once (outside
             // the per-src-slot loop) so we open the file only once per table.
             let delta_records_all = {
                 let edge_store = EdgeStore::open(&self.db_root, storage_rel_id);
-                match edge_store.and_then(|s| s.read_delta()) {
-                    Ok(records) => records,
-                    Err(_) => vec![],
-                }
+                edge_store.and_then(|s| s.read_delta()).unwrap_or_default()
             };
 
             // Scan source nodes for this label.
@@ -1733,14 +1735,14 @@ impl Engine {
                     .map(|r| r.dst.0 & 0xFFFF_FFFF)
                     .collect();
 
-                // Include CSR neighbors only when this is a single labeled
-                // rel-table query (the CSR is built for a single label pair).
-                let csr_neighbors: &[u64] =
-                    if rel_tables_to_scan.len() == 1 && src_label_id_opt.is_some() {
-                        self.csr.neighbors(src_slot)
-                    } else {
-                        &[]
-                    };
+                // Include CSR neighbors only when scanning rel-table 0 — the CSR
+                // snapshot is built exclusively for that table.  Using it for any
+                // other table would mix in neighbors from the wrong edge set.
+                let csr_neighbors: &[u64] = if *catalog_rel_id == 0 {
+                    self.csr.neighbors(src_slot)
+                } else {
+                    &[]
+                };
                 let all_neighbors: Vec<u64> = csr_neighbors
                     .iter()
                     .copied()
@@ -1752,8 +1754,18 @@ impl Engine {
                         continue;
                     }
                     let dst_node = NodeId(((effective_dst_label_id as u64) << 32) | dst_slot);
-                    let dst_props = if !col_ids_dst.is_empty() {
-                        self.store.get_node_raw(dst_node, &col_ids_dst)?
+                    let dst_props = if !col_ids_dst.is_empty() || !dst_node_pat.props.is_empty() {
+                        let all_needed: Vec<u32> = {
+                            let mut v = col_ids_dst.clone();
+                            for p in &dst_node_pat.props {
+                                let col_id = prop_name_to_col_id(&p.key);
+                                if !v.contains(&col_id) {
+                                    v.push(col_id);
+                                }
+                            }
+                            v
+                        };
+                        self.store.get_node_raw(dst_node, &all_needed)?
                     } else {
                         vec![]
                     };
