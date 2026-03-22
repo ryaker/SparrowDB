@@ -106,6 +106,8 @@ println!("snapshot txn_id: {}", tx.snapshot_txn_id);
 
 // Write transaction (at most one writer at a time)
 let mut tx = db.begin_write()?;
+let label_id = tx.get_or_create_label_id("Person")?;
+let col_id = sparrowdb::fnv1a_col_id("name");
 tx.create_node(label_id, &[(col_id, Value::String("Alice".into()))])?;
 let txn_id = tx.commit()?; // dropping without commit = rollback
 ```

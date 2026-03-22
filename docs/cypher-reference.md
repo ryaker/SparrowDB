@@ -109,12 +109,9 @@ SET n.age = 31, n.city = 'Portland'
 Delete a node. Delete its edges first — deleting a node with live edges produces undefined behaviour in v0.1.
 
 ```cypher
--- Safe pattern: delete edges, then node
+-- Safe pattern: delete edges and node together
 MATCH (n:Person {name: 'Alice'})-[r]-()
-DELETE r
-
-MATCH (n:Person {name: 'Alice'})
-DELETE n
+DELETE r, n
 ```
 
 ---

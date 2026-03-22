@@ -165,8 +165,8 @@ Tools exposed: `execute_cypher`, `checkpoint`, `info`.
 
 ## Guides
 
-| | |
-|---|---|
+| Guide | Description |
+|-------|-------------|
 | [docs/quickstart.md](docs/quickstart.md) | Step-by-step first graph |
 | [docs/cypher-reference.md](docs/cypher-reference.md) | Full Cypher support reference |
 | [docs/bindings.md](docs/bindings.md) | Rust, Python, Node.js, Ruby |

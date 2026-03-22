@@ -272,9 +272,9 @@ SET n.age = 31
 ### DELETE
 
 ```cypher
--- Delete a node (delete its edges first)
-MATCH (n:Person {name: 'Alice'})
-DELETE n
+-- Delete a node and its edges (safe pattern)
+MATCH (n:Person {name: 'Alice'})-[r]-()
+DELETE r, n
 ```
 
 ---
