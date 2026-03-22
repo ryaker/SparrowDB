@@ -36,10 +36,8 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 fn create_path_both_nodes_and_edge_persisted() {
     let (_dir, db) = make_db();
 
-    db.execute(
-        "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
-    )
-    .expect("standalone CREATE path must succeed");
+    db.execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
+        .expect("standalone CREATE path must succeed");
 
     let result = db
         .execute("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name")
@@ -61,10 +59,8 @@ fn create_path_both_nodes_and_edge_persisted() {
 fn create_path_rhs_node_is_queryable() {
     let (_dir, db) = make_db();
 
-    db.execute(
-        "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
-    )
-    .expect("standalone CREATE path must succeed");
+    db.execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
+        .expect("standalone CREATE path must succeed");
 
     // Both nodes must be visible.
     let result = db
@@ -87,10 +83,8 @@ fn create_path_rhs_node_is_queryable() {
 fn create_path_rel_type_registered_in_catalog() {
     let (dir, db) = make_db();
 
-    db.execute(
-        "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
-    )
-    .expect("standalone CREATE path must succeed");
+    db.execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
+        .expect("standalone CREATE path must succeed");
 
     let catalog = Catalog::open(dir.path()).expect("catalog re-open");
     let tables = catalog.list_rel_tables().expect("list_rel_tables");
