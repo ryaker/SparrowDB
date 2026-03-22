@@ -26,7 +26,6 @@ fn main() {
     let mut out = stdout.lock();
 
     for line in stdin.lock().lines() {
-        // Stdin EOF or read error → exit gracefully
         let line = match line {
             Ok(l) => l,
             Err(_) => break,
@@ -49,7 +48,6 @@ fn main() {
             Ok(s) => s,
             Err(_) => continue,
         };
-        // Stdout write error (broken pipe) → exit gracefully
         if writeln!(out, "{resp_str}").is_err() {
             break;
         }
@@ -92,6 +90,26 @@ fn handle_request(req: JsonRpcRequest) -> JsonRpcResponse {
                     }
                 },
                 {
+                    "name": "create_entity",
+                    "description": "Create a node (entity) in SparrowDB with the given label and properties. Equivalent to CREATE (n:ClassName {props}) but with a structured interface that surfaces descriptive errors (SPA-243).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "db_path": {"type": "string"},
+                            "class_name": {
+                                "type": "string",
+                                "description": "The node label / class name (e.g. \"Person\")"
+                            },
+                            "properties": {
+                                "type": "object",
+                                "description": "Key-value pairs: string, number, or boolean values only.",
+                                "additionalProperties": true
+                            }
+                        },
+                        "required": ["db_path", "class_name"]
+                    }
+                },
+                {
                     "name": "checkpoint",
                     "description": "Flush WAL and compact the database",
                     "inputSchema": {
@@ -131,6 +149,63 @@ fn handle_request(req: JsonRpcRequest) -> JsonRpcResponse {
     }
 }
 
+/// Escape a string for safe Cypher single-quoted literal interpolation.
+fn escape_cypher_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// Build a Cypher CREATE query from a class name and a JSON properties object.
+///
+/// Returns Err with a descriptive message when class_name is empty or a
+/// property value is null, an array, or a nested object.
+fn build_create_query(class_name: &str, props: &Value) -> Result<String, String> {
+    if class_name.is_empty() {
+        return Err("create_entity: class_name must not be empty".into());
+    }
+
+    let mut prop_parts: Vec<String> = Vec::new();
+
+    if let Some(obj) = props.as_object() {
+        for (key, val) in obj {
+            if key.is_empty() {
+                return Err("create_entity: property key must not be empty".into());
+            }
+            let cypher_val = match val {
+                Value::String(s) => format!("'{}'", escape_cypher_string(s)),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Null => {
+                    return Err(format!(
+                        "create_entity: property '{}' is null; use a concrete value",
+                        key
+                    ))
+                }
+                Value::Array(_) => {
+                    return Err(format!(
+                        "create_entity: property '{}' is an array; only scalar values are supported",
+                        key
+                    ))
+                }
+                Value::Object(_) => {
+                    return Err(format!(
+                        "create_entity: property '{}' is a nested object; only scalar values are supported",
+                        key
+                    ))
+                }
+            };
+            prop_parts.push(format!("{}: {}", key, cypher_val));
+        }
+    }
+
+    let props_clause = if prop_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {{{}}}", prop_parts.join(", "))
+    };
+
+    Ok(format!("CREATE (n:{}{})", class_name, props_clause))
+}
+
 fn handle_tool_call(params: Option<Value>) -> Result<Value, Value> {
     let params = params.ok_or_else(|| json!({"code": -32602, "message": "Missing params"}))?;
     let tool_name = params["name"]
@@ -149,6 +224,49 @@ fn handle_tool_call(params: Option<Value>) -> Result<Value, Value> {
                 .map_err(|e| json!({"code": -32000, "message": e.to_string()}))?;
             Ok(json!({"content": [{"type": "text", "text": "Checkpoint complete"}]}))
         }
+        "create_entity" => {
+            let db_path = args["db_path"]
+                .as_str()
+                .ok_or_else(|| json!({"code": -32602, "message": "Missing db_path"}))?;
+            let class_name = args["class_name"]
+                .as_str()
+                .ok_or_else(|| json!({"code": -32602, "message": "Missing class_name"}))?;
+            let props = &args["properties"];
+
+            // Build the Cypher CREATE statement, surfacing argument errors as
+            // -32602 (invalid params) not -32000 (generic execution error).
+            // SPA-243 root cause: the tool was absent; callers received the
+            // generic "Unknown tool: create_entity" error.
+            let query = build_create_query(class_name, props)
+                .map_err(|msg| json!({"code": -32602, "message": msg}))?;
+
+            let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path)).map_err(|e| {
+                json!({
+                    "code": -32000,
+                    "message": format!(
+                        "create_entity: failed to open database at '{}': {}",
+                        db_path, e
+                    )
+                })
+            })?;
+
+            db.execute(&query).map_err(|e| {
+                json!({
+                    "code": -32000,
+                    "message": format!(
+                        "create_entity: write failed for class '{}': {}",
+                        class_name, e
+                    )
+                })
+            })?;
+
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Entity created successfully (class: '{}')", class_name)
+                }]
+            }))
+        }
         "execute_cypher" => {
             let db_path = args["db_path"]
                 .as_str()
@@ -161,9 +279,6 @@ fn handle_tool_call(params: Option<Value>) -> Result<Value, Value> {
             match db.execute(query) {
                 Ok(result) => Ok(json!({
                     "content": [{"type": "text", "text": format!("{result:?}")}]
-                })),
-                Err(e) if e.to_string().contains("not yet implemented") => Ok(json!({
-                    "content": [{"type": "text", "text": "Cypher execution not yet implemented"}]
                 })),
                 Err(e) => Err(json!({"code": -32000, "message": e.to_string()})),
             }
