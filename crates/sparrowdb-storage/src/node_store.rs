@@ -282,18 +282,6 @@ impl NodeStore {
         Ok(ids)
     }
 
-    /// Create a new node in `label_id` with the given properties.
-    ///
-    /// Returns the new [`NodeId`] packed as `(label_id << 32) | slot`.
-    ///
-    /// ## Slot alignment guarantee (SPA-187)
-    ///
-    /// Every column file for `label_id` must have exactly `node_count * 8`
-    /// bytes so that slot N always refers to node N across all columns.  When
-    /// a node is created without a value for an already-known column, that
-    /// column file is zero-padded to `(slot + 1) * 8` bytes.  The zero
-    /// sentinel is recognised by `read_col_slot_nullable` as "absent" and
-
     /// Return the **on-disk** high-water mark for a label, bypassing any
     /// in-memory advances made by `peek_next_slot`.
     ///
@@ -417,6 +405,15 @@ impl NodeStore {
 
     /// Create a new node in `label_id` with the given properties.
     ///
+    /// Returns the new [`NodeId`] packed as `(label_id << 32) | slot`.
+    ///
+    /// ## Slot alignment guarantee (SPA-187)
+    ///
+    /// Every column file for `label_id` must have exactly `node_count * 8`
+    /// bytes so that slot N always refers to node N across all columns.  When
+    /// a node is created without a value for an already-known column, that
+    /// column file is zero-padded to `(slot + 1) * 8` bytes.  The zero
+    /// sentinel is recognised by `read_col_slot_nullable` as "absent" and
     /// surfaces as `Value::Null` in query results.
     pub fn create_node(&mut self, label_id: u32, props: &[(u32, Value)]) -> Result<NodeId> {
         // Load or get cached hwm.
