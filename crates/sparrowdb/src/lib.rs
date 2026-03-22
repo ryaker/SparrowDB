@@ -430,6 +430,22 @@ impl GraphDb {
             }
         }
 
+        // SPA-208: reject reserved __SO_ label prefix on nodes.
+        for node in &create.nodes {
+            if let Some(label) = node.labels.first() {
+                if is_reserved_label(label) {
+                    return Err(reserved_label_error(label));
+                }
+            }
+        }
+
+        // SPA-208: reject reserved __SO_ rel-type prefix on edges.
+        for (_, rel_pat, _) in &create.edges {
+            if is_reserved_label(&rel_pat.rel_type) {
+                return Err(reserved_label_error(&rel_pat.rel_type));
+            }
+        }
+
         let mut tx = self.begin_write()?;
 
         // Map variable name → NodeId for all newly created nodes.
@@ -657,18 +673,30 @@ impl GraphDb {
             &self.inner.path,
         );
 
+        // SPA-208: reject reserved __SO_ rel-type prefix on edges in the CREATE clause.
+        // Check before the Unimplemented guard so the reserved-name error takes priority.
+        for (_, rel_pat, _) in &mc.create.edges {
+            if is_reserved_label(&rel_pat.rel_type) {
+                return Err(reserved_label_error(&rel_pat.rel_type));
+            }
+        }
+
+        // MATCH…CREATE only supports edge creation from matched bindings.
+        // Standalone node creation (CREATE clause with no edges) is not yet
+        // implemented.  Note: the parser includes edge-endpoint nodes in
+        // mc.create.nodes even for pure edge patterns, so we guard on
+        // mc.create.edges being empty rather than mc.create.nodes being
+        // non-empty (SPA-183 had the wrong guard).
+        if mc.create.edges.is_empty() {
+            return Err(Error::Unimplemented);
+        }
+
         // Execute the MATCH clause to get correlated binding rows.
         // Each row is a HashMap<variable_name, NodeId> representing one
         // matched combination.  This replaces the old `scan_match_create`
         // approach which collected candidates per variable independently and
         // then took a full Cartesian product — causing N² edge creation when
         // multiple nodes of the same label existed (SPA-183).
-        // MATCH…CREATE only supports edge creation from matched bindings.
-        // Node creation in the CREATE body is not yet implemented — reject early
-        // to avoid silently dropping the requested node writes.
-        if !mc.create.nodes.is_empty() {
-            return Err(Error::Unimplemented);
-        }
 
         let matched_rows = engine.scan_match_create_rows(mc)?;
 
@@ -1564,6 +1592,25 @@ fn open_csr_map(path: &Path) -> HashMap<u32, CsrForward> {
         }
     }
     map
+}
+
+// ── Reserved label/type protection (SPA-208) ──────────────────────────────────
+
+/// Returns `true` if `label` starts with the reserved `__SO_` prefix.
+///
+/// The `__SO_` namespace is reserved for internal SparrowDB system objects.
+/// Any attempt to CREATE a node or relationship using a label/type in this
+/// namespace is rejected with an [`Error::InvalidArgument`].
+#[inline]
+fn is_reserved_label(label: &str) -> bool {
+    label.starts_with("__SO_")
+}
+
+/// Return an [`Error::InvalidArgument`] for a reserved label/type.
+fn reserved_label_error(label: &str) -> sparrowdb_common::Error {
+    sparrowdb_common::Error::InvalidArgument(format!(
+        "invalid argument: label \"{label}\" is reserved — the __SO_ prefix is for internal use only"
+    ))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
