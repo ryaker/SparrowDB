@@ -1,212 +1,15 @@
 # SparrowDB
 
-> An embedded Rust graph database with Cypher queries, WAL-backed crash recovery, and factorized execution.
+**Embedded graph database with Cypher queries — no server, no subscription, no cloud.**
 
 [![CI](https://github.com/ryaker/SparrowDB/actions/workflows/ci.yml/badge.svg)](https://github.com/ryaker/SparrowDB/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
----
-
-## What It Is
-
-SparrowDB is an embedded graph database written in Rust. Drop it into a process — no server, no daemon, no cloud dependency.
-
-It runs Cypher queries over a durable on-disk graph using a factorized execution engine that avoids Cartesian blowup on multi-hop traversals. The storage format is byte-stable and versioned.
-
-**First production target:** replace Neo4j Aura in a local Knowledge Management System — same Cypher, local on-device, zero latency, no subscription.
+SparrowDB runs inside your process. Drop it into a Rust app, a Python script, or a Node.js service and query your graph with Cypher. Data lives on disk, survives crashes, and never phones home.
 
 ---
 
-## Status
-
-| Phase | Description | Status |
-|-------|-------------|--------|
-| 0 | Repo, CI, 7-crate workspace scaffold | ✅ Done |
-| 1 | TLV catalog codec + dual metapage | ✅ Done |
-| 2 | WAL write-ahead log + 8 crash failpoints | ✅ Done |
-| 3 | CSR edge storage + node property columns | ✅ Done |
-| 4 | Cypher parser, binder, factorized execution engine | ✅ Done |
-| 5 | SWMR transactions, snapshot isolation, CHECKPOINT/OPTIMIZE | ✅ Done |
-| 6 | XChaCha20-Poly1305 encryption, WAL payload encryption, golden fixtures | ✅ Done |
-| infra | Criterion benchmarks + deterministic fixture generator | ✅ Done |
-| 6 (cont.) | Spill-to-disk (ORDER BY + ASP-Join), PyO3 Python bindings, CLI + MCP server | ✅ Done |
-| 7 | Mutation Cypher: MERGE, SET, DELETE, CREATE edge, WAL records, MVCC | ✅ Done |
-| 8 | UNWIND, variable-length paths, function library, Node.js bindings | ✅ Done |
-| 9–11 | LDBC SNB benchmark, Neo4j import bridge, publication | ⏳ Planned |
-
-Acceptance checks passing: 1-hop scan, 2-hop ASP-Join, WAL crash recovery, CHECKPOINT/OPTIMIZE, snapshot isolation, encryption auth, spill-to-disk sort + join, Python binding round-trip, Node.js binding round-trip, mutation (MERGE/SET/DELETE/CREATE edge), MVCC write-write conflict detection, UNWIND, variable-length paths, full-text search, list predicates, IS NULL / IS NOT NULL.
-
----
-
-## Quickstart
-
-```rust
-use sparrowdb::GraphDb;
-
-// Open or create a database directory
-let db = GraphDb::open("my.db")?;
-
-// Create nodes
-db.execute("CREATE (a:Person {name: \"Alice\"})")?;
-db.execute("CREATE (b:Person {name: \"Bob\"})")?;
-
-// Create an edge
-db.execute(
-    "MATCH (a:Person {name: \"Alice\"}), (b:Person {name: \"Bob\"})
-     CREATE (a)-[:KNOWS]->(b)"
-)?;
-
-// 1-hop query
-let result = db.execute(
-    "MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->(f:Person) RETURN f.name"
-)?;
-for row in &result.rows {
-    println!("{:?}", row);
-}
-
-// 2-hop query (factorized, no Cartesian blowup)
-let fof = db.execute(
-    "MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->()-[:KNOWS]->(fof:Person)
-     RETURN DISTINCT fof.name"
-)?;
-
-// Paginate results
-let page2 = db.execute(
-    "MATCH (n:Person) RETURN n.name ORDER BY n.name SKIP 10 LIMIT 10"
-)?;
-```
-
-Full guide: [docs/getting-started.md](docs/getting-started.md)
-
----
-
-## CLI Usage
-
-```bash
-# Run a Cypher query
-sparrowdb query --db my.db "MATCH (n:Person) RETURN n.name LIMIT 5"
-
-# Checkpoint the WAL
-sparrowdb checkpoint --db my.db
-
-# Show database metadata
-sparrowdb info --db my.db
-```
-
-Build from source:
-```bash
-cargo build --release --bin sparrowdb --bin sparrowdb-mcp
-```
-
-## MCP Server
-
-`sparrowdb-mcp` speaks JSON-RPC 2.0 over stdio — compatible with any MCP client (Claude Code, etc.):
-
-```json
-{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
-```
-
-Tools: `execute_cypher`, `checkpoint`, `info`.
-
----
-
-## Cypher Support (v0.1)
-
-| Feature | Supported |
-|---------|-----------|
-| `CREATE (n:Label {prop: val})` | ✅ |
-| `MATCH (n:Label) RETURN n.prop` | ✅ |
-| `MATCH (n)` without label (scans all labels) | ✅ |
-| `WHERE n.prop = val` | ✅ |
-| `WHERE n.prop CONTAINS str` | ✅ |
-| `WHERE n.prop IS NULL` / `IS NOT NULL` | ✅ |
-| 1-hop `MATCH (a)-[:REL]->(b)` | ✅ |
-| 2-hop `MATCH (a)-[:R]->()-[:R]->(c)` | ✅ |
-| Undirected `MATCH (a)-[:REL]-(b)` | ✅ |
-| Variable-length paths `[:R*1..3]` | ✅ |
-| Relationship variables `[r:REL]` | ✅ |
-| `RETURN DISTINCT` | ✅ |
-| `ORDER BY`, `LIMIT` | ✅ |
-| `SKIP` (result pagination) | ✅ |
-| `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT expr)` | ✅ |
-| `SUM`, `AVG`, `MIN`, `MAX` | ✅ |
-| `COLLECT()` aggregation | ✅ |
-| `ANY/ALL/NONE/SINGLE` list predicates | ✅ |
-| `id(n)`, `type(r)`, `labels(n)` functions | ✅ |
-| Parameters `$param` | ✅ |
-| `DELETE`, `SET` | ✅ |
-| `MERGE` (upsert node) | ✅ |
-| `CREATE (a)-[:REL]->(b)` (edge creation) | ✅ |
-| MVCC write-write conflict detection | ✅ |
-| `UNWIND list AS var` | ✅ |
-| `OPTIONAL MATCH` | ✅ |
-| `UNION` / `UNION ALL` | ✅ |
-| `CALL db.index.fulltext.queryNodes` | ✅ |
-| `CALL db.schema()` | Schema introspection — labels, rel types, property keys | ✅ |
-| Reserved label prefix `__SO_` protection | ✅ |
-| Subqueries, `WITH` chaining | ⚠️ Partial |
-| `UNION` across complex multi-clause queries | ⚠️ Partial |
-
-Full reference: [docs/cypher-reference.md](docs/cypher-reference.md)
-
----
-
-## Architecture
-
-```
-crates/
-  sparrowdb-common/     # ID types, Error enum, CRC32C helpers
-  sparrowdb-storage/    # WAL, CSR, node/edge stores, metapage, encryption
-  sparrowdb-catalog/    # Label and rel-table registry (TLV on-disk format)
-  sparrowdb-cypher/     # Lexer, recursive-descent parser, AST, binder
-  sparrowdb-execution/  # TypedVector, FactorizedChunk, operators, ASP-Join, spill
-  sparrowdb/            # Public Rust API (GraphDb entry point)
-  sparrowdb-python/     # PyO3 bindings (maturin wheel)
-  sparrowdb-node/       # napi-rs Node.js/TypeScript bindings
-  sparrowdb-ruby/       # Magnus native gem (Ruby bindings)
-  sparrowdb-cli/        # `sparrowdb` CLI binary (query/checkpoint/info)
-  sparrowdb-mcp/        # JSON-RPC 2.0 MCP server over stdio
-
-tests/
-  fixtures/             # Golden binary fixtures + small seeded JSON datasets
-  integration/          # End-to-end use-case tests (UC-1 through UC-7)
-
-benches/                # Criterion benchmarks (WAL, CSR, metapage, CRC32C)
-specs/                  # Byte-exact implementation spec (source of truth)
-docs/                   # User-facing guides and API reference
-```
-
-### Database directory layout
-
-```
-my.db/
-  catalog.bin           # TLV catalog entries + dual metapages
-  nodes/{label_id}/     # Per-label property column files
-  edges/{rel_id}/       # CSR forward + backward + delta.log
-  wal/                  # WAL segments (000000.wal, ...)
-```
-
-### Factorized execution
-
-Queries return `FactorizedChunk` — a structure that tracks `multiplicity` rather than materializing repeated rows. A 2-hop friend-of-friend query over 10 k nodes never emits O(N²) intermediate rows; multiplicity is resolved only at `RETURN`.
-
-### Encryption
-
-Pass a 32-byte key to get XChaCha20-Poly1305 encryption of every page. Physical stride is `page_size + 40` bytes (`24` nonce + `16` AEAD tag). Wrong key → `Error::EncryptionAuthFailed`. No key → transparent passthrough. WAL records are also encrypted per-record with LSN as AAD.
-
----
-
-## Installation
-
-### From source (Rust stable 1.75+)
-
-```bash
-git clone https://github.com/ryaker/SparrowDB
-cd SparrowDB
-cargo build --release
-```
-
-### As a library dependency
+## Install
 
 ```toml
 # Cargo.toml
@@ -214,136 +17,162 @@ cargo build --release
 sparrowdb = { git = "https://github.com/ryaker/SparrowDB" }
 ```
 
-Crates.io publication planned for v0.1 release.
-
-Full install guide: [docs/getting-started.md](docs/getting-started.md)
+Crates.io publication is planned for v0.1. Python and Node.js packages are available — see [docs/bindings.md](docs/bindings.md).
 
 ---
 
-## Python Bindings
+## 5-minute quickstart
 
-Install via maturin (requires Rust):
+```rust
+use sparrowdb::GraphDb;
 
-```bash
-cd crates/sparrowdb-python
-pip install maturin
-maturin develop
-```
+fn main() -> sparrowdb::Result<()> {
+    // Open (or create) a database directory
+    let db = GraphDb::open(std::path::Path::new("my.db"))?;
 
-Usage:
+    // Create nodes
+    db.execute("CREATE (alice:Person {name: 'Alice', age: 30})")?;
+    db.execute("CREATE (bob:Person   {name: 'Bob',   age: 25})")?;
+    db.execute("CREATE (carol:Person {name: 'Carol', age: 35})")?;
 
-```python
-import sparrowdb
+    // Create a relationship
+    db.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
+         CREATE (a)-[:KNOWS]->(b)",
+    )?;
 
-# Open or create a database
-db = sparrowdb.GraphDb("/tmp/my.db")
+    // Query Alice's friends
+    let result = db.execute(
+        "MATCH (a:Person {name: 'Alice'})-[:KNOWS]->(f:Person)
+         RETURN f.name",
+    )?;
+    for row in &result.rows {
+        println!("{:?}", row); // ["Bob"]
+    }
 
-# Execute Cypher — returns list of dicts
-rows = db.execute("MATCH (n:Person) RETURN n.name LIMIT 5")
-for row in rows:
-    print(row)
+    // Aggregate
+    let stats = db.execute(
+        "MATCH (p:Person) RETURN COUNT(*), AVG(p.age), MAX(p.age)",
+    )?;
+    println!("{:?}", stats.rows[0]); // [3, 30.0, 35]
 
-# Transactions
-with db.begin_write() as tx:
-    tx.commit()
+    // Paginate
+    let page = db.execute(
+        "MATCH (n:Person) RETURN n.name ORDER BY n.name SKIP 0 LIMIT 10",
+    )?;
 
-txn_id = db.begin_read().snapshot_txn_id
-
-# Maintenance
-db.checkpoint()
-db.optimize()
-```
-
-Python 3.9+ supported via stable ABI wheel (`abi3`).
-
----
-
-## Node.js Bindings
-
-Build via napi-rs (requires Rust):
-
-```bash
-cd crates/sparrowdb-node
-npm install -g @napi-rs/cli
-napi build --platform --release
-```
-
-Usage:
-
-```javascript
-const { SparrowDB } = require('./sparrowdb.node')
-
-// Open or create a database
-const db = SparrowDB.open('/path/to/my.db')
-
-// Execute Cypher — returns { columns, rows }
-const result = db.execute('MATCH (n:Person) RETURN n.name LIMIT 5')
-for (const row of result.rows) {
-  console.log(row['n.name'])
+    Ok(())
 }
-
-// Checkpoint the WAL
-db.checkpoint()
 ```
 
-TypeScript types are included. Value types map as: `null`, `number`, `boolean`, `string`, and structured objects `{ $type: "node" | "edge", id: string }` for graph elements.
+Full walkthrough: [docs/quickstart.md](docs/quickstart.md)
 
 ---
 
-## Ruby Bindings
+## What Cypher is supported
 
-Build via Magnus (requires Rust):
+| Feature | Status |
+|---------|--------|
+| `CREATE (n:Label {prop: val})` | ✅ |
+| `MATCH (n:Label) RETURN n.prop` | ✅ |
+| `MATCH (n)` — scan all labels | ✅ |
+| `WHERE` with `=`, `<>`, `<`, `<=`, `>`, `>=` | ✅ |
+| `WHERE n.prop CONTAINS str` | ✅ |
+| `WHERE n.prop IS NULL` / `IS NOT NULL` | ✅ |
+| 1-hop `(a)-[:REL]->(b)` | ✅ |
+| Multi-hop `(a)-[:R]->()-[:R]->(c)` | ✅ |
+| Undirected `(a)-[:REL]-(b)` | ✅ |
+| Variable-length paths `[:R*1..3]` | ✅ |
+| `RETURN DISTINCT` | ✅ |
+| `ORDER BY`, `LIMIT`, `SKIP` | ✅ |
+| `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT expr)` | ✅ |
+| `SUM`, `AVG`, `MIN`, `MAX`, `collect()` | ✅ |
+| `WITH … AS … WHERE` pipeline | ✅ |
+| `UNWIND list AS var` | ✅ |
+| `OPTIONAL MATCH` | ✅ |
+| `UNION` / `UNION ALL` | ✅ |
+| `MERGE` (upsert node) | ✅ |
+| `SET`, `DELETE` | ✅ |
+| `CREATE (a)-[:REL]->(b)` — edge creation | ✅ |
+| `CASE WHEN … THEN … ELSE … END` | ✅ |
+| `EXISTS { (n)-[:REL]->(:Label) }` | ✅ |
+| `shortestPath((a)-[:R*]->(b))` | ✅ |
+| `ANY / ALL / NONE / SINGLE` list predicates | ✅ |
+| `id(n)`, `labels(n)`, `type(r)` | ✅ |
+| `size()`, `range()`, `toInteger()`, `toString()` | ✅ |
+| `toUpper()`, `toLower()`, `trim()`, `replace()`, `substring()` | ✅ |
+| `abs()`, `ceil()`, `floor()`, `sqrt()`, `sign()` | ✅ |
+| `CALL db.index.fulltext.queryNodes` | ✅ |
+| `CALL db.schema()` | ✅ |
+| Parameters `$param` | ✅ |
+| MVCC write-write conflict detection | ✅ |
+| `coalesce()` | ⚠️ Not yet implemented |
+| Multi-label nodes `(n:A:B)` | ⚠️ Not yet implemented |
+| Subqueries `CALL { … }` | ⚠️ Partial |
+
+Full reference: [docs/cypher-reference.md](docs/cypher-reference.md)
+
+---
+
+## Bindings
+
+| Language | Install | Docs |
+|----------|---------|------|
+| **Rust** | `git` dependency (see above) | [docs/bindings.md#rust](docs/bindings.md#rust) |
+| **Python** | `pip install sparrowdb` (or maturin) | [docs/bindings.md#python](docs/bindings.md#python) |
+| **Node.js** | `npm install sparrowdb` | [docs/bindings.md#nodejs](docs/bindings.md#nodejs) |
+| **Ruby** | `gem install sparrowdb` (or rake compile) | [docs/bindings.md#ruby](docs/bindings.md#ruby) |
+
+---
+
+## CLI
 
 ```bash
-cd crates/sparrowdb-ruby
-bundle install
-bundle exec rake compile
+# One-shot query
+sparrowdb query --db my.db "MATCH (n:Person) RETURN n.name LIMIT 5"
+
+# Compact the WAL
+sparrowdb checkpoint --db my.db
+
+# Database info
+sparrowdb info --db my.db
 ```
 
-Usage:
-
-```ruby
-# Ruby (Magnus native gem)
-require 'sparrowdb'
-db = SparrowDB::GraphDb.new('/tmp/my.db')
-rows = db.execute('MATCH (n:Person) RETURN n.name')
-# => [{"n.name" => "Alice"}]
+Build the CLI:
+```bash
+cargo build --release --bin sparrowdb
 ```
 
----
+## MCP server
 
-## Development
+`sparrowdb-mcp` speaks JSON-RPC 2.0 over stdio — plug it into Claude Code or any MCP client:
 
 ```bash
-cargo build --workspace                          # build everything
-cargo test --workspace                           # all tests
-cargo bench -p sparrowdb-storage                 # benchmarks
-cargo run --bin gen-fixtures -- --seed 42 \
-  --out tests/fixtures/                          # regenerate datasets
-cargo clippy --all-targets -- -D warnings        # lint
-cargo fmt --all                                  # format
+cargo build --release --bin sparrowdb-mcp
 ```
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for worktree workflow, TDD conventions, and CI pipeline details.
+Tools exposed: `execute_cypher`, `checkpoint`, `info`.
 
 ---
 
-## Documentation
+## Guides
 
 | | |
 |---|---|
-| [docs/getting-started.md](docs/getting-started.md) | Install, first run, compile from source |
-| [docs/api-reference.md](docs/api-reference.md) | `GraphDb` API, `QueryResult`, error handling |
-| [docs/cypher-reference.md](docs/cypher-reference.md) | Full Cypher support table with examples |
-| [docs/use-cases.md](docs/use-cases.md) | Concrete workloads and perf targets |
-| [DEVELOPMENT.md](DEVELOPMENT.md) | Contributor workflow, TDD, CI |
+| [docs/quickstart.md](docs/quickstart.md) | Step-by-step first graph |
+| [docs/cypher-reference.md](docs/cypher-reference.md) | Full Cypher support reference |
+| [docs/bindings.md](docs/bindings.md) | Rust, Python, Node.js, Ruby |
+| [DEVELOPMENT.md](DEVELOPMENT.md) | Contributor workflow, architecture |
 
 ---
 
-## Contributing
+## Why SparrowDB
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). PRs require passing CI, clippy, and fmt.
-New durable formats require a committed golden binary fixture.
+- **Embedded** — links into your binary; zero infrastructure overhead
+- **Durable** — WAL-backed crash recovery; survives `kill -9`
+- **Encrypted** — optional XChaCha20-Poly1305 per-page encryption; wrong key returns an error, never silently decrypts garbage
+- **Factorized execution** — 2-hop friend-of-friend queries don't materialise O(N²) intermediate rows
+- **Multi-binding** — same database file, same Cypher, from Rust/Python/Node.js/Ruby
 
 ---
 
