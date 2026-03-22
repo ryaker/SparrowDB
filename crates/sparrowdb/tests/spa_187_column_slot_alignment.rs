@@ -82,11 +82,7 @@ fn mixed_props_return_correct_values_per_slot() {
 
     // Node 2 (age-only): name=NULL, age=30
     assert_eq!(rows[1].0, Value::Null, "age-only node: name must be NULL");
-    assert_eq!(
-        rows[1].1,
-        Value::Int64(30),
-        "age-only node: age must be 30"
-    );
+    assert_eq!(rows[1].1, Value::Int64(30), "age-only node: age must be 30");
 
     // Charlie: name='Charlie', age=25
     assert_eq!(
