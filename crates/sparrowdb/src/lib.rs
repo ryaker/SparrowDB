@@ -396,12 +396,25 @@ impl GraphDb {
                 .map(|entry| {
                     let col_id = col_id_of(&entry.key);
                     match &entry.value {
+                        sparrowdb_cypher::ast::Expr::Literal(
+                            sparrowdb_cypher::ast::Literal::Null,
+                        ) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+                            "CREATE property '{}' is null; use a concrete value",
+                            entry.key
+                        ))),
+                        sparrowdb_cypher::ast::Expr::Literal(
+                            sparrowdb_cypher::ast::Literal::Param(p),
+                        ) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+                            "CREATE property '{}' references parameter ${p}; runtime parameters are not yet supported in standalone CREATE",
+                            entry.key
+                        ))),
                         sparrowdb_cypher::ast::Expr::Literal(lit) => {
                             Ok((col_id, literal_to_value(lit)))
                         }
-                        _ => Err(sparrowdb_common::Error::InvalidArgument(
-                            "CREATE with relationship edges currently supports only literal node properties".into(),
-                        )),
+                        _ => Err(sparrowdb_common::Error::InvalidArgument(format!(
+                            "CREATE property '{}' must be a literal value (int, float, bool, or string)",
+                            entry.key
+                        ))),
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
