@@ -52,7 +52,11 @@ fn contains_basic_match() {
         .execute("MATCH (n:Doc) WHERE n.body CONTAINS 'hi' RETURN n.title")
         .expect("MATCH WHERE CONTAINS");
 
-    assert_eq!(result.rows.len(), 2, "expected 2 rows — A and B contain 'hi'");
+    assert_eq!(
+        result.rows.len(),
+        2,
+        "expected 2 rows — A and B contain 'hi'"
+    );
     let titles: Vec<&Value> = result.rows.iter().map(|r| &r[0]).collect();
     assert!(
         titles.contains(&&Value::String("A".to_string())),
@@ -83,7 +87,11 @@ fn contains_no_match() {
         .execute("MATCH (n:Doc) WHERE n.body CONTAINS 'zzz' RETURN n.title")
         .expect("MATCH WHERE CONTAINS no match — must not error");
 
-    assert_eq!(result.rows.len(), 0, "expected 0 rows — no body contains 'zzz'");
+    assert_eq!(
+        result.rows.len(),
+        0,
+        "expected 0 rows — no body contains 'zzz'"
+    );
 }
 
 // ── CONTAINS: missing property → no match (not error) ────────────────────────
