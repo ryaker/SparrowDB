@@ -166,11 +166,7 @@ fn spa190_unwind_integer_param_resolves_list() {
     let mut params = HashMap::new();
     params.insert(
         "nums".into(),
-        Value::List(vec![
-            Value::Int64(10),
-            Value::Int64(20),
-            Value::Int64(30),
-        ]),
+        Value::List(vec![Value::Int64(10), Value::Int64(20), Value::Int64(30)]),
     );
 
     let result = db
