@@ -236,7 +236,7 @@ impl WalReplayer {
     pub fn scan_schema(wal_dir: &Path) -> Result<WalSchema> {
         let segments = match collect_segments(wal_dir) {
             Ok(s) => s,
-            Err(Error::Io(_)) => {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(WalSchema {
                     node_props: HashMap::new(),
                     rel_props: HashMap::new(),
@@ -251,7 +251,8 @@ impl WalReplayer {
             let path = segment_path(wal_dir, *seg_no);
             let data = match std::fs::read(&path) {
                 Ok(d) => d,
-                Err(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::Io(e)),
             };
             let mut offset = 0usize;
             while offset < data.len() {
