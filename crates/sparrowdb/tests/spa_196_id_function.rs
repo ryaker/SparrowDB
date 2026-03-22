@@ -94,42 +94,29 @@ fn id_in_where_filters_by_id() {
         .expect("scan with id() must succeed");
     assert_eq!(all.rows.len(), 3, "should have 3 Tag nodes");
 
-    // Pick the ID of the second node and verify we can filter by it.
-    let target_id = match all.rows[1][0] {
-        Value::Int64(v) => v,
-        ref other => panic!("expected Int64 id, got {:?}", other),
+    // Pick the ID and label of the second node.
+    let (target_id, target_label) = match (&all.rows[1][0], &all.rows[1][1]) {
+        (Value::Int64(id), Value::String(lbl)) => (*id, lbl.clone()),
+        other => panic!("expected (Int64, String), got {:?}", other),
     };
 
-    // Filtering by the raw integer literal won't match because id() returns
-    // an internal opaque integer — just verify the value is non-null and
-    // that all nodes have strictly positive ids (slots start at 0 and the
-    // compound NodeId packs label_id << 32 | slot, so it will be >= 0).
-    for row in &all.rows {
-        let nid = match row[0] {
-            Value::Int64(v) => v,
-            ref other => panic!("id must be Int64, got {:?}", other),
-        };
-        assert!(
-            nid >= 0,
-            "internal node ID must be non-negative, got {}",
-            nid
-        );
-    }
+    // Filter using WHERE id(n) = <literal> and verify exactly one row is returned.
+    let query = format!("MATCH (n:Tag) WHERE id(n) = {} RETURN n.label", target_id);
+    let result = db.execute(&query).expect("WHERE id(n) = X must not error");
 
-    // Confirm the target_id is present among the returned IDs.
-    let ids: Vec<i64> = all
-        .rows
-        .iter()
-        .map(|r| match r[0] {
-            Value::Int64(v) => v,
-            _ => panic!("unexpected non-int64 id"),
-        })
-        .collect();
-    assert!(
-        ids.contains(&target_id),
-        "target_id {} must appear in {:?}",
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "WHERE id(n) = {} should return exactly 1 row, got {} rows",
         target_id,
-        ids
+        result.rows.len(),
+    );
+    assert_eq!(
+        result.rows[0][0],
+        Value::String(target_label.clone()),
+        "filtered row must have label '{}', got {:?}",
+        target_label,
+        result.rows[0][0],
     );
 }
 
@@ -152,49 +139,5 @@ fn id_with_alias_returns_correct_column() {
         matches!(result.rows[0][0], Value::Int64(_)),
         "nid column must be Int64, got {:?}",
         result.rows[0][0]
-    );
-}
-
-// ── WHERE id(n) = X actually filters by the id ───────────────────────────────
-
-/// Verify that `WHERE id(n) = <literal>` actually filters rows to a single node.
-#[test]
-fn id_in_where_actually_filters() {
-    let (_dir, db) = make_db();
-
-    db.execute("CREATE (n:Fruit {name: 'apple'})").unwrap();
-    db.execute("CREATE (n:Fruit {name: 'banana'})").unwrap();
-    db.execute("CREATE (n:Fruit {name: 'cherry'})").unwrap();
-
-    // Get all IDs.
-    let all = db
-        .execute("MATCH (n:Fruit) RETURN id(n) as nid, n.name as nm")
-        .expect("initial scan must succeed");
-    assert_eq!(all.rows.len(), 3);
-
-    // Pick one specific ID to filter by.
-    let (target_id, target_name) = match (&all.rows[1][0], &all.rows[1][1]) {
-        (Value::Int64(id), Value::String(name)) => (*id, name.clone()),
-        other => panic!("unexpected row values: {:?}", other),
-    };
-
-    // Execute WHERE id(n) = <literal> and verify exactly one row is returned.
-    let query = format!("MATCH (n:Fruit) WHERE id(n) = {} RETURN n.name", target_id);
-    let result = db.execute(&query).expect("WHERE id(n) = X must not error");
-
-    assert_eq!(
-        result.rows.len(),
-        1,
-        "WHERE id(n) = {} should return exactly 1 row, got {} rows. Query: {}",
-        target_id,
-        result.rows.len(),
-        query,
-    );
-    assert_eq!(
-        result.rows[0][0],
-        Value::String(target_name.clone()),
-        "filtered row must have name '{}', got {:?}",
-        target_name,
-        result.rows[0][0],
     );
 }
