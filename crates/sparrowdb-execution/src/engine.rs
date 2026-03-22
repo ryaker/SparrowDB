@@ -486,7 +486,8 @@ impl Engine {
                         if self.is_node_tombstoned(node_id) {
                             continue;
                         }
-                        if !self.node_matches_prop_filter(node_id, &filter_col_ids, &node_pat.props) {
+                        if !self.node_matches_prop_filter(node_id, &filter_col_ids, &node_pat.props)
+                        {
                             continue;
                         }
 
@@ -583,14 +584,19 @@ impl Engine {
                     if self.is_node_tombstoned(src_node) {
                         continue;
                     }
-                    if !self.node_matches_prop_filter(src_node, &src_filter_cols, &src_node_pat.props) {
+                    if !self.node_matches_prop_filter(
+                        src_node,
+                        &src_filter_cols,
+                        &src_node_pat.props,
+                    ) {
                         continue;
                     }
 
                     // Collect outgoing neighbours (CSR + delta adjacency map).
                     let csr_neighbors = self.csr.neighbors(src_slot);
                     let empty: Vec<u64> = Vec::new();
-                    let delta_neighbors: &[u64] = delta_adj.get(&src_slot).map_or(&empty, |v| v.as_slice());
+                    let delta_neighbors: &[u64] =
+                        delta_adj.get(&src_slot).map_or(&empty, |v| v.as_slice());
 
                     let mut seen: HashSet<u64> = HashSet::new();
                     for &dst_slot in csr_neighbors.iter().chain(delta_neighbors.iter()) {
@@ -602,7 +608,11 @@ impl Engine {
                         if self.is_node_tombstoned(dst_node) {
                             continue;
                         }
-                        if !self.node_matches_prop_filter(dst_node, &dst_filter_cols, &dst_node_pat.props) {
+                        if !self.node_matches_prop_filter(
+                            dst_node,
+                            &dst_filter_cols,
+                            &dst_node_pat.props,
+                        ) {
                             continue;
                         }
 

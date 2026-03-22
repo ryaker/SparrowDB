@@ -30,8 +30,10 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 fn match_create_exactly_one_edge_with_props() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
 
     db.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
@@ -60,8 +62,10 @@ fn match_create_exactly_one_edge_with_props() {
 fn match_create_correct_endpoints() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
 
     db.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
@@ -106,10 +110,14 @@ fn match_create_correct_endpoints() {
 fn match_create_no_cartesian_product_with_extra_nodes() {
     let (_dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
-    db.execute("CREATE (n:Person {name: 'Bob'})").expect("CREATE Bob");
-    db.execute("CREATE (n:Person {name: 'Carol'})").expect("CREATE Carol");
-    db.execute("CREATE (n:Person {name: 'Dave'})").expect("CREATE Dave");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
+    db.execute("CREATE (n:Person {name: 'Carol'})")
+        .expect("CREATE Carol");
+    db.execute("CREATE (n:Person {name: 'Dave'})")
+        .expect("CREATE Dave");
 
     // Should create exactly ONE KNOWS edge: Alice → Bob.
     db.execute(
@@ -144,7 +152,8 @@ fn match_create_no_match_no_edge_regression() {
 
     let (dir, db) = make_db();
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").expect("CREATE Alice");
+    db.execute("CREATE (n:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
 
     // 'Ghost' does not exist → MATCH yields no rows → no edges.
     db.execute(
@@ -166,6 +175,10 @@ fn match_create_no_match_no_edge_regression() {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn row(result: &sparrowdb_execution::types::QueryResult, r: usize, c: usize) -> sparrowdb_execution::types::Value {
+fn row(
+    result: &sparrowdb_execution::types::QueryResult,
+    r: usize,
+    c: usize,
+) -> sparrowdb_execution::types::Value {
     result.rows[r][c].clone()
 }
