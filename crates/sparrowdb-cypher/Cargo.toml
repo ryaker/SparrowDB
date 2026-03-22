@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+description = "Cypher query parser and planner for SparrowDB"
+keywords = ["graph", "cypher", "query", "parser", "database"]
+categories = ["database", "parser-implementations"]
 
 [dependencies]
 sparrowdb-common  = { workspace = true }

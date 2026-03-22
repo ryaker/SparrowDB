@@ -16,17 +16,17 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 authors = ["Rich Yaker"]
 repository = "https://github.com/ryaker/SparrowDB"
 
 [workspace.dependencies]
-sparrowdb-common = { path = "crates/sparrowdb-common" }
-sparrowdb-storage = { path = "crates/sparrowdb-storage" }
-sparrowdb-catalog = { path = "crates/sparrowdb-catalog" }
-sparrowdb-cypher  = { path = "crates/sparrowdb-cypher" }
-sparrowdb-execution = { path = "crates/sparrowdb-execution" }
-sparrowdb = { path = "crates/sparrowdb" }
+sparrowdb-common = { path = "crates/sparrowdb-common", version = "0.1.0" }
+sparrowdb-storage = { path = "crates/sparrowdb-storage", version = "0.1.0" }
+sparrowdb-catalog = { path = "crates/sparrowdb-catalog", version = "0.1.0" }
+sparrowdb-cypher  = { path = "crates/sparrowdb-cypher", version = "0.1.0" }
+sparrowdb-execution = { path = "crates/sparrowdb-execution", version = "0.1.0" }
+sparrowdb = { path = "crates/sparrowdb", version = "0.1.0" }
 tempfile          = "3"
 crc32fast         = "1"
 crc32c            = "0.6"

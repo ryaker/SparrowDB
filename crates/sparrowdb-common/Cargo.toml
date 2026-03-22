@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+description = "Shared types and primitives for SparrowDB embedded graph database"
+keywords = ["graph", "database", "embedded", "nosql"]
+categories = ["database", "data-structures"]
 
 [dependencies]
 crc32fast = { workspace = true }

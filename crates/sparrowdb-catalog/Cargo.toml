@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+description = "Schema catalog (labels, properties, rel-types) for SparrowDB"
+keywords = ["graph", "database", "schema", "catalog", "embedded"]
+categories = ["database", "data-structures"]
 
 [dependencies]
 sparrowdb-common = { workspace = true }

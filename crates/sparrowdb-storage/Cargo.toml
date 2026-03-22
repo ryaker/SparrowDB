@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+description = "Storage engine (WAL, node store, edge store, CSR) for SparrowDB"
+keywords = ["graph", "database", "storage", "wal", "embedded"]
+categories = ["database", "filesystem"]
 
 [dependencies]
 sparrowdb-common  = { workspace = true }

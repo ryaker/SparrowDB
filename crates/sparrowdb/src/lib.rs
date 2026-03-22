@@ -28,12 +28,36 @@
 //! ```
 
 use sparrowdb_catalog::catalog::Catalog;
-use sparrowdb_common::{col_id_of, EdgeId, Error, NodeId, Result, TxnId};
-use sparrowdb_execution::{Engine, QueryResult};
+use sparrowdb_common::{col_id_of, TxnId};
+use sparrowdb_execution::Engine;
+
+// ── Public re-exports ─────────────────────────────────────────────────────────
+//
+// Re-export the types that consumers of the top-level `sparrowdb` crate need
+// without also having to depend on the sub-crates directly.
+
+/// Query result returned by [`GraphDb::execute`] and [`GraphDb::execute_write`].
+/// Contains column names and rows of scalar [`Value`] cells.
+pub use sparrowdb_execution::QueryResult;
+
+/// Scalar value type used in query results and node property reads/writes.
+pub use sparrowdb_storage::node_store::Value;
+
+/// Opaque 64-bit node identifier.
+pub use sparrowdb_common::NodeId;
+
+/// Opaque 64-bit edge identifier.
+pub use sparrowdb_common::EdgeId;
+
+/// Error type returned by all SparrowDB operations.
+pub use sparrowdb_common::Error;
+
+/// Convenience alias: `std::result::Result<T, sparrowdb::Error>`.
+pub use sparrowdb_common::Result;
 use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
 use sparrowdb_storage::maintenance::MaintenanceEngine;
-use sparrowdb_storage::node_store::{NodeStore, Value};
+use sparrowdb_storage::node_store::NodeStore;
 use sparrowdb_storage::wal::codec::{WalPayload, WalRecordKind};
 use sparrowdb_storage::wal::writer::WalWriter;
 use std::collections::{HashMap, HashSet};
