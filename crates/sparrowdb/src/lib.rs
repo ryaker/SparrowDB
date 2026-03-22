@@ -1625,7 +1625,7 @@ pub fn fnv1a_col_id(key: &str) -> u32 {
 ///
 /// Two characters require escaping inside Cypher single-quoted strings:
 /// * `\` → `\\`  (backslash must be doubled first to avoid misinterpreting
-///                the subsequent escape sequence)
+///   the subsequent escape sequence)
 /// * `'` → `\'`  (prevents premature termination of the string literal)
 ///
 /// # Example
