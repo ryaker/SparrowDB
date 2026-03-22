@@ -182,14 +182,21 @@ fn call_yield_node_usable_in_return() {
     db.create_fulltext_index("propIndex")
         .expect("create fulltext index");
 
-    // Create a node with a known integer col_0 value.
+    // Create a node with a known integer property value.
+    // SPA-165: use create_node_named so the property is stored under its
+    // FNV-1a col_id (derived from the name "score"), not at bare col_id 0.
+    // Querying via node.score then round-trips correctly regardless of whether
+    // the name starts with "col_".
     let expected_val: i64 = 42;
     {
         let mut tx = db.begin_write().expect("begin_write");
         let label_id = tx.create_label("Doc").expect("create_label") as u32;
         let node_id = tx
-            .create_node(label_id, &[(0, StoreValue::Int64(expected_val))])
-            .expect("create_node");
+            .create_node_named(
+                label_id,
+                &[("score".to_string(), StoreValue::Int64(expected_val))],
+            )
+            .expect("create_node_named");
         tx.add_to_fulltext_index("propIndex", node_id, "knowledge graph")
             .expect("index node");
         tx.commit().expect("commit");
@@ -210,19 +217,19 @@ fn call_yield_node_usable_in_return() {
         &result.rows[0][0]
     );
 
-    // CALL with RETURN node.col_0 — verifies property projection from yielded NodeRef.
+    // CALL with RETURN node.score — verifies property projection from yielded NodeRef.
     let result2 = db
         .execute(
             "CALL db.index.fulltext.queryNodes('propIndex', 'knowledge') YIELD node \
-             RETURN node.col_0",
+             RETURN node.score",
         )
-        .expect("CALL with RETURN node.col_0");
+        .expect("CALL with RETURN node.score");
 
     assert_eq!(result2.rows.len(), 1, "one node should match");
     assert_eq!(
         result2.rows[0][0],
         Value::Int64(expected_val),
-        "RETURN node.col_0 should project the stored property value, got {:?}",
+        "RETURN node.score should project the stored property value, got {:?}",
         &result2.rows[0][0]
     );
 }
