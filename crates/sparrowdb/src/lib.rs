@@ -826,6 +826,57 @@ impl GraphDb {
         FulltextIndex::create(&self.inner.path, name)?;
         Ok(())
     }
+
+    /// Return `(node_count, edge_count)` by summing the high-water marks
+    /// across all catalog labels (nodes) and delta-log record counts across
+    /// all registered relationship tables (edges).
+    ///
+    /// Both counts reflect committed storage state; in-flight write
+    /// transactions are not visible.
+    ///
+    /// **Note:** `node_count` is based on per-label high-water marks and
+    /// therefore includes soft-deleted nodes whose slots have not yet been
+    /// reclaimed.  The count will converge to the true live-node count once
+    /// compaction / GC is implemented.
+    pub fn db_counts(&self) -> Result<(u64, u64)> {
+        let path = &self.inner.path;
+        let catalog = Catalog::open(path)?;
+        let node_store = NodeStore::open(path)?;
+
+        // Node count: sum hwm_for_label across every registered label.
+        let node_count: u64 = catalog
+            .list_labels()
+            .unwrap_or_default()
+            .iter()
+            .map(|(label_id, _name)| node_store.hwm_for_label(*label_id as u32).unwrap_or(0))
+            .sum();
+
+        // Edge count: for each registered rel table, sum CSR base edges (post-checkpoint)
+        // plus delta-log records (pre-checkpoint / unflushed).
+        let rel_table_ids = catalog.list_rel_table_ids();
+        let ids_to_scan: Vec<u64> = if rel_table_ids.is_empty() {
+            // No rel tables in catalog yet — fall back to the default table (id=0).
+            vec![0]
+        } else {
+            rel_table_ids.iter().map(|(id, _, _, _)| *id).collect()
+        };
+        let edge_count: u64 = ids_to_scan
+            .iter()
+            .map(|&id| {
+                let Ok(store) = EdgeStore::open(path, RelTableId(id as u32)) else {
+                    return 0;
+                };
+                let csr_edges = store.open_fwd().map(|csr| csr.n_edges()).unwrap_or(0);
+                let delta_edges = store
+                    .read_delta()
+                    .map(|records| records.len() as u64)
+                    .unwrap_or(0);
+                csr_edges + delta_edges
+            })
+            .sum();
+
+        Ok((node_count, edge_count))
+    }
 }
 
 /// Convenience wrapper — equivalent to [`GraphDb::open`].
@@ -866,7 +917,7 @@ impl ReadTx {
                 if let Some(v) = versions.get_at(node_id, col_id, self.snapshot_txn_id) {
                     (col_id, v)
                 } else {
-                    (col_id, Value::int64_from_u64(raw_val))
+                    (col_id, self.store.decode_raw_value(raw_val))
                 }
             })
             .collect();
@@ -1001,7 +1052,7 @@ impl WriteTx {
                 .get_node_raw(node_id, &[col_id])
                 .ok()
                 .and_then(|mut v| v.pop())
-                .map(|(_, raw)| Value::int64_from_u64(raw));
+                .map(|(_, raw)| self.store.decode_raw_value(raw));
             disk_val.map(|v| (prev_txn_id, v))
         };
 
@@ -1070,7 +1121,9 @@ impl WriteTx {
                         op_props
                             .iter()
                             .find(|&&(c, _)| c == *col_id)
-                            .map(|(_, v)| v.to_u64() == want_val.to_u64())
+                            // Compare in-memory Value objects directly so long
+                            // strings (> 7 bytes) are not truncated (SPA-212).
+                            .map(|(_, v)| v == want_val)
                             .unwrap_or(false)
                     });
                     if matches {
@@ -1091,7 +1144,11 @@ impl WriteTx {
                     stored
                         .iter()
                         .find(|&&(c, _)| c == *col_id)
-                        .map(|&(_, raw)| raw == want_val.to_u64())
+                        .map(|&(_, raw)| {
+                            // Compare decoded values so overflow strings (> 7 bytes)
+                            // match correctly (SPA-212).
+                            self.store.decode_raw_value(raw) == *want_val
+                        })
                         .unwrap_or(false)
                 });
                 if matches {

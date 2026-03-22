@@ -31,33 +31,33 @@ It runs Cypher queries over a durable on-disk graph using a factorized execution
 | infra | Criterion benchmarks + deterministic fixture generator | ✅ Done |
 | 6 (cont.) | Spill-to-disk (ORDER BY + ASP-Join), PyO3 Python bindings, CLI + MCP server | ✅ Done |
 | 7 | Mutation Cypher: MERGE, SET, DELETE, CREATE edge, WAL records, MVCC | ✅ Done |
-| 8 | UNWIND clause, multi-hop variable paths, function library | 🔄 In Progress |
+| 8 | UNWIND, variable-length paths, function library, Node.js bindings | ✅ Done |
 | 9–11 | LDBC SNB benchmark, Neo4j import bridge, publication | ⏳ Planned |
 
-Acceptance checks passing: 1-hop scan, 2-hop ASP-Join, WAL crash recovery, CHECKPOINT/OPTIMIZE, snapshot isolation, encryption auth, spill-to-disk sort + join, Python binding round-trip, mutation (MERGE/SET/DELETE/CREATE edge), MVCC write-write conflict detection.
+Acceptance checks passing: 1-hop scan, 2-hop ASP-Join, WAL crash recovery, CHECKPOINT/OPTIMIZE, snapshot isolation, encryption auth, spill-to-disk sort + join, Python binding round-trip, Node.js binding round-trip, mutation (MERGE/SET/DELETE/CREATE edge), MVCC write-write conflict detection, UNWIND, variable-length paths, full-text search, list predicates, IS NULL / IS NOT NULL.
 
 ---
 
 ## Quickstart
 
 ```rust
-use sparrowdb::Engine;
+use sparrowdb::GraphDb;
 
 // Open or create a database directory
-let engine = Engine::open("my.db")?;
+let db = GraphDb::open("my.db")?;
 
 // Create nodes
-engine.execute("CREATE (a:Person {name: \"Alice\"})")?;
-engine.execute("CREATE (b:Person {name: \"Bob\"})")?;
+db.execute("CREATE (a:Person {name: \"Alice\"})")?;
+db.execute("CREATE (b:Person {name: \"Bob\"})")?;
 
 // Create an edge
-engine.execute(
+db.execute(
     "MATCH (a:Person {name: \"Alice\"}), (b:Person {name: \"Bob\"})
      CREATE (a)-[:KNOWS]->(b)"
 )?;
 
 // 1-hop query
-let result = engine.execute(
+let result = db.execute(
     "MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->(f:Person) RETURN f.name"
 )?;
 for row in &result.rows {
@@ -65,9 +65,14 @@ for row in &result.rows {
 }
 
 // 2-hop query (factorized, no Cartesian blowup)
-let fof = engine.execute(
+let fof = db.execute(
     "MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->()-[:KNOWS]->(fof:Person)
      RETURN DISTINCT fof.name"
+)?;
+
+// Paginate results
+let page2 = db.execute(
+    "MATCH (n:Person) RETURN n.name ORDER BY n.name SKIP 10 LIMIT 10"
 )?;
 ```
 
@@ -111,22 +116,35 @@ Tools: `execute_cypher`, `checkpoint`, `info`.
 |---------|-----------|
 | `CREATE (n:Label {prop: val})` | ✅ |
 | `MATCH (n:Label) RETURN n.prop` | ✅ |
+| `MATCH (n)` without label (scans all labels) | ✅ |
 | `WHERE n.prop = val` | ✅ |
 | `WHERE n.prop CONTAINS str` | ✅ |
+| `WHERE n.prop IS NULL` / `IS NOT NULL` | ✅ |
 | 1-hop `MATCH (a)-[:REL]->(b)` | ✅ |
 | 2-hop `MATCH (a)-[:R]->()-[:R]->(c)` | ✅ |
+| Undirected `MATCH (a)-[:REL]-(b)` | ✅ |
+| Variable-length paths `[:R*1..3]` | ✅ |
 | Relationship variables `[r:REL]` | ✅ |
 | `RETURN DISTINCT` | ✅ |
 | `ORDER BY`, `LIMIT` | ✅ |
-| `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | ✅ |
+| `SKIP` (result pagination) | ✅ |
+| `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT expr)` | ✅ |
+| `SUM`, `AVG`, `MIN`, `MAX` | ✅ |
+| `COLLECT()` aggregation | ✅ |
+| `ANY/ALL/NONE/SINGLE` list predicates | ✅ |
+| `id(n)`, `type(r)`, `labels(n)` functions | ✅ |
 | Parameters `$param` | ✅ |
 | `DELETE`, `SET` | ✅ |
 | `MERGE` (upsert node) | ✅ |
 | `CREATE (a)-[:REL]->(b)` (edge creation) | ✅ |
 | MVCC write-write conflict detection | ✅ |
-| `OPTIONAL MATCH` | ❌ |
-| Variable-length paths `[:R*1..3]` | ❌ |
-| `UNION`, `UNWIND`, subqueries | ❌ |
+| `UNWIND list AS var` | ✅ |
+| `OPTIONAL MATCH` | ✅ |
+| `UNION` / `UNION ALL` | ✅ |
+| `CALL db.index.fulltext.queryNodes` | ✅ |
+| Reserved label prefix `__SO_` protection | ✅ |
+| Subqueries, `WITH` chaining | ⚠️ Partial |
+| `UNION` across complex multi-clause queries | ⚠️ Partial |
 
 Full reference: [docs/cypher-reference.md](docs/cypher-reference.md)
 
@@ -143,12 +161,13 @@ crates/
   sparrowdb-execution/  # TypedVector, FactorizedChunk, operators, ASP-Join, spill
   sparrowdb/            # Public Rust API (GraphDb entry point)
   sparrowdb-python/     # PyO3 bindings (maturin wheel)
+  sparrowdb-node/       # napi-rs Node.js/TypeScript bindings
   sparrowdb-cli/        # `sparrowdb` CLI binary (query/checkpoint/info)
   sparrowdb-mcp/        # JSON-RPC 2.0 MCP server over stdio
 
 tests/
   fixtures/             # Golden binary fixtures + small seeded JSON datasets
-  integration/          # End-to-end use-case tests (UC-1 through UC-6)
+  integration/          # End-to-end use-case tests (UC-1 through UC-7)
 
 benches/                # Criterion benchmarks (WAL, CSR, metapage, CRC32C)
 specs/                  # Byte-exact implementation spec (source of truth)
@@ -237,6 +256,38 @@ Python 3.9+ supported via stable ABI wheel (`abi3`).
 
 ---
 
+## Node.js Bindings
+
+Build via napi-rs (requires Rust):
+
+```bash
+cd crates/sparrowdb-node
+npm install -g @napi-rs/cli
+napi build --platform --release
+```
+
+Usage:
+
+```javascript
+const { SparrowDB } = require('./sparrowdb.node')
+
+// Open or create a database
+const db = SparrowDB.open('/path/to/my.db')
+
+// Execute Cypher — returns { columns, rows }
+const result = db.execute('MATCH (n:Person) RETURN n.name LIMIT 5')
+for (const row of result.rows) {
+  console.log(row['n.name'])
+}
+
+// Checkpoint the WAL
+db.checkpoint()
+```
+
+TypeScript types are included. Value types map as: `null`, `number`, `boolean`, `string`, and structured objects `{ $type: "node" | "edge", id: string }` for graph elements.
+
+---
+
 ## Development
 
 ```bash
@@ -258,7 +309,7 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for worktree workflow, TDD conventions, and
 | | |
 |---|---|
 | [docs/getting-started.md](docs/getting-started.md) | Install, first run, compile from source |
-| [docs/api-reference.md](docs/api-reference.md) | `Engine` API, `QueryResult`, error handling |
+| [docs/api-reference.md](docs/api-reference.md) | `GraphDb` API, `QueryResult`, error handling |
 | [docs/cypher-reference.md](docs/cypher-reference.md) | Full Cypher support table with examples |
 | [docs/use-cases.md](docs/use-cases.md) | Concrete workloads and perf targets |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Contributor workflow, TDD, CI |

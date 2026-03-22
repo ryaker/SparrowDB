@@ -107,6 +107,14 @@ fn value_to_rb(ruby: &Ruby, v: &sparrowdb_execution::Value) -> Value {
             }
             arr.as_value()
         }
+        // Map: produced by bare node variable projection (SPA-213) — convert to a Ruby Hash.
+        Ev::Map(entries) => {
+            let hash = ruby.hash_new();
+            for (k, v) in entries {
+                let _ = hash.aset(ruby.str_new(k), value_to_rb(ruby, v));
+            }
+            hash.as_value()
+        }
     }
 }
 

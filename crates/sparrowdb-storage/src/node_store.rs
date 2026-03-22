@@ -48,13 +48,22 @@ pub enum Value {
 
 /// Type tag embedded in the top byte (byte index 7 in LE) of a stored `u64`.
 ///
-/// - `0x00` = `Int64`  — lower 7 bytes hold the signed integer (56-bit range).
-/// - `0x01` = `Bytes`  — lower 7 bytes hold up to 7 bytes of inline string data.
+/// - `0x00` = `Int64`       — lower 7 bytes hold the signed integer (56-bit range).
+/// - `0x01` = `Bytes`       — lower 7 bytes hold up to 7 bytes of inline string data.
+/// - `0x02` = `BytesOverflow` — lower 7 bytes encode `(offset: u40 LE, len: u16 LE)`
+///   pointing into `strings.bin` (SPA-212).
 ///
-/// This encoding lets `from_u64` reconstruct the original `Value` variant
-/// without needing an out-of-band schema lookup, fixing SPA-169.
+/// The overflow encoding packs a heap pointer into 7 bytes:
+///   bytes[0..5] = heap byte offset (u40 LE, max ~1 TiB)
+///   bytes[5..7] = byte length (u16 LE, max 65535 bytes)
+///
+/// This lets `decode_raw_value` reconstruct strings of any length, fixing SPA-212.
 const TAG_INT64: u8 = 0x00;
 const TAG_BYTES: u8 = 0x01;
+/// Tag for strings > 7 bytes stored in the overflow string heap (SPA-212).
+const TAG_BYTES_OVERFLOW: u8 = 0x02;
+/// Maximum bytes that fit inline in the 7-byte payload (one byte is the tag).
+const MAX_INLINE_BYTES: usize = 7;
 
 impl Value {
     /// Encode as a packed `u64` for column storage.
@@ -62,6 +71,11 @@ impl Value {
     /// The top byte (byte 7 in little-endian) is a type tag; the remaining
     /// 7 bytes carry the payload.  This allows `from_u64` to reconstruct the
     /// correct variant at read time (SPA-169).
+    ///
+    /// For `Bytes` values that exceed 7 bytes, this method only encodes the
+    /// first 7 bytes inline.  Callers that need full overflow support must use
+    /// [`NodeStore::encode_value`] instead, which writes long strings to the
+    /// heap and returns an overflow-tagged u64 (SPA-212).
     ///
     /// # Int64 range
     /// Only the lower 56 bits of the integer are stored.  This covers all
@@ -81,7 +95,7 @@ impl Value {
             Value::Bytes(b) => {
                 let mut arr = [0u8; 8];
                 arr[7] = TAG_BYTES; // type tag in top byte
-                let len = b.len().min(7);
+                let len = b.len().min(MAX_INLINE_BYTES);
                 arr[..len].copy_from_slice(&b[..len]);
                 u64::from_le_bytes(arr)
             }
@@ -90,6 +104,10 @@ impl Value {
 
     /// Reconstruct a `Value` from a stored `u64`, using the top byte as a
     /// type tag (SPA-169).
+    ///
+    /// Only handles inline encodings (`TAG_INT64` and `TAG_BYTES`).
+    /// For overflow strings (`TAG_BYTES_OVERFLOW`), use [`NodeStore::decode_raw_value`]
+    /// which has access to the string heap (SPA-212).
     pub fn from_u64(v: u64) -> Self {
         let bytes = v.to_le_bytes(); // bytes[7] = top byte = tag
         match bytes[7] {
@@ -125,7 +143,12 @@ impl Value {
 /// ```text
 /// {root}/nodes/{label_id}/hwm.bin            — high-water mark (u64 LE)
 /// {root}/nodes/{label_id}/col_{col_id}.bin   — flat u64 column array
+/// {root}/strings.bin                         — overflow string heap (SPA-212)
 /// ```
+///
+/// The overflow heap is an append-only byte file.  Each entry is a raw byte
+/// sequence (no length prefix); the offset and length are encoded into the
+/// `TAG_BYTES_OVERFLOW` u64 stored in the column file.
 pub struct NodeStore {
     root: PathBuf,
     /// In-memory high-water marks per label.  Loaded lazily from disk.
@@ -153,6 +176,149 @@ impl NodeStore {
 
     fn col_path(&self, label_id: u32, col_id: u32) -> PathBuf {
         self.label_dir(label_id).join(format!("col_{col_id}.bin"))
+    }
+
+    /// Path to the overflow string heap (shared across all labels).
+    fn strings_bin_path(&self) -> PathBuf {
+        self.root.join("strings.bin")
+    }
+
+    // ── Overflow string heap (SPA-212) ────────────────────────────────────────
+
+    /// Append `bytes` to the overflow string heap and return an
+    /// `TAG_BYTES_OVERFLOW`-tagged `u64` encoding the (offset, len) pair.
+    ///
+    /// Layout of the returned `u64` (little-endian bytes):
+    ///   bytes[0..5] = heap byte offset as u40 LE  (max ~1 TiB)
+    ///   bytes[5..7] = byte length as u16 LE       (max 65 535 bytes)
+    ///   bytes[7]    = `TAG_BYTES_OVERFLOW` (0x02)
+    fn append_to_string_heap(&self, bytes: &[u8]) -> Result<u64> {
+        use std::io::{Seek, SeekFrom, Write};
+        let path = self.strings_bin_path();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .append(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(Error::Io)?;
+
+        // The heap offset is the current end of the file.
+        let offset = file.seek(SeekFrom::End(0)).map_err(Error::Io)?;
+        file.write_all(bytes).map_err(Error::Io)?;
+
+        // Encode (offset, len) into a 7-byte payload.
+        let len = bytes.len() as u64;
+        debug_assert!(
+            offset <= 0x00FF_FFFF_FFFF_u64,
+            "string heap too large for 5-byte offset"
+        );
+        debug_assert!(len <= 0xFFFF, "string longer than 65535 bytes");
+
+        let mut arr = [0u8; 8];
+        // Store offset in bytes[0..5] (40-bit LE).
+        arr[0] = offset as u8;
+        arr[1] = (offset >> 8) as u8;
+        arr[2] = (offset >> 16) as u8;
+        arr[3] = (offset >> 24) as u8;
+        arr[4] = (offset >> 32) as u8;
+        // Store len in bytes[5..7] (16-bit LE).
+        arr[5] = len as u8;
+        arr[6] = (len >> 8) as u8;
+        // Tag byte.
+        arr[7] = TAG_BYTES_OVERFLOW;
+        Ok(u64::from_le_bytes(arr))
+    }
+
+    /// Read string bytes from the overflow heap given an `TAG_BYTES_OVERFLOW`
+    /// tagged `u64` produced by [`append_to_string_heap`].
+    fn read_from_string_heap(&self, tagged: u64) -> Result<Vec<u8>> {
+        let arr = tagged.to_le_bytes();
+        debug_assert_eq!(arr[7], TAG_BYTES_OVERFLOW, "not an overflow pointer");
+
+        // Decode (offset, len).
+        let offset = arr[0] as u64
+            | ((arr[1] as u64) << 8)
+            | ((arr[2] as u64) << 16)
+            | ((arr[3] as u64) << 24)
+            | ((arr[4] as u64) << 32);
+        let len = arr[5] as usize | ((arr[6] as usize) << 8);
+
+        let path = self.strings_bin_path();
+        let file_bytes = fs::read(&path).map_err(Error::Io)?;
+        let end = offset as usize + len;
+        if file_bytes.len() < end {
+            return Err(Error::Corruption(format!(
+                "string heap too short: need {} bytes, have {}",
+                end,
+                file_bytes.len()
+            )));
+        }
+        Ok(file_bytes[offset as usize..end].to_vec())
+    }
+
+    // ── Value encode / decode with overflow support ───────────────────────────
+
+    /// Encode a `Value` for column storage, writing long `Bytes` strings to
+    /// the overflow heap (SPA-212).
+    ///
+    /// - `Int64`          → identical to `Value::to_u64()`.
+    /// - `Bytes` ≤ 7 B    → inline `TAG_BYTES` encoding, identical to `Value::to_u64()`.
+    /// - `Bytes` > 7 B    → appended to `strings.bin`; returns `TAG_BYTES_OVERFLOW` u64.
+    pub fn encode_value(&self, val: &Value) -> Result<u64> {
+        match val {
+            Value::Int64(_) => Ok(val.to_u64()),
+            Value::Bytes(b) if b.len() <= MAX_INLINE_BYTES => Ok(val.to_u64()),
+            Value::Bytes(b) => self.append_to_string_heap(b),
+        }
+    }
+
+    /// Decode a raw `u64` column value back to a `Value`, reading the
+    /// overflow string heap when the tag is `TAG_BYTES_OVERFLOW` (SPA-212).
+    ///
+    /// Handles all three tags:
+    /// - `TAG_INT64`          → `Value::Int64`
+    /// - `TAG_BYTES`          → `Value::Bytes` (inline, ≤ 7 bytes)
+    /// - `TAG_BYTES_OVERFLOW` → `Value::Bytes` (from heap)
+    pub fn decode_raw_value(&self, raw: u64) -> Value {
+        let tag = (raw >> 56) as u8;
+        if tag == TAG_BYTES_OVERFLOW {
+            match self.read_from_string_heap(raw) {
+                Ok(bytes) => Value::Bytes(bytes),
+                Err(e) => {
+                    // Corruption fallback: return empty bytes and log.
+                    eprintln!(
+                        "WARN: failed to read overflow string from heap (raw={raw:#018x}): {e}"
+                    );
+                    Value::Bytes(Vec::new())
+                }
+            }
+        } else {
+            Value::from_u64(raw)
+        }
+    }
+
+    /// Check whether a raw stored `u64` encodes a string equal to `s`.
+    ///
+    /// Handles both inline (`TAG_BYTES`) and overflow (`TAG_BYTES_OVERFLOW`)
+    /// encodings (SPA-212).  Used by WHERE-clause and prop-filter comparison.
+    pub fn raw_str_matches(&self, raw: u64, s: &str) -> bool {
+        let tag = (raw >> 56) as u8;
+        match tag {
+            TAG_BYTES => {
+                // Fast inline comparison: encode s the same way and compare u64s.
+                raw == Value::Bytes(s.as_bytes().to_vec()).to_u64()
+            }
+            TAG_BYTES_OVERFLOW => {
+                // Overflow: read from heap and compare bytes.
+                match self.read_from_string_heap(raw) {
+                    Ok(bytes) => bytes == s.as_bytes(),
+                    Err(_) => false,
+                }
+            }
+            _ => false, // INT64 or unknown — not a string
+        }
     }
 
     /// Read the high-water mark for `label_id` from disk (or return 0).
@@ -261,6 +427,10 @@ impl NodeStore {
     /// Returns `Err` when the directory exists but cannot be read (e.g.
     /// permissions failure or I/O error).  A missing directory is not an
     /// error — it simply means no nodes of this label have been created yet.
+    pub fn col_ids_for_label(&self, label_id: u32) -> Result<Vec<u32>> {
+        self.existing_col_ids(label_id)
+    }
+
     fn existing_col_ids(&self, label_id: u32) -> Result<Vec<u32>> {
         let dir = self.label_dir(label_id);
         let read_dir = match fs::read_dir(&dir) {
@@ -269,7 +439,7 @@ impl NodeStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(Error::Io(e)),
         };
-        let ids = read_dir
+        let mut ids: Vec<u32> = read_dir
             .flatten()
             .filter_map(|entry| {
                 let name = entry.file_name();
@@ -279,6 +449,7 @@ impl NodeStore {
                 id_str.parse::<u32>().ok()
             })
             .collect();
+        ids.sort_unstable();
         Ok(ids)
     }
 
@@ -339,7 +510,7 @@ impl NodeStore {
 
         let write_result = (|| {
             for &(col_id, ref val) in props {
-                self.append_col(label_id, col_id, slot, val.to_u64())?;
+                self.append_col(label_id, col_id, slot, self.encode_value(val)?)?;
             }
             Ok::<(), sparrowdb_common::Error>(())
         })();
@@ -469,7 +640,7 @@ impl NodeStore {
         let write_result = (|| {
             // Write supplied columns with their actual values.
             for &(col_id, ref val) in props {
-                self.append_col(label_id, col_id, slot, val.to_u64())?;
+                self.append_col(label_id, col_id, slot, self.encode_value(val)?)?;
             }
             // Zero-pad existing columns that were NOT supplied for this node.
             for &col_id in &cols_to_zero_pad {
@@ -567,7 +738,7 @@ impl NodeStore {
             .map_err(|_| Error::NotFound)?;
         let offset = slot as u64 * 8;
         file.seek(SeekFrom::Start(offset)).map_err(Error::Io)?;
-        file.write_all(&value.to_u64().to_le_bytes())
+        file.write_all(&self.encode_value(value)?.to_le_bytes())
             .map_err(Error::Io)
     }
 
@@ -622,7 +793,7 @@ impl NodeStore {
         // Seek to target slot and overwrite.
         file.seek(SeekFrom::Start(slot as u64 * 8))
             .map_err(Error::Io)?;
-        file.write_all(&value.to_u64().to_le_bytes())
+        file.write_all(&self.encode_value(value)?.to_le_bytes())
             .map_err(Error::Io)
     }
 
@@ -706,15 +877,13 @@ impl NodeStore {
 
     /// Retrieve the typed property values for a node.
     ///
-    /// Convenience wrapper over [`get_node_raw`] that uses the type tag
-    /// embedded in the stored `u64` to reconstruct the correct `Value` variant
-    /// (SPA-169).  The returned `Value` will be `Int64` or `Bytes` depending
-    /// on what was written by `create_node`.
+    /// Convenience wrapper over [`get_node_raw`] that decodes every raw `u64`
+    /// back to a `Value`, reading the overflow string heap when needed (SPA-212).
     pub fn get_node(&self, node_id: NodeId, col_ids: &[u32]) -> Result<Vec<(u32, Value)>> {
         let raw = self.get_node_raw(node_id, col_ids)?;
         Ok(raw
             .into_iter()
-            .map(|(col_id, v)| (col_id, Value::from_u64(v)))
+            .map(|(col_id, v)| (col_id, self.decode_raw_value(v)))
             .collect())
     }
 }
