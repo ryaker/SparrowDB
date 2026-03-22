@@ -77,8 +77,9 @@ fn spa244_unimplemented_feature_returns_real_error() {
     db.execute("CREATE (b:Person {name: 'Bob'})").unwrap();
 
     // MATCH…CREATE with an *incoming* direction is `Error::Unimplemented`.
-    let result =
-        db.execute("MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)<-[:KNOWS]-(b)");
+    let result = db.execute(
+        "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)<-[:KNOWS]-(b)",
+    );
 
     match result {
         Err(e) => {
