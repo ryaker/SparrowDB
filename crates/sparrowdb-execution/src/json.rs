@@ -36,6 +36,13 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         Value::NodeRef(n) => serde_json::json!({"$type": "node", "id": n.0.to_string()}),
         Value::EdgeRef(e) => serde_json::json!({"$type": "edge", "id": e.0.to_string()}),
         Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+        Value::Map(entries) => {
+            let obj: serde_json::Map<String, serde_json::Value> = entries
+                .iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
     }
 }
 

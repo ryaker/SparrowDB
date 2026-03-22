@@ -37,6 +37,14 @@ fn value_to_py(py: Python<'_>, v: &sparrowdb_execution::Value) -> PyObject {
             }
             py_list.into()
         }
+        // Map: produced by bare node variable projection (SPA-213) — convert to a Python dict.
+        Value::Map(entries) => {
+            let py_dict = PyDict::new_bound(py);
+            for (k, v) in entries {
+                py_dict.set_item(k, value_to_py(py, v)).unwrap();
+            }
+            py_dict.into()
+        }
     }
 }
 

@@ -58,6 +58,9 @@ pub enum Value {
     EdgeRef(EdgeId),
     /// A list of values, produced by `collect()` aggregation.
     List(Vec<Value>),
+    /// A property map, returned when a bare node variable is projected (SPA-213).
+    /// Keys are `"col_{id}"` strings; values are the decoded property values.
+    Map(Vec<(String, Value)>),
 }
 
 impl Value {
@@ -89,6 +92,16 @@ impl std::fmt::Display for Value {
                     write!(f, "{item}")?;
                 }
                 write!(f, "]")
+            }
+            Value::Map(entries) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{k}: {v}")?;
+                }
+                write!(f, "}}")
             }
         }
     }

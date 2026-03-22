@@ -261,6 +261,10 @@ impl NodeStore {
     /// Returns `Err` when the directory exists but cannot be read (e.g.
     /// permissions failure or I/O error).  A missing directory is not an
     /// error — it simply means no nodes of this label have been created yet.
+    pub fn col_ids_for_label(&self, label_id: u32) -> Result<Vec<u32>> {
+        self.existing_col_ids(label_id)
+    }
+
     fn existing_col_ids(&self, label_id: u32) -> Result<Vec<u32>> {
         let dir = self.label_dir(label_id);
         let read_dir = match fs::read_dir(&dir) {
