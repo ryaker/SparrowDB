@@ -96,7 +96,10 @@ fn labels_fn_animal_nodes() {
                     items[0]
                 );
             }
-            other => panic!("expected Value::List from labels(n) for Animal, got: {:?}", other),
+            other => panic!(
+                "expected Value::List from labels(n) for Animal, got: {:?}",
+                other
+            ),
         }
     }
 }
