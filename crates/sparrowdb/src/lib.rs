@@ -489,6 +489,14 @@ impl GraphDb {
 
             let node_id = tx.create_node(label_id, &props)?;
 
+            // Register property key names in the catalog for db.schema() introspection.
+            for entry in &node.props {
+                let col_id = col_id_of(&entry.key);
+                let _ = tx
+                    .catalog
+                    .register_property_key(label_id as u16, col_id, &entry.key);
+            }
+
             // Record the binding so edge patterns can resolve (src_var, dst_var).
             if !node.var.is_empty() {
                 var_to_node.insert(node.var.clone(), node_id);
@@ -1026,6 +1034,14 @@ impl WriteTx {
             }
         }
 
+        // Register property keys in the catalog (idempotent) for db.schema().
+        for (key, col_id, _) in &col_kv {
+            // Ignore errors — catalog registration is best-effort metadata.
+            let _ = self
+                .catalog
+                .register_property_key(label_id as u16, *col_id, key);
+        }
+
         // Not found — create a new node (buffered, same as create_node).
         let disk_props: Vec<(u32, Value)> = col_kv
             .iter()
@@ -1056,6 +1072,10 @@ impl WriteTx {
     pub fn set_property(&mut self, node_id: NodeId, key: &str, val: Value) -> Result<()> {
         let col_id = fnv1a_col_id(key);
         self.dirty_nodes.insert(node_id.0);
+
+        // Register the property key in the catalog (idempotent) for db.schema().
+        let label_id = (node_id.0 >> 32) as u16;
+        let _ = self.catalog.register_property_key(label_id, col_id, key);
 
         // Stage the update through the write buffer (records before-image for
         // WAL and MVCC). WAL emission happens exactly once at commit time via

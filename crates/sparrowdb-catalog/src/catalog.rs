@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use sparrowdb_common::{Error, Result};
 
-use crate::tlv::{encode_entries, LabelEntry, RelTableEntry, TlvEntry};
+use crate::tlv::{encode_entries, ColumnEntry, LabelEntry, RelTableEntry, TlvEntry};
 
 /// Label identifier (u16 matches the TLV label_id field).
 pub type LabelId = u16;
@@ -26,6 +26,11 @@ pub struct Catalog {
     labels: Vec<LabelEntry>,
     /// In-memory relationship table entries.
     rel_tables: Vec<RelTableEntry>,
+    /// In-memory column entries: tracks observed property key names per owner.
+    ///
+    /// Keyed by `(owner_kind, owner_id)` → set of `(field_id, name)` pairs.
+    /// `owner_kind = 0` means a node label; `owner_id` is the `label_id as u64`.
+    column_entries: Vec<ColumnEntry>,
     /// Next label_id to assign.
     next_label_id: u16,
     /// Next rel_table_id to assign.
@@ -43,6 +48,7 @@ impl Catalog {
             path,
             labels: Vec::new(),
             rel_tables: Vec::new(),
+            column_entries: Vec::new(),
             next_label_id: 0,
             next_rel_table_id: 0,
         };
@@ -228,6 +234,54 @@ impl Catalog {
             .collect()
     }
 
+    // --- Property key tracking ---
+
+    /// Register an observed property key name for a node label.
+    ///
+    /// If the `(label_id, field_id)` pair is already registered, this is a
+    /// no-op (idempotent).  Otherwise, the column entry is persisted to the
+    /// catalog file and added to the in-memory set.
+    ///
+    /// `field_id` should be the FNV-1a hash derived from `name` via
+    /// `sparrowdb_common::col_id_of`.
+    pub fn register_property_key(
+        &mut self,
+        label_id: u16,
+        field_id: u32,
+        name: &str,
+    ) -> Result<()> {
+        // Check idempotency — already registered?
+        let already = self
+            .column_entries
+            .iter()
+            .any(|e| e.owner_kind == 0 && e.owner_id == label_id as u64 && e.field_id == field_id);
+        if already {
+            return Ok(());
+        }
+        let entry = ColumnEntry {
+            owner_kind: 0,
+            owner_id: label_id as u64,
+            field_id,
+            name: name.to_string(),
+            type_tag: 0,
+            nullable: 1,
+            has_default: 0,
+            default_bytes: Vec::new(),
+        };
+        self.append_entry(TlvEntry::Column(entry.clone()))?;
+        self.column_entries.push(entry);
+        Ok(())
+    }
+
+    /// Return all observed property key names for a given node label.
+    pub fn list_property_keys(&self, label_id: u16) -> Vec<String> {
+        self.column_entries
+            .iter()
+            .filter(|e| e.owner_kind == 0 && e.owner_id == label_id as u64)
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
     // --- Private helpers ---
 
     /// Load all TLV entries from the catalog file into memory.
@@ -268,6 +322,18 @@ impl Catalog {
                         self.next_rel_table_id = e.rel_table_id + 1;
                     }
                     self.rel_tables.push(e);
+                }
+                TlvEntry::Column(e) => {
+                    // Load column (property key) entries into memory.
+                    // Duplicates are silently skipped (idempotent on re-open).
+                    let already = self.column_entries.iter().any(|x| {
+                        x.owner_kind == e.owner_kind
+                            && x.owner_id == e.owner_id
+                            && x.field_id == e.field_id
+                    });
+                    if !already {
+                        self.column_entries.push(e);
+                    }
                 }
                 _ => {} // other entry types are not processed in Phase 1
             }
