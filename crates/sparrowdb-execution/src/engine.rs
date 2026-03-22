@@ -535,7 +535,11 @@ impl Engine {
                     if !node_pat.props.is_empty() {
                         match self.store.get_node_raw(node_id, &filter_col_ids) {
                             Ok(props) => {
-                                if !matches_prop_filter_static(&props, &node_pat.props, &self.dollar_params()) {
+                                if !matches_prop_filter_static(
+                                    &props,
+                                    &node_pat.props,
+                                    &self.dollar_params(),
+                                ) {
                                     continue;
                                 }
                             }
