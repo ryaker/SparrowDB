@@ -1160,6 +1160,23 @@ impl WriteTx {
         self.catalog.create_label(name)
     }
 
+    /// Look up `name` in the catalog, creating it if it does not yet exist.
+    ///
+    /// Returns the `label_id` as a `u32` (upper 32 bits of a packed NodeId).
+    /// Unlike [`create_label`], this method is idempotent: calling it multiple
+    /// times with the same name always returns the same id.
+    ///
+    /// Primarily used by the bulk-import path (SPA-148) where labels may be
+    /// seen for the first time on any row.
+    ///
+    /// [`create_label`]: WriteTx::create_label
+    pub fn get_or_create_label_id(&mut self, name: &str) -> Result<u32> {
+        match self.catalog.get_label(name)? {
+            Some(id) => Ok(id as u32),
+            None => Ok(self.catalog.create_label(name)? as u32),
+        }
+    }
+
     // ── Phase 7 mutation API (SPA-123 … SPA-126) ─────────────────────────────
 
     /// SPA-123: Find or create a node matching `label` + `props`.
