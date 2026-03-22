@@ -1389,7 +1389,8 @@ impl Engine {
         tracing::debug!(src_label = %src_label, fof_label = %fof_label, hwm_src = hwm_src, "two-hop traversal start");
 
         // Collect col_ids for fof: projected columns plus any columns referenced by prop filters.
-        // Also include any columns referenced by the WHERE clause.
+        // Also include any columns referenced by the WHERE clause, scoped to the fof variable so
+        // that src-only predicates do not cause spurious column fetches from fof nodes.
         let col_ids_fof = {
             let mut ids = collect_col_ids_for_var(&fof_node_pat.var, column_names, fof_label_id);
             for p in &fof_node_pat.props {
@@ -1399,16 +1400,17 @@ impl Engine {
                 }
             }
             if let Some(ref where_expr) = m.where_clause {
-                collect_col_ids_from_expr(where_expr, &mut ids);
+                collect_col_ids_from_expr_for_var(where_expr, &fof_node_pat.var, &mut ids);
             }
             ids
         };
 
-        // Collect col_ids for src that are referenced by the WHERE clause.
+        // Collect col_ids for src that are referenced by the WHERE clause, scoped to the src
+        // variable so that fof-only predicates do not cause spurious column fetches from src nodes.
         let col_ids_src_where: Vec<u32> = {
             let mut ids = Vec::new();
             if let Some(ref where_expr) = m.where_clause {
-                collect_col_ids_from_expr(where_expr, &mut ids);
+                collect_col_ids_from_expr_for_var(where_expr, &src_node_pat.var, &mut ids);
             }
             ids
         };
@@ -1526,6 +1528,19 @@ impl Engine {
                         row_vals.insert(
                             format!("{}.__labels__", fof_node_pat.var),
                             Value::List(vec![Value::String(fof_label.clone())]),
+                        );
+                    }
+                    // Inject relationship type metadata so type(r) works in WHERE.
+                    if !pat.rels[0].var.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__type__", pat.rels[0].var),
+                            Value::String(pat.rels[0].rel_type.clone()),
+                        );
+                    }
+                    if !pat.rels[1].var.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__type__", pat.rels[1].var),
+                            Value::String(pat.rels[1].rel_type.clone()),
                         );
                     }
                     if !eval_where(where_expr, &row_vals) {
@@ -1968,6 +1983,56 @@ fn extract_return_column_names(items: &[ReturnItem]) -> Vec<String> {
             },
         })
         .collect()
+}
+
+/// Collect all column IDs referenced by property accesses in an expression,
+/// scoped to a specific variable name.
+///
+/// Only `PropAccess` nodes whose `var` field matches `target_var` contribute
+/// column IDs, so callers can separate src-side from fof-side columns without
+/// accidentally fetching unrelated properties from the wrong node.
+fn collect_col_ids_from_expr_for_var(expr: &Expr, target_var: &str, out: &mut Vec<u32>) {
+    match expr {
+        Expr::PropAccess { var, prop } => {
+            if var == target_var {
+                let col_id = prop_name_to_col_id(prop);
+                if !out.contains(&col_id) {
+                    out.push(col_id);
+                }
+            }
+        }
+        Expr::BinOp { left, right, .. } => {
+            collect_col_ids_from_expr_for_var(left, target_var, out);
+            collect_col_ids_from_expr_for_var(right, target_var, out);
+        }
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            collect_col_ids_from_expr_for_var(l, target_var, out);
+            collect_col_ids_from_expr_for_var(r, target_var, out);
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_col_ids_from_expr_for_var(inner, target_var, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_col_ids_from_expr_for_var(expr, target_var, out);
+            for item in list {
+                collect_col_ids_from_expr_for_var(item, target_var, out);
+            }
+        }
+        Expr::FnCall { args, .. } | Expr::List(args) => {
+            for arg in args {
+                collect_col_ids_from_expr_for_var(arg, target_var, out);
+            }
+        }
+        Expr::ListPredicate {
+            list_expr,
+            predicate,
+            ..
+        } => {
+            collect_col_ids_from_expr_for_var(list_expr, target_var, out);
+            collect_col_ids_from_expr_for_var(predicate, target_var, out);
+        }
+        _ => {}
+    }
 }
 
 /// Collect all column IDs referenced by property accesses in an expression.

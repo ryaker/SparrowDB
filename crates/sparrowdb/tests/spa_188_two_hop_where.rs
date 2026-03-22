@@ -168,3 +168,77 @@ fn two_hop_without_where_returns_all_paths() {
     names.sort();
     assert_eq!(names, vec!["Charlie", "Dave"]);
 }
+
+/// Source-side WHERE binding test.
+///
+/// Graph:
+///   Alice -[:KNOWS]-> Bob -[:KNOWS]-> Charlie
+///   Alice -[:KNOWS]-> Bob -[:KNOWS]-> Dave
+///   Eve   -[:KNOWS]-> Bob -[:KNOWS]-> Charlie
+///   Eve   -[:KNOWS]-> Bob -[:KNOWS]-> Dave
+///
+/// Query:
+///   MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)
+///   WHERE a.name = 'Alice' AND c.name = 'Charlie' RETURN c.name
+///
+/// Expected: exactly one row containing String("Charlie").
+/// A bug that ignores src-side WHERE bindings would return 2 rows (Alice and Eve paths).
+#[test]
+fn two_hop_where_filters_by_src_and_fof() {
+    let (_dir, db) = make_db();
+
+    db.execute("CREATE (:Person {name: 'Alice'})")
+        .expect("CREATE Alice");
+    db.execute("CREATE (:Person {name: 'Bob'})")
+        .expect("CREATE Bob");
+    db.execute("CREATE (:Person {name: 'Charlie'})")
+        .expect("CREATE Charlie");
+    db.execute("CREATE (:Person {name: 'Dave'})")
+        .expect("CREATE Dave");
+    db.execute("CREATE (:Person {name: 'Eve'})")
+        .expect("CREATE Eve");
+
+    // Alice -> Bob
+    db.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    )
+    .expect("edge Alice->Bob");
+
+    // Eve -> Bob (second source so src-side filtering is load-bearing)
+    db.execute("MATCH (e:Person {name: 'Eve'}), (b:Person {name: 'Bob'}) CREATE (e)-[:KNOWS]->(b)")
+        .expect("edge Eve->Bob");
+
+    // Bob -> Charlie
+    db.execute(
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS]->(c)",
+    )
+    .expect("edge Bob->Charlie");
+
+    // Bob -> Dave
+    db.execute(
+        "MATCH (b:Person {name: 'Bob'}), (d:Person {name: 'Dave'}) CREATE (b)-[:KNOWS]->(d)",
+    )
+    .expect("edge Bob->Dave");
+
+    let result = db
+        .execute(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+             WHERE a.name = 'Alice' AND c.name = 'Charlie' RETURN c.name",
+        )
+        .expect("two-hop WHERE src+fof query");
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "WHERE a.name='Alice' AND c.name='Charlie' must return exactly 1 row; got {} row(s): {:?}",
+        result.rows.len(),
+        result.rows
+    );
+
+    assert_eq!(
+        result.rows[0][0],
+        Value::String("Charlie".to_string()),
+        "returned value must be String('Charlie'), got {:?}",
+        result.rows[0][0]
+    );
+}
