@@ -126,6 +126,8 @@ fn param_in_where_clause_returns_matching_row() {
 // ── GAP-10: multiple params ────────────────────────────────────────────────────
 
 /// Multiple params in the same query must all be resolved.
+/// Uses both $name and $age in the WHERE clause so that both params are
+/// actually exercised (not just one with an unused extra key).
 #[test]
 fn multiple_params_in_prop_filter() {
     let (_dir, db) = make_db();
@@ -137,23 +139,20 @@ fn multiple_params_in_prop_filter() {
     db.execute("CREATE (:Person {name: 'Bob', age: 30})")
         .unwrap();
 
-    // Match on name only (age is not yet supported in combined multi-prop param
-    // filters but single param must work).
+    // Both $name and $age must be substituted — only the Alice node with
+    // age 30 should survive the combined WHERE filter.
     let result = db
         .execute_with_params(
-            "MATCH (n:Person {name: $name}) RETURN n.name",
+            "MATCH (n:Person) WHERE n.name = $name AND n.age = $age RETURN n.name",
             params(&[
                 ("name", Value::String("Alice".into())),
-                ("unused", Value::Int64(42)),
+                ("age", Value::Int64(30)),
             ]),
         )
-        .expect("execute_with_params with multiple params");
+        .expect("multi-param query");
 
-    // Both Alice nodes (different ages) should match.
-    assert_eq!(result.rows.len(), 2, "both Alice nodes must be returned");
-    for row in &result.rows {
-        assert_eq!(row[0], Value::String("Alice".into()));
-    }
+    assert_eq!(result.rows.len(), 1, "only one Alice node has age 30");
+    assert_eq!(result.rows[0][0], Value::String("Alice".into()));
 }
 
 // ── Regression: plain execute() still works ───────────────────────────────────

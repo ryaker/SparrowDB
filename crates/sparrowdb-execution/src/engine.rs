@@ -1010,6 +1010,9 @@ impl Engine {
                     continue;
                 }
             }
+            // Merge dollar_params into the projected row so that downstream
+            // RETURN/ORDER-BY/SKIP/LIMIT expressions can resolve $param references.
+            with_vals.extend(self.dollar_params());
             projected.push(with_vals);
         }
 
