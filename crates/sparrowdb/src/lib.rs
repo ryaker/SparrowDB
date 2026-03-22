@@ -752,6 +752,57 @@ impl GraphDb {
         FulltextIndex::create(&self.inner.path, name)?;
         Ok(())
     }
+
+    /// Return `(node_count, edge_count)` by summing the high-water marks
+    /// across all catalog labels (nodes) and delta-log record counts across
+    /// all registered relationship tables (edges).
+    ///
+    /// Both counts reflect committed storage state; in-flight write
+    /// transactions are not visible.
+    ///
+    /// **Note:** `node_count` is based on per-label high-water marks and
+    /// therefore includes soft-deleted nodes whose slots have not yet been
+    /// reclaimed.  The count will converge to the true live-node count once
+    /// compaction / GC is implemented.
+    pub fn db_counts(&self) -> Result<(u64, u64)> {
+        let path = &self.inner.path;
+        let catalog = Catalog::open(path)?;
+        let node_store = NodeStore::open(path)?;
+
+        // Node count: sum hwm_for_label across every registered label.
+        let node_count: u64 = catalog
+            .list_labels()
+            .unwrap_or_default()
+            .iter()
+            .map(|(label_id, _name)| node_store.hwm_for_label(*label_id as u32).unwrap_or(0))
+            .sum();
+
+        // Edge count: for each registered rel table, sum CSR base edges (post-checkpoint)
+        // plus delta-log records (pre-checkpoint / unflushed).
+        let rel_table_ids = catalog.list_rel_table_ids();
+        let ids_to_scan: Vec<u64> = if rel_table_ids.is_empty() {
+            // No rel tables in catalog yet — fall back to the default table (id=0).
+            vec![0]
+        } else {
+            rel_table_ids.iter().map(|(id, _, _, _)| *id).collect()
+        };
+        let edge_count: u64 = ids_to_scan
+            .iter()
+            .map(|&id| {
+                let Ok(store) = EdgeStore::open(path, RelTableId(id as u32)) else {
+                    return 0;
+                };
+                let csr_edges = store.open_fwd().map(|csr| csr.n_edges()).unwrap_or(0);
+                let delta_edges = store
+                    .read_delta()
+                    .map(|records| records.len() as u64)
+                    .unwrap_or(0);
+                csr_edges + delta_edges
+            })
+            .sum();
+
+        Ok((node_count, edge_count))
+    }
 }
 
 /// Convenience wrapper — equivalent to [`GraphDb::open`].
