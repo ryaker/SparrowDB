@@ -418,12 +418,17 @@ impl Engine {
             let node_id = NodeId(((label_id as u64) << 32) | slot);
             let props = read_node_props(&self.store, node_id, &all_col_ids)?;
 
-            if !matches_prop_filter_static(&props, &node_pat.props, &self.dollar_params()) {
+            if !matches_prop_filter_static(
+                &props,
+                &node_pat.props,
+                &self.dollar_params(),
+                &self.store,
+            ) {
                 continue;
             }
 
             if let Some(ref where_expr) = mm.where_clause {
-                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
                 row_vals.extend(self.dollar_params());
                 if !eval_where(where_expr, &row_vals) {
                     continue;
@@ -471,7 +476,9 @@ impl Engine {
             return true;
         }
         match self.store.get_node_raw(node_id, filter_col_ids) {
-            Ok(raw_props) => matches_prop_filter_static(&raw_props, props, &self.dollar_params()),
+            Ok(raw_props) => {
+                matches_prop_filter_static(&raw_props, props, &self.dollar_params(), &self.store)
+            }
             Err(_) => false,
         }
     }
@@ -539,6 +546,7 @@ impl Engine {
                                     &props,
                                     &node_pat.props,
                                     &self.dollar_params(),
+                                    &self.store,
                                 ) {
                                     continue;
                                 }
@@ -1098,7 +1106,7 @@ impl Engine {
                 if !self.matches_prop_filter(&props, &node.props) {
                     continue;
                 }
-                let row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                let row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
                 if let Some(wexpr) = &where_clause {
                     let mut row_vals_p = row_vals.clone();
                     row_vals_p.extend(self.dollar_params());
@@ -1284,7 +1292,7 @@ impl Engine {
                 continue;
             }
             if let Some(ref wexpr) = mom.match_where {
-                let mut row_vals = build_row_vals(&props, lead_var, &lead_all_col_ids);
+                let mut row_vals = build_row_vals(&props, lead_var, &lead_all_col_ids, &self.store);
                 row_vals.extend(self.dollar_params());
                 if !eval_where(wexpr, &row_vals) {
                     continue;
@@ -1308,7 +1316,8 @@ impl Engine {
         let mut result_rows: Vec<Vec<Value>> = Vec::new();
 
         for (lead_slot, lead_props) in &lead_rows {
-            let lead_row_vals = build_row_vals(lead_props, lead_var, &lead_all_col_ids);
+            let lead_row_vals =
+                build_row_vals(lead_props, lead_var, &lead_all_col_ids, &self.store);
 
             // Attempt the optional sub-pattern.
             // We only support the common case:
@@ -1471,7 +1480,7 @@ impl Engine {
             if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
                 continue;
             }
-            let row_vals = build_row_vals(&dst_props, dst_var, &col_ids_dst);
+            let row_vals = build_row_vals(&dst_props, dst_var, &col_ids_dst, &self.store);
             sub_rows.push(row_vals);
         }
 
@@ -1577,7 +1586,7 @@ impl Engine {
             // Apply WHERE clause.
             let var_name = node.var.as_str();
             if let Some(ref where_expr) = m.where_clause {
-                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
                 // Inject label metadata so labels(n) works in WHERE.
                 if !var_name.is_empty() && !label.is_empty() {
                     row_vals.insert(
@@ -1598,7 +1607,7 @@ impl Engine {
 
             if use_eval_path {
                 // Build eval_expr-compatible map for aggregation / id() path.
-                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
                 // Inject label metadata for aggregation.
                 if !var_name.is_empty() && !label.is_empty() {
                     row_vals.insert(
@@ -1618,7 +1627,10 @@ impl Engine {
                             .iter()
                             .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
                             .collect();
-                        row_vals.insert(var_name.to_string(), build_node_map(&all_props));
+                        row_vals.insert(
+                            var_name.to_string(),
+                            build_node_map(&all_props, &self.store),
+                        );
                     } else {
                         row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
                     }
@@ -1629,7 +1641,14 @@ impl Engine {
                 raw_rows.push(row_vals);
             } else {
                 // Project RETURN columns directly (fast path).
-                let row = project_row(&props, column_names, &all_col_ids, var_name, &label);
+                let row = project_row(
+                    &props,
+                    column_names,
+                    &all_col_ids,
+                    var_name,
+                    &label,
+                    &self.store,
+                );
                 rows.push(row);
             }
         }
@@ -1744,7 +1763,7 @@ impl Engine {
 
                 // Apply WHERE clause.
                 if let Some(ref where_expr) = m.where_clause {
-                    let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                    let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
                     if !var_name.is_empty() {
                         row_vals.insert(
                             format!("{}.__labels__", var_name),
@@ -1759,7 +1778,7 @@ impl Engine {
                 }
 
                 if use_eval_path_all {
-                    let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                    let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
                     if !var_name.is_empty() {
                         row_vals.insert(
                             format!("{}.__labels__", var_name),
@@ -1776,7 +1795,10 @@ impl Engine {
                                 .iter()
                                 .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
                                 .collect();
-                            row_vals.insert(var_name.to_string(), build_node_map(&all_props));
+                            row_vals.insert(
+                                var_name.to_string(),
+                                build_node_map(&all_props, &self.store),
+                            );
                         } else {
                             row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
                         }
@@ -1785,7 +1807,14 @@ impl Engine {
                     }
                     raw_rows.push(row_vals);
                 } else {
-                    let row = project_row(&props, column_names, &all_col_ids, var_name, label_name);
+                    let row = project_row(
+                        &props,
+                        column_names,
+                        &all_col_ids,
+                        var_name,
+                        label_name,
+                        &self.store,
+                    );
                     rows.push(row);
                 }
             }
@@ -2042,12 +2071,17 @@ impl Engine {
 
                     // Apply WHERE clause.
                     if let Some(ref where_expr) = m.where_clause {
-                        let mut row_vals =
-                            build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
+                        let mut row_vals = build_row_vals(
+                            &src_props,
+                            &src_node_pat.var,
+                            &col_ids_src,
+                            &self.store,
+                        );
                         row_vals.extend(build_row_vals(
                             &dst_props,
                             &dst_node_pat.var,
                             &col_ids_dst,
+                            &self.store,
                         ));
                         // Inject relationship metadata so type(r) works in WHERE.
                         if !rel_pat.var.is_empty() {
@@ -2076,12 +2110,17 @@ impl Engine {
                     }
 
                     if use_agg {
-                        let mut row_vals =
-                            build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
+                        let mut row_vals = build_row_vals(
+                            &src_props,
+                            &src_node_pat.var,
+                            &col_ids_src,
+                            &self.store,
+                        );
                         row_vals.extend(build_row_vals(
                             &dst_props,
                             &dst_node_pat.var,
                             &col_ids_dst,
+                            &self.store,
                         ));
                         // Inject relationship and label metadata for aggregate path.
                         if !rel_pat.var.is_empty() {
@@ -2140,6 +2179,7 @@ impl Engine {
                             rel_var_type,
                             src_label_meta,
                             dst_label_meta,
+                            &self.store,
                         );
                         rows.push(row);
                     }
@@ -2274,12 +2314,17 @@ impl Engine {
 
                         // Apply WHERE clause.
                         if let Some(ref where_expr) = m.where_clause {
-                            let mut row_vals =
-                                build_row_vals(&b_props, &src_node_pat.var, &col_ids_src);
+                            let mut row_vals = build_row_vals(
+                                &b_props,
+                                &src_node_pat.var,
+                                &col_ids_src,
+                                &self.store,
+                            );
                             row_vals.extend(build_row_vals(
                                 &a_props,
                                 &dst_node_pat.var,
                                 &col_ids_dst,
+                                &self.store,
                             ));
                             if !rel_pat.var.is_empty() {
                                 row_vals.insert(
@@ -2310,12 +2355,17 @@ impl Engine {
                         }
 
                         if use_agg {
-                            let mut row_vals =
-                                build_row_vals(&b_props, &src_node_pat.var, &col_ids_src);
+                            let mut row_vals = build_row_vals(
+                                &b_props,
+                                &src_node_pat.var,
+                                &col_ids_src,
+                                &self.store,
+                            );
                             row_vals.extend(build_row_vals(
                                 &a_props,
                                 &dst_node_pat.var,
                                 &col_ids_dst,
+                                &self.store,
                             ));
                             if !rel_pat.var.is_empty() {
                                 row_vals.insert(
@@ -2375,6 +2425,7 @@ impl Engine {
                                 rel_var_type,
                                 src_label_meta,
                                 dst_label_meta,
+                                &self.store,
                             );
                             rows.push(row);
                         }
@@ -2572,9 +2623,18 @@ impl Engine {
 
                 // Apply WHERE clause predicate.
                 if let Some(ref where_expr) = m.where_clause {
-                    let mut row_vals =
-                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src_where);
-                    row_vals.extend(build_row_vals(&fof_props, &fof_node_pat.var, &col_ids_fof));
+                    let mut row_vals = build_row_vals(
+                        &src_props,
+                        &src_node_pat.var,
+                        &col_ids_src_where,
+                        &self.store,
+                    );
+                    row_vals.extend(build_row_vals(
+                        &fof_props,
+                        &fof_node_pat.var,
+                        &col_ids_fof,
+                        &self.store,
+                    ));
                     // Inject label metadata so labels(n) works in WHERE.
                     if !src_node_pat.var.is_empty() && !src_label.is_empty() {
                         row_vals.insert(
@@ -2607,7 +2667,7 @@ impl Engine {
                     }
                 }
 
-                let row = project_fof_row(&fof_props, column_names, &fof_node_pat.var);
+                let row = project_fof_row(&fof_props, column_names, &fof_node_pat.var, &self.store);
                 rows.push(row);
             }
         }
@@ -2783,8 +2843,14 @@ impl Engine {
 
                 // Apply WHERE clause.
                 if let Some(ref where_expr) = m.where_clause {
-                    let mut row_vals = build_row_vals(&src_props, &src_node_pat.var, &col_ids_src);
-                    row_vals.extend(build_row_vals(&dst_props, &dst_node_pat.var, &col_ids_dst));
+                    let mut row_vals =
+                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src, &self.store);
+                    row_vals.extend(build_row_vals(
+                        &dst_props,
+                        &dst_node_pat.var,
+                        &col_ids_dst,
+                        &self.store,
+                    ));
                     // Inject relationship metadata so type(r) works in WHERE.
                     if !rel_pat.var.is_empty() {
                         row_vals.insert(
@@ -2835,6 +2901,7 @@ impl Engine {
                     rel_var_type,
                     src_label_meta,
                     dst_label_meta,
+                    &self.store,
                 );
                 rows.push(row);
             }
@@ -2878,7 +2945,7 @@ impl Engine {
         props: &[(u32, u64)],
         filters: &[sparrowdb_cypher::ast::PropEntry],
     ) -> bool {
-        matches_prop_filter_static(props, filters, &self.dollar_params())
+        matches_prop_filter_static(props, filters, &self.dollar_params(), &self.store)
     }
 
     /// Build a map of runtime parameters keyed with a `$` prefix,
@@ -2900,6 +2967,7 @@ fn matches_prop_filter_static(
     props: &[(u32, u64)],
     filters: &[sparrowdb_cypher::ast::PropEntry],
     params: &HashMap<String, Value>,
+    store: &NodeStore,
 ) -> bool {
     for f in filters {
         let col_id = prop_name_to_col_id(&f.key);
@@ -2915,9 +2983,9 @@ fn matches_prop_filter_static(
                 stored_val == Some(StoreValue::Int64(n).to_u64())
             }
             Value::String(s) => {
-                // Strings are stored with TAG_BYTES (0x01) in the top byte.
-                // Encode the literal the same way and compare (SPA-161, SPA-169).
-                stored_val == Some(string_to_raw_u64(&s))
+                // Use store.raw_str_matches to handle both inline (≤7 bytes) and
+                // overflow (>7 bytes) string encodings (SPA-212).
+                stored_val.is_some_and(|raw| store.raw_str_matches(raw, &s))
             }
             Value::Null => true, // null filter passes (param-like behaviour)
             _ => false,
@@ -3293,11 +3361,11 @@ fn read_node_props(
 /// Decode a raw `u64` column value (as returned by `get_node_raw`) into the
 /// execution-layer `Value` type.
 ///
-/// Uses `StoreValue::from_u64` to honour the type tag embedded in the top
-/// byte (SPA-169), then maps `StoreValue::Bytes` → `Value::String` so that
-/// string properties are returned as strings, not garbage integers.
-fn decode_raw_val(raw: u64) -> Value {
-    match StoreValue::from_u64(raw) {
+/// Uses `NodeStore::decode_raw_value` to honour the type tag embedded in the
+/// top byte (SPA-169/SPA-212), reading from the overflow string heap when
+/// necessary, then maps `StoreValue::Bytes` → `Value::String`.
+fn decode_raw_val(raw: u64, store: &NodeStore) -> Value {
+    match store.decode_raw_value(raw) {
         StoreValue::Int64(n) => Value::Int64(n),
         StoreValue::Bytes(b) => Value::String(String::from_utf8_lossy(&b).into_owned()),
     }
@@ -3307,11 +3375,12 @@ fn build_row_vals(
     props: &[(u32, u64)],
     var_name: &str,
     _col_ids: &[u32],
+    store: &NodeStore,
 ) -> HashMap<String, Value> {
     let mut map = HashMap::new();
     for &(col_id, raw) in props {
         let key = format!("{var_name}.col_{col_id}");
-        map.insert(key, decode_raw_val(raw));
+        map.insert(key, decode_raw_val(raw, store));
     }
     map
 }
@@ -3616,6 +3685,7 @@ fn project_row(
     var_name: &str,
     // Primary label for the scanned node, used for labels(n) columns.
     node_label: &str,
+    store: &NodeStore,
 ) -> Vec<Value> {
     column_names
         .iter()
@@ -3635,7 +3705,7 @@ fn project_row(
             props
                 .iter()
                 .find(|(c, _)| *c == col_id)
-                .map(|(_, v)| decode_raw_val(*v))
+                .map(|(_, v)| decode_raw_val(*v, store))
                 .unwrap_or(Value::Null)
         })
         .collect()
@@ -3654,6 +3724,7 @@ fn project_hop_row(
     src_label_meta: Option<(&str, &str)>,
     // Optional (dst_var, dst_label) for resolving `labels(dst_var)` columns.
     dst_label_meta: Option<(&str, &str)>,
+    store: &NodeStore,
 ) -> Vec<Value> {
     column_names
         .iter()
@@ -3694,7 +3765,7 @@ fn project_hop_row(
                 props
                     .iter()
                     .find(|(c, _)| *c == col_id)
-                    .map(|(_, val)| decode_raw_val(*val))
+                    .map(|(_, val)| decode_raw_val(*val, store))
                     .unwrap_or(Value::Null)
             } else {
                 Value::Null
@@ -3707,6 +3778,7 @@ fn project_fof_row(
     fof_props: &[(u32, u64)],
     column_names: &[String],
     _fof_var: &str,
+    store: &NodeStore,
 ) -> Vec<Value> {
     column_names
         .iter()
@@ -3720,7 +3792,7 @@ fn project_fof_row(
             fof_props
                 .iter()
                 .find(|(c, _)| *c == col_id)
-                .map(|(_, v)| decode_raw_val(*v))
+                .map(|(_, v)| decode_raw_val(*v, store))
                 .unwrap_or(Value::Null)
         })
         .collect()
@@ -3905,10 +3977,10 @@ fn bare_var_names_in_return(items: &[ReturnItem]) -> Vec<String> {
 ///
 /// Keys are `"col_{col_id}"` strings; values are decoded via [`decode_raw_val`].
 /// This is used to project a bare node variable (SPA-213).
-fn build_node_map(props: &[(u32, u64)]) -> Value {
+fn build_node_map(props: &[(u32, u64)], store: &NodeStore) -> Value {
     let entries: Vec<(String, Value)> = props
         .iter()
-        .map(|&(col_id, raw)| (format!("col_{col_id}"), decode_raw_val(raw)))
+        .map(|&(col_id, raw)| (format!("col_{col_id}"), decode_raw_val(raw, store)))
         .collect();
     Value::Map(entries)
 }
@@ -4216,7 +4288,7 @@ fn eval_call_expr(expr: &Expr, env: &HashMap<String, Value>, store: &NodeStore) 
                 read_node_props(store, *node_id, &[col_id])
                     .ok()
                     .and_then(|pairs| pairs.into_iter().find(|(c, _)| *c == col_id))
-                    .map(|(_, raw)| decode_raw_val(raw))
+                    .map(|(_, raw)| decode_raw_val(raw, store))
                     .unwrap_or(Value::Null)
             }
             Some(other) => other.clone(),

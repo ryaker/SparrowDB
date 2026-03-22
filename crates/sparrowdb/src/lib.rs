@@ -917,7 +917,7 @@ impl ReadTx {
                 if let Some(v) = versions.get_at(node_id, col_id, self.snapshot_txn_id) {
                     (col_id, v)
                 } else {
-                    (col_id, Value::int64_from_u64(raw_val))
+                    (col_id, self.store.decode_raw_value(raw_val))
                 }
             })
             .collect();
@@ -1052,7 +1052,7 @@ impl WriteTx {
                 .get_node_raw(node_id, &[col_id])
                 .ok()
                 .and_then(|mut v| v.pop())
-                .map(|(_, raw)| Value::int64_from_u64(raw));
+                .map(|(_, raw)| self.store.decode_raw_value(raw));
             disk_val.map(|v| (prev_txn_id, v))
         };
 
@@ -1121,7 +1121,9 @@ impl WriteTx {
                         op_props
                             .iter()
                             .find(|&&(c, _)| c == *col_id)
-                            .map(|(_, v)| v.to_u64() == want_val.to_u64())
+                            // Compare in-memory Value objects directly so long
+                            // strings (> 7 bytes) are not truncated (SPA-212).
+                            .map(|(_, v)| v == want_val)
                             .unwrap_or(false)
                     });
                     if matches {
@@ -1142,7 +1144,11 @@ impl WriteTx {
                     stored
                         .iter()
                         .find(|&&(c, _)| c == *col_id)
-                        .map(|&(_, raw)| raw == want_val.to_u64())
+                        .map(|&(_, raw)| {
+                            // Compare decoded values so overflow strings (> 7 bytes)
+                            // match correctly (SPA-212).
+                            self.store.decode_raw_value(raw) == *want_val
+                        })
                         .unwrap_or(false)
                 });
                 if matches {
