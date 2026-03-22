@@ -102,12 +102,12 @@ fn cmd_info(db_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>>
     let db = sparrowdb::GraphDb::open(db_path)?;
     let rx = db.begin_read()?;
     let txn_id = rx.snapshot_txn_id;
+    let (node_count, edge_count) = db.db_counts()?;
     let info = serde_json::json!({
         "db_path": db_path.display().to_string(),
         "txn_id": txn_id,
-        "node_count": null,
-        "edge_count": null,
-        "note": "node_count/edge_count will be populated once the catalog API is promoted"
+        "node_count": node_count,
+        "edge_count": edge_count,
     });
     println!("{}", serde_json::to_string_pretty(&info)?);
     Ok(())
