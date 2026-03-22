@@ -34,7 +34,7 @@ fn to_napi<E: std::fmt::Display>(e: E) -> napi::Error {
 /// }
 /// db.checkpoint()
 /// ```
-#[napi]
+#[napi(js_name = "SparrowDB")]
 pub struct SparrowDB {
     inner: ::sparrowdb::GraphDb,
 }
