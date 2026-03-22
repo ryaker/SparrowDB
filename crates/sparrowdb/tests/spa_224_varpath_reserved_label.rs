@@ -48,7 +48,7 @@ fn build_so_graph() -> (tempfile::TempDir, sparrowdb::GraphDb) {
             .expect("create __SO_Class label") as u32;
 
         // slot 0 = Person (Bytes stores string values)
-        let person_node = NodeId((label_id as u64) << 32 | 0);
+        let person_node = NodeId((label_id as u64) << 32);
         tx.create_node(label_id, &[(name_col, Value::Bytes(b"Person".to_vec()))])
             .expect("create Person node");
 

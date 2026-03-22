@@ -40,7 +40,7 @@ fn so_label_varpath_repro() {
         tx.create_node(label_id, &[(name_col, Value::Bytes(b"Employee".to_vec()))])
             .expect("create Employee");
 
-        let person_node = NodeId((label_id as u64) << 32 | 0);
+        let person_node = NodeId((label_id as u64) << 32);
         let employee_node = NodeId((label_id as u64) << 32 | 1);
 
         // Employee -> Person
