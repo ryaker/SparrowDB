@@ -17,7 +17,7 @@ use sparrowdb_cypher::ast::{
     Statement, UnionStatement, UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
-use sparrowdb_storage::csr::CsrForward;
+use sparrowdb_storage::csr::{CsrBackward, CsrForward};
 use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
 use sparrowdb_storage::fulltext_index::FulltextIndex;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
@@ -1572,31 +1572,49 @@ impl Engine {
         let src_node_pat = &pat.nodes[0];
         let dst_node_pat = &pat.nodes[1];
         let rel_pat = &pat.rels[0];
-        if rel_pat.dir != sparrowdb_cypher::ast::EdgeDir::Outgoing {
-            return Err(sparrowdb_common::Error::Unimplemented);
-        }
+
+        let dir = &rel_pat.dir;
+        // Incoming-only: swap the logical src/dst and recurse as Outgoing by
+        // swapping pattern roles.  We handle it by falling through with the
+        // node patterns in swapped order below.
+        // Both (undirected): handled by running forward + backward passes.
+        // Unknown directions remain unimplemented.
+        use sparrowdb_cypher::ast::EdgeDir;
 
         let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
         let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
-        let src_label_id = self
+
+        // For Incoming, the edge physically runs dst→src, so we swap labels.
+        let (scan_src_label, scan_dst_label, scan_src_pat, _scan_dst_pat) = match dir {
+            EdgeDir::Incoming => (&dst_label, &src_label, dst_node_pat, src_node_pat),
+            _ => (&src_label, &dst_label, src_node_pat, dst_node_pat),
+        };
+
+        let scan_src_label_id = self
             .catalog
-            .get_label(&src_label)?
+            .get_label(scan_src_label)?
             .ok_or(sparrowdb_common::Error::NotFound)? as u32;
         // SPA-198: destination label is optional — an unlabeled endpoint `(b)`
         // should match any node at the other end of the edge.  Only resolve
         // the label ID when a label constraint was actually specified.
-        let dst_label_id: Option<u32> = if dst_node_pat.labels.is_empty() {
+        let scan_dst_label_id: Option<u32> = if scan_dst_label.is_empty() {
             None
         } else {
-            Some(
-                self.catalog
-                    .get_label(&dst_label)?
-                    .ok_or(sparrowdb_common::Error::NotFound)? as u32,
-            )
+            self.catalog.get_label(scan_dst_label)?.map(|id| id as u32)
         };
 
-        let hwm_src = self.store.hwm_for_label(src_label_id)?;
-        tracing::debug!(src_label = %src_label, dst_label = %dst_label, hwm_src = hwm_src, "one-hop traversal start");
+        // We also need the original label ids for the column projection.
+        let src_label_id = match dir {
+            EdgeDir::Incoming => scan_dst_label_id.unwrap_or(0),
+            _ => scan_src_label_id,
+        };
+        let dst_label_id: Option<u32> = match dir {
+            EdgeDir::Incoming => Some(scan_src_label_id),
+            _ => scan_dst_label_id,
+        };
+
+        let hwm_scan_src = self.store.hwm_for_label(scan_src_label_id)?;
+        tracing::debug!(src_label = %src_label, dst_label = %dst_label, dir = ?dir, "one-hop traversal start");
 
         let mut col_ids_src =
             collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
@@ -1633,15 +1651,34 @@ impl Engine {
 
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
+        // For undirected (Both), track seen (src_slot, dst_slot) pairs from the
+        // forward pass so we don't re-emit them in the backward pass.
+        let mut seen_undirected: HashSet<(u64, u64)> = HashSet::new();
 
-        // Scan source nodes.
-        for src_slot in 0..hwm_src {
-            let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
-            let src_props = {
+        // Open CsrBackward once for undirected/incoming traversal (fallback to
+        // None if it doesn't exist yet, e.g. no checkpoint has been written).
+        let csr_bwd: Option<CsrBackward> = match dir {
+            EdgeDir::Outgoing => None,
+            _ => EdgeStore::open(&self.db_root, RelTableId(0))
+                .and_then(|s| s.open_bwd())
+                .ok(),
+        };
+
+        // Read the full delta log once (used for both forward and backward
+        // neighbor resolution when direction is Both).
+        let delta_records: Vec<sparrowdb_storage::edge_store::DeltaRecord> =
+            EdgeStore::open(&self.db_root, RelTableId(0))
+                .and_then(|s| s.read_delta())
+                .unwrap_or_default();
+
+        // ── Forward pass (Outgoing or Both) ──────────────────────────────────
+        // Scan nodes matching scan_src_pat and follow their outgoing edges.
+        for scan_src_slot in 0..hwm_scan_src {
+            let scan_src_node = NodeId(((scan_src_label_id as u64) << 32) | scan_src_slot);
+            let scan_src_props = if !col_ids_src.is_empty() || !scan_src_pat.props.is_empty() {
                 let all_needed: Vec<u32> = {
                     let mut v = col_ids_src.clone();
-                    // Add prop filter cols
-                    for p in &src_node_pat.props {
+                    for p in &scan_src_pat.props {
                         let col_id = prop_name_to_col_id(&p.key);
                         if !v.contains(&col_id) {
                             v.push(col_id);
@@ -1649,11 +1686,12 @@ impl Engine {
                     }
                     v
                 };
-                read_node_props(&self.store, src_node, &all_needed)?
+                self.store.get_node_raw(scan_src_node, &all_needed)?
+            } else {
+                vec![]
             };
 
-            // Apply src inline prop filter.
-            if !self.matches_prop_filter(&src_props, &src_node_pat.props) {
+            if !self.matches_prop_filter(&scan_src_props, &scan_src_pat.props) {
                 continue;
             }
 
@@ -1661,36 +1699,30 @@ impl Engine {
             // with CSR neighbors so edges are visible before a checkpoint.
             // SPA-198: keep the full dst NodeId (label encoded in upper 32 bits)
             // so that unlabeled destination endpoints can be resolved correctly.
-            let delta_neighbors: Vec<u64> = {
-                let edge_store = EdgeStore::open(&self.db_root, RelTableId(0));
-                match edge_store.and_then(|s| s.read_delta()) {
-                    Ok(records) => records
-                        .into_iter()
-                        .filter(|r| {
-                            let r_src_label = (r.src.0 >> 32) as u32;
-                            let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                            if r_src_label != src_label_id || r_src_slot != src_slot {
-                                return false;
-                            }
-                            // If a dst label filter is specified, apply it.
-                            if let Some(required_dst_label) = dst_label_id {
-                                let r_dst_label = (r.dst.0 >> 32) as u32;
-                                r_dst_label == required_dst_label
-                            } else {
-                                true
-                            }
-                        })
-                        .map(|r| r.dst.0) // full NodeId — label in upper 32 bits
-                        .collect(),
-                    Err(_) => vec![],
-                }
-            };
+            let delta_neighbors: Vec<u64> = delta_records
+                .iter()
+                .filter(|r| {
+                    let r_src_label = (r.src.0 >> 32) as u32;
+                    let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                    if r_src_label != scan_src_label_id || r_src_slot != scan_src_slot {
+                        return false;
+                    }
+                    // If a dst label filter is specified, apply it.
+                    if let Some(required_dst_label) = scan_dst_label_id {
+                        let r_dst_label = (r.dst.0 >> 32) as u32;
+                        r_dst_label == required_dst_label
+                    } else {
+                        true
+                    }
+                })
+                .map(|r| r.dst.0) // full NodeId — label in upper 32 bits
+                .collect();
 
             // Traverse CSR.  The CSR is indexed by plain src slot (0..hwm_src).
             // Neighbors are stored as plain dst slot indices; we re-encode them
             // as full NodeIds below using dst_label_id (or, for unlabeled dst,
             // the dst label encoded in the neighbor slot via delta-log full ids).
-            let csr_neighbors_raw = self.csr.neighbors(src_slot);
+            let csr_neighbors_raw = self.csr.neighbors(scan_src_slot);
             // For labeled dst: filter CSR slots by dst_label_id and re-encode as
             // full NodeIds.  For unlabeled dst: include all CSR slots and set
             // the dst label to 0 (unknown at CSR read time; unlabeled dst queries
@@ -1731,10 +1763,75 @@ impl Engine {
                 if !seen_neighbors.insert(dst_full_id) {
                     continue;
                 }
-                // Reconstruct the dst NodeId from the full encoded value.
-                let dst_node = NodeId(dst_full_id);
-                let dst_props = if !col_ids_dst.is_empty() {
-                    self.store.get_node_raw(dst_node, &col_ids_dst)?
+
+                // For Outgoing/Both: dst_full_id encodes the physical dst (= logical dst).
+                // For Incoming: scan was reversed (scan_src = logical dst), so
+                // dst_full_id encodes the physical dst (= logical src).
+                // Map to logical (src_node, dst_node) for row construction.
+                let (src_node, dst_node) = match dir {
+                    EdgeDir::Incoming => {
+                        // Physical dst is the logical src; scan_src_node is the logical dst.
+                        let logical_src = NodeId(dst_full_id);
+                        (logical_src, scan_src_node)
+                    }
+                    _ => {
+                        // Reconstruct dst from full encoded value.
+                        (scan_src_node, NodeId(dst_full_id))
+                    }
+                };
+                if *dir == EdgeDir::Both {
+                    let src_slot = scan_src_slot;
+                    let dst_slot = dst_full_id & 0xFFFF_FFFF;
+                    seen_undirected.insert((src_slot, dst_slot));
+                }
+
+                // Fetch props for the logical src and dst nodes.
+                // For Outgoing/Both the scan_src_node IS the logical src node.
+                // For Incoming the scan_src_node is the logical dst node, so
+                // we need to re-fetch in the right direction.
+                let src_props = match dir {
+                    EdgeDir::Incoming => {
+                        // scan_src is the logical dst; we need logical src props
+                        if !col_ids_src.is_empty() || !src_node_pat.props.is_empty() {
+                            let all_needed: Vec<u32> = {
+                                let mut v = col_ids_src.clone();
+                                for p in &src_node_pat.props {
+                                    let col_id = prop_name_to_col_id(&p.key);
+                                    if !v.contains(&col_id) {
+                                        v.push(col_id);
+                                    }
+                                }
+                                v
+                            };
+                            self.store.get_node_raw(src_node, &all_needed)?
+                        } else {
+                            vec![]
+                        }
+                    }
+                    _ => scan_src_props.clone(),
+                };
+
+                // For Incoming direction, src props were just fetched above;
+                // apply src prop filter now (for Outgoing/Both it was applied
+                // before the neighbor scan in the outer loop).
+                if *dir == EdgeDir::Incoming
+                    && !self.matches_prop_filter(&src_props, &src_node_pat.props)
+                {
+                    continue;
+                }
+
+                let dst_props = if !col_ids_dst.is_empty() || !dst_node_pat.props.is_empty() {
+                    let all_needed: Vec<u32> = {
+                        let mut v = col_ids_dst.clone();
+                        for p in &dst_node_pat.props {
+                            let col_id = prop_name_to_col_id(&p.key);
+                            if !v.contains(&col_id) {
+                                v.push(col_id);
+                            }
+                        }
+                        v
+                    };
+                    self.store.get_node_raw(dst_node, &all_needed)?
                 } else {
                     vec![]
                 };
@@ -1857,7 +1954,181 @@ impl Engine {
             }
         }
 
-        if use_eval_path {
+        // ── Backward pass for undirected (Both) ──────────────────────────────
+        // For (a)-[r]-(b), the forward pass already emitted rows for edges
+        // a→b.  Now we scan all nodes matching `src_node_pat` (the "a" side)
+        // and look for *incoming* edges (edges whose physical direction is
+        // b→a).  We use CsrBackward.predecessors(a_slot) for checkpointed
+        // edges and the delta log (reversed) for in-flight edges.
+        if *dir == EdgeDir::Both {
+            let hwm_dst_side = self.store.hwm_for_label(src_label_id)?;
+            for a_slot in 0..hwm_dst_side {
+                let a_node = NodeId(((src_label_id as u64) << 32) | a_slot);
+                let a_props = if !col_ids_src.is_empty() || !src_node_pat.props.is_empty() {
+                    let all_needed: Vec<u32> = {
+                        let mut v = col_ids_src.clone();
+                        for p in &src_node_pat.props {
+                            let col_id = prop_name_to_col_id(&p.key);
+                            if !v.contains(&col_id) {
+                                v.push(col_id);
+                            }
+                        }
+                        v
+                    };
+                    self.store.get_node_raw(a_node, &all_needed)?
+                } else {
+                    vec![]
+                };
+                if !self.matches_prop_filter(&a_props, &src_node_pat.props) {
+                    continue;
+                }
+
+                // Predecessors via CsrBackward (checkpointed edges b→a).
+                let bwd_predecessors: Vec<u64> = csr_bwd
+                    .as_ref()
+                    .map(|bwd| bwd.predecessors(a_slot).to_vec())
+                    .unwrap_or_default();
+
+                // Predecessors via delta log (edges b→a not yet checkpointed).
+                let delta_predecessors: Vec<u64> = delta_records
+                    .iter()
+                    .filter(|r| {
+                        // The edge goes r.src → r.dst; we want edges *to* a_slot.
+                        let r_dst_label = (r.dst.0 >> 32) as u32;
+                        let r_dst_slot = r.dst.0 & 0xFFFF_FFFF;
+                        r_dst_label == src_label_id && r_dst_slot == a_slot
+                    })
+                    .map(|r| r.src.0 & 0xFFFF_FFFF)
+                    .collect();
+
+                let all_predecessors: Vec<u64> = bwd_predecessors
+                    .into_iter()
+                    .chain(delta_predecessors)
+                    .collect();
+
+                let mut seen_preds: HashSet<u64> = HashSet::new();
+                for b_slot in all_predecessors {
+                    if !seen_preds.insert(b_slot) {
+                        continue;
+                    }
+                    // Skip pairs already emitted in the forward pass.
+                    if seen_undirected.contains(&(a_slot, b_slot)) {
+                        continue;
+                    }
+
+                    let b_node = NodeId(((dst_label_id.unwrap_or(0) as u64) << 32) | b_slot);
+                    let b_props = if !col_ids_dst.is_empty() || !dst_node_pat.props.is_empty() {
+                        let all_needed: Vec<u32> = {
+                            let mut v = col_ids_dst.clone();
+                            for p in &dst_node_pat.props {
+                                let col_id = prop_name_to_col_id(&p.key);
+                                if !v.contains(&col_id) {
+                                    v.push(col_id);
+                                }
+                            }
+                            v
+                        };
+                        self.store.get_node_raw(b_node, &all_needed)?
+                    } else {
+                        vec![]
+                    };
+
+                    if !self.matches_prop_filter(&b_props, &dst_node_pat.props) {
+                        continue;
+                    }
+
+                    // Apply WHERE clause.
+                    if let Some(ref where_expr) = m.where_clause {
+                        let mut row_vals =
+                            build_row_vals(&a_props, &src_node_pat.var, &col_ids_src);
+                        row_vals.extend(build_row_vals(&b_props, &dst_node_pat.var, &col_ids_dst));
+                        if !rel_pat.var.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__type__", rel_pat.var),
+                                Value::String(rel_pat.rel_type.clone()),
+                            );
+                        }
+                        if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__labels__", src_node_pat.var),
+                                Value::List(vec![Value::String(src_label.clone())]),
+                            );
+                        }
+                        if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__labels__", dst_node_pat.var),
+                                Value::List(vec![Value::String(dst_label.clone())]),
+                            );
+                        }
+                        if !eval_where(where_expr, &row_vals) {
+                            continue;
+                        }
+                    }
+
+                    if use_agg {
+                        let mut row_vals =
+                            build_row_vals(&a_props, &src_node_pat.var, &col_ids_src);
+                        row_vals.extend(build_row_vals(&b_props, &dst_node_pat.var, &col_ids_dst));
+                        if !rel_pat.var.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__type__", rel_pat.var),
+                                Value::String(rel_pat.rel_type.clone()),
+                            );
+                        }
+                        if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__labels__", src_node_pat.var),
+                                Value::List(vec![Value::String(src_label.clone())]),
+                            );
+                        }
+                        if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__labels__", dst_node_pat.var),
+                                Value::List(vec![Value::String(dst_label.clone())]),
+                            );
+                        }
+                        if !src_node_pat.var.is_empty() {
+                            row_vals.insert(src_node_pat.var.clone(), Value::NodeRef(a_node));
+                        }
+                        if !dst_node_pat.var.is_empty() {
+                            row_vals.insert(dst_node_pat.var.clone(), Value::NodeRef(b_node));
+                        }
+                        raw_rows.push(row_vals);
+                    } else {
+                        let rel_var_type = if !rel_pat.var.is_empty() {
+                            Some((rel_pat.var.as_str(), rel_pat.rel_type.as_str()))
+                        } else {
+                            None
+                        };
+                        let src_label_meta =
+                            if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                                Some((src_node_pat.var.as_str(), src_label.as_str()))
+                            } else {
+                                None
+                            };
+                        let dst_label_meta =
+                            if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
+                                Some((dst_node_pat.var.as_str(), dst_label.as_str()))
+                            } else {
+                                None
+                            };
+                        let row = project_hop_row(
+                            &a_props,
+                            &b_props,
+                            column_names,
+                            &src_node_pat.var,
+                            &dst_node_pat.var,
+                            rel_var_type,
+                            src_label_meta,
+                            dst_label_meta,
+                        );
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+
+        if use_agg {
             rows = aggregate_rows(&raw_rows, &m.return_clause.items);
         } else {
             // DISTINCT
