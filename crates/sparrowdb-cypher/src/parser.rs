@@ -673,14 +673,22 @@ impl Parser {
         self.expect_tok(&Token::Merge)?;
         self.expect_tok(&Token::LParen)?;
 
-        // Optional variable name (we discard it — MERGE doesn't bind variables).
-        if let Token::Ident(_) = self.peek().clone() {
-            if !matches!(self.peek2(), Token::Colon | Token::RParen) {
-                // ambiguous — treat as anonymous
-            } else if matches!(self.peek2(), Token::Colon) {
-                self.advance(); // consume var name
+        // Optional variable name — capture it so RETURN can reference it.
+        let var = if let Token::Ident(_) = self.peek().clone() {
+            if matches!(self.peek2(), Token::Colon) {
+                // `n:Label` — capture variable name.
+                let name = match self.advance().clone() {
+                    Token::Ident(s) => s,
+                    _ => unreachable!(),
+                };
+                name
+            } else {
+                // ambiguous or anonymous — treat as anonymous
+                String::new()
             }
-        }
+        } else {
+            String::new()
+        };
 
         // Label(s) — at least one required for MERGE.
         if !matches!(self.peek(), Token::Colon) {
@@ -707,7 +715,22 @@ impl Parser {
         };
 
         self.expect_tok(&Token::RParen)?;
-        Ok(Statement::Merge(MergeStatement { label, props }))
+
+        // Optional RETURN clause.
+        let return_clause = if matches!(self.peek(), Token::Return) {
+            self.advance(); // consume RETURN
+            let items = self.parse_return_items()?;
+            Some(ReturnClause { items })
+        } else {
+            None
+        };
+
+        Ok(Statement::Merge(MergeStatement {
+            var,
+            label,
+            props,
+            return_clause,
+        }))
     }
 
     // ── CREATE ────────────────────────────────────────────────────────────────
