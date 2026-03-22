@@ -17,7 +17,7 @@ crate-type = ["cdylib"]
 sparrowdb = { path = "../sparrowdb" }
 sparrowdb-common = { path = "../sparrowdb-common" }
 sparrowdb-execution = { path = "../sparrowdb-execution" }
-magnus = { version = "0.7", features = ["rb-sys"] }
+magnus = { version = "0.8", features = ["rb-sys"] }
 rb-sys = { version = "0.9", features = ["no-link-ruby"] }
 
 [features]

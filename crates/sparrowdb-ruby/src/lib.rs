@@ -24,7 +24,7 @@
 //! ```
 
 use magnus::{
-    class, define_module, exception, function, method,
+    function, method,
     prelude::*,
     rb_sys::{AsRawValue, FromRawValue},
     Error as MagnusError, ExceptionClass, Ruby, Value,
@@ -254,10 +254,15 @@ impl RbWriteTx {
     fn commit(&self) -> Result<u64, MagnusError> {
         match self.inner.borrow_mut().take() {
             Some(tx) => Ok(tx.commit().map_err(db_err)?.0),
-            None => Err(MagnusError::new(
-                exception::runtime_error(),
-                "transaction already committed or rolled back",
-            )),
+            None => {
+                let ruby = Ruby::get().map_err(|e| {
+                    MagnusError::new(sparrow_error(), e.to_string())
+                })?;
+                Err(MagnusError::new(
+                    ruby.exception_runtime_error(),
+                    "transaction already committed or rolled back",
+                ))
+            }
         }
     }
 
@@ -271,7 +276,7 @@ impl RbWriteTx {
 /// Magnus init function — called by Ruby when the native extension is required.
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), MagnusError> {
-    let module = define_module("SparrowDB")?;
+    let module = ruby.define_module("SparrowDB")?;
 
     // ── Exception hierarchy ───────────────────────────────────────────────────
     // SparrowDB::Error < StandardError
@@ -283,7 +288,7 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
     WRITER_BUSY_VALUE.store(writer_busy_cls.as_raw() as usize, Ordering::Release);
 
     // ── SparrowDB::GraphDb ────────────────────────────────────────────────────
-    let db_class = module.define_class("GraphDb", class::object())?;
+    let db_class = module.define_class("GraphDb", ruby.class_object())?;
     db_class.define_singleton_method("new", function!(RbGraphDb::open, 1))?;
     db_class.define_method("checkpoint", method!(RbGraphDb::checkpoint, 0))?;
     db_class.define_method("optimize", method!(RbGraphDb::optimize, 0))?;
@@ -295,13 +300,13 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
     db_class.define_method("to_s", method!(RbGraphDb::inspect, 0))?;
 
     // ── SparrowDB::ReadTx ─────────────────────────────────────────────────────
-    let read_tx_class = module.define_class("ReadTx", class::object())?;
+    let read_tx_class = module.define_class("ReadTx", ruby.class_object())?;
     read_tx_class.define_method("snapshot_txn_id", method!(RbReadTx::snapshot_txn_id, 0))?;
     read_tx_class.define_method("inspect", method!(RbReadTx::inspect, 0))?;
     read_tx_class.define_method("to_s", method!(RbReadTx::inspect, 0))?;
 
     // ── SparrowDB::WriteTx ────────────────────────────────────────────────────
-    let write_tx_class = module.define_class("WriteTx", class::object())?;
+    let write_tx_class = module.define_class("WriteTx", ruby.class_object())?;
     write_tx_class.define_method("commit", method!(RbWriteTx::commit, 0))?;
     write_tx_class.define_method("inspect", method!(RbWriteTx::inspect, 0))?;
     write_tx_class.define_method("to_s", method!(RbWriteTx::inspect, 0))?;
