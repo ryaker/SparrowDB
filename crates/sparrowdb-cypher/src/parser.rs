@@ -822,12 +822,17 @@ impl Parser {
         // Supports: [r:REL_TYPE], [:REL_TYPE], [r], []
         self.expect_tok(&Token::LBracket)?;
 
-        // Capture variable if present: `[r:TYPE]` or `[r]` (variable only).
-        // A bare ident not followed by `:` is treated as a variable binding
-        // (no relationship-type constraint), matching standard Cypher semantics.
+        // SPA-195: parse optional variable name and optional rel type.
+        //
+        // Supported forms inside `[...]`:
+        //   [r]          → var="r", rel_type=""      (variable only, no type filter)
+        //   [:TYPE]      → var="",  rel_type="TYPE"  (type filter, no variable)
+        //   [r:TYPE]     → var="r", rel_type="TYPE"  (both)
+        //   [:TYPE*M..N] → variable-length with type
+        //   [*]          → error (variable-length requires a rel type)
         let var = match self.peek().clone() {
             Token::Ident(s) if matches!(self.peek2(), Token::Colon) => {
-                // `[r:TYPE]` — var followed by colon and type.
+                // `r:TYPE` — consume the variable identifier; colon handled below.
                 self.advance();
                 s
             }
@@ -835,6 +840,51 @@ impl Parser {
                 // `[r]` — variable only, no rel-type constraint (SPA-198).
                 self.advance();
                 s
+            }
+            Token::Ident(s) if matches!(self.peek2(), Token::RBracket | Token::Star) => {
+                // `r]` or `r*` — variable only, no rel type.
+                // Variable-length without type (`[r*]`) is not valid Cypher;
+                // emit a clear error rather than a confusing type-not-found one.
+                self.advance();
+                if matches!(self.peek(), Token::Star) {
+                    return Err(Error::InvalidArgument(
+                        "variable-length paths require a relationship type: \
+                         use [r:R*] not [r*]"
+                            .into(),
+                    ));
+                }
+                self.expect_tok(&Token::RBracket)?;
+                // Parse direction after `]`.
+                let dir = if incoming {
+                    if matches!(self.peek(), Token::Dash) {
+                        self.advance();
+                    } else {
+                        return Err(Error::InvalidArgument(format!(
+                            "expected '-' after ']' for incoming relationship, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    EdgeDir::Incoming
+                } else if matches!(self.peek(), Token::Arrow) {
+                    self.advance();
+                    EdgeDir::Outgoing
+                } else if matches!(self.peek(), Token::Dash) {
+                    self.advance();
+                    EdgeDir::Both
+                } else {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected '->' or '-' after ']' for outgoing/undirected \
+                         relationship, got {:?}",
+                        self.peek()
+                    )));
+                };
+                return Ok(RelPattern {
+                    var: s,
+                    rel_type: String::new(),
+                    dir,
+                    min_hops: None,
+                    max_hops: None,
+                });
             }
             _ => String::new(),
         };
