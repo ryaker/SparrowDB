@@ -15,7 +15,11 @@ fn debug_case_when() {
     let r2 = db
         .execute("MATCH (n:Person) WHERE n.age > 30 RETURN n.name")
         .unwrap();
-    assert_eq!(r2.rows.len(), 1, "expected one row matching WHERE n.age > 30");
+    assert_eq!(
+        r2.rows.len(),
+        1,
+        "expected one row matching WHERE n.age > 30"
+    );
     assert_eq!(
         r2.rows[0][0],
         Value::String("Alice".to_string()),
