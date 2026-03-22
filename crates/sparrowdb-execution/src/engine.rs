@@ -3376,16 +3376,28 @@ fn string_to_raw_u64(s: &str) -> u64 {
     StoreValue::Bytes(s.as_bytes().to_vec()).to_u64()
 }
 
-/// Map a property name like "col_0" or "name" to a col_id.
+/// Map a property name to a col_id via the canonical FNV-1a hash.
 ///
-/// Uses the canonical [`sparrowdb_common::col_id_of`] FNV-1a hash so that
-/// this always agrees with what the storage layer wrote to disk (SPA-160).
+/// All property names — including those that start with `col_` (e.g. `col_id`,
+/// `col_name`, `col_0`) — are hashed with [`col_id_of`] so that the col_id
+/// computed here always agrees with what the storage layer wrote to disk
+/// (SPA-160).  The Cypher write path (`create_node_named`,
+/// `execute_create_standalone`) consistently uses `col_id_of`, so the read
+/// path must too.
+///
+/// ## SPA-165 bug fix
+///
+/// The previous implementation special-cased names matching `col_N`:
+/// - If the suffix parsed as a `u32` the numeric value was returned directly.
+/// - If it did not parse, `unwrap_or(0)` silently mapped to column 0.
+///
+/// Both behaviours were wrong for user-defined property names.  A name like
+/// `col_id` resolved to column 0 (the tombstone sentinel), and even `col_0`
+/// was inconsistent because `create_node_named` writes it at `col_id_of("col_0")`
+/// while the old read path returned column 0.  The fix removes the `col_`
+/// prefix shorthand entirely; every name goes through `col_id_of`.
 fn prop_name_to_col_id(name: &str) -> u32 {
-    if let Some(suffix) = name.strip_prefix("col_") {
-        suffix.parse().unwrap_or(0)
-    } else {
-        col_id_of(name)
-    }
+    col_id_of(name)
 }
 
 fn collect_col_ids_from_columns(column_names: &[String]) -> Vec<u32> {
