@@ -1200,7 +1200,7 @@ fn kms_q31_variable_length_path_traversal() {
 
     // If it runs, know-002 (dist 1) and know-003 (dist 2) should be reachable.
     assert!(
-        result.rows.len() >= 1,
+        !result.rows.is_empty(),
         "expected at least know-002 at distance 1"
     );
 }
@@ -1407,7 +1407,7 @@ fn kms_q37_optional_match_for_entity_summary() {
     // alice has incoming ABOUT from know-001.
     // Note: the ABOUT edge goes Knowledge→Person (directed), so undirected pattern finds it.
     assert!(
-        result.rows.len() >= 1,
+        !result.rows.is_empty(),
         "should have at least 1 row for alice: {:?}",
         result.rows
     );
