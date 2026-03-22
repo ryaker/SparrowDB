@@ -18,7 +18,7 @@ use sparrowdb_cypher::ast::{
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::CsrForward;
-use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
+use sparrowdb_storage::edge_store::{DeltaRecord, EdgeStore, RelTableId};
 use sparrowdb_storage::fulltext_index::FulltextIndex;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
 
@@ -28,21 +28,40 @@ use crate::types::{QueryResult, Value};
 pub struct Engine {
     pub store: NodeStore,
     pub catalog: Catalog,
-    pub csr: CsrForward,
+    /// Per-relationship-type CSR forward files, keyed by `RelTableId` (u32).
+    /// Replaces the old single `csr: CsrForward` field so that different
+    /// relationship types use separate edge tables (SPA-185).
+    pub csrs: HashMap<u32, CsrForward>,
     pub db_root: std::path::PathBuf,
     /// Runtime query parameters supplied by the caller (e.g. `$name` → Value).
     pub params: HashMap<String, Value>,
 }
 
 impl Engine {
-    pub fn new(store: NodeStore, catalog: Catalog, csr: CsrForward, db_root: &Path) -> Self {
+    /// Create an engine with a pre-built per-type CSR map.
+    ///
+    /// The `csrs` map associates each `RelTableId` (u32) with its forward CSR.
+    /// Use [`Engine::with_single_csr`] in tests or legacy code that only has
+    /// one CSR.
+    pub fn new(store: NodeStore, catalog: Catalog, csrs: HashMap<u32, CsrForward>, db_root: &Path) -> Self {
         Engine {
             store,
             catalog,
-            csr,
+            csrs,
             db_root: db_root.to_path_buf(),
             params: HashMap::new(),
         }
+    }
+
+    /// Convenience constructor for tests and legacy callers that have a single
+    /// [`CsrForward`] (stored at `RelTableId(0)`).
+    ///
+    /// SPA-185: prefer `Engine::new` with a full `HashMap<u32, CsrForward>` for
+    /// production use so that per-type filtering is correct.
+    pub fn with_single_csr(store: NodeStore, catalog: Catalog, csr: CsrForward, db_root: &Path) -> Self {
+        let mut csrs = HashMap::new();
+        csrs.insert(0u32, csr);
+        Self::new(store, catalog, csrs, db_root)
     }
 
     /// Attach runtime query parameters to this engine instance.
@@ -52,6 +71,78 @@ impl Engine {
     pub fn with_params(mut self, params: HashMap<String, Value>) -> Self {
         self.params = params;
         self
+    }
+
+    // ── Per-type CSR / delta helpers ─────────────────────────────────────────
+
+    /// Return the `RelTableId` (u32) for `(src_label_id, dst_label_id, rel_type)`.
+    ///
+    /// When `rel_type` is empty the query carries no type filter; we return
+    /// `None` to signal "all rel types".
+    fn resolve_rel_table_id(
+        &self,
+        src_label_id: u32,
+        dst_label_id: u32,
+        rel_type: &str,
+    ) -> Option<u32> {
+        if rel_type.is_empty() {
+            return None;
+        }
+        self.catalog
+            .get_rel_table(src_label_id as u16, dst_label_id as u16, rel_type)
+            .ok()
+            .flatten()
+            .map(|id| id as u32)
+    }
+
+    /// Read delta records for a specific relationship type.
+    ///
+    /// Returns an empty `Vec` if the rel type has not been registered yet, or
+    /// if the delta file does not exist.
+    fn read_delta_for(
+        &self,
+        rel_table_id: u32,
+    ) -> Vec<sparrowdb_storage::edge_store::DeltaRecord> {
+        EdgeStore::open(&self.db_root, RelTableId(rel_table_id))
+            .and_then(|s| s.read_delta())
+            .unwrap_or_default()
+    }
+
+    /// Read delta records across **all** registered rel types.
+    ///
+    /// Used by code paths that traverse edges without a type filter.
+    fn read_delta_all(&self) -> Vec<sparrowdb_storage::edge_store::DeltaRecord> {
+        let ids = self.catalog.list_rel_table_ids();
+        if ids.is_empty() {
+            // No rel types in catalog yet; fall back to table-id 0 (legacy).
+            return EdgeStore::open(&self.db_root, RelTableId(0))
+                .and_then(|s| s.read_delta())
+                .unwrap_or_default();
+        }
+        ids.into_iter()
+            .flat_map(|(id, _, _, _)| {
+                EdgeStore::open(&self.db_root, RelTableId(id as u32))
+                    .and_then(|s| s.read_delta())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Return neighbor slots from the CSR for a given src slot and rel table.
+    fn csr_neighbors(&self, rel_table_id: u32, src_slot: u64) -> Vec<u64> {
+        self.csrs
+            .get(&rel_table_id)
+            .map(|csr| csr.neighbors(src_slot).to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Return neighbor slots merged across **all** registered rel types.
+    fn csr_neighbors_all(&self, src_slot: u64) -> Vec<u64> {
+        let mut out: Vec<u64> = Vec::new();
+        for csr in self.csrs.values() {
+            out.extend_from_slice(csr.neighbors(src_slot));
+        }
+        out
     }
 
     /// Parse, bind, plan, and execute a Cypher query.
@@ -563,26 +654,30 @@ impl Engine {
                     .map(|p| prop_name_to_col_id(&p.key))
                     .collect();
 
+                // SPA-185: resolve per-type rel table for delta and CSR reads.
+                let rel_lookup =
+                    self.resolve_rel_table_id(src_label_id, dst_label_id, &rel_pat.rel_type);
+                if matches!(rel_lookup, RelTableLookup::NotFound) {
+                    return Ok(vec![]);
+                }
+
                 // Build a src_slot → Vec<dst_slot> adjacency map from the delta log once,
                 // filtering by src_label to avoid O(N*M) scanning inside the outer loop.
-                // TODO: filter by rel_pat.rel_type when multi-rel-table support lands.
                 let delta_adj: HashMap<u64, Vec<u64>> = {
-                    let edge_store = EdgeStore::open(&self.db_root, RelTableId(0));
-                    match edge_store.and_then(|s| s.read_delta()) {
-                        Ok(records) => {
-                            let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
-                            for r in records {
-                                let s = r.src.0;
-                                let s_label = (s >> 32) as u32;
-                                if s_label == src_label_id {
-                                    let s_slot = s & 0xFFFF_FFFF;
-                                    adj.entry(s_slot).or_default().push(r.dst.0 & 0xFFFF_FFFF);
-                                }
-                            }
-                            adj
+                    let records: Vec<DeltaRecord> = match rel_lookup {
+                        RelTableLookup::Found(rtid) => self.read_delta_for(rtid),
+                        _ => self.read_delta_all(),
+                    };
+                    let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+                    for r in records {
+                        let s = r.src.0;
+                        let s_label = (s >> 32) as u32;
+                        if s_label == src_label_id {
+                            let s_slot = s & 0xFFFF_FFFF;
+                            adj.entry(s_slot).or_default().push(r.dst.0 & 0xFFFF_FFFF);
                         }
-                        Err(_) => HashMap::new(),
                     }
+                    adj
                 };
 
                 let hwm_src = self.store.hwm_for_label(src_label_id)?;
@@ -605,13 +700,16 @@ impl Engine {
                     }
 
                     // Collect outgoing neighbours (CSR + delta adjacency map).
-                    let csr_neighbors = self.csr.neighbors(src_slot);
+                    let csr_neighbors_vec: Vec<u64> = match rel_lookup {
+                        RelTableLookup::Found(rtid) => self.csr_neighbors(rtid, src_slot),
+                        _ => self.csr_neighbors_all(src_slot),
+                    };
                     let empty: Vec<u64> = Vec::new();
                     let delta_neighbors: &[u64] =
                         delta_adj.get(&src_slot).map_or(&empty, |v| v.as_slice());
 
                     let mut seen: HashSet<u64> = HashSet::new();
-                    for &dst_slot in csr_neighbors.iter().chain(delta_neighbors.iter()) {
+                    for &dst_slot in csr_neighbors_vec.iter().chain(delta_neighbors.iter()) {
                         if !seen.insert(dst_slot) {
                             continue;
                         }
@@ -1243,7 +1341,7 @@ impl Engine {
         dst_label_id: Option<u32>,
         _src_pat: &sparrowdb_cypher::ast::NodePattern,
         dst_node_pat: &sparrowdb_cypher::ast::NodePattern,
-        _rel_pat: &sparrowdb_cypher::ast::RelPattern,
+        rel_pat: &sparrowdb_cypher::ast::RelPattern,
         opt_vars: &[String],
         column_names: &[String],
     ) -> Result<Vec<HashMap<String, Value>>> {
@@ -1256,27 +1354,31 @@ impl Engine {
         let col_ids_dst = collect_col_ids_for_var(dst_var, column_names, dst_label_id);
         let _ = opt_vars;
 
-        // Read delta log neighbors.
+        // SPA-185: read delta log neighbors from the correct per-type edge store.
         let delta_neighbors: Vec<u64> = {
-            let edge_store = EdgeStore::open(&self.db_root, RelTableId(0));
-            match edge_store.and_then(|s| s.read_delta()) {
-                Ok(records) => records
-                    .into_iter()
-                    .filter(|r| {
-                        let r_src_label = (r.src.0 >> 32) as u32;
-                        let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                        r_src_label == src_label_id && r_src_slot == src_slot
-                    })
-                    .map(|r| r.dst.0 & 0xFFFF_FFFF)
-                    .collect(),
-                Err(_) => vec![],
-            }
+            let records: Vec<DeltaRecord> =
+                match self.resolve_rel_table_id(src_label_id, dst_label_id, &rel_pat.rel_type) {
+                    Some(rtid) => self.read_delta_for(rtid),
+                    None => self.read_delta_all(),
+                };
+            records
+                .into_iter()
+                .filter(|r| {
+                    let r_src_label = (r.src.0 >> 32) as u32;
+                    let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                    r_src_label == src_label_id && r_src_slot == src_slot
+                })
+                .map(|r| r.dst.0 & 0xFFFF_FFFF)
+                .collect()
         };
 
-        let csr_neighbors = self.csr.neighbors(src_slot);
+        // SPA-185: use the correct per-type CSR.
+        let csr_neighbors = match self.resolve_rel_table_id(src_label_id, dst_label_id, &rel_pat.rel_type) {
+            Some(rtid) => self.csr_neighbors(rtid, src_slot),
+            None => self.csr_neighbors_all(src_slot),
+        };
         let all_neighbors: Vec<u64> = csr_neighbors
-            .iter()
-            .copied()
+            .into_iter()
             .chain(delta_neighbors)
             .collect();
 
@@ -2202,28 +2304,33 @@ impl Engine {
             ids
         };
 
-        // SPA-163: build a slot-level adjacency map from the delta log so that
-        // edges written since the last checkpoint are visible for 2-hop queries.
+        // SPA-163 + SPA-185: build a slot-level adjacency map from all delta
+        // logs so that edges written since the last checkpoint are visible for
+        // 2-hop queries.  We aggregate across all rel types here because the
+        // 2-hop executor does not currently filter on rel_type.
         // Map: src_slot → Vec<dst_slot> (only records whose src label matches).
         let delta_adj: HashMap<u64, Vec<u64>> = {
             let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
-            if let Ok(store) = EdgeStore::open(&self.db_root, RelTableId(0)) {
-                if let Ok(records) = store.read_delta() {
-                    for r in records {
-                        let r_src_label = (r.src.0 >> 32) as u32;
-                        let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                        if r_src_label == src_label_id {
-                            adj.entry(r_src_slot)
-                                .or_default()
-                                .push(r.dst.0 & 0xFFFF_FFFF);
-                        }
-                    }
+            for r in self.read_delta_all() {
+                let r_src_label = (r.src.0 >> 32) as u32;
+                let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                if r_src_label == src_label_id {
+                    adj.entry(r_src_slot)
+                        .or_default()
+                        .push(r.dst.0 & 0xFFFF_FFFF);
                 }
             }
             adj
         };
 
-        let join = AspJoin::new(&self.csr);
+        // For 2-hop we need a single CSR; use the first available (or empty).
+        // A proper multi-type 2-hop will be addressed in a follow-up ticket.
+        let combined_csr_key = self.csrs.keys().copied().next();
+        let empty_csr = CsrForward::build(0, &[]);
+        let two_hop_csr = combined_csr_key
+            .and_then(|k| self.csrs.get(&k))
+            .unwrap_or(&empty_csr);
+        let join = AspJoin::new(two_hop_csr);
         let mut rows = Vec::new();
 
         // Scan source nodes.
@@ -2264,8 +2371,8 @@ impl Engine {
             if !first_hop_delta.is_empty() {
                 let mut delta_fof: HashSet<u64> = HashSet::new();
                 for &mid_slot in first_hop_delta {
-                    // CSR second hop from mid:
-                    for &fof in self.csr.neighbors(mid_slot) {
+                    // CSR second hop from mid (use combined 2-hop CSR):
+                    for &fof in two_hop_csr.neighbors(mid_slot) {
                         delta_fof.insert(fof);
                     }
                     // Delta second hop from mid:
@@ -2356,26 +2463,21 @@ impl Engine {
 
     /// Collect all neighbor slot-ids reachable from `src_slot` via the delta
     /// log and CSR adjacency.  src_label_id is used to filter delta records.
+    ///
+    /// SPA-185: reads across all rel types (used by variable-length path
+    /// traversal which does not currently filter on rel_type).
     fn get_node_neighbors_by_slot(&self, src_slot: u64, src_label_id: u32) -> Vec<u64> {
-        let csr_neighbors: Vec<u64> = self.csr.neighbors(src_slot).to_vec();
-        let delta_neighbors: Vec<u64> = {
-            let edge_store = sparrowdb_storage::edge_store::EdgeStore::open(
-                &self.db_root,
-                sparrowdb_storage::edge_store::RelTableId(0),
-            );
-            match edge_store.and_then(|s| s.read_delta()) {
-                Ok(records) => records
-                    .into_iter()
-                    .filter(|r| {
-                        let r_src_label = (r.src.0 >> 32) as u32;
-                        let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                        r_src_label == src_label_id && r_src_slot == src_slot
-                    })
-                    .map(|r| r.dst.0 & 0xFFFF_FFFF)
-                    .collect(),
-                Err(_) => vec![],
-            }
-        };
+        let csr_neighbors: Vec<u64> = self.csr_neighbors_all(src_slot);
+        let delta_neighbors: Vec<u64> = self
+            .read_delta_all()
+            .into_iter()
+            .filter(|r| {
+                let r_src_label = (r.src.0 >> 32) as u32;
+                let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                r_src_label == src_label_id && r_src_slot == src_slot
+            })
+            .map(|r| r.dst.0 & 0xFFFF_FFFF)
+            .collect();
         let mut all: std::collections::HashSet<u64> = csr_neighbors.into_iter().collect();
         all.extend(delta_neighbors);
         all.into_iter().collect()

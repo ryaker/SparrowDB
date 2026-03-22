@@ -20,7 +20,7 @@ fn setup_people(dir: &std::path::Path) -> Engine {
     let store = NodeStore::open(dir).expect("node store");
     let cat = Catalog::open(dir).expect("catalog");
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir);
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir);
 
     engine
         .execute("CREATE (n:Person {name: 'Alice', age: 30})")

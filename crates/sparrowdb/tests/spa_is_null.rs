@@ -17,7 +17,7 @@ fn fresh_engine(dir: &std::path::Path) -> Engine {
     let store = NodeStore::open(dir).expect("node store");
     let cat = Catalog::open(dir).expect("catalog");
     let csr = CsrForward::build(0, &[]);
-    Engine::new(store, cat, csr, dir)
+    Engine::with_single_csr(store, cat, csr, dir)
 }
 
 // ── Test 1: IS NULL — node created without the property is returned ───────────
