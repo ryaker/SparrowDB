@@ -598,7 +598,11 @@ impl GraphDb {
             // Use the execution-layer Value type for building QueryResult rows.
             type ExecValue = sparrowdb_execution::Value;
 
-            let var = if m.var.is_empty() { "n" } else { m.var.as_str() };
+            let var = if m.var.is_empty() {
+                "n"
+            } else {
+                m.var.as_str()
+            };
 
             // Build an eval map: "{var}.{prop_name}" -> ExecValue.
             // Convert storage Value (Int64/Bytes) to execution Value (Int64/String).
@@ -1547,9 +1551,9 @@ fn expr_to_value(expr: &sparrowdb_cypher::ast::Expr) -> Value {
 fn storage_value_to_exec(val: &Value) -> sparrowdb_execution::Value {
     match val {
         Value::Int64(n) => sparrowdb_execution::Value::Int64(*n),
-        Value::Bytes(b) => sparrowdb_execution::Value::String(
-            String::from_utf8_lossy(b).into_owned(),
-        ),
+        Value::Bytes(b) => {
+            sparrowdb_execution::Value::String(String::from_utf8_lossy(b).into_owned())
+        }
     }
 }
 
@@ -1566,7 +1570,9 @@ fn eval_expr_merge(
     match expr {
         Expr::PropAccess { var, prop } => {
             let key = format!("{var}.{prop}");
-            vals.get(&key).cloned().unwrap_or(sparrowdb_execution::Value::Null)
+            vals.get(&key)
+                .cloned()
+                .unwrap_or(sparrowdb_execution::Value::Null)
         }
         Expr::Literal(lit) => match lit {
             Literal::Int(n) => sparrowdb_execution::Value::Int64(*n),
@@ -1575,7 +1581,10 @@ fn eval_expr_merge(
             Literal::String(s) => sparrowdb_execution::Value::String(s.clone()),
             Literal::Null | Literal::Param(_) => sparrowdb_execution::Value::Null,
         },
-        Expr::Var(v) => vals.get(v.as_str()).cloned().unwrap_or(sparrowdb_execution::Value::Null),
+        Expr::Var(v) => vals
+            .get(v.as_str())
+            .cloned()
+            .unwrap_or(sparrowdb_execution::Value::Null),
         _ => sparrowdb_execution::Value::Null,
     }
 }
