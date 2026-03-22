@@ -8,8 +8,8 @@
 //!   - `unwind_param_string_list`    — string list `$names = [...]` → 3 rows
 //!   - `unwind_param_empty_list`     — empty list `$items = []` → 0 rows, no error
 //!   - `unwind_param_with_match`     — UNWIND IDs, then MATCH each node; verifies
-//!                                     that UNWIND param results can drive subsequent
-//!                                     MATCH queries (two-query pattern)
+//!     that UNWIND param results can drive subsequent
+//!     MATCH queries (two-query pattern)
 
 use sparrowdb::open;
 use sparrowdb_execution::Value;
