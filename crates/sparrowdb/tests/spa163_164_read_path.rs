@@ -5,6 +5,12 @@
 //!
 //! SPA-164: Nodes deleted via `WriteTx::delete_node` must not appear in scan
 //!          results.
+//!
+//! SPA-165 follow-up: `create_node` with a bare `col_id=0` was never
+//! compatible with `RETURN n.col_0` after the SPA-165 fix changed
+//! `prop_name_to_col_id` to call `col_id_of("col_0")` (FNV-1a hash).
+//! Tests now use `create_node_named` so the stored col_id matches what the
+//! query engine resolves.
 
 use sparrowdb::open;
 use sparrowdb_catalog::catalog::Catalog;
@@ -40,15 +46,19 @@ fn spa163_delta_edges_visible_without_checkpoint() {
     }
 
     // Create two Person nodes.
+    // SPA-165: use create_node_named so the property is stored under the
+    // FNV-1a col_id derived from "col_0", matching `RETURN b.col_0` in the
+    // query.  create_node(&[(0u32, …)]) stores at col_id 0, which is NOT what
+    // prop_name_to_col_id("col_0") resolves to after SPA-165.
     let alice;
     let bob;
     {
         let mut tx = db.begin_write().unwrap();
         alice = tx
-            .create_node(label_id, &[(0u32, Value::Int64(1))])
+            .create_node_named(label_id, &[("col_0".to_string(), Value::Int64(1))])
             .expect("create Alice");
         bob = tx
-            .create_node(label_id, &[(0u32, Value::Int64(2))])
+            .create_node_named(label_id, &[("col_0".to_string(), Value::Int64(2))])
             .expect("create Bob");
         tx.commit().unwrap();
     }
@@ -104,15 +114,17 @@ fn spa164_deleted_node_absent_from_scan() {
     }
 
     // Create Alice (to survive deletion) and Dave (to be deleted).
+    // SPA-165: use create_node_named so the FNV-1a col_id for "col_0" matches
+    // what `RETURN n.col_0` resolves to in the query engine.
     let alice;
     let dave;
     {
         let mut tx = db.begin_write().unwrap();
         alice = tx
-            .create_node(label_id, &[(0u32, Value::Int64(1))])
+            .create_node_named(label_id, &[("col_0".to_string(), Value::Int64(1))])
             .expect("create Alice");
         dave = tx
-            .create_node(label_id, &[(0u32, Value::Int64(4))])
+            .create_node_named(label_id, &[("col_0".to_string(), Value::Int64(4))])
             .expect("create Dave");
         tx.commit().unwrap();
     }
@@ -167,11 +179,12 @@ fn spa164_tombstone_sentinel_not_emitted() {
     }
 
     // Create and immediately delete a single Widget node.
+    // SPA-165: use create_node_named so the property col_id matches the query.
     let widget;
     {
         let mut tx = db.begin_write().unwrap();
         widget = tx
-            .create_node(label_id, &[(0u32, Value::Int64(42))])
+            .create_node_named(label_id, &[("col_0".to_string(), Value::Int64(42))])
             .expect("create Widget");
         tx.commit().unwrap();
     }
