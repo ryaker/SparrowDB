@@ -2232,17 +2232,14 @@ impl Engine {
                     .map(|r| r.dst.0 & 0xFFFF_FFFF)
                     .collect();
 
-                // Include CSR neighbors only when scanning rel-table 0 — the CSR
-                // snapshot is built exclusively for that table.  Using it for any
-                // other table would mix in neighbors from the wrong edge set.
-                let csr_neighbors: &[u64] = if *catalog_rel_id == 0 {
-                    self.csrs
-                        .get(&0)
-                        .map(|c| c.neighbors(src_slot))
-                        .unwrap_or(&[])
-                } else {
-                    &[]
-                };
+                // Look up the CSR for this specific rel table.  open_csr_map
+                // builds a per-table map keyed by catalog_rel_id, so each rel
+                // type's checkpointed edges are found under its own key.
+                let csr_neighbors: &[u64] = self
+                    .csrs
+                    .get(&(*catalog_rel_id as u32))
+                    .map(|c| c.neighbors(src_slot))
+                    .unwrap_or(&[]);
                 let all_neighbors: Vec<u64> = csr_neighbors
                     .iter()
                     .copied()
