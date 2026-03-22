@@ -2,22 +2,24 @@
 
 ## Rust API
 
-### `Engine`
+### `GraphDb`
 
 The primary entry point. Opens or creates a database directory.
 
 ```rust
-use sparrowdb::Engine;
+use sparrowdb::GraphDb;
 
-// Open without encryption
-let engine = Engine::open("path/to/db")?;
-
-// Open with XChaCha20-Poly1305 encryption
-let key: [u8; 32] = /* your 32-byte key */;
-let engine = Engine::open_encrypted("path/to/db", key)?;
+// Open (or create) a database
+let db = GraphDb::open(std::path::Path::new("path/to/db"))?;
 ```
 
-#### `Engine::execute`
+There is also a convenience free function:
+
+```rust
+let db = sparrowdb::open(std::path::Path::new("path/to/db"))?;
+```
+
+#### `GraphDb::execute`
 
 Execute a Cypher statement. Returns a `QueryResult`.
 
@@ -25,42 +27,97 @@ Execute a Cypher statement. Returns a `QueryResult`.
 pub fn execute(&self, cypher: &str) -> Result<QueryResult>
 ```
 
-**Write operations** (CREATE, DELETE, SET) commit immediately.
+**Write operations** (CREATE, MERGE, DELETE, SET) commit immediately.
 
 **Read operations** (MATCH ... RETURN) return rows in the result.
 
 ```rust
 // Write
-engine.execute("CREATE (n:Person {name: \"Alice\"})")?;
+db.execute("CREATE (n:Person {name: \"Alice\"})")?;
 
 // Read
-let result = engine.execute("MATCH (n:Person) RETURN n.name")?;
+let result = db.execute("MATCH (n:Person) RETURN n.name")?;
 ```
 
-#### `Engine::execute_with_params`
+#### `GraphDb::checkpoint`
 
-Execute with named parameters (avoids string interpolation for user data):
+Flush the WAL and compact the database. Call periodically in long-running
+processes to bound WAL growth.
 
 ```rust
-pub fn execute_with_params(
-    &self,
-    cypher: &str,
-    params: HashMap<String, Value>,
-) -> Result<QueryResult>
+pub fn checkpoint(&self) -> Result<()>
+```
+
+#### `GraphDb::optimize`
+
+Checkpoint + sort adjacency lists for faster traversal. Heavier than
+`checkpoint`; best run during a maintenance window.
+
+```rust
+pub fn optimize(&self) -> Result<()>
+```
+
+#### `GraphDb::begin_read`
+
+Open a read-only snapshot transaction pinned to the current committed state.
+Multiple readers may coexist with an active writer.
+
+```rust
+pub fn begin_read(&self) -> Result<ReadTx>
+```
+
+#### `GraphDb::begin_write`
+
+Open a write transaction. Only one writer may be active at a time; returns
+`Error::WriterBusy` if another writer is already open.
+
+```rust
+pub fn begin_write(&self) -> Result<WriteTx<'_>>
+```
+
+---
+
+### `ReadTx`
+
+Read-only snapshot transaction. Sees only data committed at or before the
+snapshot point; immune to concurrent writes.
+
+```rust
+pub struct ReadTx {
+    pub snapshot_txn_id: u64,
+    // ...
+}
 ```
 
 ```rust
-use std::collections::HashMap;
-use sparrowdb::Value;
-
-let mut params = HashMap::new();
-params.insert("name".to_string(), Value::String("Alice".to_string()));
-
-let result = engine.execute_with_params(
-    "MATCH (n:Person {name: $name}) RETURN n.name",
-    params,
-)?;
+let tx = db.begin_read()?;
+println!("Pinned to txn_id {}", tx.snapshot_txn_id);
 ```
+
+---
+
+### `WriteTx<'db>`
+
+Write transaction. Commit explicitly; dropping without committing rolls back
+all staged changes.
+
+```rust
+let mut tx = db.begin_write()?;
+tx.create_node(label_id, &[(col_id, Value::String("Alice".into()))])?;
+let txn_id = tx.commit()?;
+```
+
+Key methods:
+
+| Method | Description |
+|--------|-------------|
+| `create_node(label_id, props)` | Stage a new node |
+| `set_node_col(node_id, col_id, value)` | Stage a property update |
+| `set_property(node_id, key, value)` | Stage a property update by name |
+| `create_edge(src, rel_type, dst, props)` | Stage a new edge |
+| `delete_node(node_id)` | Stage a node deletion |
+| `create_label(name)` | Create a new label in the catalog |
+| `commit(self)` | Commit — returns the new `TxnId` |
 
 ---
 
@@ -76,7 +133,7 @@ pub struct QueryResult {
 ```
 
 ```rust
-let result = engine.execute("MATCH (n:Person) RETURN n.name, n.age")?;
+let result = db.execute("MATCH (n:Person) RETURN n.name, n.age")?;
 
 println!("Columns: {:?}", result.columns); // ["n.name", "n.age"]
 for row in &result.rows {
@@ -100,6 +157,9 @@ pub enum Value {
     Float64(f64),
     String(String),
     Bytes(Vec<u8>),
+    NodeRef(NodeId),
+    EdgeRef(EdgeId),
+    List(Vec<Value>),
 }
 ```
 
@@ -111,6 +171,46 @@ for row in &result.rows {
         println!("Name: {}", name);
     }
 }
+```
+
+---
+
+### Cypher Parameter Binding
+
+Use `$param` placeholders instead of string interpolation to safely pass
+user-supplied values. Parameters are passed as a `HashMap<String, Value>`.
+
+```rust
+use std::collections::HashMap;
+use sparrowdb::{GraphDb, Value};
+
+let db = GraphDb::open(std::path::Path::new("my.db"))?;
+
+let mut params = HashMap::new();
+params.insert("name".to_string(), Value::String("Alice".to_string()));
+params.insert("age".to_string(),  Value::Int64(30));
+
+// Write with parameters
+db.execute_with_params(
+    "CREATE (n:Person {name: $name, age: $age})",
+    params.clone(),
+)?;
+
+// Read with parameters
+let result = db.execute_with_params(
+    "MATCH (n:Person {name: $name}) RETURN n.name, n.age",
+    params,
+)?;
+```
+
+The `execute_with_params` signature:
+
+```rust
+pub fn execute_with_params(
+    &self,
+    cypher: &str,
+    params: HashMap<String, Value>,
+) -> Result<QueryResult>
 ```
 
 ---
@@ -128,15 +228,19 @@ pub enum Error {
     VersionMismatch,          // format version not supported
     DecryptionFailed,         // wrong encryption key or tampered page
     InvalidArgument(String),  // bad caller input (unknown label, etc.)
+    WriterBusy,               // begin_write() called while writer is active
     Unimplemented,            // feature not yet implemented
 }
 ```
 
 ```rust
-match engine.execute("MATCH (n:Ghost) RETURN n") {
+match db.execute("MATCH (n:Ghost) RETURN n") {
     Ok(result) => { /* ... */ }
     Err(sparrowdb::Error::InvalidArgument(msg)) => {
-        eprintln!("Schema error: {}", msg); // "unknown label: Ghost"
+        eprintln!("Schema error: {}", msg);
+    }
+    Err(sparrowdb::Error::WriterBusy) => {
+        eprintln!("Another write transaction is active");
     }
     Err(e) => return Err(e),
 }
@@ -160,6 +264,353 @@ let decrypted = ctx.decrypt_page(page_id, &encrypted)?;
 
 // Passthrough mode (no encryption)
 let ctx = EncryptionContext::none();
+```
+
+---
+
+## Python API
+
+The Python extension module is named `sparrowdb`. Build it with
+[maturin](https://www.maturin.rs/):
+
+```bash
+pip install maturin
+cd crates/sparrowdb-python && maturin develop
+```
+
+Or install from PyPI once published:
+
+```bash
+pip install sparrowdb
+```
+
+### `GraphDb`
+
+```python
+import sparrowdb
+
+db = sparrowdb.GraphDb("path/to/my.db")
+```
+
+#### `GraphDb.execute(cypher)` → `list[dict]`
+
+Execute a Cypher statement. Returns a list of dicts where each dict maps
+column name to value.
+
+Supported Python value types: `None`, `int`, `float`, `bool`, `str`.
+`NodeRef` and `EdgeRef` are returned as `int` (their packed id).
+`List` values from `collect()` aggregation are returned as Python `list`.
+
+```python
+db.execute('CREATE (:Person {name: "Alice", age: 30})')
+
+results = db.execute("MATCH (n:Person) RETURN n.name, n.age")
+# [{"n.name": "Alice", "n.age": 30}]
+
+for row in results:
+    print(row["n.name"], row["n.age"])
+```
+
+#### `GraphDb.checkpoint()` → `None`
+
+Flush the WAL and compact the database.
+
+```python
+db.checkpoint()
+```
+
+#### `GraphDb.optimize()` → `None`
+
+Checkpoint + sort adjacency lists for faster traversal.
+
+```python
+db.optimize()
+```
+
+#### `GraphDb.begin_read()` → `ReadTx`
+
+Open a read-only snapshot transaction.
+
+```python
+tx = db.begin_read()
+print(tx.snapshot_txn_id)  # int — the committed txn_id this reader is pinned to
+```
+
+#### `GraphDb.begin_write()` → `WriteTx`
+
+Open a write transaction. Raises `RuntimeError` if another writer is active.
+
+```python
+tx = db.begin_write()
+txn_id = tx.commit()  # int
+```
+
+Dropping a `WriteTx` without calling `commit()` silently rolls it back.
+
+### `ReadTx`
+
+#### `tx.snapshot_txn_id` → `int`
+
+The committed transaction ID this reader is pinned to.
+
+### `WriteTx`
+
+#### `tx.commit()` → `int`
+
+Commit all staged changes. Returns the new transaction ID as an `int`.
+Raises `RuntimeError` if already committed or rolled back.
+
+### Python Example
+
+```python
+import sparrowdb
+
+db = sparrowdb.GraphDb("/tmp/people.db")
+
+# Write nodes
+db.execute('CREATE (:Person {name: "Alice", age: 30})')
+db.execute('CREATE (:Person {name: "Bob",   age: 25})')
+db.execute(
+    'MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) '
+    'CREATE (a)-[:KNOWS]->(b)'
+)
+
+# Read
+people = db.execute("MATCH (n:Person) RETURN n.name, n.age ORDER BY n.age")
+for row in people:
+    print(f"{row['n.name']} is {row['n.age']} years old")
+
+# Explicit transaction (for txn_id tracking)
+tx = db.begin_write()
+txn_id = tx.commit()
+print(f"committed at txn_id {txn_id}")
+
+# Maintenance
+db.checkpoint()
+```
+
+### Cypher Parameter Binding (Python)
+
+Native `$param` binding via `execute_with_params` is not yet exposed in the
+Python API. Until then, use typed Python values directly in f-strings to avoid
+injection risk (numeric and boolean values cannot be injected):
+
+```python
+# Safe: integer/boolean values carry no injection risk
+age_threshold = 25
+results = db.execute(f"MATCH (n:Person) WHERE n.age > {int(age_threshold)} RETURN n.name")
+```
+
+---
+
+## Node.js Bindings
+
+The Node.js native addon (`sparrowdb.node`) is built with
+[napi-rs](https://napi.rs/). It exposes `SparrowDB`, `ReadTx`, and `WriteTx`
+classes.
+
+### Building
+
+```bash
+cargo build --release -p sparrowdb-node
+# or via napi-cli:
+napi build --platform --release
+```
+
+The resulting `sparrowdb.node` binary is loaded at runtime:
+
+```js
+const { SparrowDB } = require('./sparrowdb.node')
+```
+
+### `SparrowDB`
+
+Top-level database handle. Open with the static factory method `SparrowDB.open()`.
+
+#### `SparrowDB.open(path)` → `SparrowDB`
+
+Open (or create) a SparrowDB database at `path`. Throws if the directory
+cannot be created or the database files are corrupt.
+
+```typescript
+const db = SparrowDB.open('/path/to/my.db')
+```
+
+#### `db.execute(cypher)` → `{ columns: string[], rows: object[] }`
+
+Execute a Cypher query. Returns an object with:
+
+- `columns` — array of column name strings in RETURN order
+- `rows` — array of plain objects, each mapping column name to value
+
+Supported value types:
+
+| JS type | Notes |
+|---------|-------|
+| `null` | SparrowDB `Null` |
+| `number` | `Int64` and `Float64`; `Int64` values outside ±(2^53−1) are returned as `string` |
+| `boolean` | `Bool` |
+| `string` | `String`, and large integers |
+| `{ $type: "node", id: string }` | Node reference |
+| `{ $type: "edge", id: string }` | Edge reference |
+
+```typescript
+db.execute('CREATE (:Person {name: "Alice", age: 30})')
+
+const result = db.execute('MATCH (n:Person) RETURN n.name, n.age')
+// result.columns  => ["n.name", "n.age"]
+// result.rows     => [{ "n.name": "Alice", "n.age": 30 }]
+
+for (const row of result.rows) {
+  console.log(row['n.name'], row['n.age'])
+}
+```
+
+#### `db.checkpoint()` → `void`
+
+Flush the WAL and compact the database. Throws on I/O error.
+
+```typescript
+db.checkpoint()
+```
+
+#### `db.optimize()` → `void`
+
+Checkpoint + sort adjacency lists for faster traversal.
+
+```typescript
+db.optimize()
+```
+
+#### `db.beginRead()` → `ReadTx`
+
+Open a read-only snapshot transaction pinned to the current committed state.
+Multiple readers may coexist with an active writer.
+
+```typescript
+const tx = db.beginRead()
+console.log(tx.snapshotTxnId) // string (decimal u64)
+```
+
+#### `db.beginWrite()` → `WriteTx`
+
+Open a write transaction. Throws `WriterBusy` if another writer is already open.
+
+```typescript
+const tx = db.beginWrite()
+const txnId = tx.commit() // string (decimal u64)
+```
+
+---
+
+### `ReadTx`
+
+Read-only snapshot transaction. Obtained via `db.beginRead()`.
+
+#### `tx.snapshotTxnId` → `string`
+
+The committed transaction ID this reader is pinned to. Returned as a decimal
+string to preserve the full `u64` range (JavaScript `Number` only safely
+represents integers up to 2^53−1).
+
+```typescript
+const tx = db.beginRead()
+console.log(`pinned to txn ${tx.snapshotTxnId}`)
+```
+
+> **Note:** `ReadTx.execute()` is not yet implemented. Snapshot-pinned query
+> execution is tracked in SPA-100. Use `SparrowDB.execute()` to query the
+> latest committed state.
+
+---
+
+### `WriteTx`
+
+Write transaction. Obtained via `db.beginWrite()`. Commit explicitly;
+dropping without committing rolls back all staged changes.
+
+#### `tx.execute(cypher)` → `{ columns: string[], rows: object[] }`
+
+Execute a Cypher mutation inside this transaction.
+
+> **Note:** `WriteTx.execute()` is not yet implemented. Use
+> `SparrowDB.execute()` for mutations (auto-commit mode). Explicit
+> transactional mutations are planned.
+
+#### `tx.commit()` → `string`
+
+Commit all staged changes. Returns the new transaction ID as a decimal string.
+Throws if the transaction was already committed or rolled back.
+
+```typescript
+const tx = db.beginWrite()
+const txnId = tx.commit()
+console.log(`committed at txn ${txnId}`)
+```
+
+#### `tx.rollback()` → `void`
+
+Roll back all staged changes explicitly. Equivalent to dropping the
+transaction without committing.
+
+```typescript
+const tx = db.beginWrite()
+tx.rollback() // discard changes
+```
+
+---
+
+### TypeScript Example
+
+```typescript
+import { SparrowDB } from 'sparrowdb'
+
+// Open the database
+const db = SparrowDB.open('/tmp/people.db')
+
+// Write nodes (auto-commit)
+db.execute('CREATE (:Person {name: "Alice", age: 30})')
+db.execute('CREATE (:Person {name: "Bob",   age: 25})')
+db.execute(
+  'MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) ' +
+  'CREATE (a)-[:KNOWS]->(b)'
+)
+
+// Read all people
+const result = db.execute('MATCH (n:Person) RETURN n.name, n.age ORDER BY n.age')
+console.log('Columns:', result.columns)
+// Columns: ["n.name", "n.age"]
+
+for (const row of result.rows) {
+  console.log(`${row['n.name']} is ${row['n.age']} years old`)
+}
+// Bob is 25 years old
+// Alice is 30 years old
+
+// Read a snapshot
+const snap = db.beginRead()
+console.log('snapshot txn:', snap.snapshotTxnId)
+
+// Write transaction (for txn_id tracking / future transactional mutations)
+const tx = db.beginWrite()
+const txnId = tx.commit()
+console.log('committed at txn:', txnId)
+
+// Maintenance
+db.checkpoint()
+db.optimize()
+```
+
+### Cypher Parameter Binding (Node.js)
+
+The `SparrowDB.execute()` method takes a raw Cypher string. Native `$param`
+binding in the Node.js API is planned. Until then, use typed values to avoid
+injection risks:
+
+```typescript
+// Safe: numeric values carry no injection risk
+const minAge = 25
+const result = db.execute(`MATCH (n:Person) WHERE n.age > ${Number(minAge)} RETURN n.name`)
 ```
 
 ---
@@ -212,32 +663,4 @@ WalReplayer::replay(wal_dir, last_applied_lsn, |page_id, data, lsn| {
     // apply page write
     Ok(())
 })?;
-```
-
----
-
-## Python API (Phase 6 — coming soon)
-
-```python
-import sparrowdb
-
-# Open database
-with sparrowdb.open("my.db") as db:
-    db.query('CREATE (:Person {name: "Alice"})')
-    result = db.query('MATCH (n:Person) RETURN n.name')
-    for row in result:
-        print(row['n.name'])
-
-# With encryption
-with sparrowdb.open("secure.db", key=bytes(32)) as db:
-    db.query('CREATE (:Knowledge {content: "secret"})')
-```
-
-Install via pip (once published):
-
-```bash
-pip install sparrowdb
-# or build from source:
-pip install maturin
-cd crates/sparrowdb-python && maturin develop
 ```
