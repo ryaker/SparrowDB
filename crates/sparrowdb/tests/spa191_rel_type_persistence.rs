@@ -66,16 +66,14 @@ fn spa191_rel_type_persists_without_checkpoint() {
         // The edge data won't be in the CSR yet (no checkpoint), but the
         // binder must not throw "unknown relationship type: KNOWS".
         let result = db2.execute("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name");
-        match result {
-            Err(e) => {
-                let msg = format!("{e}");
-                assert!(
-                    !msg.contains("unknown relationship type"),
-                    "binder must not reject KNOWS — SPA-191: {msg}"
-                );
-            }
-            Ok(_) => {} // query succeeded — even better
+        if let Err(e) = result {
+            let msg = format!("{e}");
+            assert!(
+                !msg.contains("unknown relationship type"),
+                "binder must not reject KNOWS — SPA-191: {msg}"
+            );
         }
+        // Ok(_) => query succeeded, which is acceptable
     }
 }
 
