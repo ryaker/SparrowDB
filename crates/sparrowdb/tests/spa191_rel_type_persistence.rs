@@ -15,8 +15,10 @@ fn spa191_rel_type_persists_across_sessions() {
     // Session 1: create graph data and checkpoint.
     {
         let db = GraphDb::open(&db_path).expect("open session 1");
-        db.execute("CREATE (a:Person {name:'Alice'})").expect("create Alice");
-        db.execute("CREATE (b:Person {name:'Bob'})").expect("create Bob");
+        db.execute("CREATE (a:Person {name:'Alice'})")
+            .expect("create Alice");
+        db.execute("CREATE (b:Person {name:'Bob'})")
+            .expect("create Bob");
         db.execute(
             "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)",
         )
@@ -47,8 +49,10 @@ fn spa191_rel_type_persists_without_checkpoint() {
     // Session 1: create graph data but do NOT checkpoint.
     {
         let db = GraphDb::open(&db_path).expect("open session 1");
-        db.execute("CREATE (a:Person {name:'Alice'})").expect("create Alice");
-        db.execute("CREATE (b:Person {name:'Bob'})").expect("create Bob");
+        db.execute("CREATE (a:Person {name:'Alice'})")
+            .expect("create Alice");
+        db.execute("CREATE (b:Person {name:'Bob'})")
+            .expect("create Bob");
         db.execute(
             "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)",
         )
@@ -61,9 +65,7 @@ fn spa191_rel_type_persists_without_checkpoint() {
         let db2 = GraphDb::open(&db_path).expect("open session 2");
         // The edge data won't be in the CSR yet (no checkpoint), but the
         // binder must not throw "unknown relationship type: KNOWS".
-        let result = db2.execute(
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name",
-        );
+        let result = db2.execute("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name");
         match result {
             Err(e) => {
                 let msg = format!("{e}");
@@ -89,8 +91,10 @@ fn spa191_catalog_rel_table_survives_reopen() {
     // Session 1: create a KNOWS rel.
     {
         let db = GraphDb::open(&db_path).expect("open session 1");
-        db.execute("CREATE (a:Person {name:'Alice'})").expect("create Alice");
-        db.execute("CREATE (b:Person {name:'Bob'})").expect("create Bob");
+        db.execute("CREATE (a:Person {name:'Alice'})")
+            .expect("create Alice");
+        db.execute("CREATE (b:Person {name:'Bob'})")
+            .expect("create Bob");
         db.execute(
             "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)",
         )
@@ -118,8 +122,10 @@ fn spa191_multiple_rel_types_all_persist() {
     // Session 1: create KNOWS and FOLLOWS edges.
     {
         let db = GraphDb::open(&db_path).expect("open session 1");
-        db.execute("CREATE (a:Person {name:'Alice'})").expect("create Alice");
-        db.execute("CREATE (b:Person {name:'Bob'})").expect("create Bob");
+        db.execute("CREATE (a:Person {name:'Alice'})")
+            .expect("create Alice");
+        db.execute("CREATE (b:Person {name:'Bob'})")
+            .expect("create Bob");
         db.execute(
             "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)",
         )
