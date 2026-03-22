@@ -1482,14 +1482,12 @@ fn collect_maintenance_params(
                 .and_then(|s| s.read_delta().ok())
         })
         .flat_map(|records| {
-            records
-                .into_iter()
-                .flat_map(|r| {
-                    // Strip label bits — CSR needs slot indices only.
-                    let src_slot = r.src.0 & 0xFFFF_FFFF;
-                    let dst_slot = r.dst.0 & 0xFFFF_FFFF;
-                    [src_slot, dst_slot].into_iter()
-                })
+            records.into_iter().flat_map(|r| {
+                // Strip label bits — CSR needs slot indices only.
+                let src_slot = r.src.0 & 0xFFFF_FFFF;
+                let dst_slot = r.dst.0 & 0xFFFF_FFFF;
+                [src_slot, dst_slot].into_iter()
+            })
         })
         .max()
         .map(|max_slot| max_slot + 1)

@@ -131,10 +131,8 @@ fn checkpoint_fan_out_all_neighbors_correct() {
     .unwrap_or_else(|_| {
         // If MATCH…CREATE is not supported, create Carol separately and wire via
         // a path CREATE.
-        db.execute(
-            "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(c:Person {name: 'Carol'})",
-        )
-        .ok();
+        db.execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(c:Person {name: 'Carol'})")
+            .ok();
         sparrowdb_execution::types::QueryResult {
             columns: vec![],
             rows: vec![],
