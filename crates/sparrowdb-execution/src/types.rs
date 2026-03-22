@@ -95,7 +95,9 @@ impl std::fmt::Display for Value {
             }
             Value::Map(entries) => {
                 write!(f, "{{")?;
-                for (i, (k, v)) in entries.iter().enumerate() {
+                let mut sorted: Vec<&(String, Value)> = entries.iter().collect();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                for (i, (k, v)) in sorted.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }

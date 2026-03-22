@@ -1777,14 +1777,20 @@ impl Engine {
 
         if use_eval_path_all {
             rows = aggregate_rows(&raw_rows, &m.return_clause.items);
-        } else {
-            if m.distinct {
-                deduplicate_rows(&mut rows);
-            }
-            apply_order_by(&mut rows, m, column_names);
-            if let Some(lim) = m.limit {
-                rows.truncate(lim as usize);
-            }
+        }
+
+        // DISTINCT / ORDER BY / SKIP / LIMIT apply regardless of which path
+        // built the rows (eval or fast path).
+        if m.distinct {
+            deduplicate_rows(&mut rows);
+        }
+        apply_order_by(&mut rows, m, column_names);
+        if let Some(skip) = m.skip {
+            let skip = (skip as usize).min(rows.len());
+            rows.drain(0..skip);
+        }
+        if let Some(lim) = m.limit {
+            rows.truncate(lim as usize);
         }
 
         tracing::debug!(rows = rows.len(), "label-less full scan complete");
