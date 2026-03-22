@@ -418,12 +418,13 @@ impl Engine {
             let node_id = NodeId(((label_id as u64) << 32) | slot);
             let props = read_node_props(&self.store, node_id, &all_col_ids)?;
 
-            if !matches_prop_filter_static(&props, &node_pat.props) {
+            if !matches_prop_filter_static(&props, &node_pat.props, &self.dollar_params()) {
                 continue;
             }
 
             if let Some(ref where_expr) = mm.where_clause {
-                let row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                row_vals.extend(self.dollar_params());
                 if !eval_where(where_expr, &row_vals) {
                     continue;
                 }
@@ -470,7 +471,7 @@ impl Engine {
             return true;
         }
         match self.store.get_node_raw(node_id, filter_col_ids) {
-            Ok(raw_props) => matches_prop_filter_static(&raw_props, props),
+            Ok(raw_props) => matches_prop_filter_static(&raw_props, props, &self.dollar_params()),
             Err(_) => false,
         }
     }
@@ -534,7 +535,11 @@ impl Engine {
                     if !node_pat.props.is_empty() {
                         match self.store.get_node_raw(node_id, &filter_col_ids) {
                             Ok(props) => {
-                                if !matches_prop_filter_static(&props, &node_pat.props) {
+                                if !matches_prop_filter_static(
+                                    &props,
+                                    &node_pat.props,
+                                    &self.dollar_params(),
+                                ) {
                                     continue;
                                 }
                             }
@@ -999,10 +1004,15 @@ impl Engine {
                 with_vals.insert(item.alias.clone(), val);
             }
             if let Some(ref where_expr) = m.with_clause.where_clause {
-                if !eval_where(where_expr, &with_vals) {
+                let mut with_vals_p = with_vals.clone();
+                with_vals_p.extend(self.dollar_params());
+                if !eval_where(where_expr, &with_vals_p) {
                     continue;
                 }
             }
+            // Merge dollar_params into the projected row so that downstream
+            // RETURN/ORDER-BY/SKIP/LIMIT expressions can resolve $param references.
+            with_vals.extend(self.dollar_params());
             projected.push(with_vals);
         }
 
@@ -1090,7 +1100,9 @@ impl Engine {
                 }
                 let row_vals = build_row_vals(&props, var_name, &all_col_ids);
                 if let Some(wexpr) = &where_clause {
-                    if !eval_where(wexpr, &row_vals) {
+                    let mut row_vals_p = row_vals.clone();
+                    row_vals_p.extend(self.dollar_params());
+                    if !eval_where(wexpr, &row_vals_p) {
                         continue;
                     }
                 }
@@ -1272,7 +1284,8 @@ impl Engine {
                 continue;
             }
             if let Some(ref wexpr) = mom.match_where {
-                let row_vals = build_row_vals(&props, lead_var, &lead_all_col_ids);
+                let mut row_vals = build_row_vals(&props, lead_var, &lead_all_col_ids);
+                row_vals.extend(self.dollar_params());
                 if !eval_where(wexpr, &row_vals) {
                     continue;
                 }
@@ -1576,6 +1589,8 @@ impl Engine {
                 if !var_name.is_empty() {
                     row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
                 }
+                // Inject runtime params so $param references in WHERE work.
+                row_vals.extend(self.dollar_params());
                 if !eval_where(where_expr, &row_vals) {
                     continue;
                 }
@@ -1737,6 +1752,7 @@ impl Engine {
                         );
                         row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
                     }
+                    row_vals.extend(self.dollar_params());
                     if !eval_where(where_expr, &row_vals) {
                         continue;
                     }
@@ -2053,6 +2069,7 @@ impl Engine {
                                 Value::List(vec![Value::String(effective_dst_label.to_string())]),
                             );
                         }
+                        row_vals.extend(self.dollar_params());
                         if !eval_where(where_expr, &row_vals) {
                             continue;
                         }
@@ -2286,6 +2303,7 @@ impl Engine {
                                     )]),
                                 );
                             }
+                            row_vals.extend(self.dollar_params());
                             if !eval_where(where_expr, &row_vals) {
                                 continue;
                             }
@@ -2583,6 +2601,7 @@ impl Engine {
                             Value::String(pat.rels[1].rel_type.clone()),
                         );
                     }
+                    row_vals.extend(self.dollar_params());
                     if !eval_where(where_expr, &row_vals) {
                         continue;
                     }
@@ -2786,6 +2805,7 @@ impl Engine {
                             Value::List(vec![Value::String(dst_label.clone())]),
                         );
                     }
+                    row_vals.extend(self.dollar_params());
                     if !eval_where(where_expr, &row_vals) {
                         continue;
                     }
@@ -2858,7 +2878,19 @@ impl Engine {
         props: &[(u32, u64)],
         filters: &[sparrowdb_cypher::ast::PropEntry],
     ) -> bool {
-        matches_prop_filter_static(props, filters)
+        matches_prop_filter_static(props, filters, &self.dollar_params())
+    }
+
+    /// Build a map of runtime parameters keyed with a `$` prefix,
+    /// suitable for passing to `eval_expr` / `eval_where`.
+    ///
+    /// For example, `params["name"] = Value::String("Alice")` becomes
+    /// `{"$name": Value::String("Alice")}` in the returned map.
+    fn dollar_params(&self) -> HashMap<String, Value> {
+        self.params
+            .iter()
+            .map(|(k, v)| (format!("${k}"), v.clone()))
+            .collect()
     }
 }
 
@@ -2867,14 +2899,15 @@ impl Engine {
 fn matches_prop_filter_static(
     props: &[(u32, u64)],
     filters: &[sparrowdb_cypher::ast::PropEntry],
+    params: &HashMap<String, Value>,
 ) -> bool {
     for f in filters {
         let col_id = prop_name_to_col_id(&f.key);
         let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
 
-        // Evaluate the filter expression (supports literals and function calls).
-        let empty_filter_bindings: HashMap<String, Value> = HashMap::new();
-        let filter_val = eval_expr(&f.value, &empty_filter_bindings);
+        // Evaluate the filter expression (supports literals, function calls, and
+        // runtime parameters via `$name` — params are keyed as `"$name"` in the map).
+        let filter_val = eval_expr(&f.value, params);
         let matches = match filter_val {
             Value::Int64(n) => {
                 // Int64 values are stored with TAG_INT64 (0x00) in the top byte.
@@ -3419,7 +3452,11 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             Literal::Float(f) => Value::Float64(*f),
             Literal::Bool(b) => Value::Bool(*b),
             Literal::String(s) => Value::String(s.clone()),
-            Literal::Param(_p) => Value::Null, // params not bound in engine
+            Literal::Param(p) => {
+                // Runtime parameters are stored in `vals` with a `$` prefix key
+                // (inserted by the engine before evaluation via `inject_params`).
+                vals.get(&format!("${p}")).cloned().unwrap_or(Value::Null)
+            }
             Literal::Null => Value::Null,
         },
         Expr::FnCall { name, args } => {
