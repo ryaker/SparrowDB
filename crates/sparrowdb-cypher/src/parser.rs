@@ -819,7 +819,7 @@ impl Parser {
             )));
         };
 
-        // [ :REL_TYPE ]
+        // Supports: [r:REL_TYPE], [:REL_TYPE], [r], []
         self.expect_tok(&Token::LBracket)?;
 
         // Capture variable if present: `[r:TYPE]` or `[r]` (variable only).
@@ -839,9 +839,18 @@ impl Parser {
             _ => String::new(),
         };
 
-        // Parse optional colon before rel type (or error on bare star).
-        if matches!(self.peek(), Token::Colon) {
-            self.advance();
+        // Parse optional colon + rel type, or detect illegal bare star.
+        let rel_type = if matches!(self.peek(), Token::Colon) {
+            self.advance(); // consume ':'
+            match self.advance().clone() {
+                Token::Ident(s) => s,
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected relationship type, got {:?}",
+                        other
+                    )))
+                }
+            }
         } else if matches!(self.peek(), Token::Star) {
             return Err(Error::InvalidArgument(
                 "variable-length paths require a relationship type: use [:R*] not [*]".into(),
@@ -880,16 +889,9 @@ impl Parser {
                 min_hops: None,
                 max_hops: None,
             });
-        }
-
-        let rel_type = match self.advance().clone() {
-            Token::Ident(s) => s,
-            other => {
-                return Err(Error::InvalidArgument(format!(
-                    "expected relationship type, got {:?}",
-                    other
-                )))
-            }
+        } else {
+            // No colon — rel type is unspecified (matches any relationship type).
+            String::new()
         };
 
         // Parse optional variable-length hop spec after rel type:
