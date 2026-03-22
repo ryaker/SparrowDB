@@ -287,6 +287,11 @@ pub struct GraphDb {
 }
 
 impl GraphDb {
+    /// Return the filesystem path of this database.
+    pub fn path(&self) -> &Path {
+        &self.inner.path
+    }
+
     /// Open (or create) a SparrowDB database at `path`.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
