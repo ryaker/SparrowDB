@@ -129,13 +129,12 @@ fn ensure_rel_type(rel_type: &str, catalog: &Catalog) -> Result<()> {
     }
 }
 
-fn bind_match_optional_match(mom: &MatchOptionalMatchStatement, catalog: &Catalog) -> Result<()> {
+fn bind_match_optional_match(_mom: &MatchOptionalMatchStatement, _catalog: &Catalog) -> Result<()> {
     // Both the leading MATCH and OPTIONAL MATCH patterns skip strict existence
     // checks: if a label doesn't exist in the catalog the engine returns 0 rows
     // for the leading MATCH (Cypher semantics — no error) and NULL rows for the
     // OPTIONAL MATCH.  Suppressing the binder check here avoids a premature
     // "unknown label" error before the engine has a chance to handle it cleanly.
-    let _ = (mom, catalog);
     Ok(())
 }
 
