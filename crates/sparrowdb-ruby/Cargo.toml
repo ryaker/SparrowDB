@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "sparrowdb-ruby"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Rich Yaker"]
+description = "Ruby bindings for SparrowDB embedded graph database"
+repository = "https://github.com/ryaker/SparrowDB"
+
+[lib]
+name = "sparrowdb_ruby"
+crate-type = ["cdylib"]
+
+[dependencies]
+sparrowdb = { path = "../sparrowdb" }
+sparrowdb-common = { path = "../sparrowdb-common" }
+sparrowdb-execution = { path = "../sparrowdb-execution" }
+magnus = { version = "0.7", features = ["rb-sys"] }
+rb-sys = { version = "0.9", features = ["no-link-ruby"] }
+
+[features]
+default = []
