@@ -293,6 +293,101 @@ impl NodeStore {
     /// a node is created without a value for an already-known column, that
     /// column file is zero-padded to `(slot + 1) * 8` bytes.  The zero
     /// sentinel is recognised by `read_col_slot_nullable` as "absent" and
+
+    /// Return the **on-disk** high-water mark for a label, bypassing any
+    /// in-memory advances made by `peek_next_slot`.
+    ///
+    /// Used by [`WriteTx::merge_node`] to limit the disk scan to only slots
+    /// that have actually been persisted.
+    pub fn disk_hwm_for_label(&self, label_id: u32) -> Result<u64> {
+        self.load_hwm(label_id)
+    }
+
+    /// Reserve the slot index that the *next* `create_node` call will use for
+    /// `label_id`, advancing the in-memory HWM so that the slot is not
+    /// assigned again within the same [`NodeStore`] instance.
+    ///
+    /// This is used by [`WriteTx::create_node`] to pre-compute a [`NodeId`]
+    /// before the actual disk write, so the ID can be returned to the caller
+    /// while the write is deferred until commit (SPA-181).
+    ///
+    /// The on-disk HWM is **not** updated here; it is updated when the
+    /// buffered `NodeCreate` operation is applied in `commit()`.
+    pub fn peek_next_slot(&mut self, label_id: u32) -> Result<u32> {
+        // Load from disk if not cached yet.
+        if !self.hwm.contains_key(&label_id) {
+            let h = self.load_hwm(label_id)?;
+            self.hwm.insert(label_id, h);
+        }
+        let h = *self.hwm.get(&label_id).unwrap();
+        // Advance the in-memory HWM so a subsequent peek returns the next slot.
+        self.hwm.insert(label_id, h + 1);
+        Ok(h as u32)
+    }
+
+    /// Write a node at a pre-reserved `slot` (SPA-181 commit path).
+    ///
+    /// Like [`create_node`] but uses the caller-specified `slot` index instead
+    /// of deriving it from the HWM.  Used by [`WriteTx::commit`] to flush
+    /// buffered node-create operations in the exact order they were issued,
+    /// with slots that were already pre-allocated by [`peek_next_slot`].
+    ///
+    /// Advances the on-disk HWM to `slot + 1` (or higher if already past that).
+    pub fn create_node_at_slot(
+        &mut self,
+        label_id: u32,
+        slot: u32,
+        props: &[(u32, Value)],
+    ) -> Result<NodeId> {
+        // Snapshot original column sizes for rollback on partial failure.
+        let original_sizes: Vec<(u32, u64)> = props
+            .iter()
+            .map(|&(col_id, _)| {
+                let path = self.col_path(label_id, col_id);
+                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                (col_id, size)
+            })
+            .collect();
+
+        let write_result = (|| {
+            for &(col_id, ref val) in props {
+                self.append_col(label_id, col_id, slot, val.to_u64())?;
+            }
+            Ok::<(), sparrowdb_common::Error>(())
+        })();
+
+        if let Err(e) = write_result {
+            for (col_id, original_size) in &original_sizes {
+                let path = self.col_path(label_id, *col_id);
+                if path.exists() {
+                    let _ = fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .and_then(|f| f.set_len(*original_size));
+                }
+            }
+            return Err(e);
+        }
+
+        // Advance the on-disk HWM to at least slot + 1.
+        // Always write to disk; in-memory HWM may have been speculatively
+        // advanced by peek_next_slot but the disk HWM may be lower.
+        let new_hwm = slot as u64 + 1;
+        let disk_hwm = self.load_hwm(label_id)?;
+        if new_hwm > disk_hwm {
+            self.save_hwm(label_id, new_hwm)?;
+        }
+        // Keep in-memory HWM at least as high as new_hwm.
+        let mem_hwm = self.hwm.get(&label_id).copied().unwrap_or(0);
+        if new_hwm > mem_hwm {
+            self.hwm.insert(label_id, new_hwm);
+        }
+
+        Ok(NodeId((label_id as u64) << 32 | slot as u64))
+    }
+
+    /// Create a new node in `label_id` with the given properties.
+    ///
     /// surfaces as `Value::Null` in query results.
     pub fn create_node(&mut self, label_id: u32, props: &[(u32, Value)]) -> Result<NodeId> {
         // Load or get cached hwm.
