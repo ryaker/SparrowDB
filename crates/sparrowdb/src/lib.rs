@@ -427,6 +427,72 @@ impl GraphDb {
         Ok(QueryResult::empty(vec![]))
     }
 
+    /// Execute a Cypher query with runtime parameter bindings.
+    ///
+    /// This is the parameterised variant of [`execute`].  Parameters are
+    /// supplied as a `HashMap<String, sparrowdb_execution::Value>` and are
+    /// available inside the query as `$name` expressions.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use sparrowdb::GraphDb;
+    /// use sparrowdb_execution::Value;
+    /// use std::collections::HashMap;
+    ///
+    /// let db = GraphDb::open(std::path::Path::new("/tmp/my.sparrow")).unwrap();
+    /// let mut params = HashMap::new();
+    /// params.insert("names".into(), Value::List(vec![
+    ///     Value::String("Alice".into()),
+    ///     Value::String("Bob".into()),
+    /// ]));
+    /// let result = db.execute_with_params("UNWIND $names AS name RETURN name", params).unwrap();
+    /// ```
+    pub fn execute_with_params(
+        &self,
+        cypher: &str,
+        params: HashMap<String, sparrowdb_execution::Value>,
+    ) -> Result<QueryResult> {
+        use sparrowdb_cypher::ast::Statement;
+        use sparrowdb_cypher::{bind, parse};
+
+        let stmt = parse(cypher)?;
+        let catalog_snap = Catalog::open(&self.inner.path)?;
+        let bound = bind(stmt, &catalog_snap)?;
+
+        if Engine::is_mutation(&bound.inner) {
+            // Mutation paths do not support runtime parameters today.
+            match bound.inner {
+                Statement::Merge(ref m) => self.execute_merge(m),
+                Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
+                Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
+                _ => unreachable!(),
+            }
+        } else {
+            let _span = info_span!("sparrowdb.query_with_params").entered();
+
+            let mut engine = {
+                let _open_span = info_span!("sparrowdb.open_engine").entered();
+                let csr = open_csr_forward(&self.inner.path);
+                Engine::new(
+                    NodeStore::open(&self.inner.path)?,
+                    catalog_snap,
+                    csr,
+                    &self.inner.path,
+                )
+                .with_params(params)
+            };
+
+            let result = {
+                let _exec_span = info_span!("sparrowdb.execute").entered();
+                engine.execute_statement(bound.inner)?
+            };
+
+            tracing::debug!(rows = result.rows.len(), "query_with_params complete");
+            Ok(result)
+        }
+    }
+
     /// Internal: execute a MERGE statement by opening a write transaction.
     fn execute_merge(&self, m: &sparrowdb_cypher::ast::MergeStatement) -> Result<QueryResult> {
         let props: HashMap<String, Value> = m
