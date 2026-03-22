@@ -1,9 +1,17 @@
-# SparrowDB
+<p align="center">
+  <img src="docs/logo.png" alt="SparrowDB — graph-based sparrow's nest" width="320" />
+</p>
 
-**Embedded graph database with Cypher queries — no server, no subscription, no cloud.**
+<h1 align="center">SparrowDB</h1>
 
-[![CI](https://github.com/ryaker/SparrowDB/actions/workflows/ci.yml/badge.svg)](https://github.com/ryaker/SparrowDB/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<p align="center"><strong>Embedded graph database with Cypher queries — no server, no subscription, no cloud.</strong></p>
+
+<p align="center">
+  <a href="https://github.com/ryaker/SparrowDB/actions"><img src="https://github.com/ryaker/SparrowDB/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT" /></a>
+  <img src="https://img.shields.io/badge/language-Rust-orange.svg" alt="Rust" />
+  <img src="https://img.shields.io/badge/bindings-Python%20%7C%20Node.js%20%7C%20Ruby-blue.svg" alt="Bindings" />
+</p>
 
 SparrowDB runs inside your process. Drop it into a Rust app, a Python script, or a Node.js service and query your graph with Cypher. Data lives on disk, survives crashes, and never phones home.
 
