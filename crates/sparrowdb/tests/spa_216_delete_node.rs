@@ -4,6 +4,7 @@
 //! tombstones the matched node so that subsequent MATCH queries return 0 rows.
 
 use sparrowdb::{open, GraphDb};
+use sparrowdb_execution::types::Value;
 
 fn make_db() -> (tempfile::TempDir, GraphDb) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -143,6 +144,12 @@ fn deleted_node_invisible_to_future_queries() {
         1,
         "expected 1 remaining node after deleting Alice, got {}",
         remaining.rows.len()
+    );
+    // Verify the remaining node is Charlie (not a corrupted/stale Alice row).
+    assert_eq!(
+        remaining.rows[0][0],
+        Value::String("Charlie".to_string()),
+        "expected remaining node to be Charlie"
     );
 
     // Confirm the survivor is specifically Charlie, not a corrupted row.
