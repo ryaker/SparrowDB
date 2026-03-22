@@ -261,6 +261,10 @@ impl NodeStore {
     /// Returns `Err` when the directory exists but cannot be read (e.g.
     /// permissions failure or I/O error).  A missing directory is not an
     /// error — it simply means no nodes of this label have been created yet.
+    pub fn col_ids_for_label(&self, label_id: u32) -> Result<Vec<u32>> {
+        self.existing_col_ids(label_id)
+    }
+
     fn existing_col_ids(&self, label_id: u32) -> Result<Vec<u32>> {
         let dir = self.label_dir(label_id);
         let read_dir = match fs::read_dir(&dir) {
@@ -269,7 +273,7 @@ impl NodeStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(Error::Io(e)),
         };
-        let ids = read_dir
+        let mut ids: Vec<u32> = read_dir
             .flatten()
             .filter_map(|entry| {
                 let name = entry.file_name();
@@ -279,6 +283,7 @@ impl NodeStore {
                 id_str.parse::<u32>().ok()
             })
             .collect();
+        ids.sort_unstable();
         Ok(ids)
     }
 

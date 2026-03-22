@@ -1508,6 +1508,7 @@ impl Engine {
         // project_row path only stores individual property columns, so it
         // cannot evaluate id().  Force the eval path whenever id() appears in
         // any RETURN item, even when no aggregation is requested.
+        // SPA-213: bare variable projection also requires the eval path.
         let use_eval_path = use_agg || needs_node_ref_in_return(&m.return_clause.items);
         if use_eval_path {
             // Aggregate / eval expressions reference properties not captured by
@@ -1518,6 +1519,16 @@ impl Engine {
                 collect_col_ids_from_expr(&item.expr, &mut all_col_ids);
             }
         }
+
+        // SPA-213: bare node variable projection needs ALL stored columns for the label.
+        // Collect them once before the scan loop so we can build a Value::Map per node.
+        let bare_vars = bare_var_names_in_return(&m.return_clause.items);
+        let all_label_col_ids: Vec<u32> = if !bare_vars.is_empty() {
+            self.store.col_ids_for_label(label_id_u32)?
+        } else {
+            vec![]
+        };
+
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
@@ -1581,7 +1592,24 @@ impl Engine {
                     );
                 }
                 if !var_name.is_empty() {
-                    row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+                    // SPA-213: when this variable is returned bare, read all properties
+                    // for the node and expose them as a Value::Map under the var key.
+                    // Also keep NodeRef under __node_id__ so id(n) continues to work.
+                    if bare_vars.contains(&var_name.to_string()) && !all_label_col_ids.is_empty() {
+                        let all_nullable = self
+                            .store
+                            .get_node_raw_nullable(node_id, &all_label_col_ids)?;
+                        let all_props: Vec<(u32, u64)> = all_nullable
+                            .iter()
+                            .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
+                            .collect();
+                        row_vals.insert(var_name.to_string(), build_node_map(&all_props));
+                    } else {
+                        row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+                    }
+                    // Always store NodeRef under __node_id__ so id(n) works even when
+                    // the var itself is a Map (SPA-213).
+                    row_vals.insert(format!("{}.__node_id__", var_name), Value::NodeRef(node_id));
                 }
                 raw_rows.push(row_vals);
             } else {
@@ -1653,11 +1681,16 @@ impl Engine {
         }
 
         let use_agg = has_aggregate_in_return(&m.return_clause.items);
-        if use_agg {
+        // SPA-213: bare variable also needs the eval path in label-less scan.
+        let use_eval_path_all = use_agg || needs_node_ref_in_return(&m.return_clause.items);
+        if use_eval_path_all {
             for item in &m.return_clause.items {
                 collect_col_ids_from_expr(&item.expr, &mut all_col_ids);
             }
         }
+
+        // SPA-213: detect bare var names for property-map projection.
+        let bare_vars_all = bare_var_names_in_return(&m.return_clause.items);
 
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -1666,6 +1699,13 @@ impl Engine {
             let label_id_u32 = *label_id as u32;
             let hwm = self.store.hwm_for_label(label_id_u32)?;
             tracing::debug!(label = %label_name, hwm = hwm, "label-less scan: label slot");
+
+            // SPA-213: read all col_ids for this label once per label.
+            let all_label_col_ids_here: Vec<u32> = if !bare_vars_all.is_empty() {
+                self.store.col_ids_for_label(label_id_u32)?
+            } else {
+                vec![]
+            };
 
             for slot in 0..hwm {
                 let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
@@ -1695,20 +1735,37 @@ impl Engine {
                             format!("{}.__labels__", var_name),
                             Value::List(vec![Value::String(label_name.clone())]),
                         );
+                        row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
                     }
                     if !eval_where(where_expr, &row_vals) {
                         continue;
                     }
                 }
 
-                if use_agg {
+                if use_eval_path_all {
                     let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
                     if !var_name.is_empty() {
                         row_vals.insert(
                             format!("{}.__labels__", var_name),
                             Value::List(vec![Value::String(label_name.clone())]),
                         );
-                        row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+                        // SPA-213: bare variable → Value::Map; otherwise NodeRef.
+                        if bare_vars_all.contains(&var_name.to_string())
+                            && !all_label_col_ids_here.is_empty()
+                        {
+                            let all_nullable = self
+                                .store
+                                .get_node_raw_nullable(node_id, &all_label_col_ids_here)?;
+                            let all_props: Vec<(u32, u64)> = all_nullable
+                                .iter()
+                                .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
+                                .collect();
+                            row_vals.insert(var_name.to_string(), build_node_map(&all_props));
+                        } else {
+                            row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+                        }
+                        row_vals
+                            .insert(format!("{}.__node_id__", var_name), Value::NodeRef(node_id));
                     }
                     raw_rows.push(row_vals);
                 } else {
@@ -1718,16 +1775,22 @@ impl Engine {
             }
         }
 
-        if use_agg {
+        if use_eval_path_all {
             rows = aggregate_rows(&raw_rows, &m.return_clause.items);
-        } else {
-            if m.distinct {
-                deduplicate_rows(&mut rows);
-            }
-            apply_order_by(&mut rows, m, column_names);
-            if let Some(lim) = m.limit {
-                rows.truncate(lim as usize);
-            }
+        }
+
+        // DISTINCT / ORDER BY / SKIP / LIMIT apply regardless of which path
+        // built the rows (eval or fast path).
+        if m.distinct {
+            deduplicate_rows(&mut rows);
+        }
+        apply_order_by(&mut rows, m, column_names);
+        if let Some(skip) = m.skip {
+            let skip = (skip as usize).min(rows.len());
+            rows.drain(0..skip);
+        }
+        if let Some(lim) = m.limit {
+            rows.truncate(lim as usize);
         }
 
         tracing::debug!(rows = rows.len(), "label-less full scan complete");
@@ -3104,6 +3167,7 @@ fn value_to_store_value(val: Value) -> StoreValue {
         Value::NodeRef(id) => StoreValue::Int64(id.0 as i64),
         Value::EdgeRef(id) => StoreValue::Int64(id.0 as i64),
         Value::List(_) => StoreValue::Int64(0),
+        Value::Map(_) => StoreValue::Int64(0),
     }
 }
 
@@ -3373,6 +3437,22 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
                 if let Some(Expr::Var(var_name)) = args.first() {
                     let meta_key = format!("{}.__labels__", var_name);
                     return vals.get(&meta_key).cloned().unwrap_or(Value::Null);
+                }
+            }
+            // SPA-213: id(n) must look up the NodeRef even when var n holds a Map.
+            // Check __node_id__ first so it works with both NodeRef and Map values.
+            if name_lc == "id" {
+                if let Some(Expr::Var(var_name)) = args.first() {
+                    // Prefer the explicit __node_id__ entry (present whenever eval path is used).
+                    let id_key = format!("{}.__node_id__", var_name);
+                    if let Some(Value::NodeRef(nid)) = vals.get(&id_key) {
+                        return Value::Int64(nid.0 as i64);
+                    }
+                    // Fallback: var itself may be a NodeRef (old code path).
+                    if let Some(Value::NodeRef(nid)) = vals.get(var_name.as_str()) {
+                        return Value::Int64(nid.0 as i64);
+                    }
+                    return Value::Null;
                 }
             }
             // Evaluate each argument recursively, then dispatch to the function library.
@@ -3753,15 +3833,47 @@ fn has_aggregate_in_return(items: &[ReturnItem]) -> bool {
 /// Returns `true` if any RETURN item requires a `NodeRef` / `EdgeRef` value to
 /// be present in the row map in order to evaluate correctly.
 ///
-/// Currently this covers `id(var)` — a scalar (non-aggregate) function that
-/// receives the whole node/relationship reference rather than a scalar property.
+/// This covers:
+/// - `id(var)` — a scalar function that receives the whole node reference.
+/// - Bare `var` — projecting a node variable as a property map (SPA-213).
+///
 /// When this returns `true`, the scan must use the eval path (which inserts
-/// `Value::NodeRef` under the variable key) instead of the fast `project_row`
-/// path (which only stores individual property columns).
+/// `Value::Map` / `Value::NodeRef` under the variable key) instead of the fast
+/// `project_row` path (which only stores individual property columns).
 fn needs_node_ref_in_return(items: &[ReturnItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(&item.expr, Expr::FnCall { name, .. } if name.to_lowercase() == "id")
+            || matches!(&item.expr, Expr::Var(_))
+    })
+}
+
+/// Collect the variable names that appear as bare `Expr::Var` in a RETURN clause (SPA-213).
+///
+/// These variables must be projected as a `Value::Map` containing all node properties
+/// rather than returning `Value::Null` or a raw `NodeRef`.
+fn bare_var_names_in_return(items: &[ReturnItem]) -> Vec<String> {
     items
         .iter()
-        .any(|item| matches!(&item.expr, Expr::FnCall { name, .. } if name.to_lowercase() == "id"))
+        .filter_map(|item| {
+            if let Expr::Var(v) = &item.expr {
+                Some(v.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Build a `Value::Map` from a raw property slice.
+///
+/// Keys are `"col_{col_id}"` strings; values are decoded via [`decode_raw_val`].
+/// This is used to project a bare node variable (SPA-213).
+fn build_node_map(props: &[(u32, u64)]) -> Value {
+    let entries: Vec<(String, Value)> = props
+        .iter()
+        .map(|&(col_id, raw)| (format!("col_{col_id}"), decode_raw_val(raw)))
+        .collect();
+    Value::Map(entries)
 }
 
 /// The aggregation kind for a single RETURN item.

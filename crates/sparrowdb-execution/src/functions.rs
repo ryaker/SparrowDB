@@ -507,6 +507,10 @@ fn fn_to_string(args: Vec<Value>) -> Result<Value> {
             "{}",
             crate::types::Value::List(items.clone())
         ))),
+        Value::Map(entries) => Ok(Value::String(format!(
+            "{}",
+            crate::types::Value::Map(entries.clone())
+        ))),
     }
 }
 
