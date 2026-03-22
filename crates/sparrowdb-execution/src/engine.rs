@@ -1020,6 +1020,12 @@ impl Engine {
         let pat = &m.pattern[0];
         let node = &pat.nodes[0];
 
+        // SPA-194: when no label is specified, scan ALL known labels and union
+        // the results.  Delegate to the per-label helper for each label.
+        if node.labels.is_empty() {
+            return self.execute_scan_all_labels(m, column_names);
+        }
+
         let label = node.labels.first().cloned().unwrap_or_default();
         let label_id = self
             .catalog
@@ -1142,6 +1148,123 @@ impl Engine {
         }
 
         tracing::debug!(rows = rows.len(), "node scan complete");
+        Ok(QueryResult {
+            columns: column_names.to_vec(),
+            rows,
+        })
+    }
+
+    // ── Label-less full scan: MATCH (n) RETURN … — SPA-194 ───────────────────
+    //
+    // When the node pattern carries no label filter we must scan every label
+    // that is registered in the catalog and union the results.  Aggregation,
+    // ORDER BY and LIMIT are applied once after the union so that e.g.
+    // `count(n)` counts all nodes and `LIMIT k` returns exactly k rows across
+    // all labels rather than k rows per label.
+
+    fn execute_scan_all_labels(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<QueryResult> {
+        let all_labels = self.catalog.list_labels()?;
+        tracing::debug!(label_count = all_labels.len(), "label-less full scan start");
+
+        let pat = &m.pattern[0];
+        let node = &pat.nodes[0];
+        let var_name = node.var.as_str();
+
+        // Collect col_ids needed across all labels (same set for every label).
+        let mut all_col_ids: Vec<u32> = collect_col_ids_from_columns(column_names);
+        if let Some(ref where_expr) = m.where_clause {
+            collect_col_ids_from_expr(where_expr, &mut all_col_ids);
+        }
+        for p in &node.props {
+            let col_id = prop_name_to_col_id(&p.key);
+            if !all_col_ids.contains(&col_id) {
+                all_col_ids.push(col_id);
+            }
+        }
+
+        let use_agg = has_aggregate_in_return(&m.return_clause.items);
+        if use_agg {
+            for item in &m.return_clause.items {
+                collect_col_ids_from_expr(&item.expr, &mut all_col_ids);
+            }
+        }
+
+        let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+
+        for (label_id, label_name) in &all_labels {
+            let label_id_u32 = *label_id as u32;
+            let hwm = self.store.hwm_for_label(label_id_u32)?;
+            tracing::debug!(label = %label_name, hwm = hwm, "label-less scan: label slot");
+
+            for slot in 0..hwm {
+                let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
+
+                // Skip tombstoned nodes (SPA-164).
+                let col0_check = self.store.get_node_raw(node_id, &[0u32])?;
+                if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                    continue;
+                }
+
+                let nullable_props = self.store.get_node_raw_nullable(node_id, &all_col_ids)?;
+                let props: Vec<(u32, u64)> = nullable_props
+                    .iter()
+                    .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
+                    .collect();
+
+                // Apply inline prop filter.
+                if !self.matches_prop_filter(&props, &node.props) {
+                    continue;
+                }
+
+                // Apply WHERE clause.
+                if let Some(ref where_expr) = m.where_clause {
+                    let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                    if !var_name.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", var_name),
+                            Value::List(vec![Value::String(label_name.clone())]),
+                        );
+                    }
+                    if !eval_where(where_expr, &row_vals) {
+                        continue;
+                    }
+                }
+
+                if use_agg {
+                    let mut row_vals = build_row_vals(&props, var_name, &all_col_ids);
+                    if !var_name.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", var_name),
+                            Value::List(vec![Value::String(label_name.clone())]),
+                        );
+                        row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+                    }
+                    raw_rows.push(row_vals);
+                } else {
+                    let row = project_row(&props, column_names, &all_col_ids, var_name, label_name);
+                    rows.push(row);
+                }
+            }
+        }
+
+        if use_agg {
+            rows = aggregate_rows(&raw_rows, &m.return_clause.items);
+        } else {
+            if m.distinct {
+                deduplicate_rows(&mut rows);
+            }
+            apply_order_by(&mut rows, m, column_names);
+            if let Some(lim) = m.limit {
+                rows.truncate(lim as usize);
+            }
+        }
+
+        tracing::debug!(rows = rows.len(), "label-less full scan complete");
         Ok(QueryResult {
             columns: column_names.to_vec(),
             rows,
