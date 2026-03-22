@@ -354,6 +354,30 @@ impl GraphDb {
         &self,
         create: &sparrowdb_cypher::ast::CreateStatement,
     ) -> Result<QueryResult> {
+        // Pre-flight: verify that every variable referenced by an edge is
+        // declared as a named node in this CREATE clause.  Doing this before
+        // opening the write transaction ensures that a malformed CREATE fails
+        // cleanly without leaving orphaned nodes on disk.
+        let declared_vars: HashSet<&str> = create
+            .nodes
+            .iter()
+            .filter(|n| !n.var.is_empty())
+            .map(|n| n.var.as_str())
+            .collect();
+
+        for (left_var, _, right_var) in &create.edges {
+            if !left_var.is_empty() && !declared_vars.contains(left_var.as_str()) {
+                return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                    "CREATE edge references undeclared variable '{left_var}'"
+                )));
+            }
+            if !right_var.is_empty() && !declared_vars.contains(right_var.as_str()) {
+                return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                    "CREATE edge references undeclared variable '{right_var}'"
+                )));
+            }
+        }
+
         let mut tx = self.begin_write()?;
 
         // Map variable name → NodeId for all newly created nodes.
@@ -384,24 +408,18 @@ impl GraphDb {
             }
         }
 
-        // Create edges between the freshly-created (or pre-existing) nodes.
+        // Create edges between the freshly-created nodes.
         for (left_var, rel_pat, right_var) in &create.edges {
-            let src = match var_to_node.get(left_var) {
-                Some(&id) => id,
-                None => {
-                    return Err(sparrowdb_common::Error::InvalidArgument(format!(
-                        "CREATE edge references unresolved variable '{left_var}'"
-                    )));
-                }
-            };
-            let dst = match var_to_node.get(right_var) {
-                Some(&id) => id,
-                None => {
-                    return Err(sparrowdb_common::Error::InvalidArgument(format!(
-                        "CREATE edge references unresolved variable '{right_var}'"
-                    )));
-                }
-            };
+            let src = var_to_node.get(left_var).copied().ok_or_else(|| {
+                sparrowdb_common::Error::InvalidArgument(format!(
+                    "CREATE edge references unresolved variable '{left_var}'"
+                ))
+            })?;
+            let dst = var_to_node.get(right_var).copied().ok_or_else(|| {
+                sparrowdb_common::Error::InvalidArgument(format!(
+                    "CREATE edge references unresolved variable '{right_var}'"
+                ))
+            })?;
             tx.create_edge(src, dst, &rel_pat.rel_type, HashMap::new())?;
         }
 
