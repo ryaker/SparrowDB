@@ -17,7 +17,7 @@ use sparrowdb_cypher::ast::{
     Statement, UnionStatement, UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
-use sparrowdb_storage::csr::{CsrBackward, CsrForward};
+use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
 use sparrowdb_storage::fulltext_index::FulltextIndex;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
@@ -1753,6 +1753,11 @@ impl Engine {
                     if !seen_neighbors.insert(dst_slot) {
                         continue;
                     }
+                    // For undirected (Both) track emitted (src,dst) pairs so the
+                    // backward pass can skip them to avoid double-emission.
+                    if *dir == EdgeDir::Both {
+                        seen_undirected.insert((src_slot, dst_slot));
+                    }
                     let dst_node = NodeId(((effective_dst_label_id as u64) << 32) | dst_slot);
                     let dst_props = if !col_ids_dst.is_empty() || !dst_node_pat.props.is_empty() {
                         let all_needed: Vec<u32> = {
@@ -1773,6 +1778,12 @@ impl Engine {
                     // Apply dst inline prop filter.
                     if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
                         continue;
+                    }
+
+                    // For undirected (Both), record (src_slot, dst_slot) so the
+                    // backward pass skips already-emitted pairs.
+                    if *dir == EdgeDir::Both {
+                        seen_undirected.insert((src_slot, dst_slot));
                     }
 
                     // Apply WHERE clause.
@@ -1932,13 +1943,9 @@ impl Engine {
 
                 // Read delta records for this rel table (edges in the forward
                 // direction b→a are stored as src=b, dst=a in the delta log).
-                let delta_records_bwd = {
-                    let edge_store = EdgeStore::open(&self.db_root, storage_rel_id);
-                    match edge_store.and_then(|s| s.read_delta()) {
-                        Ok(records) => records,
-                        Err(_) => vec![],
-                    }
-                };
+                let delta_records_bwd = EdgeStore::open(&self.db_root, storage_rel_id)
+                    .and_then(|s| s.read_delta())
+                    .unwrap_or_default();
 
                 // Scan the b-side (physical dst label = tbl_dst_label_id).
                 for b_slot in 0..hwm_bwd {
@@ -1990,8 +1997,7 @@ impl Engine {
                         }
 
                         let a_node = NodeId(((bwd_dst_label_id as u64) << 32) | a_slot);
-                        let a_props = if !col_ids_dst.is_empty() || !dst_node_pat.props.is_empty()
-                        {
+                        let a_props = if !col_ids_dst.is_empty() || !dst_node_pat.props.is_empty() {
                             let all_needed: Vec<u32> = {
                                 let mut v = col_ids_dst.clone();
                                 for p in &dst_node_pat.props {
@@ -2120,7 +2126,6 @@ impl Engine {
                 }
             }
         }
-
 
         if use_agg {
             rows = aggregate_rows(&raw_rows, &m.return_clause.items);
