@@ -706,14 +706,16 @@ impl Parser {
 
             if matches!(self.peek(), Token::Dash | Token::Arrow | Token::LeftArrow) {
                 // Edge pattern: (a)-[:R]->(b)
+                // Both endpoint nodes are always emitted so that the executor
+                // can create them and resolve variable bindings for the edge.
+                // Nodes without a variable name are anonymous and need not be
+                // tracked, but they still get created.
+                nodes.push(node);
                 let rel = self.parse_rel_pattern()?;
                 let dst_node = self.parse_node_pattern()?;
                 let dst_var = dst_node.var.clone();
                 edges.push((node_var, rel, dst_var));
-                // dst node may be referenced but not re-created
-                if !dst_node.labels.is_empty() || !dst_node.props.is_empty() {
-                    nodes.push(dst_node);
-                }
+                nodes.push(dst_node);
             } else {
                 nodes.push(node);
             }

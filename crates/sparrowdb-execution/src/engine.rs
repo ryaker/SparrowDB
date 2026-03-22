@@ -218,10 +218,13 @@ impl Engine {
     ///
     /// Used by `GraphDb::execute` to route the statement to the write path.
     pub fn is_mutation(stmt: &Statement) -> bool {
-        matches!(
-            stmt,
-            Statement::Merge(_) | Statement::MatchMutate(_) | Statement::MatchCreate(_)
-        )
+        match stmt {
+            Statement::Merge(_) | Statement::MatchMutate(_) | Statement::MatchCreate(_) => true,
+            // A standalone CREATE that contains edges must go through the
+            // write-transaction path so the executor can call create_edge.
+            Statement::Create(c) => !c.edges.is_empty(),
+            _ => false,
+        }
     }
 
     // ── Mutation execution (called by GraphDb with a write transaction) ────────
