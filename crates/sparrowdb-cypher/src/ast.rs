@@ -128,12 +128,37 @@ pub enum Expr {
     IsNull(Box<Expr>),
     /// `expr IS NOT NULL`
     IsNotNull(Box<Expr>),
+    /// `EXISTS { (n)-[:R]->(:Label) }` — positive existence subquery (SPA-137).
+    ExistsSubquery(Box<ExistsPattern>),
+    /// `CASE WHEN cond THEN val ... [ELSE val] END` — conditional expression (SPA-138).
+    CaseWhen {
+        /// List of (condition, value) branches.
+        branches: Vec<(Expr, Expr)>,
+        /// Optional ELSE value (None = ELSE NULL).
+        else_expr: Option<Box<Expr>>,
+    },
+    /// `shortestPath((a)-[:R*]->(b))` — shortest-path scalar (SPA-136).
+    ShortestPath(Box<ShortestPathExpr>),
 }
 
-/// An existence pattern used in `NOT (a)-[:R]->(b)`.
+/// An existence pattern used in `NOT (a)-[:R]->(b)` or `EXISTS { pattern }`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExistsPattern {
     pub path: PathPattern,
+}
+
+/// Shortest-path expression: `shortestPath((src:Label {props})-[:REL*]->(dst:Label {props}))`.
+///
+/// Returned as `Value::Int64(hop_count)`, or `Value::Null` when no path exists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShortestPathExpr {
+    pub src_var: String,
+    pub src_label: String,
+    pub src_props: Vec<PropEntry>,
+    pub dst_var: String,
+    pub dst_label: String,
+    pub dst_props: Vec<PropEntry>,
+    pub rel_type: String,
 }
 
 /// Binary operator kinds.

@@ -49,6 +49,11 @@ pub enum Token {
     Is,
     Call,
     Yield,
+    Case,
+    When,
+    Then,
+    Else,
+    End,
 
     // Punctuation
     LParen,    // (
@@ -332,6 +337,11 @@ fn keyword_or_ident(word: String) -> Token {
         "IS" => Token::Is,
         "CALL" => Token::Call,
         "YIELD" => Token::Yield,
+        "CASE" => Token::Case,
+        "WHEN" => Token::When,
+        "THEN" => Token::Then,
+        "ELSE" => Token::Else,
+        "END" => Token::End,
         _ => Token::Ident(word),
     }
 }

@@ -9,8 +9,8 @@ use crate::ast::{
     BinOpKind, CallStatement, CreateStatement, EdgeDir, ExistsPattern, Expr, ListPredicateKind,
     Literal, MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement,
     MatchStatement, MergeStatement, Mutation, NodePattern, OptionalMatchStatement, PathPattern,
-    PropEntry, RelPattern, ReturnClause, ReturnItem, SortDir, Statement, UnionStatement,
-    UnwindStatement,
+    PropEntry, RelPattern, ReturnClause, ReturnItem, ShortestPathExpr, SortDir, Statement,
+    UnionStatement, UnwindStatement,
 };
 use crate::lexer::{tokenize, Token};
 
@@ -1405,6 +1405,13 @@ impl Parser {
                     };
                     Ok(Expr::PropAccess { var, prop })
                 } else if matches!(next2, Token::LParen) {
+                    // Special-case shortestPath(…) and allShortestPaths(…) — SPA-136.
+                    if var.to_lowercase() == "shortestpath"
+                        || var.to_lowercase() == "allshortestpaths"
+                    {
+                        self.advance(); // consume function name
+                        return self.parse_shortest_path_fn();
+                    }
                     // Function call: name(arg, arg, ...)
                     self.advance(); // consume function name
                     self.advance(); // consume '('
@@ -1485,6 +1492,74 @@ impl Parser {
                     predicate: Box::new(predicate),
                 })
             }
+            // EXISTS { pattern } — positive existence subquery (SPA-137).
+            Token::Exists => {
+                self.advance(); // consume EXISTS
+                self.expect_tok(&Token::LBrace)?;
+                let path = self.parse_path_pattern()?;
+                self.expect_tok(&Token::RBrace)?;
+                Ok(Expr::ExistsSubquery(Box::new(ExistsPattern { path })))
+            }
+            // CASE WHEN cond THEN val [WHEN cond THEN val]* [ELSE val] END (SPA-138).
+            Token::Case => {
+                self.advance(); // consume CASE
+                let mut branches: Vec<(Expr, Expr)> = Vec::new();
+                let mut else_expr: Option<Box<Expr>> = None;
+                let mut seen_when = false;
+                let mut seen_else = false;
+                loop {
+                    match self.peek().clone() {
+                        Token::When => {
+                            if seen_else {
+                                return Err(Error::InvalidArgument(
+                                    "WHEN cannot follow ELSE in CASE expression".to_string(),
+                                ));
+                            }
+                            self.advance(); // consume WHEN
+                            let cond = self.parse_expr()?;
+                            self.expect_tok(&Token::Then)?;
+                            let val = self.parse_expr()?;
+                            branches.push((cond, val));
+                            seen_when = true;
+                        }
+                        Token::Else => {
+                            if !seen_when {
+                                return Err(Error::InvalidArgument(
+                                    "ELSE requires at least one WHEN branch in CASE expression"
+                                        .to_string(),
+                                ));
+                            }
+                            if seen_else {
+                                return Err(Error::InvalidArgument(
+                                    "duplicate ELSE in CASE expression".to_string(),
+                                ));
+                            }
+                            self.advance(); // consume ELSE
+                            else_expr = Some(Box::new(self.parse_expr()?));
+                            seen_else = true;
+                        }
+                        Token::End => {
+                            if !seen_when {
+                                return Err(Error::InvalidArgument(
+                                    "CASE expression requires at least one WHEN branch".to_string(),
+                                ));
+                            }
+                            self.advance(); // consume END
+                            break;
+                        }
+                        other => {
+                            return Err(Error::InvalidArgument(format!(
+                                "expected WHEN, ELSE, or END in CASE expression, got {:?}",
+                                other
+                            )));
+                        }
+                    }
+                }
+                Ok(Expr::CaseWhen {
+                    branches,
+                    else_expr,
+                })
+            }
             // Unary minus: -expr (negates a numeric literal or sub-expression).
             Token::Dash => {
                 self.advance();
@@ -1506,6 +1581,32 @@ impl Parser {
                 other
             ))),
         }
+    }
+
+    /// Parse `shortestPath((src)-[:REL*]->(dst))` — invoked from the Ident branch (SPA-136).
+    fn parse_shortest_path_fn(&mut self) -> Result<Expr> {
+        self.expect_tok(&Token::LParen)?;
+        let path = self.parse_path_pattern()?;
+        self.expect_tok(&Token::RParen)?;
+
+        if path.nodes.len() != 2 || path.rels.len() != 1 {
+            return Err(Error::InvalidArgument(
+                "shortestPath() requires exactly one relationship pattern".into(),
+            ));
+        }
+        let src_node = &path.nodes[0];
+        let dst_node = &path.nodes[1];
+        let rel = &path.rels[0];
+
+        Ok(Expr::ShortestPath(Box::new(ShortestPathExpr {
+            src_var: src_node.var.clone(),
+            src_label: src_node.labels.first().cloned().unwrap_or_default(),
+            src_props: src_node.props.clone(),
+            dst_var: dst_node.var.clone(),
+            dst_label: dst_node.labels.first().cloned().unwrap_or_default(),
+            dst_props: dst_node.props.clone(),
+            rel_type: rel.rel_type.clone(),
+        })))
     }
 
     // ── RETURN items ──────────────────────────────────────────────────────────
