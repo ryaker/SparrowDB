@@ -2897,6 +2897,22 @@ impl Engine {
         let col_ids_src = collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
         let col_ids_dst = collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
 
+        // Build dst read set: projection columns + dst inline-prop filter columns +
+        // WHERE-clause columns on the dst variable.  Mirrors the 1-hop code (SPA-224).
+        let dst_all_col_ids: Vec<u32> = {
+            let mut v = col_ids_dst.clone();
+            for p in &dst_node_pat.props {
+                let col_id = prop_name_to_col_id(&p.key);
+                if !v.contains(&col_id) {
+                    v.push(col_id);
+                }
+            }
+            if let Some(ref where_expr) = m.where_clause {
+                collect_col_ids_from_expr(where_expr, &mut v);
+            }
+            v
+        };
+
         let mut rows: Vec<Vec<Value>> = Vec::new();
         let mut seen_pairs: std::collections::HashSet<(u64, u64)> =
             std::collections::HashSet::new();
@@ -2912,6 +2928,9 @@ impl Engine {
                     if !v.contains(&col_id) {
                         v.push(col_id);
                     }
+                }
+                if let Some(ref where_expr) = m.where_clause {
+                    collect_col_ids_from_expr(where_expr, &mut v);
                 }
                 v
             };
@@ -2930,7 +2949,11 @@ impl Engine {
                 }
 
                 let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
-                let dst_props = read_node_props(&self.store, dst_node, &col_ids_dst)?;
+                // SPA-224: read dst props using the full column set (projection +
+                // inline filter + WHERE), not just the projection set.  Without the
+                // filter columns the inline prop check below always fails silently
+                // when the dst variable is not referenced in RETURN.
+                let dst_props = read_node_props(&self.store, dst_node, &dst_all_col_ids)?;
 
                 if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
                     continue;
