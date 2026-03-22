@@ -1582,18 +1582,29 @@ impl Engine {
             .catalog
             .get_label(&src_label)?
             .ok_or(sparrowdb_common::Error::NotFound)? as u32;
-        let dst_label_id = self
-            .catalog
-            .get_label(&dst_label)?
-            .ok_or(sparrowdb_common::Error::NotFound)? as u32;
+        // SPA-198: destination label is optional — an unlabeled endpoint `(b)`
+        // should match any node at the other end of the edge.  Only resolve
+        // the label ID when a label constraint was actually specified.
+        let dst_label_id: Option<u32> = if dst_node_pat.labels.is_empty() {
+            None
+        } else {
+            Some(
+                self.catalog
+                    .get_label(&dst_label)?
+                    .ok_or(sparrowdb_common::Error::NotFound)? as u32,
+            )
+        };
 
         let hwm_src = self.store.hwm_for_label(src_label_id)?;
         tracing::debug!(src_label = %src_label, dst_label = %dst_label, hwm_src = hwm_src, "one-hop traversal start");
 
         let mut col_ids_src =
             collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
+        // For the dst column ID collection, use label_id 0 as a placeholder
+        // when the destination is unlabeled — col IDs are derived from property
+        // names only and do not depend on the label.
         let mut col_ids_dst =
-            collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
+            collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id.unwrap_or(0));
 
         let use_agg = has_aggregate_in_return(&m.return_clause.items);
         // SPA-196: also use eval path when id() appears in RETURN.
@@ -1633,6 +1644,8 @@ impl Engine {
 
             // SPA-163: read delta log edges for this source node and merge
             // with CSR neighbors so edges are visible before a checkpoint.
+            // SPA-198: keep the full dst NodeId (label encoded in upper 32 bits)
+            // so that unlabeled destination endpoints can be resolved correctly.
             let delta_neighbors: Vec<u64> = {
                 let edge_store = EdgeStore::open(&self.db_root, RelTableId(0));
                 match edge_store.and_then(|s| s.read_delta()) {
@@ -1641,28 +1654,55 @@ impl Engine {
                         .filter(|r| {
                             let r_src_label = (r.src.0 >> 32) as u32;
                             let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                            r_src_label == src_label_id && r_src_slot == src_slot
+                            if r_src_label != src_label_id || r_src_slot != src_slot {
+                                return false;
+                            }
+                            // If a dst label filter is specified, apply it.
+                            if let Some(required_dst_label) = dst_label_id {
+                                let r_dst_label = (r.dst.0 >> 32) as u32;
+                                r_dst_label == required_dst_label
+                            } else {
+                                true
+                            }
                         })
-                        .map(|r| r.dst.0 & 0xFFFF_FFFF)
+                        .map(|r| r.dst.0) // full NodeId — label in upper 32 bits
                         .collect(),
                     Err(_) => vec![],
                 }
             };
 
-            // Traverse CSR.
-            let csr_neighbors = self.csr.neighbors(src_slot);
-            let all_neighbors: Vec<u64> = csr_neighbors
+            // Traverse CSR.  The CSR stores full NodeIds for both src and dst.
+            // Look up src by its full NodeId value.
+            let src_full_node_id = (src_label_id as u64) << 32 | src_slot;
+            let csr_neighbors_raw = self.csr.neighbors(src_full_node_id);
+            // Filter CSR neighbors by dst label when a constraint is present.
+            let csr_neighbors: Vec<u64> = csr_neighbors_raw
                 .iter()
                 .copied()
+                .filter(|&dst_full| {
+                    if let Some(required) = dst_label_id {
+                        (dst_full >> 32) as u32 == required
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+            let all_neighbors: Vec<u64> = csr_neighbors
+                .into_iter()
                 .chain(delta_neighbors.into_iter())
                 .collect();
             let mut seen_neighbors: HashSet<u64> = HashSet::new();
-            for &dst_slot in &all_neighbors {
-                if !seen_neighbors.insert(dst_slot) {
+            for &dst_full_id in &all_neighbors {
+                if !seen_neighbors.insert(dst_full_id) {
                     continue;
                 }
-                let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
-                let dst_props = read_node_props(&self.store, dst_node, &col_ids_dst)?;
+                // Reconstruct the dst NodeId from the full encoded value.
+                let dst_node = NodeId(dst_full_id);
+                let dst_props = if !col_ids_dst.is_empty() {
+                    self.store.get_node_raw(dst_node, &col_ids_dst)?
+                } else {
+                    vec![]
+                };
 
                 // Apply dst inline prop filter.
                 if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {

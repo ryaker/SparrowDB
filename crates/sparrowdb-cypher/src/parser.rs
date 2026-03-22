@@ -822,8 +822,17 @@ impl Parser {
         // [ :REL_TYPE ]
         self.expect_tok(&Token::LBracket)?;
 
+        // Capture variable if present: `[r:TYPE]` or `[r]` (variable only).
+        // A bare ident not followed by `:` is treated as a variable binding
+        // (no relationship-type constraint), matching standard Cypher semantics.
         let var = match self.peek().clone() {
             Token::Ident(s) if matches!(self.peek2(), Token::Colon) => {
+                // `[r:TYPE]` — var followed by colon and type.
+                self.advance();
+                s
+            }
+            Token::Ident(s) if matches!(self.peek2(), Token::RBracket) => {
+                // `[r]` — variable only, no rel-type constraint (SPA-198).
                 self.advance();
                 s
             }
@@ -837,6 +846,40 @@ impl Parser {
             return Err(Error::InvalidArgument(
                 "variable-length paths require a relationship type: use [:R*] not [*]".into(),
             ));
+        } else if matches!(self.peek(), Token::RBracket) {
+            // `[r]` or `[]` — no rel-type at all; leave rel_type empty.
+            let rel_type = String::new();
+            // Parse direction and return early.
+            self.expect_tok(&Token::RBracket)?;
+            let dir = if incoming {
+                if matches!(self.peek(), Token::Dash) {
+                    self.advance();
+                } else {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected '-' after ']' for incoming relationship, got {:?}",
+                        self.peek()
+                    )));
+                }
+                EdgeDir::Incoming
+            } else if matches!(self.peek(), Token::Arrow) {
+                self.advance();
+                EdgeDir::Outgoing
+            } else if matches!(self.peek(), Token::Dash) {
+                self.advance();
+                EdgeDir::Both
+            } else {
+                return Err(Error::InvalidArgument(format!(
+                    "expected '->' or '-' after ']' for outgoing/undirected relationship, got {:?}",
+                    self.peek()
+                )));
+            };
+            return Ok(RelPattern {
+                var,
+                rel_type,
+                dir,
+                min_hops: None,
+                max_hops: None,
+            });
         }
 
         let rel_type = match self.advance().clone() {
