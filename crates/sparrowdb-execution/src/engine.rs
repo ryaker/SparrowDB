@@ -998,6 +998,10 @@ impl Engine {
         if m.distinct {
             deduplicate_rows(&mut rows);
         }
+        if let Some(skip) = m.skip {
+            let skip = (skip as usize).min(rows.len());
+            rows.drain(0..skip);
+        }
         if let Some(lim) = m.limit {
             rows.truncate(lim as usize);
         }
@@ -1130,6 +1134,7 @@ impl Engine {
             where_clause: om.where_clause.clone(),
             return_clause: om.return_clause.clone(),
             order_by: om.order_by.clone(),
+            skip: om.skip,
             limit: om.limit,
             distinct: om.distinct,
         };
@@ -1350,6 +1355,10 @@ impl Engine {
         if mom.distinct {
             deduplicate_rows(&mut result_rows);
         }
+        if let Some(skip) = mom.skip {
+            let skip = (skip as usize).min(result_rows.len());
+            result_rows.drain(0..skip);
+        }
         if let Some(lim) = mom.limit {
             result_rows.truncate(lim as usize);
         }
@@ -1567,6 +1576,12 @@ impl Engine {
 
             // ORDER BY
             apply_order_by(&mut rows, m, column_names);
+
+            // SKIP
+            if let Some(skip) = m.skip {
+                let skip = (skip as usize).min(rows.len());
+                rows.drain(0..skip);
+            }
 
             // LIMIT
             if let Some(lim) = m.limit {
@@ -2274,6 +2289,12 @@ impl Engine {
             // ORDER BY
             apply_order_by(&mut rows, m, column_names);
 
+            // SKIP
+            if let Some(skip) = m.skip {
+                let skip = (skip as usize).min(rows.len());
+                rows.drain(0..skip);
+            }
+
             // LIMIT
             if let Some(lim) = m.limit {
                 rows.truncate(lim as usize);
@@ -2492,6 +2513,12 @@ impl Engine {
 
         // ORDER BY
         apply_order_by(&mut rows, m, column_names);
+
+        // SKIP
+        if let Some(skip) = m.skip {
+            let skip = (skip as usize).min(rows.len());
+            rows.drain(0..skip);
+        }
 
         // LIMIT
         if let Some(lim) = m.limit {
@@ -2713,6 +2740,12 @@ impl Engine {
 
         // ORDER BY
         apply_order_by(&mut rows, m, column_names);
+
+        // SKIP
+        if let Some(skip) = m.skip {
+            let skip = (skip as usize).min(rows.len());
+            rows.drain(0..skip);
+        }
 
         // LIMIT
         if let Some(lim) = m.limit {
