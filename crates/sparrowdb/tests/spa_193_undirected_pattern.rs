@@ -21,10 +21,8 @@ fn undirected_returns_both_directions() {
 
     db.execute("CREATE (a:Person {name: 'Alice'})").unwrap();
     db.execute("CREATE (b:Person {name: 'Bob'})").unwrap();
-    db.execute(
-        "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)")
+        .unwrap();
 
     let result = db
         .execute("MATCH (a:Person)-[r]-(b:Person) RETURN a.name, b.name")
@@ -69,10 +67,8 @@ fn undirected_with_src_prop_filter() {
 
     db.execute("CREATE (a:Person {name: 'Alice'})").unwrap();
     db.execute("CREATE (b:Person {name: 'Bob'})").unwrap();
-    db.execute(
-        "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)")
+        .unwrap();
 
     let result = db
         .execute("MATCH (a:Person {name:'Alice'})-[r]-(b:Person) RETURN b.name")
@@ -95,10 +91,8 @@ fn undirected_from_destination_side() {
 
     db.execute("CREATE (a:Person {name: 'Alice'})").unwrap();
     db.execute("CREATE (b:Person {name: 'Bob'})").unwrap();
-    db.execute(
-        "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)")
+        .unwrap();
 
     let result = db
         .execute("MATCH (a:Person {name:'Bob'})-[r]-(b:Person) RETURN b.name")

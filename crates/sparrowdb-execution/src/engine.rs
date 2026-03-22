@@ -1669,9 +1669,7 @@ impl Engine {
         // Read the full delta log once (used for both forward and backward
         // neighbor resolution when direction is Both).
         let delta_records: Vec<sparrowdb_storage::edge_store::DeltaRecord> =
-            match EdgeStore::open(&self.db_root, RelTableId(0))
-                .and_then(|s| s.read_delta())
-            {
+            match EdgeStore::open(&self.db_root, RelTableId(0)).and_then(|s| s.read_delta()) {
                 Ok(r) => r,
                 Err(_) => vec![],
             };
@@ -1680,22 +1678,21 @@ impl Engine {
         // Scan nodes matching scan_src_pat and follow their outgoing edges.
         for scan_src_slot in 0..hwm_scan_src {
             let scan_src_node = NodeId(((scan_src_label_id as u64) << 32) | scan_src_slot);
-            let scan_src_props =
-                if !col_ids_src.is_empty() || !scan_src_pat.props.is_empty() {
-                    let all_needed: Vec<u32> = {
-                        let mut v = col_ids_src.clone();
-                        for p in &scan_src_pat.props {
-                            let col_id = prop_name_to_col_id(&p.key);
-                            if !v.contains(&col_id) {
-                                v.push(col_id);
-                            }
+            let scan_src_props = if !col_ids_src.is_empty() || !scan_src_pat.props.is_empty() {
+                let all_needed: Vec<u32> = {
+                    let mut v = col_ids_src.clone();
+                    for p in &scan_src_pat.props {
+                        let col_id = prop_name_to_col_id(&p.key);
+                        if !v.contains(&col_id) {
+                            v.push(col_id);
                         }
-                        v
-                    };
-                    self.store.get_node_raw(scan_src_node, &all_needed)?
-                } else {
-                    vec![]
+                    }
+                    v
                 };
+                self.store.get_node_raw(scan_src_node, &all_needed)?
+            } else {
+                vec![]
+            };
 
             if !self.matches_prop_filter(&scan_src_props, &scan_src_pat.props) {
                 continue;
