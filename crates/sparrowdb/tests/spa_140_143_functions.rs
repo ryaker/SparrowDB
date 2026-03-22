@@ -18,7 +18,7 @@ fn engine_with_person(dir: &std::path::Path) -> Engine {
     let store = NodeStore::open(dir).expect("node store");
     let cat = Catalog::open(dir).expect("catalog");
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir);
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir);
     engine
         .execute("CREATE (n:Person {name: 'Alice', age: 30})")
         .expect("CREATE Person");
@@ -30,7 +30,7 @@ fn reopen_engine(dir: &std::path::Path) -> Engine {
     let store = NodeStore::open(dir).expect("node store");
     let cat = Catalog::open(dir).expect("catalog");
     let csr = CsrForward::build(0, &[]);
-    Engine::new(store, cat, csr, dir)
+    Engine::with_single_csr(store, cat, csr, dir)
 }
 
 // ── SPA-140: String functions ─────────────────────────────────────────────────
@@ -42,7 +42,7 @@ fn spa140_tostring_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN toString(42)").expect("toString(42)");
     assert_eq!(result.rows.len(), 1);
@@ -58,7 +58,7 @@ fn spa140_toupper_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN toUpper('hello')").expect("toUpper");
     assert_eq!(result.rows.len(), 1);
@@ -74,7 +74,7 @@ fn spa140_tolower_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN toLower('WORLD')").expect("toLower");
     assert_eq!(result.rows.len(), 1);
@@ -90,7 +90,7 @@ fn spa140_trim_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN trim('  hello  ')").expect("trim");
     assert_eq!(result.rows.len(), 1);
@@ -106,7 +106,7 @@ fn spa140_size_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN size('hello')").expect("size");
     assert_eq!(result.rows.len(), 1);
@@ -119,7 +119,7 @@ fn spa140_replace_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine
         .execute("RETURN replace('hello world', 'world', 'cypher')")
@@ -137,7 +137,7 @@ fn spa140_substring_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine
         .execute("RETURN substring('hello', 1, 3)")
@@ -157,7 +157,7 @@ fn spa141_abs_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN abs(-42)").expect("abs");
     assert_eq!(result.rows.len(), 1);
@@ -170,7 +170,7 @@ fn spa141_ceil_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN ceil(1.2)").expect("ceil");
     assert_eq!(result.rows.len(), 1);
@@ -183,7 +183,7 @@ fn spa141_floor_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN floor(3.9)").expect("floor");
     assert_eq!(result.rows.len(), 1);
@@ -196,7 +196,7 @@ fn spa141_sqrt_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN sqrt(4.0)").expect("sqrt");
     assert_eq!(result.rows.len(), 1);
@@ -209,7 +209,7 @@ fn spa141_sign_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN sign(-5)").expect("sign negative");
     assert_eq!(result.rows.len(), 1);
@@ -225,7 +225,7 @@ fn spa142_range_unwind_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine
         .execute("UNWIND range(1, 5) AS x RETURN x")
@@ -249,7 +249,7 @@ fn spa142_range_with_step_unwind() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine
         .execute("UNWIND range(0, 10, 2) AS x RETURN x")
@@ -272,7 +272,7 @@ fn spa142_reverse_string_in_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN reverse('abc')").expect("reverse");
     assert_eq!(result.rows.len(), 1);
@@ -290,7 +290,7 @@ fn spa143_tostring_int() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN toString(42)").expect("toString(42)");
     assert_eq!(result.rows.len(), 1);
@@ -306,7 +306,7 @@ fn spa143_tointeger_string() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine
         .execute("RETURN toInteger('123')")
@@ -321,7 +321,7 @@ fn spa143_tofloat_int() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN toFloat(7)").expect("toFloat");
     assert_eq!(result.rows.len(), 1);
@@ -334,7 +334,7 @@ fn spa143_toboolean_string() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine
         .execute("RETURN toBoolean('true')")
@@ -349,7 +349,7 @@ fn spa143_coalesce_returns_first_nonnull() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine
         .execute("RETURN coalesce(null, 'default')")
@@ -367,7 +367,7 @@ fn spa143_coalesce_all_null_returns_null() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine
         .execute("RETURN coalesce(null, null)")
@@ -382,7 +382,7 @@ fn spa143_isnull_true() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN isNull(null)").expect("isNull(null)");
     assert_eq!(result.rows.len(), 1);
@@ -395,7 +395,7 @@ fn spa143_isnotnull_true() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine
         .execute("RETURN isNotNull('hello')")
@@ -443,7 +443,7 @@ fn spa141_abs_in_standalone_return() {
     let store = NodeStore::open(dir.path()).unwrap();
     let cat = Catalog::open(dir.path()).unwrap();
     let csr = CsrForward::build(0, &[]);
-    let mut engine = Engine::new(store, cat, csr, dir.path());
+    let mut engine = Engine::with_single_csr(store, cat, csr, dir.path());
 
     let result = engine.execute("RETURN abs(-10)").expect("abs(-10)");
     assert_eq!(result.rows.len(), 1);

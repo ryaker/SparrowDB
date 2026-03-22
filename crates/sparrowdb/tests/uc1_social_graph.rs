@@ -69,7 +69,7 @@ fn setup_social_graph(dir: &std::path::Path) -> Engine {
     std::fs::create_dir_all(fwd_path.parent().unwrap()).unwrap();
     fwd.write(&fwd_path).expect("write CSR");
 
-    Engine::new(store, cat, fwd, dir)
+    Engine::with_single_csr(store, cat, fwd, dir)
 }
 
 /// Acceptance check #3: 1-hop MATCH friend lookup.

@@ -375,11 +375,11 @@ impl GraphDb {
 
             let mut engine = {
                 let _open_span = info_span!("sparrowdb.open_engine").entered();
-                let csr = open_csr_forward(&self.inner.path);
+                let csrs = open_csr_map(&self.inner.path);
                 Engine::new(
                     NodeStore::open(&self.inner.path)?,
                     catalog_snap,
-                    csr,
+                    csrs,
                     &self.inner.path,
                 )
             };
@@ -546,11 +546,11 @@ impl GraphDb {
 
         let mut engine = {
             let _open_span = info_span!("sparrowdb.open_engine").entered();
-            let csr = open_csr_forward(&self.inner.path);
+            let csrs = open_csr_map(&self.inner.path);
             Engine::new(
                 NodeStore::open(&self.inner.path)?,
                 catalog_snap,
-                csr,
+                csrs,
                 &self.inner.path,
             )
             .with_params(params)
@@ -595,11 +595,11 @@ impl GraphDb {
         // transaction was opened against.  Because we hold the write lock,
         // the data on disk cannot change between this scan and the mutations
         // below.
-        let csr = open_csr_forward(&self.inner.path);
+        let csrs = open_csr_map(&self.inner.path);
         let engine = Engine::new(
             NodeStore::open(&self.inner.path)?,
             Catalog::open(&self.inner.path)?,
-            csr,
+            csrs,
             &self.inner.path,
         );
 
@@ -649,11 +649,11 @@ impl GraphDb {
         let mut tx = self.begin_write()?;
 
         // Build an Engine for the read-scan phase.
-        let csr = open_csr_forward(&self.inner.path);
+        let csrs = open_csr_map(&self.inner.path);
         let engine = Engine::new(
             NodeStore::open(&self.inner.path)?,
             Catalog::open(&self.inner.path)?,
-            csr,
+            csrs,
             &self.inner.path,
         );
 
@@ -1047,12 +1047,24 @@ impl WriteTx {
     ///
     /// [`commit`]: WriteTx::commit
     pub fn delete_node(&mut self, node_id: NodeId) -> Result<()> {
-        // Check the persisted delta log for attached edges.
-        let delta = EdgeStore::open(&self.inner.path, RelTableId(0))
-            .and_then(|s| s.read_delta())
-            .unwrap_or_default();
-        if delta.iter().any(|r| r.src == node_id || r.dst == node_id) {
-            return Err(Error::NodeHasEdges { node_id: node_id.0 });
+        // SPA-185: check ALL per-type delta logs for attached edges, not just
+        // the hardcoded RelTableId(0).  Always include table-0 so that any
+        // edges written before the catalog had entries are still detected.
+        let rel_entries = self.catalog.list_rel_table_ids();
+        let mut rel_ids_to_check: Vec<u32> =
+            rel_entries.iter().map(|(id, _, _, _)| *id as u32).collect();
+        // Always include the legacy table-0 slot.  If it is already in the
+        // catalog list this dedup prevents a double-read.
+        if !rel_ids_to_check.contains(&0u32) {
+            rel_ids_to_check.push(0u32);
+        }
+        for rel_id in rel_ids_to_check {
+            let delta = EdgeStore::open(&self.inner.path, RelTableId(rel_id))
+                .and_then(|s| s.read_delta())
+                .unwrap_or_default();
+            if delta.iter().any(|r| r.src == node_id || r.dst == node_id) {
+                return Err(Error::NodeHasEdges { node_id: node_id.0 });
+            }
         }
 
         // Also check buffered (not-yet-committed) edge creates in this
@@ -1466,7 +1478,19 @@ fn collect_maintenance_params(
     node_store: &NodeStore,
     db_root: &Path,
 ) -> (Vec<u32>, u64) {
-    let rel_table_ids = vec![0u32]; // default table; extend for multi-rel-table support
+    // SPA-185: collect all registered rel table IDs from the catalog instead
+    // of hardcoding [0].  This ensures every per-type edge store is checkpointed.
+    // Always include table-0 so that any edges written before the catalog had
+    // entries (legacy data or pre-SPA-185 databases) are also checkpointed.
+    let rel_table_entries = catalog.list_rel_table_ids();
+    let mut rel_table_ids: Vec<u32> = rel_table_entries
+        .iter()
+        .map(|(id, _, _, _)| *id as u32)
+        .collect();
+    // Always include the legacy table-0 slot.  Dedup if already present.
+    if !rel_table_ids.contains(&0u32) {
+        rel_table_ids.push(0u32);
+    }
 
     // n_nodes must cover the highest node-store HWM AND the highest node ID
     // present in any delta record, so that the CSR bounds check passes even
@@ -1508,12 +1532,38 @@ fn collect_maintenance_params(
     (rel_table_ids, n_nodes)
 }
 
-fn open_csr_forward(path: &Path) -> CsrForward {
-    // Try to open the CSR forward file; fall back to an empty CSR.
-    match EdgeStore::open(path, RelTableId(0)).and_then(|s| s.open_fwd()) {
-        Ok(csr) => csr,
-        Err(_) => CsrForward::build(0, &[]),
+/// Open all per-type CSR forward files that exist on disk, keyed by rel_table_id.
+///
+/// SPA-185: replaces the old `open_csr_forward` that only opened `RelTableId(0)`.
+/// The catalog is used to discover all registered rel types.
+fn open_csr_map(path: &Path) -> HashMap<u32, CsrForward> {
+    let catalog = match Catalog::open(path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    let mut map = HashMap::new();
+
+    // Collect rel IDs from catalog.
+    let mut rel_ids: Vec<u32> = catalog
+        .list_rel_table_ids()
+        .into_iter()
+        .map(|(id, _, _, _)| id as u32)
+        .collect();
+
+    // Always include the legacy table-0 slot so that checkpointed CSRs
+    // written before the catalog had entries (pre-SPA-185 data) are loaded.
+    if !rel_ids.contains(&0u32) {
+        rel_ids.push(0u32);
     }
+
+    for rid in rel_ids {
+        if let Ok(store) = EdgeStore::open(path, RelTableId(rid)) {
+            if let Ok(csr) = store.open_fwd() {
+                map.insert(rid, csr);
+            }
+        }
+    }
+    map
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
