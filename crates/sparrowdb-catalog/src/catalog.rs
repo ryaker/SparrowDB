@@ -163,6 +163,25 @@ impl Catalog {
             .collect())
     }
 
+    /// List all relationship table IDs.
+    ///
+    /// Returns `(rel_table_id, src_label_id, dst_label_id, rel_type)` for every
+    /// registered relationship table.  Used by maintenance operations (CHECKPOINT,
+    /// OPTIMIZE) to discover all per-type edge stores.
+    pub fn list_rel_table_ids(&self) -> Vec<(u64, u16, u16, String)> {
+        self.rel_tables
+            .iter()
+            .map(|e| {
+                (
+                    e.rel_table_id,
+                    e.src_label_id,
+                    e.dst_label_id,
+                    e.rel_type.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Look up a relationship table by label IDs and type.
     pub fn get_rel_table(
         &self,
