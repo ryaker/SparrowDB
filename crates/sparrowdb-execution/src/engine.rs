@@ -24,6 +24,22 @@ use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
 
 use crate::types::{QueryResult, Value};
 
+/// Tri-state result for relationship table lookup.
+///
+/// Distinguishes three cases that previously both returned `Option::None` from
+/// `resolve_rel_table_id`, causing typed queries to fall back to scanning
+/// all edge stores when the rel type was not yet in the catalog (SPA-185).
+#[derive(Debug, Clone, Copy)]
+enum RelTableLookup {
+    /// The query has no rel-type filter — scan all rel types.
+    All,
+    /// The rel type was found in the catalog; use this specific store.
+    Found(u32),
+    /// The rel type was specified but not found in the catalog — the
+    /// edge cannot exist, so return empty results immediately.
+    NotFound,
+}
+
 /// The execution engine holds references to the storage layer.
 pub struct Engine {
     pub store: NodeStore,
@@ -75,24 +91,30 @@ impl Engine {
 
     // ── Per-type CSR / delta helpers ─────────────────────────────────────────
 
-    /// Return the `RelTableId` (u32) for `(src_label_id, dst_label_id, rel_type)`.
+    /// Return the relationship table lookup state for `(src_label_id, dst_label_id, rel_type)`.
     ///
-    /// When `rel_type` is empty the query carries no type filter; we return
-    /// `None` to signal "all rel types".
+    /// - Empty `rel_type` → [`RelTableLookup::All`] (no type filter).
+    /// - Rel type found in catalog → [`RelTableLookup::Found(id)`].
+    /// - Rel type specified but not in catalog → [`RelTableLookup::NotFound`]
+    ///   (the typed edge cannot exist; callers must return empty results).
     fn resolve_rel_table_id(
         &self,
         src_label_id: u32,
         dst_label_id: u32,
         rel_type: &str,
-    ) -> Option<u32> {
+    ) -> RelTableLookup {
         if rel_type.is_empty() {
-            return None;
+            return RelTableLookup::All;
         }
-        self.catalog
+        match self
+            .catalog
             .get_rel_table(src_label_id as u16, dst_label_id as u16, rel_type)
             .ok()
             .flatten()
-            .map(|id| id as u32)
+        {
+            Some(id) => RelTableLookup::Found(id as u32),
+            None => RelTableLookup::NotFound,
+        }
     }
 
     /// Read delta records for a specific relationship type.
@@ -1354,13 +1376,19 @@ impl Engine {
         let col_ids_dst = collect_col_ids_for_var(dst_var, column_names, dst_label_id);
         let _ = opt_vars;
 
-        // SPA-185: read delta log neighbors from the correct per-type edge store.
+        // SPA-185: resolve rel-type lookup once; use for both delta and CSR reads.
+        let rel_lookup = self.resolve_rel_table_id(src_label_id, dst_label_id, &rel_pat.rel_type);
+
+        // If the rel type was specified but not registered, no edges can exist.
+        if matches!(rel_lookup, RelTableLookup::NotFound) {
+            return Ok(vec![]);
+        }
+
         let delta_neighbors: Vec<u64> = {
-            let records: Vec<DeltaRecord> =
-                match self.resolve_rel_table_id(src_label_id, dst_label_id, &rel_pat.rel_type) {
-                    Some(rtid) => self.read_delta_for(rtid),
-                    None => self.read_delta_all(),
-                };
+            let records: Vec<DeltaRecord> = match rel_lookup {
+                RelTableLookup::Found(rtid) => self.read_delta_for(rtid),
+                _ => self.read_delta_all(),
+            };
             records
                 .into_iter()
                 .filter(|r| {
@@ -1372,10 +1400,9 @@ impl Engine {
                 .collect()
         };
 
-        // SPA-185: use the correct per-type CSR.
-        let csr_neighbors = match self.resolve_rel_table_id(src_label_id, dst_label_id, &rel_pat.rel_type) {
-            Some(rtid) => self.csr_neighbors(rtid, src_slot),
-            None => self.csr_neighbors_all(src_slot),
+        let csr_neighbors = match rel_lookup {
+            RelTableLookup::Found(rtid) => self.csr_neighbors(rtid, src_slot),
+            _ => self.csr_neighbors_all(src_slot),
         };
         let all_neighbors: Vec<u64> = csr_neighbors
             .into_iter()
@@ -1841,7 +1868,7 @@ impl Engine {
                 // snapshot is built exclusively for that table.  Using it for any
                 // other table would mix in neighbors from the wrong edge set.
                 let csr_neighbors: &[u64] = if *catalog_rel_id == 0 {
-                    self.csr.neighbors(src_slot)
+                    self.csrs.get(&0).map(|c| c.neighbors(src_slot)).unwrap_or(&[])
                 } else {
                     &[]
                 };
@@ -2323,14 +2350,31 @@ impl Engine {
             adj
         };
 
-        // For 2-hop we need a single CSR; use the first available (or empty).
-        // A proper multi-type 2-hop will be addressed in a follow-up ticket.
-        let combined_csr_key = self.csrs.keys().copied().next();
-        let empty_csr = CsrForward::build(0, &[]);
-        let two_hop_csr = combined_csr_key
-            .and_then(|k| self.csrs.get(&k))
-            .unwrap_or(&empty_csr);
-        let join = AspJoin::new(two_hop_csr);
+        // SPA-185: build a merged CSR that union-combines edges from all
+        // per-type CSRs so the 2-hop traversal sees paths through any rel type.
+        // AspJoin requires a single &CsrForward; we construct a combined one
+        // rather than using an arbitrary first entry.
+        let merged_csr = {
+            let max_nodes = self
+                .csrs
+                .values()
+                .map(|c| c.n_nodes())
+                .max()
+                .unwrap_or(0);
+            let mut edges: Vec<(u64, u64)> = Vec::new();
+            for csr in self.csrs.values() {
+                for src in 0..csr.n_nodes() {
+                    for &dst in csr.neighbors(src) {
+                        edges.push((src, dst));
+                    }
+                }
+            }
+            // CsrForward::build requires a sorted edge list.
+            edges.sort_unstable();
+            edges.dedup();
+            CsrForward::build(max_nodes, &edges)
+        };
+        let join = AspJoin::new(&merged_csr);
         let mut rows = Vec::new();
 
         // Scan source nodes.
@@ -2371,8 +2415,8 @@ impl Engine {
             if !first_hop_delta.is_empty() {
                 let mut delta_fof: HashSet<u64> = HashSet::new();
                 for &mid_slot in first_hop_delta {
-                    // CSR second hop from mid (use combined 2-hop CSR):
-                    for &fof in two_hop_csr.neighbors(mid_slot) {
+                    // CSR second hop from mid (use merged multi-type CSR):
+                    for &fof in merged_csr.neighbors(mid_slot) {
                         delta_fof.insert(fof);
                     }
                     // Delta second hop from mid:

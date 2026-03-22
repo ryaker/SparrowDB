@@ -162,9 +162,9 @@ fn spa185_distinct_rel_types_after_checkpoint() {
     assert_eq!(likes_names.len(), 1, "post-checkpoint LIKES must return 1 row");
 }
 
-/// Three relationship types: verify each filters independently.
+/// Two relationship types: verify each filters independently.
 #[test]
-fn spa185_three_rel_types_independent_filters() {
+fn spa185_two_rel_types_independent_filters() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = open(dir.path()).expect("open db");
 

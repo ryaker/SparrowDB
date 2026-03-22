@@ -546,11 +546,11 @@ impl GraphDb {
 
         let mut engine = {
             let _open_span = info_span!("sparrowdb.open_engine").entered();
-            let csr = open_csr_forward(&self.inner.path);
+            let csrs = open_csr_map(&self.inner.path);
             Engine::new(
                 NodeStore::open(&self.inner.path)?,
                 catalog_snap,
-                csr,
+                csrs,
                 &self.inner.path,
             )
             .with_params(params)
@@ -1048,13 +1048,18 @@ impl WriteTx {
     /// [`commit`]: WriteTx::commit
     pub fn delete_node(&mut self, node_id: NodeId) -> Result<()> {
         // SPA-185: check ALL per-type delta logs for attached edges, not just
-        // the hardcoded RelTableId(0).
+        // the hardcoded RelTableId(0).  Always include table-0 so that any
+        // edges written before the catalog had entries are still detected.
         let rel_entries = self.catalog.list_rel_table_ids();
-        let rel_ids_to_check: Vec<u32> = if rel_entries.is_empty() {
-            vec![0u32] // legacy fallback
-        } else {
-            rel_entries.iter().map(|(id, _, _, _)| *id as u32).collect()
-        };
+        let mut rel_ids_to_check: Vec<u32> = rel_entries
+            .iter()
+            .map(|(id, _, _, _)| *id as u32)
+            .collect();
+        // Always include the legacy table-0 slot.  If it is already in the
+        // catalog list this dedup prevents a double-read.
+        if !rel_ids_to_check.contains(&0u32) {
+            rel_ids_to_check.push(0u32);
+        }
         for rel_id in rel_ids_to_check {
             let delta = EdgeStore::open(&self.inner.path, RelTableId(rel_id))
                 .and_then(|s| s.read_delta())
@@ -1477,15 +1482,17 @@ fn collect_maintenance_params(
 ) -> (Vec<u32>, u64) {
     // SPA-185: collect all registered rel table IDs from the catalog instead
     // of hardcoding [0].  This ensures every per-type edge store is checkpointed.
+    // Always include table-0 so that any edges written before the catalog had
+    // entries (legacy data or pre-SPA-185 databases) are also checkpointed.
     let rel_table_entries = catalog.list_rel_table_ids();
-    let rel_table_ids: Vec<u32> = if rel_table_entries.is_empty() {
-        // No rel types yet — include the legacy table-0 slot so that any
-        // pre-catalog edges (written before SPA-185 was merged) are still
-        // checkpointed correctly.
-        vec![0u32]
-    } else {
-        rel_table_entries.iter().map(|(id, _, _, _)| *id as u32).collect()
-    };
+    let mut rel_table_ids: Vec<u32> = rel_table_entries
+        .iter()
+        .map(|(id, _, _, _)| *id as u32)
+        .collect();
+    // Always include the legacy table-0 slot.  Dedup if already present.
+    if !rel_table_ids.contains(&0u32) {
+        rel_table_ids.push(0u32);
+    }
 
     // n_nodes must cover the highest node-store HWM AND the highest node ID
     // present in any delta record, so that the CSR bounds check passes even
