@@ -3406,20 +3406,12 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         // Normal same-type comparisons.
         (Value::Int64(x), Value::Int64(y)) => x == y,
-        (Value::String(x), Value::String(y)) => {
-            // First try exact match (short strings, or both full strings).
-            if x == y {
-                return true;
-            }
-            // If the stored value was decoded from the 7-byte inline encoding,
-            // it is truncated.  Compare using the inline-encoded forms so that
-            // a truncated stored value matches the corresponding full literal
-            // (SPA-169).  Two distinct strings that share the same first 7
-            // bytes will incorrectly compare equal — this is an accepted
-            // limitation of the v1 inline encoding (overflow deferred).
-            StoreValue::Bytes(x.as_bytes().to_vec()).to_u64()
-                == StoreValue::Bytes(y.as_bytes().to_vec()).to_u64()
-        }
+        // SPA-212: overflow string storage ensures values are never truncated,
+        // so a plain equality check is now correct and sufficient.  The former
+        // 7-byte inline-encoding fallback (SPA-169) has been removed because it
+        // caused two distinct strings sharing the same 7-byte prefix to compare
+        // equal (e.g. "TypeScript" == "TypeScripx").
+        (Value::String(x), Value::String(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Float64(x), Value::Float64(y)) => x == y,
         // Mixed: stored raw-int vs string literal — kept for backwards

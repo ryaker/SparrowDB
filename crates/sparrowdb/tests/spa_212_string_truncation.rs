@@ -129,6 +129,38 @@ fn long_string_where_filter_works() {
     );
 }
 
+/// Two strings that share the same first 7 bytes must NOT compare equal.
+///
+/// "TypeScript" and "TypeScripx" both start with "TypeScri" (8 bytes), so
+/// their first 7 bytes ("TypeScr") are identical.  The old inline-encoding
+/// fallback in `values_equal()` collapsed both to the same u64, making
+/// `WHERE n.name = 'TypeScript'` return both rows.  With SPA-212 overflow
+/// storage this regression must not occur.
+#[test]
+fn prefix_equal_strings_are_not_equal_in_where() {
+    let (_dir, db) = make_db();
+    db.execute("CREATE (n:Language {name: 'TypeScript'})")
+        .unwrap();
+    db.execute("CREATE (n:Language {name: 'TypeScripx'})")
+        .unwrap();
+
+    let result = db
+        .execute("MATCH (n:Language) WHERE n.name = 'TypeScript' RETURN n.name")
+        .expect("WHERE filter with prefix-equal strings");
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "WHERE n.name = 'TypeScript' must return exactly 1 row, not 2 — \
+         'TypeScript' and 'TypeScripx' share a 7-byte prefix but are distinct (SPA-212)"
+    );
+    assert_eq!(
+        result.rows[0][0],
+        Value::String("TypeScript".to_string()),
+        "The single returned row must be 'TypeScript', not 'TypeScripx'"
+    );
+}
+
 /// Long string must survive a DB reopen (overflow heap persisted correctly).
 #[test]
 fn long_string_survives_reopen() {
