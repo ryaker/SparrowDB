@@ -549,7 +549,8 @@ impl NodeStore {
         }
 
         // Seek to the slot and write the tombstone value.
-        f.seek(SeekFrom::Start(slot as u64 * 8)).map_err(Error::Io)?;
+        f.seek(SeekFrom::Start(slot as u64 * 8))
+            .map_err(Error::Io)?;
         f.write_all(&u64::MAX.to_le_bytes()).map_err(Error::Io)
     }
 
