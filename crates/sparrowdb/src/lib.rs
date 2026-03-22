@@ -1051,10 +1051,8 @@ impl WriteTx {
         // the hardcoded RelTableId(0).  Always include table-0 so that any
         // edges written before the catalog had entries are still detected.
         let rel_entries = self.catalog.list_rel_table_ids();
-        let mut rel_ids_to_check: Vec<u32> = rel_entries
-            .iter()
-            .map(|(id, _, _, _)| *id as u32)
-            .collect();
+        let mut rel_ids_to_check: Vec<u32> =
+            rel_entries.iter().map(|(id, _, _, _)| *id as u32).collect();
         // Always include the legacy table-0 slot.  If it is already in the
         // catalog list this dedup prevents a double-read.
         if !rel_ids_to_check.contains(&0u32) {

@@ -59,7 +59,12 @@ impl Engine {
     /// The `csrs` map associates each `RelTableId` (u32) with its forward CSR.
     /// Use [`Engine::with_single_csr`] in tests or legacy code that only has
     /// one CSR.
-    pub fn new(store: NodeStore, catalog: Catalog, csrs: HashMap<u32, CsrForward>, db_root: &Path) -> Self {
+    pub fn new(
+        store: NodeStore,
+        catalog: Catalog,
+        csrs: HashMap<u32, CsrForward>,
+        db_root: &Path,
+    ) -> Self {
         Engine {
             store,
             catalog,
@@ -74,7 +79,12 @@ impl Engine {
     ///
     /// SPA-185: prefer `Engine::new` with a full `HashMap<u32, CsrForward>` for
     /// production use so that per-type filtering is correct.
-    pub fn with_single_csr(store: NodeStore, catalog: Catalog, csr: CsrForward, db_root: &Path) -> Self {
+    pub fn with_single_csr(
+        store: NodeStore,
+        catalog: Catalog,
+        csr: CsrForward,
+        db_root: &Path,
+    ) -> Self {
         let mut csrs = HashMap::new();
         csrs.insert(0u32, csr);
         Self::new(store, catalog, csrs, db_root)
@@ -121,10 +131,7 @@ impl Engine {
     ///
     /// Returns an empty `Vec` if the rel type has not been registered yet, or
     /// if the delta file does not exist.
-    fn read_delta_for(
-        &self,
-        rel_table_id: u32,
-    ) -> Vec<sparrowdb_storage::edge_store::DeltaRecord> {
+    fn read_delta_for(&self, rel_table_id: u32) -> Vec<sparrowdb_storage::edge_store::DeltaRecord> {
         EdgeStore::open(&self.db_root, RelTableId(rel_table_id))
             .and_then(|s| s.read_delta())
             .unwrap_or_default()
@@ -1404,10 +1411,7 @@ impl Engine {
             RelTableLookup::Found(rtid) => self.csr_neighbors(rtid, src_slot),
             _ => self.csr_neighbors_all(src_slot),
         };
-        let all_neighbors: Vec<u64> = csr_neighbors
-            .into_iter()
-            .chain(delta_neighbors)
-            .collect();
+        let all_neighbors: Vec<u64> = csr_neighbors.into_iter().chain(delta_neighbors).collect();
 
         let mut seen: HashSet<u64> = HashSet::new();
         let mut sub_rows: Vec<HashMap<String, Value>> = Vec::new();
@@ -2355,12 +2359,7 @@ impl Engine {
         // AspJoin requires a single &CsrForward; we construct a combined one
         // rather than using an arbitrary first entry.
         let merged_csr = {
-            let max_nodes = self
-                .csrs
-                .values()
-                .map(|c| c.n_nodes())
-                .max()
-                .unwrap_or(0);
+            let max_nodes = self.csrs.values().map(|c| c.n_nodes()).max().unwrap_or(0);
             let mut edges: Vec<(u64, u64)> = Vec::new();
             for csr in self.csrs.values() {
                 for src in 0..csr.n_nodes() {

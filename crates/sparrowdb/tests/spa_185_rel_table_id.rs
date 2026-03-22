@@ -34,9 +34,11 @@ fn spa185_distinct_rel_types_no_cross_contamination() {
     let db = open(dir.path()).expect("open db");
 
     // ── Create nodes ────────────────────────────────────────────────────────
-    db.execute("CREATE (:Person {name: 'Alice'})").expect("Alice");
+    db.execute("CREATE (:Person {name: 'Alice'})")
+        .expect("Alice");
     db.execute("CREATE (:Person {name: 'Bob'})").expect("Bob");
-    db.execute("CREATE (:Person {name: 'Carol'})").expect("Carol");
+    db.execute("CREATE (:Person {name: 'Carol'})")
+        .expect("Carol");
 
     // ── Create edges of different types ────────────────────────────────────
     // Alice -[:KNOWS]-> Bob
@@ -109,9 +111,11 @@ fn spa185_distinct_rel_types_after_checkpoint() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = open(dir.path()).expect("open db");
 
-    db.execute("CREATE (:Person {name: 'Alice'})").expect("Alice");
+    db.execute("CREATE (:Person {name: 'Alice'})")
+        .expect("Alice");
     db.execute("CREATE (:Person {name: 'Bob'})").expect("Bob");
-    db.execute("CREATE (:Person {name: 'Carol'})").expect("Carol");
+    db.execute("CREATE (:Person {name: 'Carol'})")
+        .expect("Carol");
 
     db.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
@@ -144,7 +148,11 @@ fn spa185_distinct_rel_types_after_checkpoint() {
         "post-checkpoint KNOWS query must NOT return Carol; got: {:?}",
         knows_names
     );
-    assert_eq!(knows_names.len(), 1, "post-checkpoint KNOWS must return 1 row");
+    assert_eq!(
+        knows_names.len(),
+        1,
+        "post-checkpoint KNOWS must return 1 row"
+    );
 
     // Post-checkpoint LIKES query must return only Carol.
     let likes_result = db
@@ -162,7 +170,11 @@ fn spa185_distinct_rel_types_after_checkpoint() {
         "post-checkpoint LIKES query must NOT return Bob; got: {:?}",
         likes_names
     );
-    assert_eq!(likes_names.len(), 1, "post-checkpoint LIKES must return 1 row");
+    assert_eq!(
+        likes_names.len(),
+        1,
+        "post-checkpoint LIKES must return 1 row"
+    );
 }
 
 /// Three relationship types: verify each filters independently with no
@@ -172,9 +184,11 @@ fn spa185_three_rel_types_independent_filters() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = open(dir.path()).expect("open db");
 
-    db.execute("CREATE (:Person {name: 'Alice'})").expect("Alice");
+    db.execute("CREATE (:Person {name: 'Alice'})")
+        .expect("Alice");
     db.execute("CREATE (:Person {name: 'Bob'})").expect("Bob");
-    db.execute("CREATE (:Person {name: 'Carol'})").expect("Carol");
+    db.execute("CREATE (:Person {name: 'Carol'})")
+        .expect("Carol");
     db.execute("CREATE (:Person {name: 'Dave'})").expect("Dave");
 
     // Alice -[:KNOWS]-> Bob

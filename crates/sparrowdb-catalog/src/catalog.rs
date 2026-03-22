@@ -171,7 +171,14 @@ impl Catalog {
     pub fn list_rel_table_ids(&self) -> Vec<(u64, u16, u16, String)> {
         self.rel_tables
             .iter()
-            .map(|e| (e.rel_table_id, e.src_label_id, e.dst_label_id, e.rel_type.clone()))
+            .map(|e| {
+                (
+                    e.rel_table_id,
+                    e.src_label_id,
+                    e.dst_label_id,
+                    e.rel_type.clone(),
+                )
+            })
             .collect()
     }
 
