@@ -452,12 +452,22 @@ impl Engine {
 
     /// Returns `true` if the given node has been tombstoned (col 0 == u64::MAX).
     ///
-    /// A read error is treated as "not tombstoned" so that missing-file errors
-    /// during a fresh scan do not suppress valid nodes.
+    /// `NotFound` is expected for new/sparse nodes where col_0 has not been
+    /// written yet and is treated as "not tombstoned".  All other errors are
+    /// logged as warnings and also treated as "not tombstoned" so that
+    /// transient storage issues do not suppress valid nodes during a scan.
     fn is_node_tombstoned(&self, node_id: NodeId) -> bool {
         match self.store.get_node_raw(node_id, &[0u32]) {
             Ok(col0) => col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX),
-            Err(_) => false,
+            Err(sparrowdb_common::Error::NotFound) => false,
+            Err(e) => {
+                tracing::warn!(
+                    node_id = node_id.0,
+                    error = ?e,
+                    "tombstone check failed; treating node as not tombstoned"
+                );
+                false
+            }
         }
     }
 

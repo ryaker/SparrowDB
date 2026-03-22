@@ -48,35 +48,50 @@ fn delete_node_with_prop_filter() {
 }
 
 /// DELETE without a label-specific filter — delete ALL Person nodes.
+///
+/// Also verifies label isolation: a Company node created alongside the Person
+/// nodes must survive the `MATCH (n:Person) DELETE n` operation.
 #[test]
 fn delete_all_nodes_of_label() {
     let (_dir, db) = make_db();
 
-    // CREATE two Person nodes.
+    // CREATE two Person nodes and one non-Person control node.
     db.execute("CREATE (:Person {name: 'Alice'})")
         .expect("CREATE Alice must succeed");
     db.execute("CREATE (:Person {name: 'Bob'})")
         .expect("CREATE Bob must succeed");
+    db.execute("CREATE (:Company {name: 'Acme'})")
+        .expect("CREATE Company must succeed");
 
-    // Verify both exist.
+    // Verify both Person nodes exist.
     let before = db
         .execute("MATCH (n:Person) RETURN n.name")
         .expect("MATCH before DELETE must succeed");
-    assert_eq!(before.rows.len(), 2, "expected 2 rows before DELETE");
+    assert_eq!(before.rows.len(), 2, "expected 2 Person rows before DELETE");
 
     // DELETE all Person nodes.
     db.execute("MATCH (n:Person) DELETE n")
         .expect("DELETE all Person nodes must succeed");
 
-    // Verify all are gone.
+    // Verify all Person nodes are gone.
     let after = db
         .execute("MATCH (n:Person) RETURN n.name")
         .expect("MATCH after DELETE must succeed");
     assert_eq!(
         after.rows.len(),
         0,
-        "expected 0 rows after DELETE all, got {}",
+        "expected 0 Person rows after DELETE all, got {}",
         after.rows.len()
+    );
+
+    // Verify the Company node was NOT deleted (label isolation).
+    let company = db
+        .execute("MATCH (n:Company {name: 'Acme'}) RETURN n.name")
+        .expect("MATCH Company after Person DELETE must succeed");
+    assert_eq!(
+        company.rows.len(),
+        1,
+        "Company node must survive MATCH (n:Person) DELETE n"
     );
 }
 
@@ -119,7 +134,7 @@ fn deleted_node_invisible_to_future_queries() {
     db.execute("MATCH (n:Person {name: 'Alice'}) DELETE n")
         .expect("DELETE Alice");
 
-    // Verify only Charlie remains.
+    // Verify only Charlie remains (by count).
     let remaining = db
         .execute("MATCH (n:Person) RETURN n.name")
         .expect("MATCH after partial DELETE");
@@ -128,6 +143,16 @@ fn deleted_node_invisible_to_future_queries() {
         1,
         "expected 1 remaining node after deleting Alice, got {}",
         remaining.rows.len()
+    );
+
+    // Confirm the survivor is specifically Charlie, not a corrupted row.
+    let charlie = db
+        .execute("MATCH (n:Person {name: 'Charlie'}) RETURN n.name")
+        .expect("MATCH Charlie after DELETE");
+    assert_eq!(
+        charlie.rows.len(),
+        1,
+        "Charlie must remain after deleting Alice"
     );
 
     // Also confirm Alice is not found by name.
