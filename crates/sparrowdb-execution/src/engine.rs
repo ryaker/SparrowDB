@@ -1176,6 +1176,13 @@ impl Engine {
         // Scan source nodes.
         for src_slot in 0..hwm_src {
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
+
+            // Skip tombstoned source nodes (col_0 == u64::MAX).
+            let col0_check = self.store.get_node_raw(src_node, &[0u32])?;
+            if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                continue;
+            }
+
             let src_props = {
                 let all_needed: Vec<u32> = {
                     let mut v = col_ids_src.clone();
@@ -1227,6 +1234,13 @@ impl Engine {
                     continue;
                 }
                 let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
+
+                // Skip tombstoned destination nodes (col_0 == u64::MAX).
+                let dst_col0_check = self.store.get_node_raw(dst_node, &[0u32])?;
+                if dst_col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                    continue;
+                }
+
                 let dst_props = read_node_props(&self.store, dst_node, &col_ids_dst)?;
 
                 // Apply dst inline prop filter.
@@ -1413,6 +1427,13 @@ impl Engine {
         // Scan source nodes.
         for src_slot in 0..hwm_src {
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
+
+            // Skip tombstoned source nodes (col_0 == u64::MAX).
+            let col0_check = self.store.get_node_raw(src_node, &[0u32])?;
+            if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                continue;
+            }
+
             let src_needed: Vec<u32> = {
                 let mut v = vec![];
                 for p in &src_node_pat.props {
@@ -1463,6 +1484,13 @@ impl Engine {
 
             for fof_slot in fof_slots {
                 let fof_node = NodeId(((fof_label_id as u64) << 32) | fof_slot);
+
+                // Skip tombstoned fof nodes (col_0 == u64::MAX).
+                let fof_col0_check = self.store.get_node_raw(fof_node, &[0u32])?;
+                if fof_col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                    continue;
+                }
+
                 let fof_props = read_node_props(&self.store, fof_node, &col_ids_fof)?;
 
                 // Apply fof inline prop filter.
@@ -1611,6 +1639,12 @@ impl Engine {
         for src_slot in 0..hwm_src {
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
 
+            // Skip tombstoned source nodes (col_0 == u64::MAX).
+            let col0_check = self.store.get_node_raw(src_node, &[0u32])?;
+            if col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                continue;
+            }
+
             // Fetch source props (for filter + projection).
             let src_all_col_ids: Vec<u32> = {
                 let mut v = col_ids_src.clone();
@@ -1637,6 +1671,13 @@ impl Engine {
                 }
 
                 let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
+
+                // Skip tombstoned destination nodes (col_0 == u64::MAX).
+                let dst_col0_check = self.store.get_node_raw(dst_node, &[0u32])?;
+                if dst_col0_check.iter().any(|&(c, v)| c == 0 && v == u64::MAX) {
+                    continue;
+                }
+
                 let dst_props = read_node_props(&self.store, dst_node, &col_ids_dst)?;
 
                 if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
