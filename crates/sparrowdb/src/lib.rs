@@ -1544,16 +1544,27 @@ fn open_csr_map(path: &Path) -> HashMap<u32, CsrForward> {
         Err(_) => return HashMap::new(),
     };
     let mut map = HashMap::new();
-    for (id, _, _, _) in catalog.list_rel_table_ids() {
-        let rid = id as u32;
+
+    // Collect rel IDs from catalog.
+    let mut rel_ids: Vec<u32> = catalog
+        .list_rel_table_ids()
+        .into_iter()
+        .map(|(id, _, _, _)| id as u32)
+        .collect();
+
+    // Always include the legacy table-0 slot so that checkpointed CSRs
+    // written before the catalog had entries (pre-SPA-185 data) are loaded.
+    if !rel_ids.contains(&0u32) {
+        rel_ids.push(0u32);
+    }
+
+    for rid in rel_ids {
         if let Ok(store) = EdgeStore::open(path, RelTableId(rid)) {
             if let Ok(csr) = store.open_fwd() {
                 map.insert(rid, csr);
             }
         }
     }
-    // If no rel types registered yet (empty catalog), provide nothing.
-    // The engine will fall back to delta-only reads.
     map
 }
 

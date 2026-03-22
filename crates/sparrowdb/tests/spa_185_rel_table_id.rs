@@ -10,14 +10,17 @@ fn name_strings(result: &sparrowdb_execution::QueryResult) -> Vec<String> {
     result
         .rows
         .iter()
-        .filter_map(|row| {
-            row.first().and_then(|v| {
-                if let sparrowdb_execution::Value::String(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
+        .map(|row| {
+            let v = row
+                .first()
+                .expect("query result row must have at least one column");
+            match v {
+                sparrowdb_execution::Value::String(s) => s.clone(),
+                other => panic!(
+                    "expected String in first column of query result, got: {:?}",
+                    other
+                ),
+            }
         })
         .collect()
 }
@@ -162,29 +165,40 @@ fn spa185_distinct_rel_types_after_checkpoint() {
     assert_eq!(likes_names.len(), 1, "post-checkpoint LIKES must return 1 row");
 }
 
-/// Two relationship types: verify each filters independently.
+/// Three relationship types: verify each filters independently with no
+/// cross-contamination across any pair.
 #[test]
-fn spa185_two_rel_types_independent_filters() {
+fn spa185_three_rel_types_independent_filters() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = open(dir.path()).expect("open db");
 
     db.execute("CREATE (:Person {name: 'Alice'})").expect("Alice");
     db.execute("CREATE (:Person {name: 'Bob'})").expect("Bob");
     db.execute("CREATE (:Person {name: 'Carol'})").expect("Carol");
+    db.execute("CREATE (:Person {name: 'Dave'})").expect("Dave");
 
+    // Alice -[:KNOWS]-> Bob
     db.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          CREATE (a)-[:KNOWS]->(b)",
     )
     .expect("KNOWS");
 
+    // Alice -[:LIKES]-> Carol
     db.execute(
         "MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:LIKES]->(c)",
     )
     .expect("LIKES");
 
-    // KNOWS → must return exactly Bob (1 row).
+    // Alice -[:FOLLOWS]-> Dave
+    db.execute(
+        "MATCH (a:Person {name: 'Alice'}), (d:Person {name: 'Dave'}) \
+         CREATE (a)-[:FOLLOWS]->(d)",
+    )
+    .expect("FOLLOWS");
+
+    // KNOWS → must return exactly Bob.
     let r = db
         .execute("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.name")
         .expect("KNOWS");
@@ -196,7 +210,7 @@ fn spa185_two_rel_types_independent_filters() {
         knows_names
     );
 
-    // LIKES → must return exactly Carol (1 row).
+    // LIKES → must return exactly Carol.
     let r = db
         .execute("MATCH (a:Person)-[:LIKES]->(b:Person) RETURN b.name")
         .expect("LIKES");
@@ -206,5 +220,17 @@ fn spa185_two_rel_types_independent_filters() {
         vec!["Carol".to_string()],
         "LIKES must return only Carol; got: {:?}",
         likes_names
+    );
+
+    // FOLLOWS → must return exactly Dave.
+    let r = db
+        .execute("MATCH (a:Person)-[:FOLLOWS]->(b:Person) RETURN b.name")
+        .expect("FOLLOWS");
+    let follows_names = name_strings(&r);
+    assert_eq!(
+        follows_names,
+        vec!["Dave".to_string()],
+        "FOLLOWS must return only Dave; got: {:?}",
+        follows_names
     );
 }
