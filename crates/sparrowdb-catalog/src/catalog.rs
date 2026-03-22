@@ -181,6 +181,34 @@ impl Catalog {
             .map(|e| e.rel_table_id))
     }
 
+    /// Look up the relationship type name for a given `RelTableId`.
+    ///
+    /// Returns `None` if no such rel table is registered in the catalog.
+    pub fn get_rel_type_name(&self, rel_table_id: RelTableId) -> Option<String> {
+        self.rel_tables
+            .iter()
+            .find(|e| e.rel_table_id == rel_table_id)
+            .map(|e| e.rel_type.clone())
+    }
+
+    /// List all relationship tables with their catalog IDs.
+    ///
+    /// Returns `(RelTableId, src_label_id, dst_label_id, rel_type)` tuples so
+    /// that callers can open the correct per-table delta log file.
+    pub fn list_rel_tables_with_ids(&self) -> Vec<(RelTableId, u16, u16, String)> {
+        self.rel_tables
+            .iter()
+            .map(|e| {
+                (
+                    e.rel_table_id,
+                    e.src_label_id,
+                    e.dst_label_id,
+                    e.rel_type.clone(),
+                )
+            })
+            .collect()
+    }
+
     // --- Private helpers ---
 
     /// Load all TLV entries from the catalog file into memory.
