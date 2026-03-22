@@ -885,6 +885,14 @@ impl Engine {
         for node in &create.nodes {
             // Resolve the primary label, creating it if absent.
             let label = node.labels.first().cloned().unwrap_or_default();
+
+            // SPA-208: reject reserved __SO_ label prefix.
+            if is_reserved_label(&label) {
+                return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                    "invalid argument: label \"{label}\" is reserved — the __SO_ prefix is for internal use only"
+                )));
+            }
+
             let label_id: u32 = match self.catalog.get_label(&label)? {
                 Some(id) => id as u32,
                 None => self.catalog.create_label(&label)? as u32,
@@ -3193,6 +3201,16 @@ fn build_row_vals(
         map.insert(key, decode_raw_val(raw));
     }
     map
+}
+
+// ── Reserved label/type protection (SPA-208) ──────────────────────────────────
+
+/// Returns `true` if `label` starts with the reserved `__SO_` prefix.
+///
+/// The `__SO_` namespace is reserved for internal SparrowDB system objects.
+#[inline]
+fn is_reserved_label(label: &str) -> bool {
+    label.starts_with("__SO_")
 }
 
 /// Compare two `Value`s for equality, handling the mixed `Int64`/`String` case.
