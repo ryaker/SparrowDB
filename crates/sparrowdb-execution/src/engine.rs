@@ -309,6 +309,40 @@ impl Engine {
         &mm.mutation
     }
 
+    // ── Node-scan helpers (shared by scan_match_create and scan_match_create_rows) ──
+
+    /// Returns `true` if the given node has been tombstoned (col 0 == u64::MAX).
+    ///
+    /// A read error is treated as "not tombstoned" so that missing-file errors
+    /// during a fresh scan do not suppress valid nodes.
+    fn is_node_tombstoned(&self, node_id: NodeId) -> bool {
+        match self.store.get_node_raw(node_id, &[0u32]) {
+            Ok(col0) => col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX),
+            Err(_) => false,
+        }
+    }
+
+    /// Returns `true` if `node_id` satisfies every inline prop predicate in
+    /// `filter_col_ids` / `props`.
+    ///
+    /// `filter_col_ids` must be pre-computed from `props` with
+    /// `prop_name_to_col_id`.  Pass an empty slice when there are no filters
+    /// (the method returns `true` immediately).
+    fn node_matches_prop_filter(
+        &self,
+        node_id: NodeId,
+        filter_col_ids: &[u32],
+        props: &[sparrowdb_cypher::ast::PropEntry],
+    ) -> bool {
+        if props.is_empty() {
+            return true;
+        }
+        match self.store.get_node_raw(node_id, filter_col_ids) {
+            Ok(raw_props) => matches_prop_filter_static(&raw_props, props),
+            Err(_) => false,
+        }
+    }
+
     // ── Scan for MATCH…CREATE (called by GraphDb with a write transaction) ──────
 
     /// Scan nodes matching the MATCH patterns in a `MatchCreateStatement` and
@@ -449,24 +483,11 @@ impl Engine {
                     for slot in 0..hwm {
                         let node_id = NodeId(((label_id as u64) << 32) | slot);
 
-                        // Skip tombstoned nodes.
-                        match self.store.get_node_raw(node_id, &[0u32]) {
-                            Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
-                                continue;
-                            }
-                            Ok(_) | Err(_) => {}
+                        if self.is_node_tombstoned(node_id) {
+                            continue;
                         }
-
-                        // Apply inline prop filter.
-                        if !node_pat.props.is_empty() {
-                            match self.store.get_node_raw(node_id, &filter_col_ids) {
-                                Ok(props) => {
-                                    if !matches_prop_filter_static(&props, &node_pat.props) {
-                                        continue;
-                                    }
-                                }
-                                Err(_) => continue,
-                            }
+                        if !self.node_matches_prop_filter(node_id, &filter_col_ids, &node_pat.props) {
+                            continue;
                         }
 
                         matching_ids.push(node_id);
@@ -534,9 +555,9 @@ impl Engine {
                     }
                 };
 
-                // Resolve the relationship type to a rel table ID for filtering.
-                // (We include all edges when rel_type is empty / not in catalog.)
-                let _rel_type = &rel_pat.rel_type;
+                // TODO: filter edges by relationship type (rel_pat.rel_type).
+                // For now we traverse all edges in the default rel table (RelTableId(0)).
+                let _ = &rel_pat;
 
                 let hwm_src = self.store.hwm_for_label(src_label_id)?;
 
@@ -546,24 +567,11 @@ impl Engine {
                 for src_slot in 0..hwm_src {
                     let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
 
-                    // Skip tombstoned sources.
-                    match self.store.get_node_raw(src_node, &[0u32]) {
-                        Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
-                            continue;
-                        }
-                        Ok(_) | Err(_) => {}
+                    if self.is_node_tombstoned(src_node) {
+                        continue;
                     }
-
-                    // Apply src prop filter.
-                    if !src_node_pat.props.is_empty() {
-                        match self.store.get_node_raw(src_node, &src_filter_cols) {
-                            Ok(props) => {
-                                if !matches_prop_filter_static(&props, &src_node_pat.props) {
-                                    continue;
-                                }
-                            }
-                            Err(_) => continue,
-                        }
+                    if !self.node_matches_prop_filter(src_node, &src_filter_cols, &src_node_pat.props) {
+                        continue;
                     }
 
                     // Collect outgoing neighbours (CSR + delta).
@@ -585,24 +593,11 @@ impl Engine {
                         }
                         let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
 
-                        // Skip tombstoned destinations.
-                        match self.store.get_node_raw(dst_node, &[0u32]) {
-                            Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
-                                continue;
-                            }
-                            Ok(_) | Err(_) => {}
+                        if self.is_node_tombstoned(dst_node) {
+                            continue;
                         }
-
-                        // Apply dst prop filter.
-                        if !dst_node_pat.props.is_empty() {
-                            match self.store.get_node_raw(dst_node, &dst_filter_cols) {
-                                Ok(props) => {
-                                    if !matches_prop_filter_static(&props, &dst_node_pat.props) {
-                                        continue;
-                                    }
-                                }
-                                Err(_) => continue,
-                            }
+                        if !self.node_matches_prop_filter(dst_node, &dst_filter_cols, &dst_node_pat.props) {
+                            continue;
                         }
 
                         let mut row: HashMap<String, NodeId> = HashMap::new();
