@@ -29,8 +29,8 @@
 //!           parsed; SPA-155 confirmed UNWIND+RETURN works but UNWIND+MATCH is not.
 //!   GAP-H: `n.type IN ['ContextTrigger','ToolRoute']` combined with
 //!           `labels(n)` filtering — compound label+property filter pattern.
-//!   GAP-I: `CALL ... YIELD node, score` — only `node` YIELD column supported;
-//!           `score` column raises InvalidArgument error.
+//!   GAP-I: FIXED (SPA-239) — `CALL ... YIELD node, score` now supported;
+//!           `score` returns a normalised relevance float in [0.0, 1.0].
 //!   GAP-J: `coalesce(missing_prop, name, 'default')` — coalesce does not skip
 //!           Null from a missing property and falls through to Null rather than
 //!           the next non-null argument.
@@ -660,9 +660,6 @@ fn kms_q17_about_relationship_to_organization() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "GAP-I: CALL db.index.fulltext.queryNodes YIELD node, score — \
-            'score' YIELD column not implemented (only 'node' supported). \
-            SPA-170 implements the procedure; score ranking needs a sub-ticket under SPA-151."]
 fn kms_q18_fulltext_search_call_procedure() {
     let (_dir, db) = make_db();
 
