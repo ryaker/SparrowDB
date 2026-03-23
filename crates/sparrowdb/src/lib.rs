@@ -1309,9 +1309,8 @@ impl GraphDb {
         let catalog = sparrowdb_catalog::catalog::Catalog::open(path)?;
 
         // Query all nodes via Cypher — id(n) is reliably Int64 from node scans.
-        let nodes = self.execute(
-            "MATCH (n) RETURN id(n) AS nid, labels(n) AS lbls, n.name AS nm",
-        )?;
+        let nodes =
+            self.execute("MATCH (n) RETURN id(n) AS nid, labels(n) AS lbls, n.name AS nm")?;
 
         // Read edges directly from storage.
         //
@@ -1325,20 +1324,14 @@ impl GraphDb {
         let mut edge_triples: Vec<(i64, String, i64)> = Vec::new();
 
         for (catalog_id, src_label_id, dst_label_id, rel_type) in &rel_tables {
-            let storage_rel_id =
-                sparrowdb_storage::edge_store::RelTableId(*catalog_id as u32);
+            let storage_rel_id = sparrowdb_storage::edge_store::RelTableId(*catalog_id as u32);
 
-            if let Ok(store) =
-                sparrowdb_storage::edge_store::EdgeStore::open(path, storage_rel_id)
+            if let Ok(store) = sparrowdb_storage::edge_store::EdgeStore::open(path, storage_rel_id)
             {
                 // Delta log: stores full NodeId pairs directly.
                 if let Ok(records) = store.read_delta() {
                     for rec in records {
-                        edge_triples.push((
-                            rec.src.0 as i64,
-                            rel_type.clone(),
-                            rec.dst.0 as i64,
-                        ));
+                        edge_triples.push((rec.src.0 as i64, rel_type.clone(), rec.dst.0 as i64));
                     }
                 }
 
@@ -1348,8 +1341,7 @@ impl GraphDb {
                     for src_slot in 0..n_nodes {
                         let src_id = ((*src_label_id as u64) << 32 | src_slot) as i64;
                         for &dst_slot in csr.neighbors(src_slot) {
-                            let dst_id =
-                                ((*dst_label_id as u64) << 32 | dst_slot) as i64;
+                            let dst_id = ((*dst_label_id as u64) << 32 | dst_slot) as i64;
                             edge_triples.push((src_id, rel_type.clone(), dst_id));
                         }
                     }
@@ -1358,9 +1350,8 @@ impl GraphDb {
         }
 
         // Build DOT output.
-        let mut dot = String::from(
-            "digraph SparrowDB {\n  rankdir=LR;\n  node [shape=ellipse];\n\n",
-        );
+        let mut dot =
+            String::from("digraph SparrowDB {\n  rankdir=LR;\n  node [shape=ellipse];\n\n");
 
         for row in &nodes.rows {
             let node_id = match &row[0] {
