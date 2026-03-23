@@ -4843,9 +4843,8 @@ fn apply_order_by(rows: &mut Vec<Vec<Value>>, m: &MatchStatement, column_names: 
                 return;
             }
         }
-        match sorter.finish() {
-            Ok(iter) => *rows = iter.map(|sr| sr.data).collect::<Vec<_>>(),
-            Err(_) => {}
+        if let Ok(iter) = sorter.finish() {
+            *rows = iter.map(|sr| sr.data).collect::<Vec<_>>();
         }
     }
 }
