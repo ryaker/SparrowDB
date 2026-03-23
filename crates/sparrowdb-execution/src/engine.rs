@@ -28,6 +28,69 @@ use sparrowdb_storage::wal::WalReplayer;
 
 use crate::types::{QueryResult, Value};
 
+// ── DegreeCache (SPA-272) ─────────────────────────────────────────────────────
+
+/// Pre-computed out-degree for every node slot across all relationship types.
+///
+/// Built eagerly at engine-open time by scanning:
+/// 1. CSR forward files (checkpointed edges) — contribution per slot from offsets.
+/// 2. Delta log records (uncheckpointed edges) — each `DeltaRecord.src` increments
+///    the source slot's count.
+///
+/// Keyed by the lower-32-bit slot extracted from `NodeId.0`
+/// (i.e. `node_id & 0xFFFF_FFFF`).
+///
+/// Lookup is O(1).  [`Engine::top_k_by_degree`] uses this cache to answer
+/// "top-k highest-degree nodes of label L" in O(N log k) where N is the
+/// label's node count (HWM), rather than O(N × E) full edge scans.
+#[derive(Debug, Default)]
+pub struct DegreeCache {
+    /// Maps slot → total out-degree across all relationship types.
+    inner: HashMap<u64, u32>,
+}
+
+impl DegreeCache {
+    /// Return the total out-degree for `slot` across all relationship types.
+    ///
+    /// Returns `0` for slots that have no outgoing edges.
+    pub fn out_degree(&self, slot: u64) -> u32 {
+        self.inner.get(&slot).copied().unwrap_or(0)
+    }
+
+    /// Increment the out-degree counter for `slot` by 1.
+    fn increment(&mut self, slot: u64) {
+        *self.inner.entry(slot).or_insert(0) += 1;
+    }
+
+    /// Build a `DegreeCache` from a set of CSR forward files and delta records.
+    ///
+    /// `csrs` — all per-rel-type CSR forward files loaded at engine open.
+    /// `delta` — all delta-log records (uncommitted/uncheckpointed edges).
+    fn build(csrs: &HashMap<u32, CsrForward>, delta: &[DeltaRecord]) -> Self {
+        let mut cache = DegreeCache::default();
+
+        // 1. Accumulate from CSR: for each rel type, for each src slot, add
+        //    the slot's out-degree (= neighbors slice length).
+        for csr in csrs.values() {
+            for slot in 0..csr.n_nodes() {
+                let deg = csr.neighbors(slot).len() as u32;
+                if deg > 0 {
+                    *cache.inner.entry(slot).or_insert(0) += deg;
+                }
+            }
+        }
+
+        // 2. Accumulate from delta log: each record increments src's slot.
+        //    Lower 32 bits of NodeId = within-label slot number.
+        for rec in delta {
+            let src_slot = rec.src.0 & 0xFFFF_FFFF;
+            cache.increment(src_slot);
+        }
+
+        cache
+    }
+}
+
 /// Tri-state result for relationship table lookup.
 ///
 /// Distinguishes three cases that previously both returned `Option::None` from
@@ -82,6 +145,13 @@ pub struct Engine {
     /// `Error::QueryTimeout` is returned immediately.  `None` means no
     /// deadline (backward-compatible default).
     pub deadline: Option<std::time::Instant>,
+    /// Pre-computed out-degree for every node slot across all relationship types
+    /// (SPA-272).
+    ///
+    /// Built eagerly in [`Engine::new`] by scanning all CSR forward files and all
+    /// delta-log records.  Provides O(1) degree lookup for
+    /// [`Engine::top_k_by_degree`].
+    pub degree_cache: DegreeCache,
 }
 
 impl Engine {
@@ -107,6 +177,27 @@ impl Engine {
         // that appear in an actual CONTAINS or STARTS WITH predicate are loaded.
         // Queries with no text predicates (COUNT(*), hop traversals, property
         // lookups) pay zero TextIndex I/O cost.
+        //
+        // SPA-272 (degree cache): built eagerly from CSR forward files + all
+        // delta-log records so that top-k degree queries are O(1) per node.
+        let delta_all: Vec<DeltaRecord> = {
+            let ids = catalog.list_rel_table_ids();
+            if ids.is_empty() {
+                EdgeStore::open(db_root, RelTableId(0))
+                    .and_then(|s| s.read_delta())
+                    .unwrap_or_default()
+            } else {
+                ids.into_iter()
+                    .flat_map(|(id, _, _, _)| {
+                        EdgeStore::open(db_root, RelTableId(id as u32))
+                            .and_then(|s| s.read_delta())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            }
+        };
+        let degree_cache = DegreeCache::build(&csrs, &delta_all);
+
         Engine {
             store,
             catalog,
@@ -116,6 +207,7 @@ impl Engine {
             prop_index: std::cell::RefCell::new(PropertyIndex::new()),
             text_index: std::cell::RefCell::new(TextIndex::new()),
             deadline: None,
+            degree_cache,
         }
     }
 
@@ -241,6 +333,33 @@ impl Engine {
             out.extend_from_slice(csr.neighbors(src_slot));
         }
         out
+    }
+
+    /// Return the top-`k` nodes of `label_id` ordered by out-degree descending.
+    ///
+    /// Each element of the returned `Vec` is `(slot, out_degree)`.  Ties in
+    /// degree are broken by slot number (lower slot first) for determinism.
+    ///
+    /// Returns an empty `Vec` when `k == 0` or the label has no nodes.
+    ///
+    /// Uses [`DegreeCache`] for O(1) per-node lookups (SPA-272).
+    pub fn top_k_by_degree(&self, label_id: u32, k: usize) -> Result<Vec<(u64, u32)>> {
+        if k == 0 {
+            return Ok(vec![]);
+        }
+        let hwm = self.store.hwm_for_label(label_id)?;
+        if hwm == 0 {
+            return Ok(vec![]);
+        }
+
+        let mut pairs: Vec<(u64, u32)> = (0..hwm)
+            .map(|slot| (slot, self.degree_cache.out_degree(slot)))
+            .collect();
+
+        // Sort descending by degree; break ties by ascending slot for determinism.
+        pairs.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        pairs.truncate(k);
+        Ok(pairs)
     }
 
     /// Parse, bind, plan, and execute a Cypher query.
@@ -4318,18 +4437,26 @@ impl Engine {
         }
     }
 
-    /// BFS traversal for variable-length path patterns `(src)-[:R*min..max]->(dst)`.
+    /// DFS traversal for variable-length path patterns `(src)-[:R*min..max]->(dst)`.
     ///
-    /// Returns the set of `(dst_slot, dst_label_id)` pairs reachable from `src_slot`
-    /// in `[min_hops, max_hops]` hops.  Max is capped at 10 to prevent runaway
-    /// traversals on dense graphs.
+    /// Returns a `Vec<(dst_slot, dst_label_id)>` with **one entry per simple path**
+    /// that ends at `depth ∈ [min_hops, max_hops]`.  The same destination node can
+    /// appear multiple times when it is reachable via distinct simple paths
+    /// (enumerative semantics, as required by OpenCypher).
     ///
-    /// Fixes applied (SPA-268):
-    ///   Bug A — frontier tracks `(slot, label_id)` so depth-2+ nodes are expanded
-    ///            with their own label, not always the source's label.
-    ///   Bug B — `results.insert` is gated behind the `visited.insert` guard so a
-    ///            self-loop cannot insert the source back into results.
-    ///   Bug C — when `min_hops == 0` the source node is pre-seeded in results.
+    /// A simple path never visits the same node twice.  "Visited" is tracked per
+    /// path using a stack that is pushed on entry and popped on backtrack — the
+    /// classic DFS-with-backtracking pattern.
+    ///
+    /// Safety cap: `max_hops` is clamped to 10 to bound worst-case traversal.
+    /// Result cap: at most `PATH_RESULT_CAP` entries are returned; a warning is
+    /// printed to stderr if the cap is hit.
+    ///
+    /// Replaces the former global-visited BFS (existential semantics) that was
+    /// correct for `shortestPath` but wrong for enumerative MATCH traversal:
+    ///   - Diamond A→B→D, A→C→D: old BFS returned D once; DFS returns D twice.
+    ///   - Zero-hop (`min_hops == 0`): source node still returned as-is.
+    ///   - Self-loop A→A: correctly excluded (A is already in the path visited set).
     #[allow(clippy::too_many_arguments)]
     fn execute_variable_hops(
         &self,
@@ -4342,56 +4469,107 @@ impl Engine {
         all_label_ids: &[u32],
         neighbors_buf: &mut std::collections::HashSet<(u64, u32)>,
     ) -> Vec<(u64, u32)> {
+        /// Maximum number of result entries returned per source node.
+        /// Prevents unbounded memory growth on highly-connected graphs.
+        const PATH_RESULT_CAP: usize = 100_000;
         const SAFETY_CAP: u32 = 10;
         let max_hops = max_hops.min(SAFETY_CAP);
 
-        // BFS state.
-        // visited  — set of (slot, label_id) pairs; prevents revisiting the same
-        //            node and guards against cross-label slot collisions.
-        // frontier — (slot, label_id) pairs at the current BFS depth.
-        // results  — (slot, label_id) pairs at depth >= min_hops.
-        let mut visited: std::collections::HashSet<(u64, u32)> = std::collections::HashSet::new();
-        visited.insert((src_slot, src_label_id));
+        let mut results: Vec<(u64, u32)> = Vec::new();
 
-        // Bug C fix: zero-hop match includes the source node itself.
-        let mut results: std::collections::HashSet<(u64, u32)> = std::collections::HashSet::new();
+        // Zero-hop match: source node itself is the only result.
         if min_hops == 0 {
-            results.insert((src_slot, src_label_id));
+            results.push((src_slot, src_label_id));
+            if max_hops == 0 {
+                return results;
+            }
         }
 
-        // Bug A fix: frontier carries label_id so each node is expanded with the
-        // correct delta-log filter, regardless of depth.
-        let mut frontier: Vec<(u64, u32)> = vec![(src_slot, src_label_id)];
+        // Iterative DFS with backtracking.
+        //
+        // Each stack frame is `(node_slot, node_label_id, depth, neighbors)`.
+        // The `neighbors` vec holds all outgoing neighbors of `node`; we consume
+        // them one by one with `pop()`.  When the vec is empty we backtrack by
+        // popping the frame and removing the node from `path_visited`.
+        //
+        // `path_visited` tracks nodes on the *current path* only (not globally),
+        // so nodes that appear in two separate paths (e.g. diamond D) are each
+        // visited once per path, yielding one result entry per path.
+        //
+        // Layout:
+        //   stack[i] = (slot, label, depth_of_slot, remaining_neighbors)
+        // where depth_of_slot is the 1-based hop distance from src to this node.
+        type Frame = (u64, u32, u32, Vec<(u64, u32)>);
 
-        for depth in 1..=max_hops {
-            let mut next_frontier: Vec<(u64, u32)> = Vec::new();
-            for &(node_slot, node_label_id) in &frontier {
-                self.get_node_neighbors_labeled(
-                    node_slot,
-                    node_label_id,
-                    delta_all,
-                    node_label,
-                    all_label_ids,
-                    neighbors_buf,
-                );
-                for &(nb_slot, nb_label) in neighbors_buf.iter() {
-                    // Bug B fix: gate results.insert behind visited.insert so
-                    // already-visited nodes (including self-loops) are excluded.
-                    if visited.insert((nb_slot, nb_label)) {
-                        next_frontier.push((nb_slot, nb_label));
-                        if depth >= min_hops {
-                            results.insert((nb_slot, nb_label));
+        // Per-path visited set — (slot, label_id) to handle heterogeneous graphs.
+        let mut path_visited: std::collections::HashSet<(u64, u32)> =
+            std::collections::HashSet::new();
+        path_visited.insert((src_slot, src_label_id));
+
+        // Build neighbors of source.
+        self.get_node_neighbors_labeled(
+            src_slot,
+            src_label_id,
+            delta_all,
+            node_label,
+            all_label_ids,
+            neighbors_buf,
+        );
+        let src_nbrs: Vec<(u64, u32)> = neighbors_buf.iter().copied().collect();
+
+        // Push the source frame at depth 1 (the neighbors are the hop-1 candidates).
+        let mut stack: Vec<Frame> = vec![(src_slot, src_label_id, 1, src_nbrs)];
+
+        while let Some(frame) = stack.last_mut() {
+            let (_, _, depth, ref mut nbrs) = *frame;
+
+            match nbrs.pop() {
+                None => {
+                    // All neighbors exhausted — backtrack.
+                    let (popped_slot, popped_label, popped_depth, _) = stack.pop().unwrap();
+                    // Remove this node from path_visited only if it was added when we
+                    // entered it (depth > 1; the source is seeded before the loop).
+                    if popped_depth > 1 {
+                        path_visited.remove(&(popped_slot, popped_label));
+                    }
+                }
+                Some((nb_slot, nb_label)) => {
+                    // Skip nodes already on the current path (simple path constraint).
+                    if path_visited.contains(&(nb_slot, nb_label)) {
+                        continue;
+                    }
+
+                    // Emit if depth is within the result window.
+                    if depth >= min_hops {
+                        results.push((nb_slot, nb_label));
+                        if results.len() >= PATH_RESULT_CAP {
+                            eprintln!(
+                                "sparrowdb: variable-length path result cap ({PATH_RESULT_CAP}) \
+                                 hit; truncating results.  Consider a tighter *M..N bound."
+                            );
+                            return results;
                         }
+                    }
+
+                    // Recurse deeper if max_hops not yet reached.
+                    if depth < max_hops {
+                        path_visited.insert((nb_slot, nb_label));
+                        self.get_node_neighbors_labeled(
+                            nb_slot,
+                            nb_label,
+                            delta_all,
+                            node_label,
+                            all_label_ids,
+                            neighbors_buf,
+                        );
+                        let next_nbrs: Vec<(u64, u32)> = neighbors_buf.iter().copied().collect();
+                        stack.push((nb_slot, nb_label, depth + 1, next_nbrs));
                     }
                 }
             }
-            if next_frontier.is_empty() {
-                break;
-            }
-            frontier = next_frontier;
         }
 
-        results.into_iter().collect()
+        results
     }
 
     /// Compatibility shim used by callers that do not need per-node label tracking.
@@ -4475,11 +4653,11 @@ impl Engine {
         };
 
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        // Track (src_slot, dst_slot, dst_label_id) triples to avoid duplicate
-        // result rows.  Including dst_label_id prevents cross-label slot collisions
-        // in heterogeneous graphs where slot 0 of label A ≠ slot 0 of label B.
-        let mut seen_pairs: std::collections::HashSet<(u64, u64, u32)> =
-            std::collections::HashSet::new();
+        // NOTE: No deduplication by (src, dst) here.  With DFS-with-backtracking
+        // the traversal returns one entry per *simple path*, so the same destination
+        // can appear multiple times when reachable via distinct paths (enumerative
+        // semantics required by OpenCypher).  The old global-visited BFS never
+        // produced duplicates and needed this guard; the DFS replacement does not.
 
         // Precompute label-id → name map once so that the hot path inside
         // `for dst_slot in dst_nodes` does not call `list_labels()` per node.
@@ -4565,10 +4743,6 @@ impl Engine {
                 // Use the actual label_id to construct the NodeId so that
                 // heterogeneous graph nodes are addressed correctly.
                 let resolved_dst_label_id = dst_label_id.unwrap_or(actual_label_id);
-
-                if !seen_pairs.insert((src_slot, dst_slot, actual_label_id)) {
-                    continue;
-                }
 
                 let dst_node = NodeId(((resolved_dst_label_id as u64) << 32) | dst_slot);
                 // SPA-224: read dst props using the full column set (projection +
