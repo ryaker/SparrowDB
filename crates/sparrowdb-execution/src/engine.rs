@@ -4745,6 +4745,12 @@ fn matches_prop_filter_static(
                 // Use StoreValue::to_u64() for canonical encoding (SPA-169).
                 stored_val == Some(StoreValue::Int64(n).to_u64())
             }
+            Value::Bool(b) => {
+                // Booleans are stored as Int64(1) for true, Int64(0) for false
+                // (see value_to_store_value / literal_to_store_value).
+                let expected = StoreValue::Int64(if b { 1 } else { 0 }).to_u64();
+                stored_val == Some(expected)
+            }
             Value::String(s) => {
                 // Use store.raw_str_matches to handle both inline (≤7 bytes) and
                 // overflow (>7 bytes) string encodings (SPA-212).
