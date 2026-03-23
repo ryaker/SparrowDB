@@ -197,3 +197,272 @@ fn index_lookup_count_correct() {
         result.rows[0][0]
     );
 }
+
+// ── Phase 1b: WHERE clause equality via index ─────────────────────────────────
+
+#[test]
+fn where_clause_equality_uses_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    // Create 1000 nodes so a full scan would be noticeably slower, but
+    // correctness (not timing) is the observable property here.
+    for i in 0..1000i64 {
+        db.execute(&format!("CREATE (:Person {{name: 'Person{i}', age: {i}}})",))
+            .unwrap();
+    }
+
+    let result = db
+        .execute("MATCH (n:Person) WHERE n.age = 30 RETURN n.name")
+        .expect("WHERE equality must succeed");
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected exactly 1 person with age=30, got {:?}",
+        result.rows
+    );
+    assert_eq!(
+        result.rows[0][0],
+        Value::String("Person30".into()),
+        "returned name must be Person30"
+    );
+}
+
+#[test]
+fn where_clause_equality_no_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    db.execute("CREATE (:Person {age: 25})").unwrap();
+    db.execute("CREATE (:Person {age: 40})").unwrap();
+
+    let result = db
+        .execute("MATCH (n:Person) WHERE n.age = 99 RETURN n.age")
+        .expect("WHERE equality with no match must succeed");
+
+    assert_eq!(
+        result.rows.len(),
+        0,
+        "expected 0 rows for age=99, got {:?}",
+        result.rows
+    );
+}
+
+// ── Phase 2: Range predicate index acceleration ───────────────────────────────
+
+#[test]
+fn where_range_gt() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    for age in [10i64, 20, 30, 40, 50] {
+        db.execute(&format!("CREATE (:Person {{age: {age}}})"))
+            .unwrap();
+    }
+
+    let result = db
+        .execute("MATCH (n:Person) WHERE n.age > 30 RETURN n.age")
+        .expect("WHERE GT must succeed");
+
+    let mut ages: Vec<i64> = result
+        .rows
+        .iter()
+        .filter_map(|r| {
+            if let Value::Int64(v) = r[0] {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .collect();
+    ages.sort_unstable();
+    assert_eq!(ages, vec![40, 50], "expected ages 40 and 50, got {ages:?}");
+}
+
+#[test]
+fn where_range_ge() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    for age in [10i64, 20, 30, 40, 50] {
+        db.execute(&format!("CREATE (:Person {{age: {age}}})"))
+            .unwrap();
+    }
+
+    let result = db
+        .execute("MATCH (n:Person) WHERE n.age >= 30 RETURN n.age")
+        .expect("WHERE GE must succeed");
+
+    let mut ages: Vec<i64> = result
+        .rows
+        .iter()
+        .filter_map(|r| {
+            if let Value::Int64(v) = r[0] {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .collect();
+    ages.sort_unstable();
+    assert_eq!(
+        ages,
+        vec![30, 40, 50],
+        "expected ages 30, 40, 50, got {ages:?}"
+    );
+}
+
+#[test]
+fn where_range_lt() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    for age in [10i64, 20, 30, 40, 50] {
+        db.execute(&format!("CREATE (:Person {{age: {age}}})"))
+            .unwrap();
+    }
+
+    let result = db
+        .execute("MATCH (n:Person) WHERE n.age < 30 RETURN n.age")
+        .expect("WHERE LT must succeed");
+
+    let mut ages: Vec<i64> = result
+        .rows
+        .iter()
+        .filter_map(|r| {
+            if let Value::Int64(v) = r[0] {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .collect();
+    ages.sort_unstable();
+    assert_eq!(ages, vec![10, 20], "expected ages 10 and 20, got {ages:?}");
+}
+
+#[test]
+fn where_range_le() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    for age in [10i64, 20, 30, 40, 50] {
+        db.execute(&format!("CREATE (:Person {{age: {age}}})"))
+            .unwrap();
+    }
+
+    let result = db
+        .execute("MATCH (n:Person) WHERE n.age <= 30 RETURN n.age")
+        .expect("WHERE LE must succeed");
+
+    let mut ages: Vec<i64> = result
+        .rows
+        .iter()
+        .filter_map(|r| {
+            if let Value::Int64(v) = r[0] {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .collect();
+    ages.sort_unstable();
+    assert_eq!(
+        ages,
+        vec![10, 20, 30],
+        "expected ages 10, 20, 30, got {ages:?}"
+    );
+}
+
+#[test]
+fn where_range_both_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    for age in [5i64, 15, 18, 30, 65, 70, 100] {
+        db.execute(&format!("CREATE (:Person {{age: {age}}})"))
+            .unwrap();
+    }
+
+    let result = db
+        .execute("MATCH (n:Person) WHERE n.age >= 18 AND n.age <= 65 RETURN n.age")
+        .expect("compound range must succeed");
+
+    let mut ages: Vec<i64> = result
+        .rows
+        .iter()
+        .filter_map(|r| {
+            if let Value::Int64(v) = r[0] {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .collect();
+    ages.sort_unstable();
+    assert_eq!(
+        ages,
+        vec![18, 30, 65],
+        "expected ages 18, 30, 65, got {ages:?}"
+    );
+}
+
+#[test]
+fn where_range_negative_integers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    // Note: Int64(0) encodes to the absent sentinel (0x0000…) and is therefore
+    // invisible to the column index.  Use -1 and 1 to bracket the negative/
+    // positive boundary instead.
+    for age in [-5i64, -3, -1, 1, 5] {
+        db.execute(&format!("CREATE (:Person {{age: {age}}})"))
+            .unwrap();
+    }
+
+    // WHERE n.age > -3 should return -1, 1, and 5 (not -5 or -3).
+    let result = db
+        .execute("MATCH (n:Person) WHERE n.age > -3 RETURN n.age")
+        .expect("negative integer range must succeed");
+
+    let mut ages: Vec<i64> = result
+        .rows
+        .iter()
+        .filter_map(|r| {
+            if let Value::Int64(v) = r[0] {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .collect();
+    ages.sort_unstable();
+    assert_eq!(
+        ages,
+        vec![-1, 1, 5],
+        "expected ages -1, 1, and 5 (above -3), got {ages:?}"
+    );
+}
+
+#[test]
+fn where_range_returns_empty_when_no_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    for age in [10i64, 20, 30, 50, 100] {
+        db.execute(&format!("CREATE (:Person {{age: {age}}})"))
+            .unwrap();
+    }
+
+    let result = db
+        .execute("MATCH (n:Person) WHERE n.age > 1000 RETURN n.age")
+        .expect("range returning empty must succeed");
+
+    assert_eq!(
+        result.rows.len(),
+        0,
+        "expected 0 rows for age > 1000, got {:?}",
+        result.rows
+    );
+}
