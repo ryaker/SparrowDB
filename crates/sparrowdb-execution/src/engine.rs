@@ -21,7 +21,6 @@ use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{DeltaRecord, EdgeStore, RelTableId};
 use sparrowdb_storage::fulltext_index::FulltextIndex;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
-use sparrowdb_storage::property_index::PropertyIndex;
 use sparrowdb_storage::wal::WalReplayer;
 
 use crate::types::{QueryResult, Value};
@@ -4628,25 +4627,30 @@ fn project_hop_row(
 }
 
 fn project_fof_row(
+    src_props: &[(u32, u64)],
     fof_props: &[(u32, u64)],
     column_names: &[String],
-    _fof_var: &str,
+    src_var: &str,
     store: &NodeStore,
 ) -> Vec<Value> {
     column_names
         .iter()
         .map(|col_name| {
-            let prop = if let Some((_, p)) = col_name.split_once('.') {
-                p
+            if let Some((var, prop)) = col_name.split_once('.') {
+                let col_id = prop_name_to_col_id(prop);
+                let props = if !src_var.is_empty() && var == src_var {
+                    src_props
+                } else {
+                    fof_props
+                };
+                props
+                    .iter()
+                    .find(|(c, _)| *c == col_id)
+                    .map(|(_, v)| decode_raw_val(*v, store))
+                    .unwrap_or(Value::Null)
             } else {
-                col_name.as_str()
-            };
-            let col_id = prop_name_to_col_id(prop);
-            fof_props
-                .iter()
-                .find(|(c, _)| *c == col_id)
-                .map(|(_, v)| decode_raw_val(*v, store))
-                .unwrap_or(Value::Null)
+                Value::Null
+            }
         })
         .collect()
 }
