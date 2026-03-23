@@ -240,6 +240,9 @@ struct DbInner {
     versions: RwLock<VersionStore>,
     /// Per-node last-committed txn_id (write-write conflict detection, SPA-128).
     node_versions: RwLock<NodeVersions>,
+    /// Optional 32-byte encryption key (SPA-98).  When `Some`, WAL payloads
+    /// are encrypted with XChaCha20-Poly1305 via [`WalWriter::open_encrypted`].
+    encryption_key: Option<[u8; 32]>,
 }
 
 // ── Write-lock guard (SPA-181: replaces 'static transmute UB) ────────────────
@@ -302,6 +305,30 @@ impl GraphDb {
                 write_locked: AtomicBool::new(false),
                 versions: RwLock::new(VersionStore::default()),
                 node_versions: RwLock::new(NodeVersions::default()),
+                encryption_key: None,
+            }),
+        })
+    }
+
+    /// Open (or create) an encrypted SparrowDB database at `path` (SPA-98).
+    ///
+    /// WAL payloads are encrypted with XChaCha20-Poly1305 using `key`.
+    /// The same 32-byte key must be supplied on every subsequent open of this
+    /// database — opening with a wrong or missing key will cause WAL replay to
+    /// fail with [`Error::EncryptionAuthFailed`].
+    ///
+    /// # Errors
+    /// Returns an error if the directory cannot be created.
+    pub fn open_encrypted(path: &Path, key: [u8; 32]) -> Result<Self> {
+        std::fs::create_dir_all(path)?;
+        Ok(GraphDb {
+            inner: Arc::new(DbInner {
+                path: path.to_path_buf(),
+                current_txn_id: AtomicU64::new(0),
+                write_locked: AtomicBool::new(false),
+                versions: RwLock::new(VersionStore::default()),
+                node_versions: RwLock::new(NodeVersions::default()),
+                encryption_key: Some(key),
             }),
         })
     }
@@ -1806,7 +1833,13 @@ impl WriteTx {
         // Step 4: WAL-first — write all mutation records and fsync before
         // touching any data page (SPA-184).  A crash between here and the end
         // of Step 6 is recoverable: WAL replay will re-apply the ops.
-        write_mutation_wal(&self.inner.path, new_id, &updates, &self.wal_mutations)?;
+        write_mutation_wal(
+            &self.inner.path,
+            new_id,
+            &updates,
+            &self.wal_mutations,
+            self.inner.encryption_key,
+        )?;
 
         // Step 5: Apply buffered structural operations to disk (SPA-181).
         // WAL is already durable at this point; a crash here is safe.
@@ -1907,6 +1940,7 @@ fn write_mutation_wal(
     txn_id: u64,
     updates: &[((u64, u32), StagedUpdate)],
     mutations: &[WalMutation],
+    encryption_key: Option<[u8; 32]>,
 ) -> Result<()> {
     // Nothing to record if there were no mutations or property updates.
     if updates.is_empty() && mutations.is_empty() {
@@ -1914,7 +1948,10 @@ fn write_mutation_wal(
     }
 
     let wal_dir = db_root.join("wal");
-    let mut wal = WalWriter::open(&wal_dir)?;
+    let mut wal = match encryption_key {
+        Some(key) => WalWriter::open_encrypted(&wal_dir, key)?,
+        None => WalWriter::open(&wal_dir)?,
+    };
     let txn = TxnId(txn_id);
 
     wal.append(WalRecordKind::Begin, txn, WalPayload::Empty)?;
