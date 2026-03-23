@@ -175,6 +175,16 @@ pub enum BinOpKind {
     EndsWith,
     Or,
     And,
+    /// Arithmetic: `a + b`
+    Add,
+    /// Arithmetic: `a - b`
+    Sub,
+    /// Arithmetic: `a * b`
+    Mul,
+    /// Arithmetic: `a / b`
+    Div,
+    /// Arithmetic: `a % b`
+    Mod,
 }
 
 /// RETURN clause item.
@@ -302,6 +312,65 @@ pub struct MatchWithStatement {
     pub distinct: bool,
 }
 
+/// A single stage in a multi-clause pipeline (SPA-134).
+///
+/// Pipelines are sequences of clauses that pass intermediate row sets from
+/// one stage to the next.  Each stage receives the projected rows from its
+/// predecessor and either transforms them or re-traverses the graph.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PipelineStage {
+    /// `WITH expr AS alias [, ...] [WHERE pred]` — project + optionally filter rows.
+    /// Also carries optional ORDER BY / SKIP / LIMIT that are applied to the WITH output.
+    With {
+        clause: WithClause,
+        order_by: Vec<(Expr, SortDir)>,
+        skip: Option<u64>,
+        limit: Option<u64>,
+    },
+    /// `MATCH pattern [WHERE pred]` — re-traverse the graph, constraining by the
+    /// variables that were projected in the preceding WITH stage.
+    Match {
+        patterns: Vec<PathPattern>,
+        where_clause: Option<Expr>,
+    },
+    /// `UNWIND alias_expr AS new_alias` — unwind a list variable from the preceding
+    /// WITH into individual rows.
+    Unwind { alias: String, new_alias: String },
+}
+
+/// A multi-clause Cypher pipeline (SPA-134).
+///
+/// Covers patterns such as:
+/// - `MATCH … WITH … MATCH … RETURN`
+/// - `UNWIND … WITH … RETURN`
+/// - `MATCH … WITH … ORDER BY … LIMIT … MATCH … RETURN`
+/// - Three-stage `MATCH … WITH … MATCH … WITH … RETURN`
+///
+/// Execution is left-to-right: the first stage produces an initial row set
+/// (from the leading MATCH or UNWIND), then each subsequent stage transforms
+/// or re-traverses until the final RETURN clause produces the output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipelineStatement {
+    /// Leading MATCH clause (if any). May be absent for UNWIND-led pipelines.
+    pub leading_match: Option<Vec<PathPattern>>,
+    /// Optional WHERE on the leading MATCH.
+    pub leading_where: Option<Expr>,
+    /// For UNWIND-led pipelines: the list expression and binding alias.
+    pub leading_unwind: Option<(Expr, String)>,
+    /// Ordered sequence of intermediate pipeline stages.
+    pub stages: Vec<PipelineStage>,
+    /// Final RETURN clause.
+    pub return_clause: ReturnClause,
+    /// Optional ORDER BY on the final RETURN.
+    pub return_order_by: Vec<(Expr, SortDir)>,
+    /// Optional SKIP on the final RETURN.
+    pub return_skip: Option<u64>,
+    /// Optional LIMIT on the final RETURN.
+    pub return_limit: Option<u64>,
+    /// Whether RETURN DISTINCT was requested.
+    pub distinct: bool,
+}
+
 /// OPTIONAL MATCH statement (standalone).
 ///
 /// Left-outer-join semantics: if no rows match (label missing or zero nodes),
@@ -384,4 +453,6 @@ pub enum Statement {
     Optimize,
     /// CALL procedure dispatch (SPA-170 — KMS full-text search).
     Call(CallStatement),
+    /// Multi-clause pipeline: MATCH/UNWIND … WITH … MATCH … WITH … RETURN (SPA-134).
+    Pipeline(PipelineStatement),
 }

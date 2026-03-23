@@ -13,8 +13,8 @@ use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
     BinOpKind, CallStatement, CreateStatement, Expr, ListPredicateKind, Literal,
     MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement,
-    MatchWithStatement, Mutation, OptionalMatchStatement, PathPattern, ReturnItem, SortDir,
-    Statement, UnionStatement, UnwindStatement, WithClause,
+    MatchWithStatement, Mutation, OptionalMatchStatement, PathPattern, PipelineStage,
+    PipelineStatement, ReturnItem, SortDir, Statement, UnionStatement, UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::{CsrBackward, CsrForward};
@@ -258,6 +258,7 @@ impl Engine {
             Statement::Union(u) => self.execute_union(u),
             Statement::Checkpoint | Statement::Optimize => Ok(QueryResult::empty(vec![])),
             Statement::Call(c) => self.execute_call(&c),
+            Statement::Pipeline(p) => self.execute_pipeline(&p),
         }
     }
 
@@ -1127,36 +1128,121 @@ impl Engine {
             &m.with_clause,
         )?;
 
-        // Step 2 & 3: project through WITH + filter.
-        let mut projected: Vec<HashMap<String, Value>> = Vec::new();
-        for row_vals in &intermediate {
-            let mut with_vals: HashMap<String, Value> = HashMap::new();
-            for item in &m.with_clause.items {
-                let val = eval_expr(&item.expr, row_vals);
-                with_vals.insert(item.alias.clone(), val);
-            }
-            if let Some(ref where_expr) = m.with_clause.where_clause {
-                let mut with_vals_p = with_vals.clone();
-                with_vals_p.extend(self.dollar_params());
-                if !self.eval_where_graph(where_expr, &with_vals_p) {
-                    continue;
+        // Step 2: check if WITH clause has aggregate expressions.
+        // If so, we aggregate the intermediate rows first, producing one output row
+        // per unique grouping key.
+        let has_agg = m
+            .with_clause
+            .items
+            .iter()
+            .any(|item| is_aggregate_expr(&item.expr));
+
+        let projected: Vec<HashMap<String, Value>> = if has_agg {
+            // Aggregate the intermediate rows into a set of projected rows.
+            let agg_rows = self.aggregate_with_items(&intermediate, &m.with_clause.items);
+            // Apply WHERE filter on the aggregated rows.
+            agg_rows
+                .into_iter()
+                .filter(|with_vals| {
+                    if let Some(ref where_expr) = m.with_clause.where_clause {
+                        let mut with_vals_p = with_vals.clone();
+                        with_vals_p.extend(self.dollar_params());
+                        self.eval_where_graph(where_expr, &with_vals_p)
+                    } else {
+                        true
+                    }
+                })
+                .map(|mut with_vals| {
+                    with_vals.extend(self.dollar_params());
+                    with_vals
+                })
+                .collect()
+        } else {
+            // Non-aggregate path: project each row through the WITH items.
+            let mut projected: Vec<HashMap<String, Value>> = Vec::new();
+            for row_vals in &intermediate {
+                let mut with_vals: HashMap<String, Value> = HashMap::new();
+                for item in &m.with_clause.items {
+                    let val = self.eval_expr_graph(&item.expr, row_vals);
+                    with_vals.insert(item.alias.clone(), val);
+                    // SPA-134: if the WITH item is a bare Var (e.g. `n AS person`),
+                    // also inject the NodeRef under the alias so that EXISTS subqueries
+                    // in a subsequent WHERE clause can resolve the source node.
+                    if let sparrowdb_cypher::ast::Expr::Var(ref src_var) = item.expr {
+                        if let Some(node_ref) = row_vals.get(src_var) {
+                            if matches!(node_ref, Value::NodeRef(_)) {
+                                with_vals.insert(item.alias.clone(), node_ref.clone());
+                                with_vals.insert(
+                                    format!("{}.__node_id__", item.alias),
+                                    node_ref.clone(),
+                                );
+                            }
+                        }
+                        // Also check __node_id__ key.
+                        let nid_key = format!("{src_var}.__node_id__");
+                        if let Some(node_ref) = row_vals.get(&nid_key) {
+                            with_vals
+                                .insert(format!("{}.__node_id__", item.alias), node_ref.clone());
+                        }
+                    }
                 }
+                if let Some(ref where_expr) = m.with_clause.where_clause {
+                    let mut with_vals_p = with_vals.clone();
+                    with_vals_p.extend(self.dollar_params());
+                    if !self.eval_where_graph(where_expr, &with_vals_p) {
+                        continue;
+                    }
+                }
+                // Merge dollar_params into the projected row so that downstream
+                // RETURN/ORDER-BY/SKIP/LIMIT expressions can resolve $param references.
+                with_vals.extend(self.dollar_params());
+                projected.push(with_vals);
             }
-            // Merge dollar_params into the projected row so that downstream
-            // RETURN/ORDER-BY/SKIP/LIMIT expressions can resolve $param references.
-            with_vals.extend(self.dollar_params());
-            projected.push(with_vals);
+            projected
+        };
+
+        // Step 3: project RETURN from the WITH-projected rows.
+        let column_names = extract_return_column_names(&m.return_clause.items);
+
+        // Apply ORDER BY on the projected rows (which still have all WITH aliases)
+        // before projecting down to RETURN columns — this allows ORDER BY on columns
+        // that are not in the RETURN clause (e.g. ORDER BY age when only name is returned).
+        let mut ordered_projected = projected;
+        if !m.order_by.is_empty() {
+            ordered_projected.sort_by(|a, b| {
+                for (expr, dir) in &m.order_by {
+                    let val_a = eval_expr(expr, a);
+                    let val_b = eval_expr(expr, b);
+                    let cmp = compare_values(&val_a, &val_b);
+                    let cmp = if *dir == SortDir::Desc {
+                        cmp.reverse()
+                    } else {
+                        cmp
+                    };
+                    if cmp != std::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
         }
 
-        // Step 4: project RETURN from the WITH-projected rows.
-        let column_names = extract_return_column_names(&m.return_clause.items);
-        let mut rows: Vec<Vec<Value>> = projected
+        // Apply SKIP / LIMIT before final projection.
+        if let Some(skip) = m.skip {
+            let skip = (skip as usize).min(ordered_projected.len());
+            ordered_projected.drain(0..skip);
+        }
+        if let Some(lim) = m.limit {
+            ordered_projected.truncate(lim as usize);
+        }
+
+        let mut rows: Vec<Vec<Value>> = ordered_projected
             .iter()
             .map(|with_vals| {
                 m.return_clause
                     .items
                     .iter()
-                    .map(|item| eval_expr(&item.expr, with_vals))
+                    .map(|item| self.eval_expr_graph(&item.expr, with_vals))
                     .collect()
             })
             .collect();
@@ -1164,18 +1250,706 @@ impl Engine {
         if m.distinct {
             deduplicate_rows(&mut rows);
         }
-        if let Some(skip) = m.skip {
-            let skip = (skip as usize).min(rows.len());
-            rows.drain(0..skip);
+
+        Ok(QueryResult {
+            columns: column_names,
+            rows,
+        })
+    }
+
+    /// Aggregate a set of raw scan rows through a list of WITH items that
+    /// include aggregate expressions (COUNT(*), collect(), etc.).
+    ///
+    /// Returns one `HashMap<String, Value>` per unique grouping key.
+    fn aggregate_with_items(
+        &self,
+        rows: &[HashMap<String, Value>],
+        items: &[sparrowdb_cypher::ast::WithItem],
+    ) -> Vec<HashMap<String, Value>> {
+        // Classify each WITH item as key or aggregate.
+        let key_indices: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| !is_aggregate_expr(&item.expr))
+            .map(|(i, _)| i)
+            .collect();
+        let agg_indices: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| is_aggregate_expr(&item.expr))
+            .map(|(i, _)| i)
+            .collect();
+
+        // Build groups.
+        let mut group_keys: Vec<Vec<Value>> = Vec::new();
+        let mut group_accum: Vec<Vec<Vec<Value>>> = Vec::new(); // [group][agg_pos] → values
+
+        for row_vals in rows {
+            let key: Vec<Value> = key_indices
+                .iter()
+                .map(|&i| eval_expr(&items[i].expr, row_vals))
+                .collect();
+            let group_idx = if let Some(pos) = group_keys.iter().position(|k| k == &key) {
+                pos
+            } else {
+                group_keys.push(key);
+                group_accum.push(vec![vec![]; agg_indices.len()]);
+                group_keys.len() - 1
+            };
+            for (ai, &ri) in agg_indices.iter().enumerate() {
+                match &items[ri].expr {
+                    sparrowdb_cypher::ast::Expr::CountStar => {
+                        group_accum[group_idx][ai].push(Value::Int64(1));
+                    }
+                    sparrowdb_cypher::ast::Expr::FnCall { name, args }
+                        if name.to_lowercase() == "collect" =>
+                    {
+                        let val = if !args.is_empty() {
+                            eval_expr(&args[0], row_vals)
+                        } else {
+                            Value::Null
+                        };
+                        if !matches!(val, Value::Null) {
+                            group_accum[group_idx][ai].push(val);
+                        }
+                    }
+                    sparrowdb_cypher::ast::Expr::FnCall { name, args }
+                        if matches!(
+                            name.to_lowercase().as_str(),
+                            "count" | "sum" | "avg" | "min" | "max"
+                        ) =>
+                    {
+                        let val = if !args.is_empty() {
+                            eval_expr(&args[0], row_vals)
+                        } else {
+                            Value::Null
+                        };
+                        if !matches!(val, Value::Null) {
+                            group_accum[group_idx][ai].push(val);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
-        if let Some(lim) = m.limit {
-            rows.truncate(lim as usize);
+
+        // If no rows were seen, still produce one output row for global aggregates
+        // (e.g. COUNT(*) over an empty scan returns 0).
+        if rows.is_empty() && key_indices.is_empty() {
+            let mut out_row: HashMap<String, Value> = HashMap::new();
+            for &ri in &agg_indices {
+                let val = match &items[ri].expr {
+                    sparrowdb_cypher::ast::Expr::CountStar => Value::Int64(0),
+                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
+                        if name.to_lowercase() == "collect" =>
+                    {
+                        Value::List(vec![])
+                    }
+                    _ => Value::Int64(0),
+                };
+                out_row.insert(items[ri].alias.clone(), val);
+            }
+            return vec![out_row];
+        }
+
+        // Finalize each group.
+        let mut result: Vec<HashMap<String, Value>> = Vec::new();
+        for (gi, key_vals) in group_keys.iter().enumerate() {
+            let mut out_row: HashMap<String, Value> = HashMap::new();
+            // Insert key values.
+            for (ki, &ri) in key_indices.iter().enumerate() {
+                out_row.insert(items[ri].alias.clone(), key_vals[ki].clone());
+            }
+            // Finalize aggregates.
+            for (ai, &ri) in agg_indices.iter().enumerate() {
+                let accum = &group_accum[gi][ai];
+                let val = match &items[ri].expr {
+                    sparrowdb_cypher::ast::Expr::CountStar => Value::Int64(accum.len() as i64),
+                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
+                        if name.to_lowercase() == "collect" =>
+                    {
+                        Value::List(accum.clone())
+                    }
+                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
+                        if name.to_lowercase() == "count" =>
+                    {
+                        Value::Int64(accum.len() as i64)
+                    }
+                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
+                        if name.to_lowercase() == "sum" =>
+                    {
+                        let sum: i64 = accum
+                            .iter()
+                            .filter_map(|v| {
+                                if let Value::Int64(n) = v {
+                                    Some(*n)
+                                } else {
+                                    None
+                                }
+                            })
+                            .sum();
+                        Value::Int64(sum)
+                    }
+                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
+                        if name.to_lowercase() == "min" =>
+                    {
+                        accum
+                            .iter()
+                            .min_by(|a, b| compare_values(a, b))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    }
+                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
+                        if name.to_lowercase() == "max" =>
+                    {
+                        accum
+                            .iter()
+                            .max_by(|a, b| compare_values(a, b))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    }
+                    _ => Value::Null,
+                };
+                out_row.insert(items[ri].alias.clone(), val);
+            }
+            result.push(out_row);
+        }
+        result
+    }
+
+    /// Execute a multi-clause Cypher pipeline (SPA-134).
+    ///
+    /// Executes stages left-to-right, passing the intermediate row set from
+    /// one stage to the next, then projects the final RETURN clause.
+    fn execute_pipeline(&self, p: &PipelineStatement) -> Result<QueryResult> {
+        // Step 1: Produce the initial row set from the leading clause.
+        let mut current_rows: Vec<HashMap<String, Value>> =
+            if let Some((expr, alias)) = &p.leading_unwind {
+                // UNWIND-led pipeline: expand the list into individual rows.
+                let values = eval_list_expr(expr, &self.params)?;
+                values
+                    .into_iter()
+                    .map(|v| {
+                        let mut m = HashMap::new();
+                        m.insert(alias.clone(), v);
+                        m
+                    })
+                    .collect()
+            } else if let Some(ref patterns) = p.leading_match {
+                // MATCH-led pipeline: scan the graph.
+                // For the pipeline we need a dummy WithClause (scan will collect all
+                // col IDs needed by subsequent stages).  Use a wide scan that includes
+                // NodeRefs for EXISTS support.
+                self.collect_pipeline_match_rows(patterns, p.leading_where.as_ref())?
+            } else {
+                vec![HashMap::new()]
+            };
+
+        // Step 2: Execute pipeline stages in order.
+        for stage in &p.stages {
+            match stage {
+                PipelineStage::With {
+                    clause,
+                    order_by,
+                    skip,
+                    limit,
+                } => {
+                    // SPA-134: ORDER BY in a WITH clause can reference variables from the
+                    // PRECEDING stage (before projection).  Apply ORDER BY / SKIP / LIMIT
+                    // on current_rows (pre-projection) first, then project.
+                    if !order_by.is_empty() {
+                        current_rows.sort_by(|a, b| {
+                            for (expr, dir) in order_by {
+                                let va = eval_expr(expr, a);
+                                let vb = eval_expr(expr, b);
+                                let cmp = compare_values(&va, &vb);
+                                let cmp = if *dir == SortDir::Desc {
+                                    cmp.reverse()
+                                } else {
+                                    cmp
+                                };
+                                if cmp != std::cmp::Ordering::Equal {
+                                    return cmp;
+                                }
+                            }
+                            std::cmp::Ordering::Equal
+                        });
+                    }
+                    if let Some(s) = skip {
+                        let s = (*s as usize).min(current_rows.len());
+                        current_rows.drain(0..s);
+                    }
+                    if let Some(l) = limit {
+                        current_rows.truncate(*l as usize);
+                    }
+
+                    // Check for aggregates.
+                    let has_agg = clause
+                        .items
+                        .iter()
+                        .any(|item| is_aggregate_expr(&item.expr));
+                    let next_rows: Vec<HashMap<String, Value>> = if has_agg {
+                        let agg_rows = self.aggregate_with_items(&current_rows, &clause.items);
+                        agg_rows
+                            .into_iter()
+                            .filter(|with_vals| {
+                                if let Some(ref where_expr) = clause.where_clause {
+                                    let mut wv = with_vals.clone();
+                                    wv.extend(self.dollar_params());
+                                    self.eval_where_graph(where_expr, &wv)
+                                } else {
+                                    true
+                                }
+                            })
+                            .map(|mut with_vals| {
+                                with_vals.extend(self.dollar_params());
+                                with_vals
+                            })
+                            .collect()
+                    } else {
+                        let mut next_rows: Vec<HashMap<String, Value>> = Vec::new();
+                        for row_vals in &current_rows {
+                            let mut with_vals: HashMap<String, Value> = HashMap::new();
+                            for item in &clause.items {
+                                let val = self.eval_expr_graph(&item.expr, row_vals);
+                                with_vals.insert(item.alias.clone(), val);
+                                // Propagate NodeRef for bare variable aliases.
+                                if let sparrowdb_cypher::ast::Expr::Var(ref src_var) = item.expr {
+                                    if let Some(nr @ Value::NodeRef(_)) = row_vals.get(src_var) {
+                                        with_vals.insert(item.alias.clone(), nr.clone());
+                                        with_vals.insert(
+                                            format!("{}.__node_id__", item.alias),
+                                            nr.clone(),
+                                        );
+                                    }
+                                    let nid_key = format!("{src_var}.__node_id__");
+                                    if let Some(nr) = row_vals.get(&nid_key) {
+                                        with_vals.insert(
+                                            format!("{}.__node_id__", item.alias),
+                                            nr.clone(),
+                                        );
+                                    }
+                                }
+                            }
+                            if let Some(ref where_expr) = clause.where_clause {
+                                let mut wv = with_vals.clone();
+                                wv.extend(self.dollar_params());
+                                if !self.eval_where_graph(where_expr, &wv) {
+                                    continue;
+                                }
+                            }
+                            with_vals.extend(self.dollar_params());
+                            next_rows.push(with_vals);
+                        }
+                        next_rows
+                    };
+                    current_rows = next_rows;
+                }
+                PipelineStage::Match {
+                    patterns,
+                    where_clause,
+                } => {
+                    // Re-traverse the graph for each row in current_rows,
+                    // substituting WITH-projected values for inline prop filters.
+                    let mut next_rows: Vec<HashMap<String, Value>> = Vec::new();
+                    for binding in &current_rows {
+                        let new_rows = self.execute_pipeline_match_stage(
+                            patterns,
+                            where_clause.as_ref(),
+                            binding,
+                        )?;
+                        next_rows.extend(new_rows);
+                    }
+                    current_rows = next_rows;
+                }
+                PipelineStage::Unwind { alias, new_alias } => {
+                    // Unwind a list variable from the current row set.
+                    let mut next_rows: Vec<HashMap<String, Value>> = Vec::new();
+                    for row_vals in &current_rows {
+                        let list_val = row_vals.get(alias.as_str()).cloned().unwrap_or(Value::Null);
+                        let items = match list_val {
+                            Value::List(v) => v,
+                            other => vec![other],
+                        };
+                        for item in items {
+                            let mut new_row = row_vals.clone();
+                            new_row.insert(new_alias.clone(), item);
+                            next_rows.push(new_row);
+                        }
+                    }
+                    current_rows = next_rows;
+                }
+            }
+        }
+
+        // Step 3: PROJECT the RETURN clause.
+        let column_names = extract_return_column_names(&p.return_clause.items);
+
+        // Apply ORDER BY on the fully-projected rows before narrowing to RETURN columns.
+        if !p.return_order_by.is_empty() {
+            current_rows.sort_by(|a, b| {
+                for (expr, dir) in &p.return_order_by {
+                    let va = eval_expr(expr, a);
+                    let vb = eval_expr(expr, b);
+                    let cmp = compare_values(&va, &vb);
+                    let cmp = if *dir == SortDir::Desc {
+                        cmp.reverse()
+                    } else {
+                        cmp
+                    };
+                    if cmp != std::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        if let Some(skip) = p.return_skip {
+            let skip = (skip as usize).min(current_rows.len());
+            current_rows.drain(0..skip);
+        }
+        if let Some(lim) = p.return_limit {
+            current_rows.truncate(lim as usize);
+        }
+
+        let mut rows: Vec<Vec<Value>> = current_rows
+            .iter()
+            .map(|row_vals| {
+                p.return_clause
+                    .items
+                    .iter()
+                    .map(|item| self.eval_expr_graph(&item.expr, row_vals))
+                    .collect()
+            })
+            .collect();
+
+        if p.distinct {
+            deduplicate_rows(&mut rows);
         }
 
         Ok(QueryResult {
             columns: column_names,
             rows,
         })
+    }
+
+    /// Collect all rows for a leading MATCH in a pipeline without a bound WithClause.
+    ///
+    /// Unlike `collect_match_rows_for_with`, this performs a wide scan that includes
+    /// all stored column IDs for each label, and always injects NodeRef entries so
+    /// EXISTS subqueries and subsequent MATCH stages can resolve node references.
+    fn collect_pipeline_match_rows(
+        &self,
+        patterns: &[PathPattern],
+        where_clause: Option<&Expr>,
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        if patterns.is_empty() {
+            return Ok(vec![HashMap::new()]);
+        }
+
+        // For simplicity handle single-node pattern (no relationship hops in leading MATCH).
+        let pat = &patterns[0];
+        let node = &pat.nodes[0];
+        let var_name = node.var.as_str();
+        let label = node.labels.first().cloned().unwrap_or_default();
+
+        let label_id = match self.catalog.get_label(&label)? {
+            Some(id) => id as u32,
+            None => return Ok(vec![]),
+        };
+        let hwm = self.store.hwm_for_label(label_id)?;
+        let col_ids: Vec<u32> = self.store.col_ids_for_label(label_id).unwrap_or_default();
+
+        let mut result: Vec<HashMap<String, Value>> = Vec::new();
+        for slot in 0..hwm {
+            let node_id = NodeId(((label_id as u64) << 32) | slot);
+            if self.is_node_tombstoned(node_id) {
+                continue;
+            }
+            let props = match self.store.get_node_raw(node_id, &col_ids) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if !self.matches_prop_filter(&props, &node.props) {
+                continue;
+            }
+            let mut row_vals = build_row_vals(&props, var_name, &col_ids, &self.store);
+            // Always inject NodeRef for EXISTS and next-stage MATCH.
+            row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+            row_vals.insert(format!("{var_name}.__node_id__"), Value::NodeRef(node_id));
+
+            if let Some(wexpr) = where_clause {
+                let mut row_vals_p = row_vals.clone();
+                row_vals_p.extend(self.dollar_params());
+                if !self.eval_where_graph(wexpr, &row_vals_p) {
+                    continue;
+                }
+            }
+            result.push(row_vals);
+        }
+        Ok(result)
+    }
+
+    /// Execute a MATCH stage within a pipeline, given a set of variable bindings
+    /// from the preceding WITH stage.
+    ///
+    /// For each node pattern in `patterns`:
+    /// - Scan the label.
+    /// - Filter by inline prop filters, substituting any value that matches
+    ///   a variable name from `binding` (e.g. `{name: pname}` where `pname`
+    ///   is bound in the preceding WITH).
+    fn execute_pipeline_match_stage(
+        &self,
+        patterns: &[PathPattern],
+        where_clause: Option<&Expr>,
+        binding: &HashMap<String, Value>,
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        if patterns.is_empty() {
+            return Ok(vec![binding.clone()]);
+        }
+
+        let pat = &patterns[0];
+
+        // Check if this is a relationship hop pattern.
+        if !pat.rels.is_empty() {
+            // Relationship traversal in a pipeline MATCH stage.
+            // Currently supports single-hop: (src)-[:REL]->(dst)
+            return self.execute_pipeline_match_hop(pat, where_clause, binding);
+        }
+
+        let node = &pat.nodes[0];
+        let var_name = node.var.as_str();
+        let label = node.labels.first().cloned().unwrap_or_default();
+
+        let label_id = match self.catalog.get_label(&label)? {
+            Some(id) => id as u32,
+            None => return Ok(vec![]),
+        };
+        let hwm = self.store.hwm_for_label(label_id)?;
+        let col_ids: Vec<u32> = self.store.col_ids_for_label(label_id).unwrap_or_default();
+
+        let mut result: Vec<HashMap<String, Value>> = Vec::new();
+        let params = self.dollar_params();
+        for slot in 0..hwm {
+            let node_id = NodeId(((label_id as u64) << 32) | slot);
+            if self.is_node_tombstoned(node_id) {
+                continue;
+            }
+            let props = match self.store.get_node_raw(node_id, &col_ids) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            // Evaluate inline prop filters, resolving variable references from binding.
+            if !self.matches_prop_filter_with_binding(&props, &node.props, binding, &params) {
+                continue;
+            }
+
+            let mut row_vals = build_row_vals(&props, var_name, &col_ids, &self.store);
+            // Merge binding variables so upstream aliases remain in scope.
+            row_vals.extend(binding.clone());
+            row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+            row_vals.insert(format!("{var_name}.__node_id__"), Value::NodeRef(node_id));
+
+            if let Some(wexpr) = where_clause {
+                let mut row_vals_p = row_vals.clone();
+                row_vals_p.extend(params.clone());
+                if !self.eval_where_graph(wexpr, &row_vals_p) {
+                    continue;
+                }
+            }
+            result.push(row_vals);
+        }
+        Ok(result)
+    }
+
+    /// Execute a single-hop relationship traversal in a pipeline MATCH stage.
+    ///
+    /// Handles `(src:Label {props})-[:REL]->(dst:Label {props})` where `src` or `dst`
+    /// variable names may already be bound in `binding`.
+    fn execute_pipeline_match_hop(
+        &self,
+        pat: &sparrowdb_cypher::ast::PathPattern,
+        where_clause: Option<&Expr>,
+        binding: &HashMap<String, Value>,
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        if pat.nodes.len() < 2 || pat.rels.is_empty() {
+            return Ok(vec![]);
+        }
+        let src_pat = &pat.nodes[0];
+        let dst_pat = &pat.nodes[1];
+        let rel_pat = &pat.rels[0];
+
+        let src_label = src_pat.labels.first().cloned().unwrap_or_default();
+        let dst_label = dst_pat.labels.first().cloned().unwrap_or_default();
+
+        let src_label_id = match self.catalog.get_label(&src_label)? {
+            Some(id) => id as u32,
+            None => return Ok(vec![]),
+        };
+        let dst_label_id = match self.catalog.get_label(&dst_label)? {
+            Some(id) => id as u32,
+            None => return Ok(vec![]),
+        };
+
+        let src_col_ids: Vec<u32> = self
+            .store
+            .col_ids_for_label(src_label_id)
+            .unwrap_or_default();
+        let dst_col_ids: Vec<u32> = self
+            .store
+            .col_ids_for_label(dst_label_id)
+            .unwrap_or_default();
+        let params = self.dollar_params();
+
+        // Find candidate src nodes.
+        let src_candidates: Vec<NodeId> = {
+            // If the src var is already bound as a NodeRef, use that directly.
+            let bound_src = binding
+                .get(&src_pat.var)
+                .or_else(|| binding.get(&format!("{}.__node_id__", src_pat.var)));
+            if let Some(Value::NodeRef(nid)) = bound_src {
+                vec![*nid]
+            } else {
+                let hwm = self.store.hwm_for_label(src_label_id)?;
+                let mut cands = Vec::new();
+                for slot in 0..hwm {
+                    let node_id = NodeId(((src_label_id as u64) << 32) | slot);
+                    if self.is_node_tombstoned(node_id) {
+                        continue;
+                    }
+                    if let Ok(props) = self.store.get_node_raw(node_id, &src_col_ids) {
+                        if self.matches_prop_filter_with_binding(
+                            &props,
+                            &src_pat.props,
+                            binding,
+                            &params,
+                        ) {
+                            cands.push(node_id);
+                        }
+                    }
+                }
+                cands
+            }
+        };
+
+        let rel_table_id = self.resolve_rel_table_id(src_label_id, dst_label_id, &rel_pat.rel_type);
+
+        let mut result: Vec<HashMap<String, Value>> = Vec::new();
+        for src_id in src_candidates {
+            let src_slot = src_id.0 & 0xFFFF_FFFF;
+            let dst_slots: Vec<u64> = match &rel_table_id {
+                RelTableLookup::Found(rtid) => self.csr_neighbors(*rtid, src_slot),
+                RelTableLookup::NotFound => continue,
+                RelTableLookup::All => self.csr_neighbors_all(src_slot),
+            };
+            // Also check the delta.
+            let delta_slots: Vec<u64> = self
+                .read_delta_all()
+                .into_iter()
+                .filter(|r| {
+                    let r_src_label = (r.src.0 >> 32) as u32;
+                    let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                    r_src_label == src_label_id && r_src_slot == src_slot
+                })
+                .map(|r| r.dst.0 & 0xFFFF_FFFF)
+                .collect();
+            let all_slots: std::collections::HashSet<u64> =
+                dst_slots.into_iter().chain(delta_slots).collect();
+
+            for dst_slot in all_slots {
+                let dst_id = NodeId(((dst_label_id as u64) << 32) | dst_slot);
+                if self.is_node_tombstoned(dst_id) {
+                    continue;
+                }
+                if let Ok(dst_props) = self.store.get_node_raw(dst_id, &dst_col_ids) {
+                    if !self.matches_prop_filter_with_binding(
+                        &dst_props,
+                        &dst_pat.props,
+                        binding,
+                        &params,
+                    ) {
+                        continue;
+                    }
+                    let src_props = self
+                        .store
+                        .get_node_raw(src_id, &src_col_ids)
+                        .unwrap_or_default();
+                    let mut row_vals =
+                        build_row_vals(&src_props, &src_pat.var, &src_col_ids, &self.store);
+                    row_vals.extend(build_row_vals(
+                        &dst_props,
+                        &dst_pat.var,
+                        &dst_col_ids,
+                        &self.store,
+                    ));
+                    // Merge upstream bindings.
+                    row_vals.extend(binding.clone());
+                    row_vals.insert(src_pat.var.clone(), Value::NodeRef(src_id));
+                    row_vals.insert(
+                        format!("{}.__node_id__", src_pat.var),
+                        Value::NodeRef(src_id),
+                    );
+                    row_vals.insert(dst_pat.var.clone(), Value::NodeRef(dst_id));
+                    row_vals.insert(
+                        format!("{}.__node_id__", dst_pat.var),
+                        Value::NodeRef(dst_id),
+                    );
+
+                    if let Some(wexpr) = where_clause {
+                        let mut row_vals_p = row_vals.clone();
+                        row_vals_p.extend(params.clone());
+                        if !self.eval_where_graph(wexpr, &row_vals_p) {
+                            continue;
+                        }
+                    }
+                    result.push(row_vals);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Filter a node's props against a set of PropEntry filters, resolving variable
+    /// references from `binding` before comparing.
+    ///
+    /// For example, `{name: pname}` where `pname` is a variable in `binding` will
+    /// look up `binding["pname"]` and use it as the expected value.
+    fn matches_prop_filter_with_binding(
+        &self,
+        props: &[(u32, u64)],
+        filters: &[sparrowdb_cypher::ast::PropEntry],
+        binding: &HashMap<String, Value>,
+        params: &HashMap<String, Value>,
+    ) -> bool {
+        for f in filters {
+            let col_id = prop_name_to_col_id(&f.key);
+            let stored_raw = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
+
+            // Evaluate the filter expression, first substituting from binding.
+            let filter_val = match &f.value {
+                sparrowdb_cypher::ast::Expr::Var(v) => {
+                    // Variable reference — look up in binding.
+                    binding.get(v).cloned().unwrap_or(Value::Null)
+                }
+                other => eval_expr(other, params),
+            };
+
+            let stored_val = stored_raw.map(|raw| decode_raw_val(raw, &self.store));
+            let matches = match (stored_val, &filter_val) {
+                (Some(Value::String(a)), Value::String(b)) => &a == b,
+                (Some(Value::Int64(a)), Value::Int64(b)) => a == *b,
+                (Some(Value::Bool(a)), Value::Bool(b)) => a == *b,
+                (Some(Value::Float64(a)), Value::Float64(b)) => a == *b,
+                (None, Value::Null) => true,
+                _ => false,
+            };
+            if !matches {
+                return false;
+            }
+        }
+        true
     }
 
     /// Scan a MATCH pattern and return one `HashMap<String, Value>` per matching row.
@@ -1231,7 +2005,11 @@ impl Engine {
                 if !self.matches_prop_filter(&props, &node.props) {
                     continue;
                 }
-                let row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
+                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
+                // SPA-134: inject NodeRef so eval_exists_subquery can resolve the
+                // source node ID when EXISTS { } appears in MATCH WHERE or WITH WHERE.
+                row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+                row_vals.insert(format!("{var_name}.__node_id__"), Value::NodeRef(node_id));
                 if let Some(wexpr) = &where_clause {
                     let mut row_vals_p = row_vals.clone();
                     row_vals_p.extend(self.dollar_params());
@@ -3611,6 +4389,28 @@ impl Engine {
                 Value::Bool(b) => Value::Bool(!b),
                 _ => Value::Null,
             },
+            // SPA-134: PropAccess where the variable resolves to a NodeRef (e.g. `WITH n AS person
+            // RETURN person.name`).  Fetch the property from the node store directly.
+            Expr::PropAccess { var, prop } => {
+                // Try normal key first (col_N or direct "var.prop" entry).
+                let normal = eval_expr(expr, vals);
+                if !matches!(normal, Value::Null) {
+                    return normal;
+                }
+                // Fallback: if the variable is a NodeRef, read the property from the store.
+                if let Some(Value::NodeRef(node_id)) = vals
+                    .get(var.as_str())
+                    .or_else(|| vals.get(&format!("{var}.__node_id__")))
+                {
+                    let col_id = prop_name_to_col_id(prop);
+                    if let Ok(props) = self.store.get_node_raw(*node_id, &[col_id]) {
+                        if let Some(&(_, raw)) = props.iter().find(|(c, _)| *c == col_id) {
+                            return decode_raw_val(raw, &self.store);
+                        }
+                    }
+                }
+                Value::Null
+            }
             _ => eval_expr(expr, vals),
         }
     }
@@ -4649,6 +5449,51 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
                 },
                 BinOpKind::Or => match (&lv, &rv) {
                     (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
+                    _ => Value::Null,
+                },
+                BinOpKind::Add => match (&lv, &rv) {
+                    (Value::Int64(a), Value::Int64(b)) => Value::Int64(a + b),
+                    (Value::Float64(a), Value::Float64(b)) => Value::Float64(a + b),
+                    (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 + b),
+                    (Value::Float64(a), Value::Int64(b)) => Value::Float64(a + *b as f64),
+                    (Value::String(a), Value::String(b)) => Value::String(format!("{a}{b}")),
+                    _ => Value::Null,
+                },
+                BinOpKind::Sub => match (&lv, &rv) {
+                    (Value::Int64(a), Value::Int64(b)) => Value::Int64(a - b),
+                    (Value::Float64(a), Value::Float64(b)) => Value::Float64(a - b),
+                    (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 - b),
+                    (Value::Float64(a), Value::Int64(b)) => Value::Float64(a - *b as f64),
+                    _ => Value::Null,
+                },
+                BinOpKind::Mul => match (&lv, &rv) {
+                    (Value::Int64(a), Value::Int64(b)) => Value::Int64(a * b),
+                    (Value::Float64(a), Value::Float64(b)) => Value::Float64(a * b),
+                    (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 * b),
+                    (Value::Float64(a), Value::Int64(b)) => Value::Float64(a * *b as f64),
+                    _ => Value::Null,
+                },
+                BinOpKind::Div => match (&lv, &rv) {
+                    (Value::Int64(a), Value::Int64(b)) => {
+                        if *b == 0 {
+                            Value::Null
+                        } else {
+                            Value::Int64(a / b)
+                        }
+                    }
+                    (Value::Float64(a), Value::Float64(b)) => Value::Float64(a / b),
+                    (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 / b),
+                    (Value::Float64(a), Value::Int64(b)) => Value::Float64(a / *b as f64),
+                    _ => Value::Null,
+                },
+                BinOpKind::Mod => match (&lv, &rv) {
+                    (Value::Int64(a), Value::Int64(b)) => {
+                        if *b == 0 {
+                            Value::Null
+                        } else {
+                            Value::Int64(a % b)
+                        }
+                    }
                     _ => Value::Null,
                 },
             }
