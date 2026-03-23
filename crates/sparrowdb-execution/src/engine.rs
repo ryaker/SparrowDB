@@ -21,6 +21,7 @@ use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{DeltaRecord, EdgeStore, RelTableId};
 use sparrowdb_storage::fulltext_index::FulltextIndex;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
+use sparrowdb_storage::property_index::PropertyIndex;
 use sparrowdb_storage::wal::WalReplayer;
 
 use crate::types::{QueryResult, Value};
@@ -2933,6 +2934,231 @@ impl Engine {
         }
 
         tracing::debug!(rows = rows.len(), "two-hop traversal complete");
+        Ok(QueryResult {
+            columns: column_names.to_vec(),
+            rows,
+        })
+    }
+
+    // ── N-hop traversal (SPA-252): (a)-[:R]->(b)-[:R]->...-(z) ──────────────
+
+    /// General N-hop traversal for inline chains with 3 or more relationship
+    /// hops in a single MATCH pattern, e.g.:
+    ///   MATCH (a)-[:R]->(b)-[:R]->(c)-[:R]->(d) RETURN a.name, b.name, c.name, d.name
+    ///
+    /// The algorithm iterates forward hop by hop.  At each level it maintains
+    /// a "frontier" of `(slot, props)` tuples for the current boundary nodes,
+    /// plus an accumulated `row_vals` map that records all variable→property
+    /// bindings seen so far.  When the frontier advances to the final node, a
+    /// result row is projected from the accumulated map.
+    ///
+    /// This replaces the previous fallthrough to `execute_scan` which only
+    /// scanned the first node and ignored all relationship hops.
+    fn execute_n_hop(&self, m: &MatchStatement, column_names: &[String]) -> Result<QueryResult> {
+        let pat = &m.pattern[0];
+        let n_nodes = pat.nodes.len();
+        let n_rels = pat.rels.len();
+
+        // Sanity: nodes.len() == rels.len() + 1 always holds for a linear chain.
+        if n_nodes != n_rels + 1 {
+            return Err(sparrowdb_common::Error::Unimplemented);
+        }
+
+        // Pre-compute col_ids needed per node variable so we only read the
+        // property columns that are actually projected or filtered.
+        let col_ids_per_node: Vec<Vec<u32>> = (0..n_nodes)
+            .map(|i| {
+                let node_pat = &pat.nodes[i];
+                let var = &node_pat.var;
+                let mut ids = if var.is_empty() {
+                    vec![]
+                } else {
+                    collect_col_ids_for_var(var, column_names, 0)
+                };
+                // Include columns required by WHERE predicates for this var.
+                if let Some(ref where_expr) = m.where_clause {
+                    if !var.is_empty() {
+                        collect_col_ids_from_expr_for_var(where_expr, var, &mut ids);
+                    }
+                }
+                // Include columns required by inline prop filters.
+                for p in &node_pat.props {
+                    let col_id = prop_name_to_col_id(&p.key);
+                    if !ids.contains(&col_id) {
+                        ids.push(col_id);
+                    }
+                }
+                // Always read at least col_0 so the node can be identified.
+                if ids.is_empty() {
+                    ids.push(0);
+                }
+                ids
+            })
+            .collect();
+
+        // Resolve label_ids for all node positions.
+        let label_ids_per_node: Vec<Option<u32>> = (0..n_nodes)
+            .map(|i| {
+                let label = pat.nodes[i].labels.first().cloned().unwrap_or_default();
+                if label.is_empty() {
+                    None
+                } else {
+                    self.catalog.get_label(&label).ok().flatten().map(|id| id as u32)
+                }
+            })
+            .collect();
+
+        // Scan the first (source) node and kick off the recursive hop chain.
+        let src_label_id = match label_ids_per_node[0] {
+            Some(id) => id,
+            None => return Err(sparrowdb_common::Error::Unimplemented),
+        };
+        let hwm_src = self.store.hwm_for_label(src_label_id)?;
+
+        // We read all delta edges once up front to avoid repeated file I/O.
+        let delta_all = self.read_delta_all();
+
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+
+        for src_slot in 0..hwm_src {
+            let src_node_id = NodeId(((src_label_id as u64) << 32) | src_slot);
+
+            // Skip tombstoned nodes.
+            if self.is_node_tombstoned(src_node_id) {
+                continue;
+            }
+
+            let src_props = read_node_props(&self.store, src_node_id, &col_ids_per_node[0])?;
+
+            // Apply inline prop filter for the source node.
+            if !self.matches_prop_filter(&src_props, &pat.nodes[0].props) {
+                continue;
+            }
+
+            // Seed the frontier with the source node binding.
+            let mut row_vals: HashMap<String, Value> = HashMap::new();
+            if !pat.nodes[0].var.is_empty() {
+                for &(col_id, raw) in &src_props {
+                    let key = format!("{}.col_{col_id}", pat.nodes[0].var);
+                    row_vals.insert(key, decode_raw_val(raw, &self.store));
+                }
+            }
+
+            // `frontier` holds (slot, accumulated_vals) pairs for the current
+            // boundary of the traversal.  Each entry represents one in-progress
+            // path; cloning ensures bindings are isolated across branches.
+            let mut frontier: Vec<(u64, HashMap<String, Value>)> =
+                vec![(src_slot, row_vals)];
+
+            for hop_idx in 0..n_rels {
+                let next_node_pat = &pat.nodes[hop_idx + 1];
+                let next_label_id_opt = label_ids_per_node[hop_idx + 1];
+                let next_col_ids = &col_ids_per_node[hop_idx + 1];
+                let cur_label_id = label_ids_per_node[hop_idx].unwrap_or(src_label_id);
+
+                let mut next_frontier: Vec<(u64, HashMap<String, Value>)> = Vec::new();
+
+                for (cur_slot, cur_vals) in frontier {
+                    // Gather neighbors from CSR + delta for this hop.
+                    let csr_nb: Vec<u64> = self.csr_neighbors_all(cur_slot);
+                    let delta_nb: Vec<u64> = delta_all
+                        .iter()
+                        .filter(|r| {
+                            let r_src_label = (r.src.0 >> 32) as u32;
+                            let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                            r_src_label == cur_label_id && r_src_slot == cur_slot
+                        })
+                        .map(|r| r.dst.0 & 0xFFFF_FFFF)
+                        .collect();
+
+                    let mut seen: HashSet<u64> = HashSet::new();
+                    let all_nb: Vec<u64> = csr_nb
+                        .into_iter()
+                        .chain(delta_nb)
+                        .filter(|&nb| seen.insert(nb))
+                        .collect();
+
+                    for next_slot in all_nb {
+                        let next_node_id = if let Some(lbl_id) = next_label_id_opt {
+                            NodeId(((lbl_id as u64) << 32) | next_slot)
+                        } else {
+                            NodeId(next_slot)
+                        };
+
+                        let next_props =
+                            read_node_props(&self.store, next_node_id, next_col_ids)?;
+
+                        // Apply inline prop filter for this hop's destination node.
+                        if !self.matches_prop_filter(&next_props, &next_node_pat.props) {
+                            continue;
+                        }
+
+                        // Clone the accumulated bindings and extend with this node's
+                        // properties, keyed under its own variable name.
+                        let mut new_vals = cur_vals.clone();
+                        if !next_node_pat.var.is_empty() {
+                            for &(col_id, raw) in &next_props {
+                                let key = format!("{}.col_{col_id}", next_node_pat.var);
+                                new_vals.insert(key, decode_raw_val(raw, &self.store));
+                            }
+                        }
+
+                        next_frontier.push((next_slot, new_vals));
+                    }
+                }
+
+                frontier = next_frontier;
+            }
+
+            // `frontier` now contains complete paths.  Project result rows.
+            for (_final_slot, path_vals) in frontier {
+                // Apply WHERE clause using the full accumulated binding map.
+                if let Some(ref where_expr) = m.where_clause {
+                    let mut eval_vals = path_vals.clone();
+                    eval_vals.extend(self.dollar_params());
+                    if !self.eval_where_graph(where_expr, &eval_vals) {
+                        continue;
+                    }
+                }
+
+                // Project column values from the accumulated binding map.
+                // Each column name is "var.prop" — look up "var.col_<id>" in the map.
+                let row: Vec<Value> = column_names
+                    .iter()
+                    .map(|col_name| {
+                        if let Some((var, prop)) = col_name.split_once('.') {
+                            let key = format!("{var}.col_{}", col_id_of(prop));
+                            path_vals.get(&key).cloned().unwrap_or(Value::Null)
+                        } else {
+                            Value::Null
+                        }
+                    })
+                    .collect();
+
+                rows.push(row);
+            }
+        }
+
+        // DISTINCT
+        if m.distinct {
+            deduplicate_rows(&mut rows);
+        }
+
+        // ORDER BY
+        apply_order_by(&mut rows, m, column_names);
+
+        // SKIP
+        if let Some(skip) = m.skip {
+            let skip = (skip as usize).min(rows.len());
+            rows.drain(0..skip);
+        }
+
+        // LIMIT
+        if let Some(lim) = m.limit {
+            rows.truncate(lim as usize);
+        }
+
+        tracing::debug!(rows = rows.len(), n_rels = n_rels, "n-hop traversal complete");
         Ok(QueryResult {
             columns: column_names.to_vec(),
             rows,

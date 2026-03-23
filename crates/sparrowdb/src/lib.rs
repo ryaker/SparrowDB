@@ -879,7 +879,303 @@ impl GraphDb {
         Ok(())
     }
 
-    /// Return `(node_count, edge_count)` by summing the high-water marks
+    /// Execute multiple Cypher queries as a single atomic batch.
+    ///
+    /// All queries share one [`WriteTx`] and a **single WAL fsync** at the end,
+    /// making this significantly faster than N individual [`execute`] calls when
+    /// ingesting many nodes (e.g. Neo4j import, bulk data load).
+    ///
+    /// ## Semantics
+    ///
+    /// * **Atomicity** — if any query in the batch fails, the entire batch is
+    ///   rolled back (the [`WriteTx`] is dropped without committing).
+    /// * **Ordering** — queries are executed in slice order; each query sees the
+    ///   mutations of all preceding queries in the batch.
+    /// * **Single fsync** — the WAL is synced exactly once, after the last
+    ///   query in the batch has been applied successfully.
+    ///
+    /// ## Restrictions
+    ///
+    /// * Only **write** statements are accepted (CREATE, MERGE, MATCH…SET,
+    ///   MATCH…DELETE, MATCH…CREATE).  Read-only `MATCH … RETURN` queries are
+    ///   allowed but their results are included in the returned `Vec`.
+    /// * `CHECKPOINT` and `OPTIMIZE` inside a batch are executed immediately
+    ///   and do **not** participate in the shared transaction; they act as
+    ///   no-ops for atomicity purposes.
+    /// * Parameters are not supported — use [`execute_with_params`] for that.
+    ///
+    /// ## Example
+    ///
+    /// ```no_run
+    /// use sparrowdb::GraphDb;
+    ///
+    /// let db = GraphDb::open(std::path::Path::new("/tmp/batch.sparrow")).unwrap();
+    ///
+    /// let queries: Vec<&str> = (0..100)
+    ///     .map(|i| Box::leak(format!("CREATE (n:Person {{id: {i}}})", i = i).into_boxed_str()) as &str)
+    ///     .collect();
+    ///
+    /// let results = db.execute_batch(&queries).unwrap();
+    /// assert_eq!(results.len(), 100);
+    /// ```
+    ///
+    /// [`execute`]: GraphDb::execute
+    /// [`execute_with_params`]: GraphDb::execute_with_params
+    pub fn execute_batch(&self, queries: &[&str]) -> Result<Vec<QueryResult>> {
+        use sparrowdb_cypher::ast::Statement;
+        use sparrowdb_cypher::{bind, parse};
+
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pre-parse and bind all queries before acquiring the writer lock.
+        // A syntax or bind error fails fast without ever locking.
+        let bound_stmts: Vec<_> = queries
+            .iter()
+            .map(|q| {
+                let stmt = parse(q)?;
+                let catalog_snap = Catalog::open(&self.inner.path)?;
+                bind(stmt, &catalog_snap)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // CHECKPOINT and OPTIMIZE cannot run inside a WriteTx (they acquire
+        // the writer lock themselves).  Execute them eagerly in document order
+        // and record placeholder results; they do not participate in the
+        // shared transaction's atomicity.
+        let mut early_results: Vec<Option<QueryResult>> = vec![None; bound_stmts.len()];
+        for (i, bound) in bound_stmts.iter().enumerate() {
+            match &bound.inner {
+                Statement::Checkpoint => {
+                    self.checkpoint()?;
+                    early_results[i] = Some(QueryResult::empty(vec![]));
+                }
+                Statement::Optimize => {
+                    self.optimize()?;
+                    early_results[i] = Some(QueryResult::empty(vec![]));
+                }
+                _ => {}
+            }
+        }
+
+        // Acquire a single WriteTx for all structural + property mutations.
+        let mut tx = self.begin_write()?;
+        let mut results: Vec<Option<QueryResult>> = vec![None; bound_stmts.len()];
+
+        for (i, bound) in bound_stmts.into_iter().enumerate() {
+            if early_results[i].is_some() {
+                continue;
+            }
+
+            let result = if Engine::is_mutation(&bound.inner) {
+                self.execute_batch_mutation(bound.inner, &mut tx)?
+            } else {
+                // Read-only statement: execute against current snapshot.
+                let csrs = open_csr_map(&self.inner.path);
+                let catalog_snap = Catalog::open(&self.inner.path)?;
+                let mut engine = Engine::new(
+                    NodeStore::open(&self.inner.path)?,
+                    catalog_snap,
+                    csrs,
+                    &self.inner.path,
+                );
+                engine.execute_statement(bound.inner)?
+            };
+            results[i] = Some(result);
+        }
+
+        // Single fsync commit — all mutations land in one WAL transaction.
+        tx.commit()?;
+
+        // Merge early (CHECKPOINT/OPTIMIZE) and mutation results in order.
+        let final_results = results
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                r.or_else(|| early_results[i].take())
+                    .unwrap_or_else(|| QueryResult::empty(vec![]))
+            })
+            .collect();
+
+        Ok(final_results)
+    }
+
+    /// Internal: apply a single mutation statement to an already-open [`WriteTx`].
+    ///
+    /// Called by [`execute_batch`] to accumulate multiple mutations into one
+    /// transaction (and therefore one WAL fsync on commit).
+    fn execute_batch_mutation(
+        &self,
+        stmt: sparrowdb_cypher::ast::Statement,
+        tx: &mut WriteTx,
+    ) -> Result<QueryResult> {
+        use sparrowdb_cypher::ast::Statement;
+
+        match stmt {
+            Statement::Create(ref c) => {
+                // Inline the logic from execute_create_standalone using the
+                // shared tx rather than opening a new WriteTx.
+                let declared_vars: HashSet<&str> = c
+                    .nodes
+                    .iter()
+                    .filter(|n| !n.var.is_empty())
+                    .map(|n| n.var.as_str())
+                    .collect();
+                for (left_var, _, right_var) in &c.edges {
+                    if !left_var.is_empty() && !declared_vars.contains(left_var.as_str()) {
+                        return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                            "CREATE edge references undeclared variable '{left_var}'"
+                        )));
+                    }
+                    if !right_var.is_empty() && !declared_vars.contains(right_var.as_str()) {
+                        return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                            "CREATE edge references undeclared variable '{right_var}'"
+                        )));
+                    }
+                }
+                for node in &c.nodes {
+                    if let Some(label) = node.labels.first() {
+                        if is_reserved_label(label) {
+                            return Err(reserved_label_error(label));
+                        }
+                    }
+                }
+                for (_, rel_pat, _) in &c.edges {
+                    if is_reserved_label(&rel_pat.rel_type) {
+                        return Err(reserved_label_error(&rel_pat.rel_type));
+                    }
+                }
+
+                let mut var_to_node: HashMap<String, NodeId> = HashMap::new();
+                for node in &c.nodes {
+                    let label = node.labels.first().cloned().unwrap_or_default();
+                    let label_id: u32 = match tx.catalog.get_label(&label)? {
+                        Some(id) => id as u32,
+                        None => tx.catalog.create_label(&label)? as u32,
+                    };
+                    let named_props: Vec<(String, Value)> = node
+                        .props
+                        .iter()
+                        .map(|entry| {
+                            let val = match &entry.value {
+                                sparrowdb_cypher::ast::Expr::Literal(
+                                    sparrowdb_cypher::ast::Literal::Null,
+                                ) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+                                    "CREATE property '{}' is null",
+                                    entry.key
+                                ))),
+                                sparrowdb_cypher::ast::Expr::Literal(
+                                    sparrowdb_cypher::ast::Literal::Param(p),
+                                ) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+                                    "CREATE property '{}' references parameter ${p}",
+                                    entry.key
+                                ))),
+                                sparrowdb_cypher::ast::Expr::Literal(lit) => {
+                                    Ok(literal_to_value(lit))
+                                }
+                                _ => Err(sparrowdb_common::Error::InvalidArgument(format!(
+                                    "CREATE property '{}' must be a literal",
+                                    entry.key
+                                ))),
+                            }?;
+                            Ok((entry.key.clone(), val))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let node_id = tx.create_node_named(label_id, &named_props)?;
+                    if !node.var.is_empty() {
+                        var_to_node.insert(node.var.clone(), node_id);
+                    }
+                }
+                for (left_var, rel_pat, right_var) in &c.edges {
+                    let src = var_to_node.get(left_var).copied().ok_or_else(|| {
+                        sparrowdb_common::Error::InvalidArgument(format!(
+                            "CREATE edge references unresolved variable '{left_var}'"
+                        ))
+                    })?;
+                    let dst = var_to_node.get(right_var).copied().ok_or_else(|| {
+                        sparrowdb_common::Error::InvalidArgument(format!(
+                            "CREATE edge references unresolved variable '{right_var}'"
+                        ))
+                    })?;
+                    tx.create_edge(src, dst, &rel_pat.rel_type, HashMap::new())?;
+                }
+                Ok(QueryResult::empty(vec![]))
+            }
+
+            Statement::Merge(ref m) => {
+                let props: HashMap<String, Value> = m
+                    .props
+                    .iter()
+                    .map(|pe| (pe.key.clone(), expr_to_value(&pe.value)))
+                    .collect();
+                tx.merge_node(&m.label, props)?;
+                Ok(QueryResult::empty(vec![]))
+            }
+
+            Statement::MatchMutate(ref mm) => {
+                let csrs = open_csr_map(&self.inner.path);
+                let engine = Engine::new(
+                    NodeStore::open(&self.inner.path)?,
+                    Catalog::open(&self.inner.path)?,
+                    csrs,
+                    &self.inner.path,
+                );
+                let matching_ids = engine.scan_match_mutate(mm)?;
+                for node_id in matching_ids {
+                    match &mm.mutation {
+                        sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
+                            let sv = expr_to_value(value);
+                            tx.set_property(node_id, prop, sv)?;
+                        }
+                        sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                            tx.delete_node(node_id)?;
+                        }
+                    }
+                }
+                Ok(QueryResult::empty(vec![]))
+            }
+
+            Statement::MatchCreate(ref mc) => {
+                for (_, rel_pat, _) in &mc.create.edges {
+                    if is_reserved_label(&rel_pat.rel_type) {
+                        return Err(reserved_label_error(&rel_pat.rel_type));
+                    }
+                }
+                if mc.create.edges.is_empty() {
+                    return Err(Error::Unimplemented);
+                }
+                let csrs = open_csr_map(&self.inner.path);
+                let engine = Engine::new(
+                    NodeStore::open(&self.inner.path)?,
+                    Catalog::open(&self.inner.path)?,
+                    csrs,
+                    &self.inner.path,
+                );
+                let matched_rows = engine.scan_match_create_rows(mc)?;
+                for row in &matched_rows {
+                    for (left_var, rel_pat, right_var) in &mc.create.edges {
+                        let src = row.get(left_var).copied().ok_or_else(|| {
+                            Error::InvalidArgument(format!(
+                                "CREATE references unbound variable: {left_var}"
+                            ))
+                        })?;
+                        let dst = row.get(right_var).copied().ok_or_else(|| {
+                            Error::InvalidArgument(format!(
+                                "CREATE references unbound variable: {right_var}"
+                            ))
+                        })?;
+                        tx.create_edge(src, dst, &rel_pat.rel_type, HashMap::new())?;
+                    }
+                }
+                Ok(QueryResult::empty(vec![]))
+            }
+
+            _ => Err(Error::Unimplemented),
+        }
+    }
+
+        /// Return `(node_count, edge_count)` by summing the high-water marks
     /// across all catalog labels (nodes) and delta-log record counts across
     /// all registered relationship tables (edges).
     ///
