@@ -1287,6 +1287,24 @@ impl GraphDb {
             match v {
                 sparrowdb_execution::types::Value::String(s) => s.clone(),
                 sparrowdb_execution::types::Value::Int64(i) => i.to_string(),
+                sparrowdb_execution::types::Value::List(items) => {
+                    // labels(n) returns a List of String items.
+                    items
+                        .iter()
+                        .filter_map(|it| {
+                            if let sparrowdb_execution::types::Value::String(s) = it {
+                                Some(s.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(":")
+                }
+                other => format!("{other}"),
+            }
+        }
+
         let path = &self.inner.path;
         let catalog = sparrowdb_catalog::catalog::Catalog::open(path)?;
 
