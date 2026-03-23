@@ -335,7 +335,7 @@ impl Engine {
         // Open the fulltext index (read-only; no flush on this path).
         // `FulltextIndex::open` validates the name for path traversal.
         let index = FulltextIndex::open(&self.db_root, &index_name)?;
-        let node_ids = index.search(&query);
+        let hits = index.search_with_scores(&query);
 
         // Determine which column names to project.
         // Default to ["node"] when no YIELD clause was specified.
@@ -345,18 +345,28 @@ impl Engine {
             c.yield_columns.clone()
         };
 
-        // Validate YIELD columns — only "node" is defined for this procedure.
-        if let Some(bad_col) = yield_cols.iter().find(|c| c.as_str() != "node") {
+        // Validate YIELD columns — "node" and "score" are supported.
+        if let Some(bad_col) = yield_cols
+            .iter()
+            .find(|c| c.as_str() != "node" && c.as_str() != "score")
+        {
             return Err(sparrowdb_common::Error::InvalidArgument(format!(
                 "unsupported YIELD column for db.index.fulltext.queryNodes: {bad_col}"
             )));
         }
 
         // Build result rows: one per matching node.
+        // Each column emits the appropriate value: NodeRef for "node", Float64 for "score".
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        for raw_id in node_ids {
+        for (raw_id, score) in hits {
             let node_id = sparrowdb_common::NodeId(raw_id);
-            let row: Vec<Value> = yield_cols.iter().map(|_| Value::NodeRef(node_id)).collect();
+            let row: Vec<Value> = yield_cols
+                .iter()
+                .map(|col| match col.as_str() {
+                    "score" => Value::Float64(score),
+                    _ => Value::NodeRef(node_id),
+                })
+                .collect();
             rows.push(row);
         }
 
