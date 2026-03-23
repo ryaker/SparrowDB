@@ -4,8 +4,7 @@
 //!
 //! Without an index, `WHERE n.prop CONTAINS 'str'` and `WHERE n.prop STARTS WITH 'str'`
 //! must decode every property value for every node in the label — O(n) disk reads.
-//! The `TextIndex` pre-decodes all string values at Engine construction time (same
-//! amortised cost as the existing `PropertyIndex`) and stores them as sorted
+//! The `TextIndex` pre-decodes all string values and stores them as sorted
 //! `(decoded_string, slot)` pairs, enabling:
 //!
 //! - **STARTS WITH** — binary search to find the first entry with the given prefix,
@@ -21,15 +20,22 @@
 //!
 //! ## Lifecycle
 //!
-//! Built at `Engine` construction alongside `PropertyIndex` by scanning all on-disk
-//! column files and decoding string-typed values.  Integer/bool/null cells are skipped.
+//! The index is built **lazily** — only when a query actually contains a CONTAINS
+//! or STARTS WITH predicate on a specific `(label_id, col_id)` pair, via
+//! [`TextIndex::build_for`].  This eliminates all TextIndex I/O for queries that
+//! have no text predicates (e.g. `COUNT(*)`, hop traversals, property lookups).
+//! Once a pair is loaded it is cached for the lifetime of the `Engine` instance.
+//!
+//! The legacy [`TextIndex::build`] method is retained for callers that need an
+//! eager full build (e.g. tests or future bulk-load paths).
+//!
 //! Updated incrementally after each `CREATE` via [`TextIndex::insert`].
 //!
 //! ## Thread safety
 //!
 //! Owned by a single `Engine` instance; no cross-thread sharing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::node_store::{NodeStore, Value as StoreValue};
 
@@ -56,19 +62,100 @@ struct TextIndexKey {
 ///
 /// Maps `(label_id, col_id)` → `Vec<(decoded_string, slot)>` sorted by string.
 ///
-/// Use [`TextIndex::build`] to construct from disk, then
+/// Use [`TextIndex::build_for`] to load a specific column on demand, or
+/// [`TextIndex::build`] for an upfront full build.  Then use
 /// [`TextIndex::lookup_contains`] / [`TextIndex::lookup_starts_with`] for
 /// candidate-slot retrieval.
 #[derive(Default)]
 pub struct TextIndex {
     /// `entries[(label_id, col_id)]` = Vec sorted by `.0` (the decoded string).
     entries: HashMap<TextIndexKey, Vec<(String, u32)>>,
+    /// Set of `(label_id, col_id)` pairs whose column file has already been
+    /// loaded into `entries`.  A pair is present here even when its column file
+    /// contained no string values, so that `build_for` can skip repeated I/O.
+    loaded: HashSet<TextIndexKey>,
 }
 
 impl TextIndex {
     /// Construct a fresh empty index (no disk I/O).
     pub fn new() -> Self {
         TextIndex::default()
+    }
+
+    /// Lazily load the text index for a single `(label_id, col_id)` pair.
+    ///
+    /// Reads `nodes/{label_id}/col_{col_id}.bin` and the corresponding tombstone
+    /// column (`col_0`) from `store`, decodes all string-typed cells, and inserts
+    /// `(decoded_string, slot)` entries into the sorted in-memory bucket for this
+    /// pair.
+    ///
+    /// **Cache hit**: if this `(label_id, col_id)` pair has already been loaded
+    /// (including cases where the column had no string values), this method
+    /// returns immediately without any I/O.
+    ///
+    /// **No-op for col_id 0**: the tombstone column is not indexed.
+    ///
+    /// Errors are logged as warnings and suppressed — the caller falls back to
+    /// a full O(n) scan when `is_indexed` returns `false`.
+    pub fn build_for(&mut self, store: &NodeStore, label_id: u32, col_id: u32) {
+        // col_0 is the tombstone column and is not a queryable property.
+        if col_id == 0 {
+            return;
+        }
+
+        let key = TextIndexKey { label_id, col_id };
+
+        // Cache hit — already loaded.
+        if self.loaded.contains(&key) {
+            return;
+        }
+
+        // Mark as loaded regardless of outcome so we don't retry on I/O errors.
+        self.loaded.insert(key);
+
+        // Read tombstone column (col_0) to skip deleted slots.
+        let tombstone_slots: HashSet<u32> = match store.read_col_all(label_id, 0) {
+            Ok(col0) => col0
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, &raw)| {
+                    if raw == TOMBSTONE {
+                        Some(slot as u32)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            Err(_) => HashSet::new(),
+        };
+
+        // Read the target column.
+        let raw_vals = match store.read_col_all(label_id, col_id) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "WARN: TextIndex::build_for: failed to read col_{col_id} for label {label_id}: {e}; skipping"
+                );
+                return;
+            }
+        };
+
+        let bucket = self.entries.entry(key).or_default();
+
+        for (slot, raw) in raw_vals.into_iter().enumerate() {
+            let slot = slot as u32;
+            if raw == ABSENT || tombstone_slots.contains(&slot) {
+                continue;
+            }
+            // Only index string values; skip integers and booleans.
+            if let StoreValue::Bytes(b) = store.decode_raw_value(raw) {
+                let s = String::from_utf8_lossy(&b).into_owned();
+                bucket.push((s, slot));
+            }
+        }
+
+        // Sort by string for binary-search prefix queries.
+        bucket.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     }
 
     /// Build the index by scanning all label/column files in `store`.
