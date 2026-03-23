@@ -63,13 +63,18 @@ pub struct Engine {
     /// `RefCell` provides interior mutability so that `build_for` can be called
     /// from `&self` scan helpers without changing every method signature.
     pub prop_index: std::cell::RefCell<PropertyIndex>,
-    /// In-memory text search index for CONTAINS and STARTS WITH (SPA-251).
+    /// In-memory text search index for CONTAINS and STARTS WITH (SPA-251, SPA-274).
     ///
-    /// Built at `Engine::new` alongside `prop_index`.  Stores sorted
-    /// `(decoded_string, slot)` pairs per `(label_id, col_id)`.
+    /// Loaded **lazily** — only when a query has a CONTAINS or STARTS WITH
+    /// predicate on a specific `(label_id, col_id)` pair, via
+    /// `TextIndex::build_for`.  Queries with no text predicates (e.g.
+    /// `COUNT(*)`, hop traversals) never trigger any TextIndex I/O.
+    /// `RefCell` provides interior mutability so that `build_for` can be called
+    /// from `&self` scan helpers without changing every method signature.
+    /// Stores sorted `(decoded_string, slot)` pairs per `(label_id, col_id)`.
     /// - CONTAINS: linear scan avoids per-slot property-decode overhead.
     /// - STARTS WITH: binary-search prefix range — O(log n + k).
-    pub text_index: TextIndex,
+    pub text_index: std::cell::RefCell<TextIndex>,
     /// Optional per-query deadline (SPA-254).
     ///
     /// When `Some`, the engine checks this deadline at the top of each hot
@@ -91,29 +96,17 @@ impl Engine {
         csrs: HashMap<u32, CsrForward>,
         db_root: &Path,
     ) -> Self {
-        // SPA-249 (lazy fix): property index is now built on demand per
+        // SPA-249 (lazy fix): property index is built on demand per
         // (label_id, col_id) pair via PropertyIndex::build_for, called from
         // execute_scan just before the first lookup for that pair.  Queries
         // with no property filter (COUNT(*), hop traversals) never trigger
         // any index I/O at all.
         //
-        // SPA-251: text search index is still built eagerly because CONTAINS /
-        // STARTS WITH predicates arrive via the WHERE clause and we don't know
-        // the col_id until scan time; the text index build cost is O(string
-        // cells only) which is typically much less than the full column scan.
-        let text_index = match catalog.list_labels() {
-            Ok(labels) => {
-                let labels_u32: Vec<(u32, String)> = labels
-                    .into_iter()
-                    .map(|(id, name)| (id as u32, name))
-                    .collect();
-                TextIndex::build(&store, &labels_u32)
-            }
-            Err(e) => {
-                tracing::warn!(error = ?e, "SPA-251: text index build failed; CONTAINS/STARTS WITH disabled");
-                TextIndex::new()
-            }
-        };
+        // SPA-274 (lazy text index): text search index is now also built lazily,
+        // mirroring the PropertyIndex pattern.  Only (label_id, col_id) pairs
+        // that appear in an actual CONTAINS or STARTS WITH predicate are loaded.
+        // Queries with no text predicates (COUNT(*), hop traversals, property
+        // lookups) pay zero TextIndex I/O cost.
         Engine {
             store,
             catalog,
@@ -121,7 +114,7 @@ impl Engine {
             db_root: db_root.to_path_buf(),
             params: HashMap::new(),
             prop_index: std::cell::RefCell::new(PropertyIndex::new()),
-            text_index,
+            text_index: std::cell::RefCell::new(TextIndex::new()),
             deadline: None,
         }
     }
@@ -2734,17 +2727,36 @@ impl Engine {
                 None
             };
 
-        // SPA-251: when the equality index has no candidates (None), check
-        // whether the WHERE clause is a simple CONTAINS or STARTS WITH predicate
-        // on a labeled node property, and use the text index to narrow the slot
-        // set.  The WHERE clause is always re-evaluated per slot afterward for
-        // correctness (tombstone filtering, compound predicates, etc.).
+        // SPA-251 / SPA-274 (lazy text index): when the equality index has no
+        // candidates (None), check whether the WHERE clause is a simple CONTAINS
+        // or STARTS WITH predicate on a labeled node property, and use the text
+        // index to narrow the slot set.  The WHERE clause is always re-evaluated
+        // per slot afterward for correctness (tombstone filtering, compound
+        // predicates, etc.).
+        //
+        // Pre-warm the text index for any text-predicate columns before the
+        // immutable borrow below, mirroring the PropertyIndex lazy pattern.
+        // Queries with no text predicates never call build_for and pay zero I/O.
+        if index_candidate_slots.is_none()
+            && where_eq_candidate_slots.is_none()
+            && where_range_candidate_slots.is_none()
+        {
+            if let Some(wexpr) = m.where_clause.as_ref() {
+                for prop_name in where_clause_text_prop_names(wexpr, node.var.as_str()) {
+                    let col_id = sparrowdb_common::col_id_of(prop_name);
+                    self.text_index
+                        .borrow_mut()
+                        .build_for(&self.store, label_id_u32, col_id);
+                }
+            }
+        }
         let text_candidate_slots: Option<Vec<u32>> = if index_candidate_slots.is_none()
             && where_eq_candidate_slots.is_none()
             && where_range_candidate_slots.is_none()
         {
             m.where_clause.as_ref().and_then(|wexpr| {
-                try_text_index_lookup(wexpr, node.var.as_str(), label_id_u32, &self.text_index)
+                let text_index_ref = self.text_index.borrow();
+                try_text_index_lookup(wexpr, node.var.as_str(), label_id_u32, &text_index_ref)
             })
         } else {
             None
@@ -5455,6 +5467,30 @@ fn try_text_index_lookup(
     };
 
     Some(slots)
+}
+
+/// SPA-274 (lazy text index): Extract the property name referenced in a
+/// WHERE-clause CONTAINS or STARTS WITH predicate (`n.prop CONTAINS 'str'` or
+/// `n.prop STARTS WITH 'str'`) so the caller can pre-build the lazy text index
+/// for that `(label_id, col_id)` pair.
+///
+/// Returns an empty vec if the expression is not a simple text predicate on
+/// the given node variable.
+fn where_clause_text_prop_names<'a>(expr: &'a Expr, node_var: &str) -> Vec<&'a str> {
+    let left = match expr {
+        Expr::BinOp { left, op, right: _ }
+            if matches!(op, BinOpKind::Contains | BinOpKind::StartsWith) =>
+        {
+            left.as_ref()
+        }
+        _ => return vec![],
+    };
+    if let Expr::PropAccess { var, prop } = left {
+        if var.as_str() == node_var {
+            return vec![prop.as_str()];
+        }
+    }
+    vec![]
 }
 
 /// SPA-249 (lazy build): Extract all property names referenced in a WHERE-clause
