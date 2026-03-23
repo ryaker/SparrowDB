@@ -4347,11 +4347,15 @@ impl Engine {
     }
 
     /// Compatibility shim used by callers that do not need per-node label tracking.
-    fn get_node_neighbors_by_slot(&self, src_slot: u64, src_label_id: u32) -> Vec<u64> {
+    fn get_node_neighbors_by_slot(
+        &self,
+        src_slot: u64,
+        src_label_id: u32,
+        delta_all: &[sparrowdb_storage::edge_store::DeltaRecord],
+    ) -> Vec<u64> {
         let csr_neighbors: Vec<u64> = self.csr_neighbors_all(src_slot);
-        let delta_neighbors: Vec<u64> = self
-            .read_delta_all()
-            .into_iter()
+        let delta_neighbors: Vec<u64> = delta_all
+            .iter()
             .filter(|r| {
                 let r_src_label = (r.src.0 >> 32) as u32;
                 let r_src_slot = r.src.0 & 0xFFFF_FFFF;
@@ -4429,6 +4433,15 @@ impl Engine {
         let mut seen_pairs: std::collections::HashSet<(u64, u64, u32)> =
             std::collections::HashSet::new();
 
+        // Precompute label-id → name map once so that the hot path inside
+        // `for dst_slot in dst_nodes` does not call `list_labels()` per node.
+        let labels_by_id: std::collections::HashMap<u16, String> = self
+            .catalog
+            .list_labels()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
         for src_slot in 0..hwm_src {
             // SPA-254: check per-query deadline at every slot boundary.
             self.check_deadline()?;
@@ -4488,19 +4501,13 @@ impl Engine {
 
                 // Resolve the actual label name for this destination node so that
                 // labels(x) and label metadata work even when the pattern is unlabeled.
+                // Use the precomputed map to avoid calling list_labels() per node.
                 let resolved_dst_label_name: String = if !dst_label.is_empty() {
                     dst_label.clone()
                 } else {
-                    // Look up the catalog name for actual_label_id.
-                    self.catalog
-                        .list_labels()
-                        .ok()
-                        .and_then(|labels| {
-                            labels
-                                .into_iter()
-                                .find(|(id, _)| *id == actual_label_id as u16)
-                                .map(|(_, name)| name)
-                        })
+                    labels_by_id
+                        .get(&(actual_label_id as u16))
+                        .cloned()
                         .unwrap_or_default()
                 };
 
@@ -4896,6 +4903,8 @@ impl Engine {
         if src_slot == dst_slot {
             return Some(0);
         }
+        // Hoist delta read out of the BFS loop to avoid repeated I/O.
+        let delta_all = self.read_delta_all();
         let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
         visited.insert(src_slot);
         let mut frontier: Vec<u64> = vec![src_slot];
@@ -4903,7 +4912,8 @@ impl Engine {
         for depth in 1..=max_hops {
             let mut next_frontier: Vec<u64> = Vec::new();
             for &node_slot in &frontier {
-                let neighbors = self.get_node_neighbors_by_slot(node_slot, src_label_id);
+                let neighbors =
+                    self.get_node_neighbors_by_slot(node_slot, src_label_id, &delta_all);
                 for nb in neighbors {
                     if nb == dst_slot {
                         return Some(depth);
@@ -5547,9 +5557,21 @@ fn try_where_range_index_lookup(
                 if !prop_index.is_indexed(label_id, col_id) {
                     return None;
                 }
-                // Merge the two half-open bounds.
-                let lo: Option<(u64, bool)> = llo.or(rlo);
-                let hi: Option<(u64, bool)> = lhi.or(rhi);
+                // Merge the two half-open bounds: pick the most restrictive
+                // (largest lower bound, smallest upper bound).  Plain `.or()`
+                // is order-dependent and would silently accept a looser bound
+                // when both sides specify the same direction (e.g. `age > 10
+                // AND age > 20` must use `> 20`, not `> 10`).
+                let lo: Option<(u64, bool)> = match (llo, rlo) {
+                    (Some(a), Some(b)) => Some(std::cmp::max(a, b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                let hi: Option<(u64, bool)> = match (lhi, rhi) {
+                    (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
                 // Validate: we need at least one bound.
                 if lo.is_none() && hi.is_none() {
                     return None;

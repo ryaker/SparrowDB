@@ -207,7 +207,9 @@ fn where_clause_equality_uses_index() {
 
     // Create 1000 nodes so a full scan would be noticeably slower, but
     // correctness (not timing) is the observable property here.
-    for i in 0..1000i64 {
+    // Start at 1 (not 0): Int64(0) encodes to the absent sentinel (0u64) and
+    // is silently skipped by the property index.
+    for i in 1..=1000i64 {
         db.execute(&format!("CREATE (:Person {{name: 'Person{i}', age: {i}}})",))
             .unwrap();
     }
