@@ -4330,6 +4330,7 @@ impl Engine {
     ///   Bug B — `results.insert` is gated behind the `visited.insert` guard so a
     ///            self-loop cannot insert the source back into results.
     ///   Bug C — when `min_hops == 0` the source node is pre-seeded in results.
+    #[allow(clippy::too_many_arguments)]
     fn execute_variable_hops(
         &self,
         src_slot: u64,
