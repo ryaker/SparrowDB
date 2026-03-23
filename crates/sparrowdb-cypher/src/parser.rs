@@ -347,7 +347,12 @@ impl Parser {
             Token::Create | Token::Match => {
                 self.advance();
             }
-            _ => {} // unexpected, but keep going
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "expected CREATE or MATCH after ON, got {:?}",
+                    other
+                )));
+            }
         }
         // Now consume the rest of the `SET var.prop = expr` (or whatever follows)
         // until we hit a top-level boundary.

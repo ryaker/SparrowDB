@@ -71,6 +71,13 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
         // MATCH…MERGE relationship: validate the MATCH patterns (labels must
         // exist); the rel type may not exist yet — merge_edge will create it.
         Statement::MatchMergeRel(mm) => {
+            if mm.rel_type.is_empty() {
+                return Err(sparrowdb_common::Error::InvalidArgument(
+                    "MERGE relationship type must not be empty; \
+                     use MERGE (a)-[r:TYPE]->(b)"
+                        .into(),
+                ));
+            }
             for pat in &mm.match_patterns {
                 bind_path_pattern(pat, catalog)?;
             }

@@ -916,6 +916,14 @@ impl GraphDb {
             &self.inner.path,
         );
 
+        // Guard: reject reserved rel-type prefix used by internal system edges.
+        if mm.rel_type.starts_with("__SO_") {
+            return Err(Error::InvalidArgument(format!(
+                "relationship type '{}' is reserved",
+                mm.rel_type
+            )));
+        }
+
         // Scan MATCH patterns to get correlated (src_var, dst_var) NodeId rows.
         let matched_rows = engine.scan_match_merge_rel_rows(mm)?;
         if matched_rows.is_empty() {
@@ -1336,6 +1344,11 @@ impl GraphDb {
 
             Statement::MatchMergeRel(ref mm) => {
                 // Find-or-create relationship batch variant (SPA-233).
+                //
+                // NOTE: MATCH...MERGE in a batch reads committed on-disk state only;
+                // nodes/edges created earlier in the same batch are not visible to
+                // the MERGE existence check.  If in-batch visibility is required,
+                // flush the transaction to disk before issuing MATCH...MERGE.
                 let csrs = open_csr_map(&self.inner.path);
                 let engine = Engine::new(
                     NodeStore::open(&self.inner.path)?,
@@ -1343,6 +1356,13 @@ impl GraphDb {
                     csrs,
                     &self.inner.path,
                 );
+                // Guard: reject reserved rel-type prefix used by internal system edges.
+                if mm.rel_type.starts_with("__SO_") {
+                    return Err(Error::InvalidArgument(format!(
+                        "relationship type '{}' is reserved",
+                        mm.rel_type
+                    )));
+                }
                 let matched_rows = engine.scan_match_merge_rel_rows(mm)?;
                 for row in &matched_rows {
                     let src = *row.get(&mm.src_var).ok_or_else(|| {
