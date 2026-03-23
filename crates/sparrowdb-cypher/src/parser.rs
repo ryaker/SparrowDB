@@ -1017,9 +1017,9 @@ impl Parser {
 
     // ── MERGE ─────────────────────────────────────────────────────────────────
 
-    /// Parse `MERGE (:Label {prop: val, ...})`.
+    /// Parse `MERGE (:Label {prop: val, ...})` and `MATCH...MERGE (a)-[:R]->(b)` patterns.
     ///
-    /// Only single-node MERGE (no paths) is supported.
+    /// Supports single-node MERGE and relationship MERGE via the match-merge path.
     fn parse_merge(&mut self) -> Result<Statement> {
         self.expect_tok(&Token::Merge)?;
         self.expect_tok(&Token::LParen)?;
