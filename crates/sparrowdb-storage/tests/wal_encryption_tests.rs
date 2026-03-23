@@ -151,7 +151,8 @@ fn encrypted_wal_lsn_aad_binding_detected() {
     let mut seg_data = std::fs::read(&seg_path).unwrap();
 
     // Find the WRITE record (kind=0x02) by scanning.
-    let mut offset = 0usize;
+    // Start at byte 1 to skip the WAL format version header byte.
+    let mut offset = 1usize;
     while offset + 5 < seg_data.len() {
         if seg_data[offset + 4] == 0x02 {
             // Found the WRITE record's kind byte at [offset+4].

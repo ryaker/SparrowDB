@@ -10,14 +10,30 @@
 //!   5       8   lsn: u64 LE
 //!  13       8   txn_id: u64 LE
 //!  21       *   payload (kind-specific, may be empty)
-//!  21+n     4   crc32: u32 LE  (over bytes [4 .. 21+n])
+//!  21+n     4   crc32c: u32 LE  (Castagnoli, over bytes [4 .. 21+n])
 //! ```
 //!
-//! Total fixed overhead: 4 (len) + 1 (kind) + 8 (lsn) + 8 (txn_id) + 4 (crc32) = 25 bytes.
+//! Total fixed overhead: 4 (len) + 1 (kind) + 8 (lsn) + 8 (txn_id) + 4 (crc32c) = 25 bytes.
 //! The `length` field value = 1 + 8 + 8 + payload_len + 4 = 21 + payload_len.
+//!
+//! ## WAL format version
+//!
+//! [`WAL_FORMAT_VERSION`] is stored as the first byte of every segment file.
+//! Version 1 used standard CRC32 (IEEE 802.3).
+//! Version 2 (current) uses CRC32C (Castagnoli / iSCSI), which has better
+//! torn-write detection properties and hardware acceleration on SSE4.2 / ARM.
 
-use crc32fast::Hasher as Crc32Hasher;
 use sparrowdb_common::{Error, Lsn, Result, TxnId};
+
+// ── WAL format version ────────────────────────────────────────────────────────
+
+/// Version byte written as the first byte of every WAL segment file.
+///
+/// | Version | Checksum algorithm |
+/// |---------|--------------------|
+/// | 1       | CRC32 (IEEE 802.3) |
+/// | 2       | CRC32C (Castagnoli) — current |
+pub const WAL_FORMAT_VERSION: u8 = 2;
 
 // ── Record kind byte values ──────────────────────────────────────────────────
 
@@ -471,8 +487,8 @@ impl WalRecord {
         // payload
         buf.extend_from_slice(&payload_bytes);
 
-        // crc32 over [kind + lsn + txn_id + payload] = bytes [4..4+crc_input_len]
-        let crc = compute_crc32(&buf[4..4 + crc_input_len]);
+        // crc32c over [kind + lsn + txn_id + payload] = bytes [4..4+crc_input_len]
+        let crc = compute_crc32c(&buf[4..4 + crc_input_len]);
         buf.extend_from_slice(&crc.to_le_bytes());
 
         debug_assert_eq!(buf.len(), total_len);
@@ -531,8 +547,8 @@ impl WalRecord {
         let stored_crc =
             u32::from_le_bytes(bytes[payload_end..payload_end + 4].try_into().unwrap());
 
-        // verify crc: covers [kind + lsn + txn_id + payload] = bytes[4..payload_end]
-        let computed_crc = compute_crc32(&bytes[4..payload_end]);
+        // verify crc32c: covers [kind + lsn + txn_id + payload] = bytes[4..payload_end]
+        let computed_crc = compute_crc32c(&bytes[4..payload_end]);
         if computed_crc != stored_crc {
             return Err(Error::ChecksumMismatch);
         }
@@ -551,12 +567,14 @@ impl WalRecord {
     }
 }
 
-// ── CRC32 helper ─────────────────────────────────────────────────────────────
+// ── CRC32C helper ────────────────────────────────────────────────────────────
 
-pub fn compute_crc32(data: &[u8]) -> u32 {
-    let mut h = Crc32Hasher::new();
-    h.update(data);
-    h.finalize()
+/// Compute CRC32C (Castagnoli) checksum over `data`.
+///
+/// Uses hardware acceleration (SSE4.2 / ARM CRC32C instructions) when
+/// available via the `crc32c` crate.
+pub fn compute_crc32c(data: &[u8]) -> u32 {
+    crc32c::crc32c(data)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -656,10 +674,10 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_record_crc32_mismatch_detected() {
+    fn test_wal_record_crc32c_mismatch_detected() {
         let rec = make_record(WalRecordKind::Begin, 1, 100, WalPayload::Empty);
         let mut encoded = rec.encode();
-        // Corrupt the last byte (CRC)
+        // Corrupt the last byte (CRC32C)
         let last = encoded.len() - 1;
         encoded[last] ^= 0xFF;
         let result = WalRecord::decode(&encoded);
@@ -667,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_record_crc32_covers_all_fields() {
+    fn test_wal_record_crc32c_covers_all_fields() {
         let rec = make_record(WalRecordKind::Begin, 1, 100, WalPayload::Empty);
         let mut encoded = rec.encode();
         // Corrupt the kind byte (byte 4)
@@ -745,5 +763,68 @@ mod tests {
             offset += consumed;
         }
         assert_eq!(lsns, vec![1, 2, 3, 4, 5]);
+    }
+}
+
+#[cfg(test)]
+mod generate_fixture {
+    use super::*;
+
+    /// Regenerate the golden WAL fixture with CRC32C checksums.
+    /// Run with: cargo test -p sparrowdb-storage -- generate_wal_fixture --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn generate_wal_fixture() {
+        let mut segment = vec![WAL_FORMAT_VERSION];
+
+        let begin = WalRecord {
+            lsn: Lsn(1),
+            txn_id: TxnId(1),
+            kind: WalRecordKind::Begin,
+            payload: WalPayload::Empty,
+        };
+        segment.extend_from_slice(&begin.encode());
+
+        let write = WalRecord {
+            lsn: Lsn(2),
+            txn_id: TxnId(1),
+            kind: WalRecordKind::Write,
+            payload: WalPayload::Write {
+                page_id: 0,
+                image: vec![0xABu8; 32],
+            },
+        };
+        segment.extend_from_slice(&write.encode());
+
+        let commit = WalRecord {
+            lsn: Lsn(3),
+            txn_id: TxnId(1),
+            kind: WalRecordKind::Commit,
+            payload: WalPayload::Empty,
+        };
+        segment.extend_from_slice(&commit.encode());
+
+        let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests/fixtures/wal_segment_000.bin");
+
+        std::fs::write(&out_path, &segment).expect("write fixture");
+        println!("Written {} bytes to {:?}", segment.len(), out_path);
+
+        // Verify round-trip decode.
+        let data = std::fs::read(&out_path).unwrap();
+        assert_eq!(data[0], WAL_FORMAT_VERSION);
+        let mut offset = 1usize;
+        let mut count = 0;
+        while offset < data.len() {
+            let (rec, consumed) = WalRecord::decode(&data[offset..]).unwrap();
+            println!("Record {}: {:?} lsn={}", count, rec.kind, rec.lsn.0);
+            offset += consumed;
+            count += 1;
+        }
+        assert_eq!(count, 3, "fixture must have 3 records");
     }
 }

@@ -283,7 +283,8 @@ fn wal_records_written_for_mutations() {
     let mut found_node_create = false;
     for seg in &segments {
         let bytes = std::fs::read(seg.path()).unwrap();
-        let mut offset = 0;
+        // Skip the 1-byte WAL format version header.
+        let mut offset = if bytes.is_empty() { 0 } else { 1 };
         while offset < bytes.len() {
             if bytes[offset..].iter().all(|&b| b == 0) {
                 break;
@@ -336,7 +337,8 @@ fn wal_node_update_round_trip() {
             continue;
         }
         let bytes = std::fs::read(entry.path()).unwrap();
-        let mut offset = 0;
+        // Skip the 1-byte WAL format version header.
+        let mut offset = if bytes.is_empty() { 0 } else { 1 };
         while offset < bytes.len() {
             if bytes[offset..].iter().all(|&b| b == 0) {
                 break;

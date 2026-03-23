@@ -25,7 +25,7 @@ use std::{
 
 use sparrowdb_common::{Error, Lsn, Result};
 
-use super::codec::{WalPayload, WalRecord, WalRecordKind};
+use super::codec::{WalPayload, WalRecord, WalRecordKind, WAL_FORMAT_VERSION};
 use super::writer::segment_path;
 use crate::encryption::EncryptionContext;
 
@@ -101,7 +101,21 @@ impl WalReplayer {
                 Err(e) => return Err(Error::Io(e)),
             };
 
-            let mut offset = 0usize;
+            if data.is_empty() {
+                continue;
+            }
+
+            // Validate the 1-byte version header.
+            let version = data[0];
+            if version != WAL_FORMAT_VERSION {
+                return Err(Error::Corruption(format!(
+                    "WAL segment {seg_no} version mismatch: found {version}, expected {WAL_FORMAT_VERSION}. \
+                     This segment was written with an incompatible WAL format."
+                )));
+            }
+
+            // Records start at byte 1 (after the version header byte).
+            let mut offset = 1usize;
             while offset < data.len() {
                 // Skip zero-padding (rotation padding or end of segment).
                 if data[offset..].iter().all(|&b| b == 0) {
@@ -254,7 +268,19 @@ impl WalReplayer {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(Error::Io(e)),
             };
-            let mut offset = 0usize;
+            if data.is_empty() {
+                continue;
+            }
+            // Validate the 1-byte version header.
+            let version = data[0];
+            if version != WAL_FORMAT_VERSION {
+                return Err(Error::Corruption(format!(
+                    "WAL segment {seg_no} version mismatch: found {version}, expected {WAL_FORMAT_VERSION}. \
+                     This segment was written with an incompatible WAL format."
+                )));
+            }
+            // Records start at byte 1 (after the version header byte).
+            let mut offset = 1usize;
             while offset < data.len() {
                 if data[offset..].iter().all(|&b| b == 0) {
                     break;
