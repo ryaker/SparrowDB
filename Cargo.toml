@@ -20,6 +20,8 @@ edition = "2021"
 license = "MIT"
 authors = ["Rich Yaker"]
 repository = "https://github.com/ryaker/SparrowDB"
+documentation = "https://docs.rs/sparrowdb"
+readme = "README.md"
 
 [workspace.dependencies]
 sparrowdb-common = { path = "crates/sparrowdb-common", version = "0.1.0" }
