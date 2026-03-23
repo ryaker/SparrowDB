@@ -86,6 +86,76 @@ fn main() -> sparrowdb::Result<()> {
 
 Full walkthrough: [docs/quickstart.md](docs/quickstart.md)
 
+### Python quickstart
+
+```python
+import sparrowdb
+
+# Context manager — database closes cleanly on exit
+with sparrowdb.GraphDb("my.db") as db:
+    db.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+    db.execute("CREATE (b:Person {name: 'Bob',   age: 25})")
+    db.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
+        "CREATE (a)-[:KNOWS]->(b)"
+    )
+    result = db.execute(
+        "MATCH (a:Person)-[:KNOWS]->(f) RETURN f.name"
+    )
+    for row in result.rows:
+        print(row)  # ['Bob']
+
+# execute() and checkpoint() release the GIL — safe to use from threads
+import concurrent.futures
+
+def run_query(q):
+    with sparrowdb.GraphDb("my.db") as db:
+        return db.execute(q)
+
+with concurrent.futures.ThreadPoolExecutor() as pool:
+    futures = [pool.submit(run_query, f"MATCH (n:Person) RETURN n.name LIMIT {i}") for i in range(5)]
+    results = [f.result() for f in futures]
+```
+
+### Graph export (DOT / Graphviz)
+
+```rust
+use sparrowdb::GraphDb;
+
+let db = GraphDb::open("my.db")?;
+let dot = db.export_dot()?;
+std::fs::write("graph.dot", dot)?;
+// Then: dot -Tpng graph.dot -o graph.png
+```
+
+Or from the CLI:
+
+```bash
+sparrowdb visualize --db my.db > graph.dot
+dot -Tpng graph.dot -o graph.png
+```
+
+### Batch writes
+
+```rust
+db.execute_batch(&[
+    "CREATE (x:Item {id: 1})",
+    "CREATE (x:Item {id: 2})",
+    "CREATE (x:Item {id: 3})",
+])?;  // single WAL fsync — much faster than three separate execute() calls
+```
+
+### Per-query timeout
+
+```rust
+use std::time::Duration;
+
+let result = db.execute_with_timeout(
+    "MATCH (a)-[:FOLLOWS*1..6]->(b) RETURN b.name",
+    Duration::from_secs(5),
+)?;
+```
+
 ---
 
 ## What Cypher is supported
@@ -125,7 +195,11 @@ Full walkthrough: [docs/quickstart.md](docs/quickstart.md)
 | `CALL db.schema()` | ✅ |
 | Parameters `$param` | ✅ |
 | MVCC write-write conflict detection | ✅ |
-| `coalesce()` | ⚠️ Not yet implemented |
+| `coalesce(expr1, expr2, …)` — first non-null | ✅ |
+| `WITH … MATCH`, `WITH … UNWIND` pipelines | ✅ |
+| `EXISTS` in `WITH … WHERE` | ✅ |
+| `UNWIND list AS var MATCH (n {id: var})` | ✅ |
+| `MERGE (a)-[:REL]->(b)` — idempotent edge creation | ✅ |
 | Multi-label nodes `(n:A:B)` | ⚠️ Not yet implemented |
 | Subqueries `CALL { … }` | ⚠️ Partial |
 
@@ -155,6 +229,9 @@ sparrowdb checkpoint --db my.db
 
 # Database info
 sparrowdb info --db my.db
+
+# Export graph to DOT format (pipe to Graphviz)
+sparrowdb visualize --db my.db | dot -Tpng -o graph.png
 ```
 
 Build the CLI:
@@ -192,10 +269,15 @@ SparrowDB is built for low-overhead, in-process graph workloads:
 | Technique | What it means |
 |-----------|---------------|
 | **Factorized execution** | Multi-hop traversals avoid materialising O(N²) intermediate rows — friend-of-friend queries stay fast at scale |
-| **B-tree property index** | Range predicates (`WHERE age > 30`) use a sorted B-tree, not full scans |
+| **B-tree property index** | Equality lookups use an in-memory B-tree (`O(log n)`) rather than full label scans |
+| **TextIndex acceleration** | `CONTAINS` and `STARTS WITH` predicates are routed through an inverted index, not a full scan |
 | **Inverted text index** | Full-text search via `CALL db.index.fulltext.queryNodes` without an external search engine |
+| **External merge sort** | `ORDER BY` on large result sets spills sorted runs to disk and merges them — no unbounded heap allocation |
+| **execute_batch()** | Group multiple writes into one WAL `fsync` — throughput-critical bulk loads |
 | **WAL-backed durability** | Writes commit to the write-ahead log; no `fsync` storm on every property update |
+| **WAL encryption** | Optional XChaCha20-Poly1305 encryption of WAL payloads when a database key is set |
 | **SWMR concurrency** | Single-writer, multiple-reader — readers never block writers; snapshot isolation at no extra cost |
+| **Per-query timeout** | `execute_with_timeout(cypher, duration)` cancels runaway queries without killing the process |
 
 ---
 
