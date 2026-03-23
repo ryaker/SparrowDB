@@ -11,7 +11,7 @@
 //!   existence checks for `CREATE` patterns.
 
 use sparrowdb_catalog::catalog::Catalog;
-use sparrowdb_common::{Error, Result};
+use sparrowdb_common::Result;
 
 use crate::ast::{
     MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement, MatchWithStatement,
@@ -110,23 +110,19 @@ fn bind_path_pattern(pat: &PathPattern, catalog: &Catalog) -> Result<()> {
 }
 
 fn ensure_label(name: &str, catalog: &Catalog) -> Result<()> {
-    match catalog.get_label(name)? {
-        Some(_) => Ok(()),
-        None => Err(Error::InvalidArgument(format!("unknown label: {name}"))),
-    }
+    // SPA-245: unknown labels in MATCH patterns yield 0 rows at execution time
+    // (standard Cypher semantics).  The binder no longer rejects them — only
+    // I/O errors from the catalog are propagated.
+    let _ = catalog.get_label(name)?;
+    Ok(())
 }
 
-fn ensure_rel_type(rel_type: &str, catalog: &Catalog) -> Result<()> {
-    // Rel tables are keyed by (src_label_id, dst_label_id, rel_type).
-    // In the binder we just check that ANY rel table with this rel_type exists.
-    let tables = catalog.list_rel_tables()?;
-    if tables.iter().any(|(_, _, rt)| rt == rel_type) {
-        Ok(())
-    } else {
-        Err(Error::InvalidArgument(format!(
-            "unknown relationship type: {rel_type}"
-        )))
-    }
+fn ensure_rel_type(_rel_type: &str, catalog: &Catalog) -> Result<()> {
+    // SPA-245: unknown rel-types in MATCH patterns yield 0 rows at execution
+    // time.  We still call list_rel_tables to propagate any I/O errors, but we
+    // no longer return InvalidArgument when the type is absent.
+    let _ = catalog.list_rel_tables()?;
+    Ok(())
 }
 
 fn bind_match_optional_match(_mom: &MatchOptionalMatchStatement, _catalog: &Catalog) -> Result<()> {
@@ -158,11 +154,13 @@ mod tests {
         bind(stmt, &cat).expect("bind must succeed");
     }
 
+    /// SPA-245: unknown labels in MATCH patterns are no longer rejected by the
+    /// binder — the execution engine returns 0 rows instead of an error.
     #[test]
-    fn bind_unknown_label_err() {
+    fn bind_unknown_label_ok() {
         let (_dir, cat) = make_catalog();
         let stmt = parse("MATCH (n:Ghost) RETURN n.name").unwrap();
-        assert!(bind(stmt, &cat).is_err());
+        bind(stmt, &cat).expect("unknown label in MATCH must bind OK (SPA-245)");
     }
 
     #[test]
@@ -172,11 +170,13 @@ mod tests {
         bind(stmt, &cat).expect("bind must succeed");
     }
 
+    /// SPA-245: unknown rel-types in MATCH patterns are no longer rejected by
+    /// the binder — the execution engine returns 0 rows instead of an error.
     #[test]
-    fn bind_unknown_rel_err() {
+    fn bind_unknown_rel_ok() {
         let (_dir, cat) = make_catalog();
         let stmt = parse("MATCH (a:Person)-[:HATES]->(b:Person) RETURN b.name").unwrap();
-        assert!(bind(stmt, &cat).is_err());
+        bind(stmt, &cat).expect("unknown rel-type in MATCH must bind OK (SPA-245)");
     }
 
     /// SPA-156: CREATE with a label that is not yet in the catalog must bind

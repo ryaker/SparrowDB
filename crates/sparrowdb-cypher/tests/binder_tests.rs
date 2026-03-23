@@ -27,12 +27,13 @@ fn bind_match_known_label_succeeds() {
     bind(stmt, &cat).expect("bind must succeed for known label");
 }
 
+/// SPA-245: unknown labels in MATCH patterns no longer fail the binder —
+/// they yield 0 rows at execution time (standard Cypher semantics).
 #[test]
-fn bind_match_unknown_label_fails() {
+fn bind_match_unknown_label_succeeds() {
     let (_dir, cat) = make_catalog();
     let stmt = parse("MATCH (n:Ghost) RETURN n.name").expect("parse");
-    let result = bind(stmt, &cat);
-    assert!(result.is_err(), "Ghost label must fail binder");
+    bind(stmt, &cat).expect("Ghost label must bind OK (SPA-245)");
 }
 
 #[test]
@@ -50,12 +51,13 @@ fn bind_match_1hop_known_rel_succeeds() {
     bind(stmt, &cat).expect("bind 1-hop KNOWS must succeed");
 }
 
+/// SPA-245: unknown rel-types in MATCH patterns no longer fail the binder —
+/// they yield 0 rows at execution time (standard Cypher semantics).
 #[test]
-fn bind_match_unknown_rel_type_fails() {
+fn bind_match_unknown_rel_type_succeeds() {
     let (_dir, cat) = make_catalog();
     let stmt = parse("MATCH (a:Person)-[:HATES]->(b:Person) RETURN b.name").expect("parse");
-    let result = bind(stmt, &cat);
-    assert!(result.is_err(), "unknown rel type HATES must fail binder");
+    bind(stmt, &cat).expect("unknown rel type HATES must bind OK (SPA-245)");
 }
 
 #[test]
