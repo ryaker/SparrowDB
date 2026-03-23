@@ -21,6 +21,7 @@ use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{DeltaRecord, EdgeStore, RelTableId};
 use sparrowdb_storage::fulltext_index::FulltextIndex;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
+use sparrowdb_storage::property_index::PropertyIndex;
 use sparrowdb_storage::wal::WalReplayer;
 
 use crate::types::{QueryResult, Value};
@@ -52,6 +53,11 @@ pub struct Engine {
     pub db_root: std::path::PathBuf,
     /// Runtime query parameters supplied by the caller (e.g. `$name` → Value).
     pub params: HashMap<String, Value>,
+    /// In-memory B-tree property equality index (SPA-249).
+    ///
+    /// Built at `Engine::new` time by scanning all on-disk column files.
+    /// Enables O(log n) equality-filter scans instead of O(n) full scans.
+    pub prop_index: PropertyIndex,
 }
 
 impl Engine {
@@ -66,12 +72,27 @@ impl Engine {
         csrs: HashMap<u32, CsrForward>,
         db_root: &Path,
     ) -> Self {
+        // SPA-249: build property equality index from on-disk column files.
+        // Degrades gracefully on error — queries still work, just O(n).
+        let prop_index = match catalog.list_labels() {
+            Ok(labels) => {
+                // catalog returns (u16, String); PropertyIndex::build expects (u32, String).
+                let labels_u32: Vec<(u32, String)> =
+                    labels.into_iter().map(|(id, name)| (id as u32, name)).collect();
+                PropertyIndex::build(&store, &labels_u32)
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "SPA-249: property index build failed; disabled");
+                PropertyIndex::new()
+            }
+        };
         Engine {
             store,
             catalog,
             csrs,
             db_root: db_root.to_path_buf(),
             params: HashMap::new(),
+            prop_index,
         }
     }
 
@@ -1777,7 +1798,28 @@ impl Engine {
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
-        for slot in 0..hwm {
+        // SPA-249: try to use the property equality index when there is exactly
+        // one inline prop filter with an inline-encodable literal value.
+        // Overflow strings (> 7 bytes) cannot be indexed, so they fall back to
+        // full scan.  A WHERE clause is always applied per-slot afterward.
+        let index_candidate_slots: Option<Vec<u32>> =
+            try_index_lookup_for_props(&node.props, label_id_u32, &self.prop_index);
+
+        // Build an iterator over candidate slot values.  When the index narrows
+        // the set, iterate only those slots; otherwise iterate 0..hwm.
+        let slot_iter: Box<dyn Iterator<Item = u64>> = match index_candidate_slots {
+            Some(ref slots) => {
+                tracing::debug!(
+                    label = %label,
+                    candidates = slots.len(),
+                    "SPA-249: index fast path"
+                );
+                Box::new(slots.iter().map(|&s| s as u64))
+            }
+            None => Box::new(0..hwm),
+        };
+
+        for slot in slot_iter {
             let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
             if slot < 1024 || slot % 10_000 == 0 {
                 tracing::trace!(slot = slot, node_id = node_id.0, "scan emit");
@@ -4108,6 +4150,45 @@ fn value_to_store_value(val: Value) -> StoreValue {
 /// comparisons against stored raw column values.
 fn string_to_raw_u64(s: &str) -> u64 {
     StoreValue::Bytes(s.as_bytes().to_vec()).to_u64()
+}
+
+/// SPA-249: attempt an O(log n) index lookup for a node pattern's prop filters.
+///
+/// Returns `Some(slots)` when *all* of the following hold:
+/// 1. There is exactly one inline prop filter in `props`.
+/// 2. The filter value is a `Literal::Int` or a short `Literal::String` (≤ 7 bytes,
+///    i.e., it can be represented inline without a heap pointer).
+/// 3. The `(label_id, col_id)` pair is present in the index.
+///
+/// In all other cases (multiple filters, overflow string, param literal, no
+/// index entry) returns `None` so the caller falls back to a full O(n) scan.
+fn try_index_lookup_for_props(
+    props: &[sparrowdb_cypher::ast::PropEntry],
+    label_id: u32,
+    prop_index: &sparrowdb_storage::property_index::PropertyIndex,
+) -> Option<Vec<u32>> {
+    // Only handle the single-equality-filter case.
+    if props.len() != 1 {
+        return None;
+    }
+    let filter = &props[0];
+
+    // Encode the filter literal as a raw u64 (the same encoding used on disk).
+    let raw_value: u64 = match &filter.value {
+        Expr::Literal(Literal::Int(n)) => StoreValue::Int64(*n).to_u64(),
+        Expr::Literal(Literal::String(s)) if s.len() <= 7 => {
+            StoreValue::Bytes(s.as_bytes().to_vec()).to_u64()
+        }
+        // Overflow strings (> 7 bytes) carry a heap pointer; not indexable.
+        // Params and other expression types also fall back to full scan.
+        _ => return None,
+    };
+
+    let col_id = prop_name_to_col_id(&filter.key);
+    if !prop_index.is_indexed(label_id, col_id) {
+        return None;
+    }
+    Some(prop_index.lookup(label_id, col_id, raw_value).to_vec())
 }
 
 /// Map a property name to a col_id via the canonical FNV-1a hash.
