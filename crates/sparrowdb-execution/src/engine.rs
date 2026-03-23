@@ -57,9 +57,12 @@ pub struct Engine {
     pub params: HashMap<String, Value>,
     /// In-memory B-tree property equality index (SPA-249).
     ///
-    /// Built at `Engine::new` time by scanning all on-disk column files.
-    /// Enables O(log n) equality-filter scans instead of O(n) full scans.
-    pub prop_index: PropertyIndex,
+    /// Loaded **lazily** on first use for each `(label_id, col_id)` pair that a
+    /// query actually filters on.  Queries with no property filter (e.g.
+    /// `COUNT(*)`, hop traversals) never touch this and pay zero build cost.
+    /// `RefCell` provides interior mutability so that `build_for` can be called
+    /// from `&self` scan helpers without changing every method signature.
+    pub prop_index: std::cell::RefCell<PropertyIndex>,
     /// In-memory text search index for CONTAINS and STARTS WITH (SPA-251).
     ///
     /// Built at `Engine::new` alongside `prop_index`.  Stores sorted
@@ -88,23 +91,27 @@ impl Engine {
         csrs: HashMap<u32, CsrForward>,
         db_root: &Path,
     ) -> Self {
-        // SPA-249: build property equality index from on-disk column files.
-        // Degrades gracefully on error — queries still work, just O(n).
-        let (prop_index, text_index) = match catalog.list_labels() {
+        // SPA-249 (lazy fix): property index is now built on demand per
+        // (label_id, col_id) pair via PropertyIndex::build_for, called from
+        // execute_scan just before the first lookup for that pair.  Queries
+        // with no property filter (COUNT(*), hop traversals) never trigger
+        // any index I/O at all.
+        //
+        // SPA-251: text search index is still built eagerly because CONTAINS /
+        // STARTS WITH predicates arrive via the WHERE clause and we don't know
+        // the col_id until scan time; the text index build cost is O(string
+        // cells only) which is typically much less than the full column scan.
+        let text_index = match catalog.list_labels() {
             Ok(labels) => {
-                // catalog returns (u16, String); index builders expect (u32, String).
                 let labels_u32: Vec<(u32, String)> = labels
                     .into_iter()
                     .map(|(id, name)| (id as u32, name))
                     .collect();
-                let pi = PropertyIndex::build(&store, &labels_u32);
-                // SPA-251: build text search index alongside property index.
-                let ti = TextIndex::build(&store, &labels_u32);
-                (pi, ti)
+                TextIndex::build(&store, &labels_u32)
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "SPA-249/SPA-251: index build failed; disabled");
-                (PropertyIndex::new(), TextIndex::new())
+                tracing::warn!(error = ?e, "SPA-251: text index build failed; CONTAINS/STARTS WITH disabled");
+                TextIndex::new()
             }
         };
         Engine {
@@ -113,7 +120,7 @@ impl Engine {
             csrs,
             db_root: db_root.to_path_buf(),
             params: HashMap::new(),
-            prop_index,
+            prop_index: std::cell::RefCell::new(PropertyIndex::new()),
             text_index,
             deadline: None,
         }
@@ -2647,20 +2654,50 @@ impl Engine {
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
+        // SPA-249 (lazy build): ensure the property index is loaded for every
+        // column referenced by inline prop filters before attempting a lookup.
+        // Each build_for call is a cache-hit no-op after the first time.
+        // We acquire and drop the mutable borrow before the immutable lookup below.
+        for p in &node.props {
+            let col_id = sparrowdb_common::col_id_of(&p.key);
+            // Errors are suppressed inside build_for; index falls back to full scan.
+            let _ = self
+                .prop_index
+                .borrow_mut()
+                .build_for(&self.store, label_id_u32, col_id);
+        }
+
         // SPA-249: try to use the property equality index when there is exactly
         // one inline prop filter with an inline-encodable literal value.
         // Overflow strings (> 7 bytes) cannot be indexed, so they fall back to
         // full scan.  A WHERE clause is always applied per-slot afterward.
-        let index_candidate_slots: Option<Vec<u32>> =
-            try_index_lookup_for_props(&node.props, label_id_u32, &self.prop_index);
+        let index_candidate_slots: Option<Vec<u32>> = {
+            let prop_index_ref = self.prop_index.borrow();
+            try_index_lookup_for_props(&node.props, label_id_u32, &prop_index_ref)
+        };
 
         // SPA-249 Phase 1b: when the inline-prop index has no candidates, try to
         // use the property index for a WHERE-clause equality predicate
         // (`WHERE n.prop = literal`).  The WHERE clause is still re-evaluated
         // per slot for correctness.
+        //
+        // We pre-build the index for any single-equality WHERE prop so the lazy
+        // cache is populated before the immutable borrow below.
+        if index_candidate_slots.is_none() {
+            if let Some(wexpr) = m.where_clause.as_ref() {
+                for prop_name in where_clause_eq_prop_names(wexpr, node.var.as_str()) {
+                    let col_id = sparrowdb_common::col_id_of(prop_name);
+                    let _ =
+                        self.prop_index
+                            .borrow_mut()
+                            .build_for(&self.store, label_id_u32, col_id);
+                }
+            }
+        }
         let where_eq_candidate_slots: Option<Vec<u32>> = if index_candidate_slots.is_none() {
+            let prop_index_ref = self.prop_index.borrow();
             m.where_clause.as_ref().and_then(|wexpr| {
-                try_where_eq_index_lookup(wexpr, node.var.as_str(), label_id_u32, &self.prop_index)
+                try_where_eq_index_lookup(wexpr, node.var.as_str(), label_id_u32, &prop_index_ref)
             })
         } else {
             None
@@ -2669,14 +2706,28 @@ impl Engine {
         // SPA-249 Phase 2: when neither equality path fired, try to use the
         // property index for a WHERE-clause range predicate (`>`, `>=`, `<`, `<=`,
         // or a compound AND of two half-open bounds on the same property).
+        //
+        // Pre-build for any range-predicate WHERE props before the immutable borrow.
+        if index_candidate_slots.is_none() && where_eq_candidate_slots.is_none() {
+            if let Some(wexpr) = m.where_clause.as_ref() {
+                for prop_name in where_clause_range_prop_names(wexpr, node.var.as_str()) {
+                    let col_id = sparrowdb_common::col_id_of(prop_name);
+                    let _ =
+                        self.prop_index
+                            .borrow_mut()
+                            .build_for(&self.store, label_id_u32, col_id);
+                }
+            }
+        }
         let where_range_candidate_slots: Option<Vec<u32>> =
             if index_candidate_slots.is_none() && where_eq_candidate_slots.is_none() {
+                let prop_index_ref = self.prop_index.borrow();
                 m.where_clause.as_ref().and_then(|wexpr| {
                     try_where_range_index_lookup(
                         wexpr,
                         node.var.as_str(),
                         label_id_u32,
-                        &self.prop_index,
+                        &prop_index_ref,
                     )
                 })
             } else {
@@ -5404,6 +5455,78 @@ fn try_text_index_lookup(
     };
 
     Some(slots)
+}
+
+/// SPA-249 (lazy build): Extract all property names referenced in a WHERE-clause
+/// equality predicate (`n.prop = literal` or `literal = n.prop`) so the caller
+/// can pre-build the lazy index for those `(label_id, col_id)` pairs.
+///
+/// Returns an empty vec if the expression does not match the pattern.
+fn where_clause_eq_prop_names<'a>(expr: &'a Expr, node_var: &str) -> Vec<&'a str> {
+    let (left, right) = match expr {
+        Expr::BinOp {
+            left,
+            op: BinOpKind::Eq,
+            right,
+        } => (left.as_ref(), right.as_ref()),
+        _ => return vec![],
+    };
+    if let Expr::PropAccess { var, prop } = left {
+        if var.as_str() == node_var {
+            return vec![prop.as_str()];
+        }
+    }
+    if let Expr::PropAccess { var, prop } = right {
+        if var.as_str() == node_var {
+            return vec![prop.as_str()];
+        }
+    }
+    vec![]
+}
+
+/// SPA-249 (lazy build): Extract all property names referenced in a WHERE-clause
+/// range predicate (`n.prop > literal`, etc., or compound AND) so the caller
+/// can pre-build the lazy index for those `(label_id, col_id)` pairs.
+///
+/// Returns an empty vec if the expression does not match the pattern.
+fn where_clause_range_prop_names<'a>(expr: &'a Expr, node_var: &str) -> Vec<&'a str> {
+    let is_range_op = |op: &BinOpKind| {
+        matches!(
+            op,
+            BinOpKind::Gt | BinOpKind::Ge | BinOpKind::Lt | BinOpKind::Le
+        )
+    };
+
+    // Simple range: `n.prop OP literal` or `literal OP n.prop`.
+    if let Expr::BinOp { left, op, right } = expr {
+        if is_range_op(op) {
+            if let Expr::PropAccess { var, prop } = left.as_ref() {
+                if var.as_str() == node_var {
+                    return vec![prop.as_str()];
+                }
+            }
+            if let Expr::PropAccess { var, prop } = right.as_ref() {
+                if var.as_str() == node_var {
+                    return vec![prop.as_str()];
+                }
+            }
+            return vec![];
+        }
+    }
+
+    // Compound AND: `lhs AND rhs` — collect from both sides.
+    if let Expr::BinOp {
+        left,
+        op: BinOpKind::And,
+        right,
+    } = expr
+    {
+        let mut names: Vec<&'a str> = where_clause_range_prop_names(left, node_var);
+        names.extend(where_clause_range_prop_names(right, node_var));
+        return names;
+    }
+
+    vec![]
 }
 
 /// SPA-249 Phase 1b: Try to use the property equality index for a WHERE-clause
