@@ -1,4 +1,3 @@
-#![doc = include_str!("../../../README.md")]
 // Suppress rustdoc warnings for Markdown links that are valid on GitHub/docs.rs
 // but cannot be resolved as Rust item paths (e.g., [LICENSE], [docs/...]).
 #![allow(rustdoc::bare_urls)]
