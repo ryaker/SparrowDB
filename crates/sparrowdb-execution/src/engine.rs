@@ -5477,6 +5477,7 @@ fn try_where_range_index_lookup(
 
     /// Extract a single (prop_name, lo, hi) range from a simple comparison.
     /// Returns None if not a recognised range pattern.
+    #[allow(clippy::type_complexity)]
     fn extract_single_bound<'a>(
         expr: &'a Expr,
         node_var: &'a str,
