@@ -25,18 +25,22 @@ If your data is fundamentally relational — recommendations, social graphs, dep
 
 ## Quick Start
 
-```rust
+```rust,no_run
 use sparrowdb::GraphDb;
 
-let db = GraphDb::open("social.db")?;
+fn main() -> sparrowdb::Result<()> {
+    let db = GraphDb::open(std::path::Path::new("social.db"))?;
 
-db.execute("CREATE (alice:Person {name: 'Alice', age: 30})")?;
-db.execute("CREATE (bob:Person   {name: 'Bob',   age: 25})")?;
-db.execute("MATCH (a:Person {name:'Alice'}), (b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)")?;
+    db.execute("CREATE (alice:Person {name: 'Alice', age: 30})")?;
+    db.execute("CREATE (bob:Person   {name: 'Bob',   age: 25})")?;
+    db.execute("MATCH (a:Person {name:'Alice'}), (b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b)")?;
 
-// Who does Alice know? Who do *they* know?
-let fof = db.execute("MATCH (a:Person {name:'Alice'})-[:KNOWS*1..2]->(f) RETURN DISTINCT f.name")?;
-// → [["Bob"], ["Carol"]]  (Carol is a friend-of-friend)
+    // Who does Alice know? Who do *they* know?
+    let fof = db.execute("MATCH (a:Person {name:'Alice'})-[:KNOWS*1..2]->(f) RETURN DISTINCT f.name")?;
+    // -> [["Bob"], ["Carol"]]  (Carol is a friend-of-friend)
+    let _ = fof;
+    Ok(())
+}
 ```
 
 That's it. The database is a directory on disk. Ship it.
@@ -195,12 +199,12 @@ cargo install sparrowdb --bin sparrowdb-mcp
 
 ### Rust
 
-```rust
+```rust,no_run
 use sparrowdb::GraphDb;
 use std::time::Duration;
 
 fn main() -> sparrowdb::Result<()> {
-    let db = GraphDb::open("my.db")?;
+    let db = GraphDb::open(std::path::Path::new("my.db"))?;
 
     // Bulk load — one fsync for all five writes
     db.execute_batch(&[
@@ -395,24 +399,35 @@ RETURN emp.name, [m IN collect(mgr) | m.name + ' (' + m.title + ')'] AS chain
 
 Protect data at rest. The key must be exactly 32 bytes. Wrong key = immediate error, never silently decrypted garbage.
 
-```rust
-let mut key = [0u8; 32];
-// Use argon2 / scrypt in production to derive from a passphrase
-key[..16].copy_from_slice(b"my-secret-phrase");
+```rust,no_run
+use sparrowdb::GraphDb;
 
-let db = GraphDb::open_encrypted("secure.db", key)?;
-db.execute("CREATE (n:Secret {data: 'classified'})")?;
-// Every WAL entry is XChaCha20-Poly1305 encrypted before hitting disk
+fn main() -> sparrowdb::Result<()> {
+    let mut key = [0u8; 32];
+    // Use argon2 / scrypt in production to derive from a passphrase
+    key[..16].copy_from_slice(b"my-secret-phrase");
+
+    let db = GraphDb::open_encrypted(std::path::Path::new("secure.db"), key)?;
+    db.execute("CREATE (n:Secret {data: 'classified'})")?;
+    // Every WAL entry is XChaCha20-Poly1305 encrypted before hitting disk
+    Ok(())
+}
 ```
 
 ### Graph Visualization
 
-```rust
-let dot = db.export_dot()?;
-std::fs::write("graph.dot", &dot)?;
-// Render:
-//   dot -Tsvg graph.dot -o graph.svg
-//   dot -Tpng graph.dot -o graph.png
+```rust,no_run
+use sparrowdb::GraphDb;
+
+fn main() -> sparrowdb::Result<()> {
+    let db = GraphDb::open(std::path::Path::new("my.db"))?;
+    let dot = db.export_dot()?;
+    std::fs::write("graph.dot", &dot)?;
+    // Render:
+    //   dot -Tsvg graph.dot -o graph.svg
+    //   dot -Tpng graph.dot -o graph.png
+    Ok(())
+}
 ```
 
 ```bash
@@ -421,48 +436,68 @@ sparrowdb visualize --db my.db | dot -Tsvg -o graph.svg
 
 ### Full-Text Search
 
-```rust
-// Index once
-db.execute(
-    "CALL db.index.fulltext.createNodeIndex('docs', ['Document'], ['content', 'title'])"
-)?;
+```rust,no_run
+use sparrowdb::GraphDb;
 
-// Index is maintained automatically on writes
-db.execute("CREATE (n:Document {title: 'Rust graph databases', content: 'Embedded and fast'})")?;
+fn main() -> sparrowdb::Result<()> {
+    let db = GraphDb::open(std::path::Path::new("my.db"))?;
 
-// Query — relevance ranked
-let results = db.execute(
-    "CALL db.index.fulltext.queryNodes('docs', 'embedded graph') \
-     YIELD node, score \
-     RETURN node.title, score ORDER BY score DESC"
-)?;
+    // Index once
+    db.execute(
+        "CALL db.index.fulltext.createNodeIndex('docs', ['Document'], ['content', 'title'])"
+    )?;
+
+    // Index is maintained automatically on writes
+    db.execute("CREATE (n:Document {title: 'Rust graph databases', content: 'Embedded and fast'})")?;
+
+    // Query -- relevance ranked
+    let results = db.execute(
+        "CALL db.index.fulltext.queryNodes('docs', 'embedded graph') \
+         YIELD node, score \
+         RETURN node.title, score ORDER BY score DESC"
+    )?;
+    let _ = results;
+    Ok(())
+}
 ```
 
 ### Per-Query Timeout
 
-```rust
+```rust,no_run
+use sparrowdb::GraphDb;
 use std::time::Duration;
 
-match db.execute_with_timeout(
-    "MATCH (a)-[:FOLLOWS*1..10]->(b) RETURN b.name",
-    Duration::from_secs(5),
-) {
-    Ok(rows) => println!("{} rows", rows.rows.len()),
-    Err(e) if e.to_string().contains("timeout") => eprintln!("Query cancelled"),
-    Err(e) => return Err(e.into()),
+fn main() -> sparrowdb::Result<()> {
+    let db = GraphDb::open(std::path::Path::new("my.db"))?;
+
+    match db.execute_with_timeout(
+        "MATCH (a)-[:FOLLOWS*1..10]->(b) RETURN b.name",
+        Duration::from_secs(5),
+    ) {
+        Ok(rows) => println!("{} rows", rows.rows.len()),
+        Err(e) if e.to_string().contains("timeout") => eprintln!("Query cancelled"),
+        Err(e) => return Err(e),
+    }
+    Ok(())
 }
 ```
 
 ### Bulk Load (single fsync)
 
-```rust
-db.execute_batch(&[
-    "CREATE (n:Product {id: 1, name: 'Widget',   price: 9.99})",
-    "CREATE (n:Product {id: 2, name: 'Gadget',   price: 24.99})",
-    "CREATE (n:Product {id: 3, name: 'Doohickey',price: 4.99})",
-    "MATCH (a:Product {id:1}),(b:Product {id:2}) CREATE (a)-[:RELATED]->(b)",
-])?;
-// All four statements committed in one WAL fsync
+```rust,no_run
+use sparrowdb::GraphDb;
+
+fn main() -> sparrowdb::Result<()> {
+    let db = GraphDb::open(std::path::Path::new("my.db"))?;
+    db.execute_batch(&[
+        "CREATE (n:Product {id: 1, name: 'Widget',   price: 9.99})",
+        "CREATE (n:Product {id: 2, name: 'Gadget',   price: 24.99})",
+        "CREATE (n:Product {id: 3, name: 'Doohickey',price: 4.99})",
+        "MATCH (a:Product {id:1}),(b:Product {id:2}) CREATE (a)-[:RELATED]->(b)",
+    ])?;
+    // All four statements committed in one WAL fsync
+    Ok(())
+}
 ```
 
 ### Neo4j Migration
@@ -498,26 +533,26 @@ SparrowDB does not yet have published LDBC SNB benchmarks (that's on the roadmap
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Language Bindings                                                   │
-│  Rust · Python (PyO3) · Node.js (napi-rs) · Ruby (Magnus)          │
-│  CLI (sparrowdb) · MCP Server (sparrowdb-mcp)                       │
-├──────────────────────────────────────────────────────────────────────┤
-│  Cypher Frontend  (sparrowdb-cypher)                                 │
-│  Lexer → AST → Binder (name resolution, type checking)              │
-├──────────────────────────────────────────────────────────────────────┤
-│  Factorized Execution Engine  (sparrowdb-execution)                  │
-│  Physical plan · iterator model · aggregation                        │
-│  External merge sort · EXISTS evaluation · deadline checks           │
-├──────────────────────────────────────────────────────────────────────┤
-│  Catalog  (sparrowdb-catalog)                                        │
-│  Label registry · B-tree property index · Inverted text index       │
-├──────────────────────────────────────────────────────────────────────┤
-│  Storage  (sparrowdb-storage)                                        │
-│  Write-Ahead Log · CSR adjacency store · Delta log                  │
-│  XChaCha20-Poly1305 encryption (optional) · Crash recovery · SWMR   │
-└──────────────────────────────────────────────────────────────────────┘
+```text
++------------------------------------------------------------------------+
+|  Language Bindings                                                     |
+|  Rust - Python (PyO3) - Node.js (napi-rs) - Ruby (Magnus)            |
+|  CLI (sparrowdb) - MCP Server (sparrowdb-mcp)                         |
++------------------------------------------------------------------------+
+|  Cypher Frontend  (sparrowdb-cypher)                                   |
+|  Lexer -> AST -> Binder (name resolution, type checking)              |
++------------------------------------------------------------------------+
+|  Factorized Execution Engine  (sparrowdb-execution)                    |
+|  Physical plan - iterator model - aggregation                          |
+|  External merge sort - EXISTS evaluation - deadline checks             |
++------------------------------------------------------------------------+
+|  Catalog  (sparrowdb-catalog)                                          |
+|  Label registry - B-tree property index - Inverted text index         |
++------------------------------------------------------------------------+
+|  Storage  (sparrowdb-storage)                                          |
+|  Write-Ahead Log - CSR adjacency store - Delta log                    |
+|  XChaCha20-Poly1305 encryption (optional) - Crash recovery - SWMR    |
++------------------------------------------------------------------------+
 ```
 
 **Crate layout:**
