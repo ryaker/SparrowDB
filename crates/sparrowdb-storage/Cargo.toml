@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Storage engine (WAL, node store, edge store, CSR) for SparrowDB"
+documentation = "https://docs.rs/sparrowdb-storage"
+readme.workspace = true
 keywords = ["graph", "database", "storage", "wal", "embedded"]
 categories = ["database", "filesystem"]
 

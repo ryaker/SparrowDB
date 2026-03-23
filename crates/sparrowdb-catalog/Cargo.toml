@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Schema catalog (labels, properties, rel-types) for SparrowDB"
+documentation = "https://docs.rs/sparrowdb-catalog"
+readme.workspace = true
 keywords = ["graph", "database", "schema", "catalog", "embedded"]
 categories = ["database", "data-structures"]
 
