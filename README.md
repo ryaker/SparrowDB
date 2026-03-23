@@ -75,7 +75,10 @@ SparrowDB is the right choice when:
 - **You need multi-hop queries.** `MATCH (a)-[:FOLLOWS*1..3]->(b)` is one query. In SQL it's recursive CTEs all the way down.
 - **You're embedding into a CLI, desktop app, agent, or edge service.** SparrowDB opens in milliseconds and has no runtime overhead when idle.
 
-SparrowDB is *not* the right choice when you need distributed writes across many nodes, or when your graph has billions of edges and you need horizontal sharding. Use Neo4j Aura or DGraph for that.
+SparrowDB is *not* the right choice when:
+
+- **Multi-hop traversal is your primary workload.** 1-hop to 5-hop queries on high-fanout graphs (social networks, web graphs) is where Neo4j's battle-hardened CSR layout and parallel execution show. SparrowDB is 70-130x behind on those queries today. That gap narrows over time, but if deep traversal is your core workload, use Neo4j.
+- **You need distributed writes across many nodes**, or your graph has billions of edges and requires horizontal sharding. Use Neo4j Aura or DGraph for that.
 
 ---
 
@@ -514,20 +517,45 @@ sparrowdb import --neo4j-csv nodes.csv,relationships.csv --db my.db
 
 ## Performance Characteristics
 
-SparrowDB is designed for in-process, latency-sensitive workloads — not distributed analytics:
+### Benchmark Results — SNAP Facebook Dataset
+
+Measured against Neo4j 5.x (server, JVM warmed). All figures are p50 latency in microseconds. Dataset: SNAP Facebook social graph.
+
+**The headline:** Indexed point lookups beat a running Neo4j server by 3x. No JVM. No server. No network hop.
+
+| Query | SparrowDB (µs) | Neo4j (µs) | Result |
+|-------|---------------|-----------|--------|
+| Q1 Point Lookup (indexed) | 444 | 1,394 | **3.1x faster** |
+| Q2 Range Filter | 113,931 | 1,605 | 71x behind |
+| Q3 1-Hop Traversal | 50,575 | 731 | 69x behind |
+| Q4 2-Hop Traversal | 48,387 | 473 | 102x behind |
+| Q5 Variable Path | 73,397 | 548 | 134x behind |
+| Q6 COUNT(*) | 7,607 | 289 | 26x behind |
+| Q7 Top-10 Degree | 1,279,071 | 18,386 | 70x behind |
+| Q8 Mutual Friends | 46,549 | 466 | 100x behind |
+| Cold start | 37 | 32,000 | **860x faster** |
+
+**Where SparrowDB wins:** Q1 and cold start. Indexed point lookups bypass the JVM and server stack entirely. Cold start at 37µs means SparrowDB is viable in serverless functions and short-lived CLI processes where Neo4j's 32ms startup is disqualifying.
+
+**Where SparrowDB trails:** Multi-hop traversal (Q3-Q5, Q8) and high-cardinality aggregation (Q7). Neo4j's CSR layout is purpose-built for high-fanout graph walks with parallel execution. SparrowDB is 70-134x behind on these queries. That is a structural gap, not a tuning issue. It narrows over time as the engine matures (see Roadmap), but it is real today.
+
+**What this means in practice:**
+
+- Use SparrowDB for: embedded apps, CLIs, agents, edge services, recommendation engines, and workloads dominated by point lookups, writes, and shallow traversals.
+- Use Neo4j for: deep multi-hop traversal on large social or web graphs as the primary query pattern.
+
+### Engine Design
 
 | Technique | What it buys you |
 |-----------|-----------------|
-| **Factorized execution** | Friend-of-friend at 1M nodes stays fast — no O(N²) intermediate rows |
+| **Factorized execution** | Multi-hop traversals avoid materializing O(N²) intermediate rows |
 | **B-tree property index** | Equality lookups: O(log n), not a full label scan |
 | **Inverted text index** | `CONTAINS` / `STARTS WITH` without scanning every node |
 | **External merge sort** | `ORDER BY` on results larger than RAM — sorted runs spill to disk |
-| **`execute_batch()`** | Orders-of-magnitude faster bulk loads — one `fsync` for N writes |
+| **`execute_batch()`** | Bulk loads committed in one `fsync` |
 | **SWMR concurrency** | Concurrent readers at zero extra cost; readers never block writers |
-| **Zero-copy open** | Opens in < 1ms — suitable for serverless and short-lived processes |
+| **Zero-copy open** | Opens in under 1ms — suitable for serverless and short-lived processes |
 | **GIL-released Python** | Python threads can issue parallel reads without contention |
-
-SparrowDB does not yet have published LDBC SNB benchmarks (that's on the roadmap). What we can say: for graphs that fit on a single machine — up to tens of millions of nodes and edges — it performs well. Pull requests with reproducible benchmarks are welcome.
 
 ---
 
@@ -680,10 +708,25 @@ We ship fast. The API is stable enough to build on, but we're still adding featu
 - WAL CRC32C integrity checksums (SPA-253)
 - HTTP/SSE transport layer (SPA-231)
 - Multi-label nodes `(n:A:B)` (SPA-200)
-- LDBC SNB benchmarks (SPA-111)
-- Publish to PyPI / npm
+- Publish SparrowOntology to crates.io (SPA-226)
+- Architecture doc
 
 Follow along: [github.com/ryaker/SparrowDB](https://github.com/ryaker/SparrowDB)
+
+---
+
+## Roadmap
+
+These are the active workstreams that will close the most meaningful gaps:
+
+| Ticket | Work | Why it matters |
+|--------|------|----------------|
+| SPA-272 | Degree cache for top-K degree queries | Q7 (Top-10 Degree) is 70x behind Neo4j today. A pre-computed degree index eliminates the full adjacency scan. |
+| SPA-253 | WAL CRC32C integrity checksums | Detects bit-rot and incomplete writes on crash. Required before 1.0. |
+| SPA-226 | Publish SparrowOntology to crates.io | Makes the ontology layer reusable as a standalone dependency. |
+| — | Architecture doc | Detailed write-up of the storage layout, execution model, and CSR format to support contributors. |
+
+The traversal gap (Q3-Q8) is also on the radar. The engine today is single-threaded and does not use a native CSR layout for adjacency walks. Parallel traversal and a tighter adjacency representation are the two structural changes that move those numbers.
 
 ---
 
