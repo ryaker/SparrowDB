@@ -112,6 +112,69 @@ impl Parser {
             )))
         }
     }
+
+    /// Consume the next token and return it as a property-name string.
+    ///
+    /// Cypher allows keywords to appear as property names when they follow a
+    /// dot (`n.count`) or appear as map keys (`{count: 42}`).  This helper
+    /// accepts any keyword token that is syntactically unambiguous in a
+    /// property-name position and converts it to its lowercase string
+    /// equivalent (SPA-265).
+    fn advance_as_prop_name(&mut self) -> Result<String> {
+        match self.advance().clone() {
+            Token::Ident(s) => Ok(s),
+            // Aggregate and common keywords that users legitimately use as
+            // property names.
+            Token::Count => Ok("count".into()),
+            Token::With => Ok("with".into()),
+            Token::As => Ok("as".into()),
+            Token::In => Ok("in".into()),
+            Token::Is => Ok("is".into()),
+            Token::Not => Ok("not".into()),
+            Token::And => Ok("and".into()),
+            Token::Or => Ok("or".into()),
+            Token::Contains => Ok("contains".into()),
+            Token::StartsWith => Ok("starts".into()),
+            Token::EndsWith => Ok("ends".into()),
+            Token::Null => Ok("null".into()),
+            Token::True => Ok("true".into()),
+            Token::False => Ok("false".into()),
+            Token::Set => Ok("set".into()),
+            Token::Delete => Ok("delete".into()),
+            Token::Detach => Ok("detach".into()),
+            Token::Merge => Ok("merge".into()),
+            Token::Match => Ok("match".into()),
+            Token::Where => Ok("where".into()),
+            Token::Return => Ok("return".into()),
+            Token::Order => Ok("order".into()),
+            Token::By => Ok("by".into()),
+            Token::Asc => Ok("asc".into()),
+            Token::Desc => Ok("desc".into()),
+            Token::Limit => Ok("limit".into()),
+            Token::Skip => Ok("skip".into()),
+            Token::Distinct => Ok("distinct".into()),
+            Token::Optional => Ok("optional".into()),
+            Token::Union => Ok("union".into()),
+            Token::Unwind => Ok("unwind".into()),
+            Token::Create => Ok("create".into()),
+            Token::Exists => Ok("exists".into()),
+            Token::Any => Ok("any".into()),
+            Token::All => Ok("all".into()),
+            Token::NoneKw => Ok("none".into()),
+            Token::Single => Ok("single".into()),
+            Token::Call => Ok("call".into()),
+            Token::Yield => Ok("yield".into()),
+            Token::Case => Ok("case".into()),
+            Token::When => Ok("when".into()),
+            Token::Then => Ok("then".into()),
+            Token::Else => Ok("else".into()),
+            Token::End => Ok("end".into()),
+            other => Err(Error::InvalidArgument(format!(
+                "expected property name, got {:?}",
+                other
+            ))),
+        }
+    }
 }
 
 // ── Statement dispatch ────────────────────────────────────────────────────────
@@ -1444,15 +1507,9 @@ impl Parser {
         }
 
         loop {
-            let key = match self.advance().clone() {
-                Token::Ident(s) => s,
-                other => {
-                    return Err(Error::InvalidArgument(format!(
-                        "expected property key, got {:?}",
-                        other
-                    )))
-                }
-            };
+            // SPA-265: property keys in map literals may be keyword tokens
+            // (e.g. `{count: 42}`).
+            let key = self.advance_as_prop_name()?;
             self.expect_tok(&Token::Colon)?;
             let value = self.parse_expr()?;
             entries.push(PropEntry { key, value });
@@ -1722,15 +1779,8 @@ impl Parser {
                 if matches!(next2, Token::Dot) {
                     self.advance(); // var
                     self.advance(); // .
-                    let prop = match self.advance().clone() {
-                        Token::Ident(s) => s,
-                        other => {
-                            return Err(Error::InvalidArgument(format!(
-                                "expected property name, got {:?}",
-                                other
-                            )))
-                        }
-                    };
+                                    // SPA-265: property names may be keyword tokens (e.g. `n.count`).
+                    let prop = self.advance_as_prop_name()?;
                     Ok(Expr::PropAccess { var, prop })
                 } else if matches!(next2, Token::LParen) {
                     // Special-case shortestPath(…) and allShortestPaths(…) — SPA-136.
