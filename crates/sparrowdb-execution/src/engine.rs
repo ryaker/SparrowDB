@@ -12,9 +12,10 @@ use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
     BinOpKind, CallStatement, CreateStatement, Expr, ListPredicateKind, Literal,
-    MatchCreateStatement, MatchMergeRelStatement, MatchMutateStatement, MatchOptionalMatchStatement,
-    MatchStatement, MatchWithStatement, Mutation, OptionalMatchStatement, PathPattern, PipelineStage,
-    PipelineStatement, ReturnItem, SortDir, Statement, UnionStatement, UnwindStatement, WithClause,
+    MatchCreateStatement, MatchMergeRelStatement, MatchMutateStatement,
+    MatchOptionalMatchStatement, MatchStatement, MatchWithStatement, Mutation,
+    OptionalMatchStatement, PathPattern, PipelineStage, PipelineStatement, ReturnItem, SortDir,
+    Statement, UnionStatement, UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::{CsrBackward, CsrForward};
