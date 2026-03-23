@@ -68,6 +68,8 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
         // CALL: procedure name and args are validated at execution time by the
         // procedure dispatcher.  No catalog lookups are required here.
         Statement::Call(_) => {}
+        // Pipeline: label binding is deferred to execution time (SPA-134).
+        Statement::Pipeline(_) => {}
     }
     Ok(BoundStatement { inner: stmt })
 }

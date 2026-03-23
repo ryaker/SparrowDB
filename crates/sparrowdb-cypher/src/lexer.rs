@@ -70,6 +70,9 @@ pub enum Token {
     Dash,      // -
     Pipe,      // |
     Star,      // *
+    Plus,      // +
+    Slash,     // /
+    Percent,   // %
     DotDot,    // ..
 
     // Operators
@@ -203,6 +206,18 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     i += 1;
                     Token::Dash
                 }
+            }
+            '+' => {
+                i += 1;
+                Token::Plus
+            }
+            '/' => {
+                i += 1;
+                Token::Slash
+            }
+            '%' => {
+                i += 1;
+                Token::Percent
             }
             '$' => {
                 i += 1;

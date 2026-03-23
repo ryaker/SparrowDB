@@ -9,8 +9,8 @@ use crate::ast::{
     BinOpKind, CallStatement, CreateStatement, EdgeDir, ExistsPattern, Expr, ListPredicateKind,
     Literal, MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement,
     MatchStatement, MergeStatement, Mutation, NodePattern, OptionalMatchStatement, PathPattern,
-    PropEntry, RelPattern, ReturnClause, ReturnItem, ShortestPathExpr, SortDir, Statement,
-    UnionStatement, UnwindStatement,
+    PipelineStage, PipelineStatement, PropEntry, RelPattern, ReturnClause, ReturnItem,
+    ShortestPathExpr, SortDir, Statement, UnionStatement, UnwindStatement, WithClause, WithItem,
 };
 use crate::lexer::{tokenize, Token};
 
@@ -556,7 +556,7 @@ impl Parser {
         patterns: Vec<PathPattern>,
         match_where: Option<Expr>,
     ) -> Result<Statement> {
-        use crate::ast::{MatchWithStatement, WithClause, WithItem};
+        use crate::ast::MatchWithStatement;
 
         // Consume WITH token.
         self.expect_tok(&Token::With)?;
@@ -588,21 +588,9 @@ impl Parser {
             where_clause: with_where,
         };
 
-        // RETURN clause.
-        self.expect_tok(&Token::Return)?;
-        let distinct = if matches!(self.peek(), Token::Distinct) {
-            self.advance();
-            true
-        } else {
-            false
-        };
-        let return_items = self.parse_return_items()?;
-        let return_clause = crate::ast::ReturnClause {
-            items: return_items,
-        };
-
-        // ORDER BY
-        let order_by = if matches!(self.peek(), Token::Order) {
+        // Optional ORDER BY / SKIP / LIMIT that belong to this WITH stage.
+        // These are consumed before checking for a continuation clause (MATCH/WITH/UNWIND).
+        let with_order_by = if matches!(self.peek(), Token::Order) {
             self.advance();
             self.expect_tok(&Token::By)?;
             self.parse_order_by_items()?
@@ -610,8 +598,7 @@ impl Parser {
             vec![]
         };
 
-        // SKIP
-        let skip = if matches!(self.peek(), Token::Skip) {
+        let with_skip = if matches!(self.peek(), Token::Skip) {
             self.advance();
             match self.advance().clone() {
                 Token::Integer(n) => {
@@ -631,8 +618,7 @@ impl Parser {
             None
         };
 
-        // LIMIT
-        let limit = if matches!(self.peek(), Token::Limit) {
+        let with_limit = if matches!(self.peek(), Token::Limit) {
             self.advance();
             match self.advance().clone() {
                 Token::Integer(n) => {
@@ -652,16 +638,309 @@ impl Parser {
             None
         };
 
-        Ok(Statement::MatchWith(MatchWithStatement {
-            match_patterns: patterns,
-            match_where,
-            with_clause,
-            return_clause,
-            order_by,
-            skip,
-            limit,
-            distinct,
-        }))
+        // Peek at the next token to decide: RETURN → simple MatchWith,
+        // MATCH/WITH/UNWIND → multi-stage Pipeline (SPA-134).
+        match self.peek().clone() {
+            Token::Return => {
+                // Simple single-WITH pipeline: MATCH … WITH … RETURN …
+                self.advance(); // consume RETURN
+                let distinct = if matches!(self.peek(), Token::Distinct) {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let return_items = self.parse_return_items()?;
+                let return_clause = ReturnClause {
+                    items: return_items,
+                };
+
+                // ORDER BY / SKIP / LIMIT on the RETURN (i.e. not on the WITH).
+                let order_by = if matches!(self.peek(), Token::Order) {
+                    self.advance();
+                    self.expect_tok(&Token::By)?;
+                    self.parse_order_by_items()?
+                } else {
+                    with_order_by
+                };
+
+                let skip = if matches!(self.peek(), Token::Skip) {
+                    self.advance();
+                    match self.advance().clone() {
+                        Token::Integer(n) => {
+                            if n < 0 {
+                                return Err(Error::InvalidArgument(
+                                    "SKIP must be non-negative".into(),
+                                ));
+                            }
+                            Some(n as u64)
+                        }
+                        other => {
+                            return Err(Error::InvalidArgument(format!(
+                                "expected integer after SKIP, got {:?}",
+                                other
+                            )))
+                        }
+                    }
+                } else {
+                    with_skip
+                };
+
+                let limit = if matches!(self.peek(), Token::Limit) {
+                    self.advance();
+                    match self.advance().clone() {
+                        Token::Integer(n) => {
+                            if n < 0 {
+                                return Err(Error::InvalidArgument(
+                                    "LIMIT must be non-negative".into(),
+                                ));
+                            }
+                            Some(n as u64)
+                        }
+                        other => {
+                            return Err(Error::InvalidArgument(format!(
+                                "expected integer after LIMIT, got {:?}",
+                                other
+                            )))
+                        }
+                    }
+                } else {
+                    with_limit
+                };
+
+                Ok(Statement::MatchWith(MatchWithStatement {
+                    match_patterns: patterns,
+                    match_where,
+                    with_clause,
+                    return_clause,
+                    order_by,
+                    skip,
+                    limit,
+                    distinct,
+                }))
+            }
+            // Continuation clause: MATCH, WITH, or UNWIND → build Pipeline.
+            Token::Match | Token::With | Token::Unwind => {
+                let first_with_stage = PipelineStage::With {
+                    clause: with_clause,
+                    order_by: with_order_by,
+                    skip: with_skip,
+                    limit: with_limit,
+                };
+                self.parse_pipeline_continuation(
+                    Some(patterns),
+                    match_where,
+                    None,
+                    vec![first_with_stage],
+                )
+            }
+            other => Err(Error::InvalidArgument(format!(
+                "expected RETURN, MATCH, WITH, or UNWIND after WITH clause, got {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// Parse the remainder of a multi-clause pipeline after the initial stages have
+    /// been set up.  Accumulates additional MATCH / WITH / UNWIND stages until a
+    /// RETURN clause terminates the pipeline.
+    fn parse_pipeline_continuation(
+        &mut self,
+        leading_match: Option<Vec<PathPattern>>,
+        leading_where: Option<Expr>,
+        leading_unwind: Option<(crate::ast::Expr, String)>,
+        mut stages: Vec<PipelineStage>,
+    ) -> Result<Statement> {
+        loop {
+            match self.peek().clone() {
+                Token::Match => {
+                    // Parse a MATCH stage.
+                    self.advance(); // consume MATCH
+                    let patterns = self.parse_pattern_list()?;
+                    let where_clause = if matches!(self.peek(), Token::Where) {
+                        self.advance();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    stages.push(PipelineStage::Match {
+                        patterns,
+                        where_clause,
+                    });
+                }
+                Token::With => {
+                    // Parse a WITH stage.
+                    self.advance(); // consume WITH
+                    let mut items: Vec<WithItem> = Vec::new();
+                    loop {
+                        let expr = self.parse_expr()?;
+                        self.expect_tok(&Token::As)?;
+                        let alias = self.expect_ident()?;
+                        items.push(WithItem { expr, alias });
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    let where_clause = if matches!(self.peek(), Token::Where) {
+                        self.advance();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    let clause = WithClause {
+                        items,
+                        where_clause,
+                    };
+                    // ORDER BY / SKIP / LIMIT on this intermediate WITH.
+                    let order_by = if matches!(self.peek(), Token::Order) {
+                        self.advance();
+                        self.expect_tok(&Token::By)?;
+                        self.parse_order_by_items()?
+                    } else {
+                        vec![]
+                    };
+                    let skip = if matches!(self.peek(), Token::Skip) {
+                        self.advance();
+                        match self.advance().clone() {
+                            Token::Integer(n) => {
+                                if n < 0 {
+                                    return Err(Error::InvalidArgument(
+                                        "SKIP must be non-negative".into(),
+                                    ));
+                                }
+                                Some(n as u64)
+                            }
+                            other => {
+                                return Err(Error::InvalidArgument(format!(
+                                    "expected integer after SKIP, got {:?}",
+                                    other
+                                )))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let limit = if matches!(self.peek(), Token::Limit) {
+                        self.advance();
+                        match self.advance().clone() {
+                            Token::Integer(n) => {
+                                if n < 0 {
+                                    return Err(Error::InvalidArgument(
+                                        "LIMIT must be non-negative".into(),
+                                    ));
+                                }
+                                Some(n as u64)
+                            }
+                            other => {
+                                return Err(Error::InvalidArgument(format!(
+                                    "expected integer after LIMIT, got {:?}",
+                                    other
+                                )))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    stages.push(PipelineStage::With {
+                        clause,
+                        order_by,
+                        skip,
+                        limit,
+                    });
+                }
+                Token::Unwind => {
+                    // Parse an UNWIND stage: UNWIND alias_var AS new_alias.
+                    self.advance(); // consume UNWIND
+                                    // In pipeline context the "list" to unwind is a variable name.
+                    let alias = self.expect_ident()?;
+                    self.expect_tok(&Token::As)?;
+                    let new_alias = self.expect_ident()?;
+                    stages.push(PipelineStage::Unwind { alias, new_alias });
+                }
+                Token::Return => {
+                    // Terminal clause.
+                    self.advance(); // consume RETURN
+                    let distinct = if matches!(self.peek(), Token::Distinct) {
+                        self.advance();
+                        true
+                    } else {
+                        false
+                    };
+                    let return_items = self.parse_return_items()?;
+                    let return_clause = ReturnClause {
+                        items: return_items,
+                    };
+                    let return_order_by = if matches!(self.peek(), Token::Order) {
+                        self.advance();
+                        self.expect_tok(&Token::By)?;
+                        self.parse_order_by_items()?
+                    } else {
+                        vec![]
+                    };
+                    let return_skip = if matches!(self.peek(), Token::Skip) {
+                        self.advance();
+                        match self.advance().clone() {
+                            Token::Integer(n) => {
+                                if n < 0 {
+                                    return Err(Error::InvalidArgument(
+                                        "SKIP must be non-negative".into(),
+                                    ));
+                                }
+                                Some(n as u64)
+                            }
+                            other => {
+                                return Err(Error::InvalidArgument(format!(
+                                    "expected integer after SKIP, got {:?}",
+                                    other
+                                )))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let return_limit = if matches!(self.peek(), Token::Limit) {
+                        self.advance();
+                        match self.advance().clone() {
+                            Token::Integer(n) => {
+                                if n < 0 {
+                                    return Err(Error::InvalidArgument(
+                                        "LIMIT must be non-negative".into(),
+                                    ));
+                                }
+                                Some(n as u64)
+                            }
+                            other => {
+                                return Err(Error::InvalidArgument(format!(
+                                    "expected integer after LIMIT, got {:?}",
+                                    other
+                                )))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    return Ok(Statement::Pipeline(PipelineStatement {
+                        leading_match,
+                        leading_where,
+                        leading_unwind,
+                        stages,
+                        return_clause,
+                        return_order_by,
+                        return_skip,
+                        return_limit,
+                        distinct,
+                    }));
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "expected MATCH, WITH, UNWIND, or RETURN in pipeline, got {:?}",
+                        other
+                    )))
+                }
+            }
+        }
     }
 
     // ── MERGE ─────────────────────────────────────────────────────────────────
@@ -756,6 +1035,12 @@ impl Parser {
         let expr = self.parse_unwind_expr()?;
         self.expect_tok(&Token::As)?;
         let alias = self.expect_ident()?;
+
+        // If the next token is WITH, this is a pipeline: UNWIND … WITH … RETURN (SPA-134).
+        if matches!(self.peek(), Token::With) {
+            return self.parse_pipeline_continuation(None, None, Some((expr, alias)), vec![]);
+        }
+
         self.expect_tok(&Token::Return)?;
         let items = self.parse_return_items()?;
         Ok(Statement::Unwind(UnwindStatement {
@@ -1247,7 +1532,7 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr> {
-        let left = self.parse_atom()?;
+        let left = self.parse_additive()?;
 
         // Handle `expr IS NULL` / `expr IS NOT NULL`
         if matches!(self.peek(), Token::Is) {
@@ -1349,12 +1634,53 @@ impl Parser {
             _ => return Ok(left),
         };
         self.advance();
-        let right = self.parse_atom()?;
+        let right = self.parse_additive()?;
         Ok(Expr::BinOp {
             left: Box::new(left),
             op,
             right: Box::new(right),
         })
+    }
+
+    /// Parse additive expressions: `a + b`, `a - b`.
+    fn parse_additive(&mut self) -> Result<Expr> {
+        let mut left = self.parse_multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                Token::Plus => BinOpKind::Add,
+                Token::Dash => BinOpKind::Sub,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_multiplicative()?;
+            left = Expr::BinOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// Parse multiplicative expressions: `a * b`, `a / b`, `a % b`.
+    fn parse_multiplicative(&mut self) -> Result<Expr> {
+        let mut left = self.parse_atom()?;
+        loop {
+            let op = match self.peek() {
+                Token::Star => BinOpKind::Mul,
+                Token::Slash => BinOpKind::Div,
+                Token::Percent => BinOpKind::Mod,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_atom()?;
+            left = Expr::BinOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
     }
 
     /// Parse a comma-separated list of atom expressions up to `]`.
