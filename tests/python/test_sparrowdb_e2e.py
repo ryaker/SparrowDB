@@ -154,3 +154,58 @@ def test_column_names_present_in_result():
         row = rows[0]
         assert "n.x" in row, f"Expected key 'n.x' in row dict, got keys: {list(row.keys())}"
         assert row["n.x"] == 42
+
+
+# ── SPA-103: Context manager ──────────────────────────────────────────────────
+
+
+def test_context_manager(tmp_path):
+    """``with sparrowdb.GraphDb(path) as db:`` syntax works end-to-end."""
+    GraphDb = _db()
+    with GraphDb(str(tmp_path / "cm.db")) as db:
+        db.execute("CREATE (n:Test {val: 1})")
+        rows = db.execute("MATCH (n:Test) RETURN n.val")
+    # rows captured inside the with-block must contain the written value.
+    assert len(rows) == 1, f"Expected 1 row, got {len(rows)}"
+    assert rows[0]["n.val"] == 1, f"Expected n.val=1, got {rows[0]}"
+
+
+def test_context_manager_exception_propagates(tmp_path):
+    """Exceptions raised inside the ``with`` block are not suppressed."""
+    GraphDb = _db()
+    with pytest.raises(ValueError, match="intentional"):
+        with GraphDb(str(tmp_path / "exc.db")) as db:
+            db.execute("CREATE (n:Canary {x: 1})")
+            raise ValueError("intentional")
+
+
+# ── SPA-256: GIL release during execute() ─────────────────────────────────────
+
+
+def test_concurrent_execute_releases_gil(tmp_path):
+    """execute() releases the GIL so multiple threads can query concurrently."""
+    import threading
+
+    GraphDb = _db()
+    db = GraphDb(str(tmp_path / "concurrent.db"))
+    db.execute("CREATE (n:Counter {v: 0})")
+
+    results = []
+    errors = []
+
+    def query():
+        try:
+            rows = db.execute("MATCH (n:Counter) RETURN n.v")
+            results.append(rows[0]["n.v"])
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=query) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"Thread(s) raised errors: {errors}"
+    assert len(results) == 5, f"Expected 5 results, got {len(results)}"
+    assert all(v == 0 for v in results), f"Unexpected values: {results}"
