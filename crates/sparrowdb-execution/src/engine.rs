@@ -4267,18 +4267,17 @@ impl Engine {
         src_slot: u64,
         src_label_id: u32,
         delta_all: &[sparrowdb_storage::edge_store::DeltaRecord],
-        node_label: &std::collections::HashMap<(u64, u32), ()>,
+        node_label: &std::collections::HashSet<(u64, u32)>,
         all_label_ids: &[u32],
-    ) -> Vec<(u64, u32)> {
+        out: &mut std::collections::HashSet<(u64, u32)>,
+    ) {
+        out.clear();
+
         // ── CSR neighbors (slot only; label recovered by scanning all label HWMs
         //    or falling back to src_label_id for homogeneous graphs) ────────────
         let csr_slots: Vec<u64> = self.csr_neighbors_all(src_slot);
 
         // ── Delta neighbors (full NodeId available) ───────────────────────────
-        // Use a map from (dst_slot, dst_label) to avoid duplicates when merging
-        // with CSR results.
-        let mut out: std::collections::HashMap<(u64, u32), ()> = std::collections::HashMap::new();
-
         // Insert delta neighbors first — their labels are authoritative.
         for r in delta_all.iter().filter(|r| {
             let r_src_label = (r.src.0 >> 32) as u32;
@@ -4287,7 +4286,7 @@ impl Engine {
         }) {
             let dst_slot = r.dst.0 & 0xFFFF_FFFF;
             let dst_label = (r.dst.0 >> 32) as u32;
-            out.insert((dst_slot, dst_label), ());
+            out.insert((dst_slot, dst_label));
         }
 
         // For each CSR slot, determine label: prefer a delta-confirmed label,
@@ -4296,16 +4295,16 @@ impl Engine {
         'csr: for dst_slot in csr_slots {
             // Check if delta already gave us a label for this slot.
             for &lid in all_label_ids {
-                if out.contains_key(&(dst_slot, lid)) {
+                if out.contains(&(dst_slot, lid)) {
                     continue 'csr; // already recorded with correct label
                 }
             }
             // Try to determine the dst label from the delta node_label registry.
-            // node_label keys are (slot, label_id) pairs seen anywhere in delta.
+            // node_label contains (slot, label_id) pairs seen anywhere in delta.
             let mut found = false;
             for &lid in all_label_ids {
-                if node_label.contains_key(&(dst_slot, lid)) {
-                    out.insert((dst_slot, lid), ());
+                if node_label.contains(&(dst_slot, lid)) {
+                    out.insert((dst_slot, lid));
                     found = true;
                     break;
                 }
@@ -4314,11 +4313,9 @@ impl Engine {
                 // No label info available — fallback to src_label_id (correct for
                 // homogeneous graphs, gracefully wrong for unmapped CSR-only nodes
                 // in heterogeneous graphs with no delta activity on those nodes).
-                out.insert((dst_slot, src_label_id), ());
+                out.insert((dst_slot, src_label_id));
             }
         }
-
-        out.into_keys().collect()
     }
 
     /// BFS traversal for variable-length path patterns `(src)-[:R*min..max]->(dst)`.
@@ -4339,27 +4336,13 @@ impl Engine {
         src_label_id: u32,
         min_hops: u32,
         max_hops: u32,
+        delta_all: &[sparrowdb_storage::edge_store::DeltaRecord],
+        node_label: &std::collections::HashSet<(u64, u32)>,
+        all_label_ids: &[u32],
+        neighbors_buf: &mut std::collections::HashSet<(u64, u32)>,
     ) -> Vec<(u64, u32)> {
         const SAFETY_CAP: u32 = 10;
         let max_hops = max_hops.min(SAFETY_CAP);
-
-        // Read the full delta once.  Build two auxiliary structures:
-        //   node_label  — set of (slot, label_id) pairs seen in any delta record
-        //   all_label_ids — de-duplicated list of label ids present in delta
-        let delta_all = self.read_delta_all();
-        let mut node_label: std::collections::HashMap<(u64, u32), ()> =
-            std::collections::HashMap::new();
-        for r in &delta_all {
-            let src_s = r.src.0 & 0xFFFF_FFFF;
-            let src_l = (r.src.0 >> 32) as u32;
-            node_label.insert((src_s, src_l), ());
-            let dst_s = r.dst.0 & 0xFFFF_FFFF;
-            let dst_l = (r.dst.0 >> 32) as u32;
-            node_label.insert((dst_s, dst_l), ());
-        }
-        let mut all_label_ids: Vec<u32> = node_label.keys().map(|&(_, l)| l).collect();
-        all_label_ids.sort_unstable();
-        all_label_ids.dedup();
 
         // BFS state.
         // visited  — set of (slot, label_id) pairs; prevents revisiting the same
@@ -4382,14 +4365,15 @@ impl Engine {
         for depth in 1..=max_hops {
             let mut next_frontier: Vec<(u64, u32)> = Vec::new();
             for &(node_slot, node_label_id) in &frontier {
-                let neighbors = self.get_node_neighbors_labeled(
+                self.get_node_neighbors_labeled(
                     node_slot,
                     node_label_id,
-                    &delta_all,
-                    &node_label,
-                    &all_label_ids,
+                    delta_all,
+                    node_label,
+                    all_label_ids,
+                    neighbors_buf,
                 );
-                for (nb_slot, nb_label) in neighbors {
+                for &(nb_slot, nb_label) in neighbors_buf.iter() {
                     // Bug B fix: gate results.insert behind visited.insert so
                     // already-visited nodes (including self-loops) are excluded.
                     if visited.insert((nb_slot, nb_label)) {
@@ -4505,6 +4489,29 @@ impl Engine {
             .into_iter()
             .collect();
 
+        // SPA-275: hoist delta read and node_label map out of the per-source loop.
+        // Previously execute_variable_hops rebuilt these on every call — O(sources)
+        // delta reads and O(sources × delta_records) HashMap insertions per query.
+        // Now we build them once and pass references into the BFS.
+        let delta_all = self.read_delta_all();
+        let mut node_label: std::collections::HashSet<(u64, u32)> =
+            std::collections::HashSet::new();
+        for r in &delta_all {
+            let src_s = r.src.0 & 0xFFFF_FFFF;
+            let src_l = (r.src.0 >> 32) as u32;
+            node_label.insert((src_s, src_l));
+            let dst_s = r.dst.0 & 0xFFFF_FFFF;
+            let dst_l = (r.dst.0 >> 32) as u32;
+            node_label.insert((dst_s, dst_l));
+        }
+        let mut all_label_ids: Vec<u32> = node_label.iter().map(|&(_, l)| l).collect();
+        all_label_ids.sort_unstable();
+        all_label_ids.dedup();
+
+        // Reusable neighbors buffer: allocated once, cleared between frontier nodes.
+        let mut neighbors_buf: std::collections::HashSet<(u64, u32)> =
+            std::collections::HashSet::new();
+
         for src_slot in 0..hwm_src {
             // SPA-254: check per-query deadline at every slot boundary.
             self.check_deadline()?;
@@ -4532,7 +4539,18 @@ impl Engine {
             }
 
             // BFS to find all reachable (slot, label_id) pairs within [min_hops, max_hops].
-            let dst_nodes = self.execute_variable_hops(src_slot, src_label_id, min_hops, max_hops);
+            // delta_all, node_label, all_label_ids, and neighbors_buf are hoisted out of
+            // this loop (SPA-275) and reused across all source nodes.
+            let dst_nodes = self.execute_variable_hops(
+                src_slot,
+                src_label_id,
+                min_hops,
+                max_hops,
+                &delta_all,
+                &node_label,
+                &all_label_ids,
+                &mut neighbors_buf,
+            );
 
             for (dst_slot, actual_label_id) in dst_nodes {
                 // When the destination pattern specifies a label, only include nodes
