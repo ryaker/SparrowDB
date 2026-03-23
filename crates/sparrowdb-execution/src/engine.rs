@@ -4778,6 +4778,13 @@ fn matches_prop_filter_static(
                 // overflow (>7 bytes) string encodings (SPA-212).
                 stored_val.is_some_and(|raw| store.raw_str_matches(raw, &s))
             }
+            Value::Float64(f) => {
+                // Float values are stored via TAG_FLOAT in the overflow heap (SPA-267).
+                // Decode the raw stored u64 back to a Value::Float and compare.
+                stored_val.is_some_and(|raw| {
+                    matches!(store.decode_raw_value(raw), StoreValue::Float(stored_f) if stored_f == f)
+                })
+            }
             Value::Null => true, // null filter passes (param-like behaviour)
             _ => false,
         };
@@ -5065,7 +5072,7 @@ fn literal_to_store_value(lit: &Literal) -> StoreValue {
     match lit {
         Literal::Int(n) => StoreValue::Int64(*n),
         Literal::String(s) => StoreValue::Bytes(s.as_bytes().to_vec()),
-        Literal::Float(f) => StoreValue::Int64(f64::to_bits(*f) as i64),
+        Literal::Float(f) => StoreValue::Float(*f),
         Literal::Bool(b) => StoreValue::Int64(if *b { 1 } else { 0 }),
         Literal::Null | Literal::Param(_) => StoreValue::Int64(0),
     }
@@ -5078,7 +5085,7 @@ fn literal_to_store_value(lit: &Literal) -> StoreValue {
 fn value_to_store_value(val: Value) -> StoreValue {
     match val {
         Value::Int64(n) => StoreValue::Int64(n),
-        Value::Float64(f) => StoreValue::Int64(f64::to_bits(f) as i64),
+        Value::Float64(f) => StoreValue::Float(f),
         Value::Bool(b) => StoreValue::Int64(if b { 1 } else { 0 }),
         Value::String(s) => StoreValue::Bytes(s.into_bytes()),
         Value::Null => StoreValue::Int64(0),
@@ -5289,6 +5296,7 @@ fn decode_raw_val(raw: u64, store: &NodeStore) -> Value {
     match store.decode_raw_value(raw) {
         StoreValue::Int64(n) => Value::Int64(n),
         StoreValue::Bytes(b) => Value::String(String::from_utf8_lossy(&b).into_owned()),
+        StoreValue::Float(f) => Value::Float64(f),
     }
 }
 

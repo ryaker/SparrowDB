@@ -2400,9 +2400,9 @@ fn write_mutation_wal(
         let before_bytes = staged
             .before_image
             .as_ref()
-            .map(|(_, v)| v.to_u64().to_le_bytes().to_vec())
+            .map(|(_, v)| value_to_wal_bytes(v))
             .unwrap_or_else(|| 0u64.to_le_bytes().to_vec());
-        let after_bytes = staged.new_value.to_u64().to_le_bytes().to_vec();
+        let after_bytes = value_to_wal_bytes(&staged.new_value);
         wal.append(
             WalRecordKind::NodeUpdate,
             txn,
@@ -2436,7 +2436,7 @@ fn write_mutation_wal(
                             .filter(|n| !n.is_empty())
                             .cloned()
                             .unwrap_or_else(|| format!("col_{col_id}"));
-                        (name, v.to_u64().to_le_bytes().to_vec())
+                        (name, value_to_wal_bytes(v))
                     })
                     .collect();
                 wal.append(
@@ -2527,9 +2527,9 @@ fn literal_to_value(lit: &sparrowdb_cypher::ast::Literal) -> Value {
     use sparrowdb_cypher::ast::Literal;
     match lit {
         Literal::Int(n) => Value::Int64(*n),
-        // Float stored as bitcast; String stored as Bytes.
-        // Full overflow-store support is Phase 9+.
-        Literal::Float(f) => Value::Int64(f.to_bits() as i64),
+        // Float stored as Value::Float — NodeStore::encode_value writes the full
+        // 8 IEEE-754 bytes to the overflow heap (SPA-267).
+        Literal::Float(f) => Value::Float(*f),
         Literal::Bool(b) => Value::Int64(if *b { 1 } else { 0 }),
         Literal::String(s) => Value::Bytes(s.as_bytes().to_vec()),
         Literal::Null | Literal::Param(_) => Value::Int64(0),
@@ -2547,14 +2547,30 @@ fn expr_to_value(expr: &sparrowdb_cypher::ast::Expr) -> Value {
     }
 }
 
-/// Convert a storage-layer `Value` (Int64 / Bytes) to the execution-layer
-/// `Value` (Int64 / String / Null / …) used in `QueryResult` rows.
+/// Encode a storage [`Value`] to a raw little-endian byte vector for WAL
+/// logging.  Unlike [`Value::to_u64`], this never panics for `Float` values —
+/// it emits the full 8 IEEE-754 bytes so the WAL payload is lossless.
+///
+/// The bytes are for observability only (schema introspection uses only the
+/// property *name*, not the value); correctness of on-disk storage is
+/// handled separately via [`NodeStore::encode_value`].
+fn value_to_wal_bytes(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Float(f) => f.to_bits().to_le_bytes().to_vec(),
+        // For Int64 and Bytes the existing to_u64() encoding is fine.
+        other => other.to_u64().to_le_bytes().to_vec(),
+    }
+}
+
+/// Convert a storage-layer `Value` (Int64 / Bytes / Float) to the execution-layer
+/// `Value` (Int64 / String / Float64 / Null / …) used in `QueryResult` rows.
 fn storage_value_to_exec(val: &Value) -> sparrowdb_execution::Value {
     match val {
         Value::Int64(n) => sparrowdb_execution::Value::Int64(*n),
         Value::Bytes(b) => {
             sparrowdb_execution::Value::String(String::from_utf8_lossy(b).into_owned())
         }
+        Value::Float(f) => sparrowdb_execution::Value::Float64(*f),
     }
 }
 
