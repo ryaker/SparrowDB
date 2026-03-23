@@ -1307,14 +1307,12 @@ impl GraphDb {
 
         // ── Query nodes ───────────────────────────────────────────────────────
         // Broad unlabeled MATCH captures every node regardless of label.
-        let nodes = self.execute(
-            "MATCH (n) RETURN id(n) AS nid, labels(n) AS lbls, n.name AS nm",
-        )?;
+        let nodes =
+            self.execute("MATCH (n) RETURN id(n) AS nid, labels(n) AS lbls, n.name AS nm")?;
 
         // ── Query edges ───────────────────────────────────────────────────────
-        let edges = self.execute(
-            "MATCH (a)-[r]->(b) RETURN id(a) AS src, type(r) AS rel, id(b) AS dst",
-        )?;
+        let edges =
+            self.execute("MATCH (a)-[r]->(b) RETURN id(a) AS src, type(r) AS rel, id(b) AS dst")?;
 
         // ── Build DOT output ──────────────────────────────────────────────────
         let mut dot =
