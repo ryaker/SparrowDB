@@ -33,3 +33,7 @@ path = "src/bin/gen-encrypted-fixture.rs"
 [[bench]]
 name    = "graph_benchmarks"
 harness = false
+
+[[bench]]
+name    = "batch_benchmarks"
+harness = false
