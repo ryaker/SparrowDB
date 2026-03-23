@@ -959,8 +959,8 @@ impl GraphDb {
             // Derive label IDs from the packed NodeIds.
             let src_label_id = (src.0 >> 32) as u16;
             let dst_label_id = (dst.0 >> 32) as u16;
-            let src_slot = (src.0 & 0xFFFF_FFFF) as u64;
-            let dst_slot = (dst.0 & 0xFFFF_FFFF) as u64;
+            let src_slot = src.0 & 0xFFFF_FFFF;
+            let dst_slot = dst.0 & 0xFFFF_FFFF;
 
             // Look up whether a rel table for this type already exists in the catalog.
             // `get_rel_table` returns `Ok(None)` if no such table is registered yet,
@@ -981,7 +981,7 @@ impl GraphDb {
 
                     // Check CSR base (post-checkpoint edges).
                     let in_csr = if let Ok(csr) = store.open_fwd() {
-                        csr.neighbors(src_slot).iter().any(|&nb| nb == dst_slot)
+                        csr.neighbors(src_slot).contains(&dst_slot)
                     } else {
                         false
                     };
@@ -1374,7 +1374,7 @@ impl GraphDb {
                                 .iter()
                                 .any(|rec| rec.src.0 == src.0 && rec.dst.0 == dst.0);
                             let in_csr = if let Ok(csr) = store.open_fwd() {
-                                csr.neighbors(src_slot).iter().any(|&nb| nb == dst_slot)
+                                csr.neighbors(src_slot).contains(&dst_slot)
                             } else {
                                 false
                             };
