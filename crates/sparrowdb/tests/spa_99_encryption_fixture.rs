@@ -89,7 +89,7 @@ fn extract_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
 /// Every read must return `Error::EncryptionAuthFailed` — never silently
 /// corrupt or panic.
 #[test]
-fn wrong_key_returns_error() {
+fn spa_99_wrong_key_returns_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.bin");
 
@@ -131,7 +131,7 @@ fn wrong_key_returns_error() {
 /// Write two pages with KEY_A, close, reopen with KEY_A.
 /// Both pages must decrypt back to the original plaintext.
 #[test]
-fn correct_key_round_trips() {
+fn spa_99_correct_key_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.bin");
 
@@ -169,7 +169,7 @@ fn correct_key_round_trips() {
     }
 }
 
-// ── Test 3: no_key_on_encrypted_db_returns_error ─────────────────────────────
+// ── Test 3: spa_99_no_key_on_encrypted_db_returns_error ──────────────────────
 
 /// Write pages in encrypted mode, then open in passthrough (no-key) mode.
 /// Because the encrypted stride is page_size+40 but the passthrough store
@@ -181,7 +181,7 @@ fn correct_key_round_trips() {
 /// an unkeyed open cannot silently expose the plaintext.  This is the threat
 /// model: data at rest is opaque without the key.
 #[test]
-fn no_key_on_encrypted_db_returns_error() {
+fn spa_99_no_key_on_encrypted_db_returns_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.bin");
 
@@ -224,7 +224,7 @@ fn no_key_on_encrypted_db_returns_error() {
     }
 }
 
-// ── Test 4: encrypted_golden_fixture_opens ────────────────────────────────────
+// ── Test 4: spa_99_encrypted_golden_fixture_opens ────────────────────────────
 
 /// Open the committed golden fixture `encrypted_graph.tar` and verify that:
 ///   1. The store opens with KEY_A without error.
@@ -237,7 +237,7 @@ fn no_key_on_encrypted_db_returns_error() {
 /// incompatible way this test will catch it on CI before any user data is
 /// affected.
 #[test]
-fn encrypted_golden_fixture_opens() {
+fn spa_99_encrypted_golden_fixture_opens() {
     let (_tmp, store_path) = extract_fixture();
 
     // ── Correct key: both pages must decrypt correctly ────────────────────────
