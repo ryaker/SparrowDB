@@ -58,10 +58,6 @@ fn seed_social_graph(db: &sparrowdb::GraphDb) {
 // Tracked by: SPA-134 (this ticket) — implement multi-stage MATCH … WITH … MATCH.
 
 #[test]
-#[ignore = "SPA-134: second MATCH after WITH is not parsed; \
-            parse_with_pipeline calls expect_tok(Return) so any non-RETURN token \
-            (including MATCH) triggers a parse error; \
-            a new AST node and parser branch are needed"]
 fn spa134_match_with_match_return() {
     let (_dir, db) = make_db();
     seed_social_graph(&db);
@@ -145,10 +141,6 @@ fn spa134_match_with_where_return() {
 // Tracked by: SPA-134 (this ticket) — aggregate functions in WITH clause.
 
 #[test]
-#[ignore = "SPA-134: COUNT(*) in WITH is not aggregated; \
-            execute_match_with iterates rows and calls eval_expr per row — \
-            eval_expr(CountStar, row) returns Value::Null, not the aggregate count; \
-            aggregation in the WITH stage is not yet implemented"]
 fn spa134_match_with_count_where_filter() {
     let (_dir, db) = make_db();
     seed_social_graph(&db);
@@ -218,9 +210,6 @@ fn spa134_match_with_count_where_filter_blocks_row() {
 // Tracked by: SPA-134 (this ticket) — ORDER BY in WITH pipeline + multi-stage MATCH.
 
 #[test]
-#[ignore = "SPA-134: second MATCH after WITH is not parsed (same as Test 1); \
-            additionally ORDER BY inside MatchWithStatement is parsed but not \
-            applied by execute_match_with — the order_by field is silently ignored"]
 fn spa134_match_with_order_limit_match_return() {
     let (_dir, db) = make_db();
     seed_social_graph(&db);
@@ -257,9 +246,6 @@ fn spa134_match_with_order_limit_match_return() {
 // Tracked by: SPA-134 (this ticket) — add WITH support after UNWIND.
 
 #[test]
-#[ignore = "SPA-134: WITH after UNWIND is not parsed; \
-            parse_unwind calls expect_tok(Return) immediately after AS <alias>; \
-            UnwindStatement only supports RETURN as the continuation clause"]
 fn spa134_unwind_with_transform_return() {
     let (_dir, db) = make_db();
 
@@ -286,10 +272,6 @@ fn spa134_unwind_with_transform_return() {
 // Tracked by: SPA-134 (this ticket) — UNWIND as continuation after WITH.
 
 #[test]
-#[ignore = "SPA-134: UNWIND after WITH is not parsed; \
-            parse_with_pipeline calls expect_tok(Return) so any other token \
-            (including UNWIND) triggers a parse error; \
-            additionally collect() in WITH requires aggregate-aware execution"]
 fn spa134_match_with_collect_unwind_return() {
     let (_dir, db) = make_db();
     seed_social_graph(&db);
@@ -338,9 +320,6 @@ fn spa134_match_with_collect_unwind_return() {
 // Tracked by: SPA-134 (this ticket) — full multi-stage pipeline execution.
 
 #[test]
-#[ignore = "SPA-134: three-stage MATCH … WITH … MATCH … WITH … RETURN is not supported; \
-            would require a new Statement variant (e.g. Pipeline) or recursive \
-            clause composition in the AST and execution engine"]
 fn spa134_three_stage_match_with_pipeline() {
     let (_dir, db) = make_db();
     seed_social_graph(&db);
@@ -385,10 +364,6 @@ fn spa134_three_stage_match_with_pipeline() {
 // Tracked by: SPA-134 (this ticket) — inject NodeRef into WITH-pipeline row_vals.
 
 #[test]
-#[ignore = "SPA-134: EXISTS in MATCH WHERE before WITH produces 0 rows; \
-            collect_match_rows_for_with uses build_row_vals which does not inject \
-            a NodeRef into the row map; eval_exists_subquery cannot resolve the \
-            source node ID and always returns false"]
 fn spa134_exists_subquery_with_clause_return() {
     let (_dir, db) = make_db();
     seed_social_graph(&db);
@@ -431,12 +406,6 @@ fn spa134_exists_subquery_with_clause_return() {
 /// the NodeRef is not available in the projected with_vals map, so the
 /// EXISTS predicate cannot resolve the source node and returns false.
 #[test]
-#[ignore = "SPA-134: EXISTS in the WITH WHERE clause is also unsupported; \
-            the projected with_vals map (built by execute_match_with step 2) \
-            does not carry a NodeRef entry for the variable, \
-            so eval_exists_subquery always returns false; \
-            additionally WITH n AS person is the correct syntax — \
-            WITH n WHERE ... (without AS) is a parse error"]
 fn spa134_exists_subquery_where_in_with_clause() {
     let (_dir, db) = make_db();
     seed_social_graph(&db);
@@ -477,10 +446,6 @@ fn spa134_exists_subquery_where_in_with_clause() {
 /// execution engine (execute_match_with does not use m.order_by or apply sorting).
 /// Marked ignored because the ORDER BY result is non-deterministic.
 #[test]
-#[ignore = "SPA-134: ORDER BY in execute_match_with is parsed into m.order_by \
-            but the field is never consumed — execute_match_with applies \
-            m.skip/m.limit but not m.order_by; \
-            result row ordering is non-deterministic (insertion order)"]
 fn spa134_match_with_order_by_limit_return() {
     let (_dir, db) = make_db();
     seed_social_graph(&db);
@@ -545,9 +510,6 @@ fn spa134_match_with_where_empty_result() {
 /// CountStar. This test documents the current (incorrect) behaviour: 3 rows of
 /// Null are returned rather than 1 row of Int64(3).
 #[test]
-#[ignore = "SPA-134: COUNT(*) in WITH is not aggregated; \
-            eval_expr(CountStar, row) returns Value::Null per row; \
-            the engine returns 3 rows of Null instead of 1 row of Int64(3)"]
 fn spa134_match_with_count_no_filter_return() {
     let (_dir, db) = make_db();
     seed_social_graph(&db);

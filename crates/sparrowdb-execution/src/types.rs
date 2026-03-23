@@ -47,7 +47,7 @@ impl TypedVector {
 }
 
 /// A scalar value (materialized from TypedVector for output).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
     Int64(i64),

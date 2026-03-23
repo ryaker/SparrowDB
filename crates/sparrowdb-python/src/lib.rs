@@ -52,11 +52,13 @@ fn value_to_py(py: Python<'_>, v: &sparrowdb_execution::Value) -> PyObject {
 
 /// Python wrapper around the top-level SparrowDB handle.
 ///
+/// Supports the context manager protocol (SPA-103):
+///
 /// ```python
 /// import sparrowdb, tempfile, os
 /// with tempfile.TemporaryDirectory() as d:
-///     db = sparrowdb.GraphDb(os.path.join(d, "test.db"))
-///     db.checkpoint()
+///     with sparrowdb.GraphDb(os.path.join(d, "test.db")) as db:
+///         db.checkpoint()
 /// ```
 #[cfg(feature = "python")]
 #[pyclass(name = "GraphDb")]
@@ -75,17 +77,46 @@ impl PyGraphDb {
         Ok(PyGraphDb { inner: db })
     }
 
+    // ── Context manager protocol (SPA-103) ────────────────────────────────────
+
+    /// Support ``with sparrowdb.GraphDb(path) as db:`` syntax.
+    ///
+    /// Returns ``self`` — SparrowDB cleans up via Rust's ``Drop`` trait, so no
+    /// extra work is needed here.
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Exit the context manager.
+    ///
+    /// SparrowDB cleans up via Rust's ``Drop`` trait; this method simply
+    /// returns ``False`` so that any Python exception propagates normally.
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_val: Option<&Bound<'_, PyAny>>,
+        _exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        Ok(false) // do not suppress exceptions
+    }
+
+    // ── I/O methods — release the GIL (SPA-256) ──────────────────────────────
+
     /// Run a WAL checkpoint — folds the delta log into the CSR base files.
-    fn checkpoint(&self) -> PyResult<()> {
-        self.inner
-            .checkpoint()
+    ///
+    /// Releases the GIL while the checkpoint I/O runs so other Python threads
+    /// can make progress concurrently (SPA-256).
+    fn checkpoint(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.checkpoint())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Run an OPTIMIZE — like checkpoint but also sorts neighbour lists.
-    fn optimize(&self) -> PyResult<()> {
-        self.inner
-            .optimize()
+    ///
+    /// Releases the GIL while the optimise I/O runs (SPA-256).
+    fn optimize(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.optimize())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -113,20 +144,24 @@ impl PyGraphDb {
         Ok(PyWriteTx { inner: Some(tx) })
     }
 
-    /// Execute a read-only Cypher query and return a list of row-dicts.
+    /// Execute a Cypher query and return a list of row-dicts.
     ///
     /// Each row is a ``dict`` mapping column name → value.  Supported value
     /// types: ``None``, ``int``, ``float``, ``bool``, ``str``.
     /// ``NodeRef`` and ``EdgeRef`` are returned as ``int`` (their packed id).
+    ///
+    /// The GIL is released while the query executes so multiple Python threads
+    /// can issue queries concurrently (SPA-256).
     ///
     /// Example::
     ///
     ///     results = db.execute("MATCH (n) RETURN n.name LIMIT 10")
     ///     # [{"n.name": "Alice"}, ...]
     fn execute(&self, py: Python<'_>, cypher: &str) -> PyResult<PyObject> {
-        let result = self
-            .inner
-            .execute(cypher)
+        // SPA-256: release the GIL during the blocking storage scan so that
+        // other Python threads (e.g. a thread pool) can run concurrently.
+        let result = py
+            .allow_threads(|| self.inner.execute(cypher))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let list = PyList::empty_bound(py);

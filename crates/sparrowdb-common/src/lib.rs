@@ -11,11 +11,15 @@ pub struct PageId(pub u64);
 pub struct TxnId(pub u64);
 
 /// Node identifier: upper 16 bits = label_id, lower 48 bits = slot_id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct NodeId(pub u64);
 
 /// Edge identifier: monotonic u64 sourced from the active metapage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct EdgeId(pub u64);
 
 /// All errors that SparrowDB can return.
@@ -49,6 +53,11 @@ pub enum Error {
     NodeHasEdges {
         node_id: u64,
     },
+    /// The per-query deadline was exceeded before the query could complete.
+    ///
+    /// Returned by [`GraphDb::execute_with_timeout`] when the supplied
+    /// [`std::time::Duration`] expires during scan or traversal.
+    QueryTimeout,
 }
 
 impl std::fmt::Display for Error {
@@ -78,6 +87,7 @@ impl std::fmt::Display for Error {
                 f,
                 "node {node_id} has attached edges and cannot be deleted without removing them first"
             ),
+            Error::QueryTimeout => write!(f, "query timeout: deadline exceeded"),
         }
     }
 }
