@@ -102,7 +102,6 @@ fn varpath_range_1_to_3_correct_set() {
 /// GAP: SPA-232 — varpath BFS engine does not apply inline endpoint property
 /// filters; the dst filter is silently ignored and returns an empty set.
 #[test]
-#[ignore = "SPA-232: varpath dst property filter not yet applied by BFS engine"]
 fn varpath_with_endpoint_property_filter() {
     let (_dir, db) = make_db();
 
