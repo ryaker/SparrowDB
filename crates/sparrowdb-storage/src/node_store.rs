@@ -34,9 +34,8 @@ use sparrowdb_common::{Error, NodeId, Result};
 
 // ── Value type ────────────────────────────────────────────────────────────────
 
-/// A typed property value.  Phase 3 supports `Int64` and `Bytes` only.
-/// Larger types (STRING overflow, VARIANT) are deferred to later phases.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A typed property value.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// Signed 64-bit integer, stored as raw `u64` bits (two's-complement).
     Int64(i64),
@@ -44,14 +43,19 @@ pub enum Value {
     /// The actual bytes are placed inline for values ≤ 8 bytes; longer blobs
     /// are truncated and marked with a sentinel in v1 (overflow deferred).
     Bytes(Vec<u8>),
+    /// IEEE-754 double-precision float.  Stored as 8 raw bytes in the overflow
+    /// heap so that no bits are masked by the type-tag scheme (SPA-267).
+    Float(f64),
 }
 
 /// Type tag embedded in the top byte (byte index 7 in LE) of a stored `u64`.
 ///
-/// - `0x00` = `Int64`       — lower 7 bytes hold the signed integer (56-bit range).
-/// - `0x01` = `Bytes`       — lower 7 bytes hold up to 7 bytes of inline string data.
+/// - `0x00` = `Int64`         — lower 7 bytes hold the signed integer (56-bit range).
+/// - `0x01` = `Bytes`         — lower 7 bytes hold up to 7 bytes of inline string data.
 /// - `0x02` = `BytesOverflow` — lower 7 bytes encode `(offset: u40 LE, len: u16 LE)`
 ///   pointing into `strings.bin` (SPA-212).
+/// - `0x03` = `Float`         — lower 7 bytes encode `(offset: u40 LE, len: u16 LE)`
+///   pointing into `strings.bin` where 8 raw IEEE-754 bytes are stored (SPA-267).
 ///
 /// The overflow encoding packs a heap pointer into 7 bytes:
 ///   bytes[0..5] = heap byte offset (u40 LE, max ~1 TiB)
@@ -62,6 +66,9 @@ const TAG_INT64: u8 = 0x00;
 const TAG_BYTES: u8 = 0x01;
 /// Tag for strings > 7 bytes stored in the overflow string heap (SPA-212).
 const TAG_BYTES_OVERFLOW: u8 = 0x02;
+/// Tag for f64 values stored as 8 raw IEEE-754 bytes in the overflow heap (SPA-267).
+/// Using the heap ensures all 64 bits of the float are preserved without any masking.
+const TAG_FLOAT: u8 = 0x03;
 /// Maximum bytes that fit inline in the 7-byte payload (one byte is the tag).
 const MAX_INLINE_BYTES: usize = 7;
 
@@ -98,6 +105,11 @@ impl Value {
                 let len = b.len().min(MAX_INLINE_BYTES);
                 arr[..len].copy_from_slice(&b[..len]);
                 u64::from_le_bytes(arr)
+            }
+            Value::Float(_) => {
+                // Float values require heap storage — callers must use
+                // NodeStore::encode_value instead of Value::to_u64.
+                panic!("Value::Float cannot be inline-encoded; use NodeStore::encode_value");
             }
         }
     }
@@ -266,25 +278,38 @@ impl NodeStore {
     /// - `Int64`          → identical to `Value::to_u64()`.
     /// - `Bytes` ≤ 7 B    → inline `TAG_BYTES` encoding, identical to `Value::to_u64()`.
     /// - `Bytes` > 7 B    → appended to `strings.bin`; returns `TAG_BYTES_OVERFLOW` u64.
+    /// - `Float`          → 8 raw IEEE-754 bytes appended to `strings.bin`;
+    ///   returns a `TAG_FLOAT` u64 so all 64 float bits are preserved (SPA-267).
     pub fn encode_value(&self, val: &Value) -> Result<u64> {
         match val {
             Value::Int64(_) => Ok(val.to_u64()),
             Value::Bytes(b) if b.len() <= MAX_INLINE_BYTES => Ok(val.to_u64()),
             Value::Bytes(b) => self.append_to_string_heap(b),
+            // SPA-267: store all 8 float bytes in the heap so no bits are masked.
+            // The heap pointer uses the same (offset: u40, len: u16) layout as
+            // TAG_BYTES_OVERFLOW but with TAG_FLOAT in byte 7.
+            Value::Float(f) => {
+                let bits = f.to_bits().to_le_bytes();
+                let heap_tagged = self.append_to_string_heap(&bits)?;
+                // Replace the TAG_BYTES_OVERFLOW tag byte with TAG_FLOAT.
+                let payload = heap_tagged & 0x00FF_FFFF_FFFF_FFFF;
+                Ok((TAG_FLOAT as u64) << 56 | payload)
+            }
         }
     }
 
     /// Decode a raw `u64` column value back to a `Value`, reading the
-    /// overflow string heap when the tag is `TAG_BYTES_OVERFLOW` (SPA-212).
+    /// overflow string heap when the tag is `TAG_BYTES_OVERFLOW` or `TAG_FLOAT` (SPA-212, SPA-267).
     ///
-    /// Handles all three tags:
+    /// Handles all four tags:
     /// - `TAG_INT64`          → `Value::Int64`
     /// - `TAG_BYTES`          → `Value::Bytes` (inline, ≤ 7 bytes)
     /// - `TAG_BYTES_OVERFLOW` → `Value::Bytes` (from heap)
+    /// - `TAG_FLOAT`          → `Value::Float` (8 raw IEEE-754 bytes from heap)
     pub fn decode_raw_value(&self, raw: u64) -> Value {
         let tag = (raw >> 56) as u8;
-        if tag == TAG_BYTES_OVERFLOW {
-            match self.read_from_string_heap(raw) {
+        match tag {
+            TAG_BYTES_OVERFLOW => match self.read_from_string_heap(raw) {
                 Ok(bytes) => Value::Bytes(bytes),
                 Err(e) => {
                     // Corruption fallback: return empty bytes and log.
@@ -293,9 +318,32 @@ impl NodeStore {
                     );
                     Value::Bytes(Vec::new())
                 }
+            },
+            // SPA-267: float values are stored as 8-byte IEEE-754 blobs in the heap.
+            // Reconstruct the heap pointer by swapping TAG_FLOAT → TAG_BYTES_OVERFLOW
+            // so read_from_string_heap can locate the bytes.
+            TAG_FLOAT => {
+                let payload = raw & 0x00FF_FFFF_FFFF_FFFF;
+                let heap_tagged = (TAG_BYTES_OVERFLOW as u64) << 56 | payload;
+                match self.read_from_string_heap(heap_tagged) {
+                    Ok(bytes) if bytes.len() == 8 => {
+                        let arr: [u8; 8] = bytes.try_into().unwrap();
+                        Value::Float(f64::from_bits(u64::from_le_bytes(arr)))
+                    }
+                    Ok(bytes) => {
+                        eprintln!(
+                            "WARN: float heap blob has unexpected length {} (raw={raw:#018x})",
+                            bytes.len()
+                        );
+                        Value::Float(f64::NAN)
+                    }
+                    Err(e) => {
+                        eprintln!("WARN: failed to read float from heap (raw={raw:#018x}): {e}");
+                        Value::Float(f64::NAN)
+                    }
+                }
             }
-        } else {
-            Value::from_u64(raw)
+            _ => Value::from_u64(raw),
         }
     }
 
