@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Query execution engine for SparrowDB embedded graph database"
+documentation = "https://docs.rs/sparrowdb-execution"
+readme.workspace = true
 keywords = ["graph", "database", "execution", "query", "embedded"]
 categories = ["database", "data-structures"]
 

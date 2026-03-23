@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Cypher query parser and planner for SparrowDB"
+documentation = "https://docs.rs/sparrowdb-cypher"
+readme.workspace = true
 keywords = ["graph", "cypher", "query", "parser", "database"]
 categories = ["database", "parser-implementations"]
 

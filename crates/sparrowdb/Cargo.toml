@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 description = "Embedded graph database with Cypher queries — no server, no subscription, no cloud"
 documentation = "https://docs.rs/sparrowdb"
-readme = "../../README.md"
+readme.workspace = true
 keywords = ["graph", "database", "cypher", "embedded", "nosql"]
 categories = ["database", "data-structures"]
 

@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Shared types and primitives for SparrowDB embedded graph database"
+documentation = "https://docs.rs/sparrowdb-common"
+readme.workspace = true
 keywords = ["graph", "database", "embedded", "nosql"]
 categories = ["database", "data-structures"]
 
