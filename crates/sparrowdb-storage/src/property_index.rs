@@ -32,10 +32,15 @@
 //!
 //! ## Lifecycle
 //!
-//! The index is built at `Engine` construction time by scanning all existing
-//! column files via [`NodeStore::read_col_all`].  It is updated incrementally
-//! after each `CREATE` (via [`PropertyIndex::insert`]) and each `SET`
-//! (via [`PropertyIndex::update`]).
+//! The index is built **lazily** — only when a query actually filters on a
+//! specific `(label_id, col_id)` pair, via [`PropertyIndex::build_for`].  This
+//! eliminates the full-table-scan overhead on queries that do not use a property
+//! filter (e.g. `COUNT(*)`, hop traversals).  Once a pair is loaded it is cached
+//! for the lifetime of the `Engine` instance, so repeated queries within the same
+//! engine reuse the in-memory index without additional I/O.
+//!
+//! The legacy [`PropertyIndex::build`] method is retained for callers that need
+//! an eager full build (e.g. tests or future bulk-load paths).
 //!
 //! Tombstoned nodes (`col_0 == u64::MAX`) are excluded during build and never
 //! inserted during incremental updates.
@@ -46,10 +51,15 @@
 //! query execution.  No cross-thread sharing occurs, so no `Mutex` is needed.
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 
-use sparrowdb_common::NodeId;
+use sparrowdb_common::{NodeId, Result};
 
 use crate::node_store::NodeStore;
+
+// Bring tracing macros into scope for build_for warnings.
+#[allow(unused_imports)]
+use tracing;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -101,18 +111,95 @@ pub struct IndexKey {
 ///
 /// Maps `(label_id, col_id) → BTreeMap<raw_value, Vec<slot>>`.
 ///
-/// Use [`PropertyIndex::build`] to construct from disk, then
+/// Use [`PropertyIndex::build_for`] to load a specific column on demand, or
+/// [`PropertyIndex::build`] for an upfront full build.  Then use
 /// [`PropertyIndex::lookup`] for O(log n) equality queries.
 #[derive(Default)]
 pub struct PropertyIndex {
     /// `index[(label_id, col_id)][raw_value] = [slot, ...]`
     index: std::collections::HashMap<IndexKey, BTreeMap<u64, Vec<u32>>>,
+    /// Set of `(label_id, col_id)` pairs whose column file has already been
+    /// loaded into `index`.  A pair is present here even when its column file
+    /// contained no indexable values, so that `build_for` can skip repeated I/O.
+    loaded: HashSet<IndexKey>,
 }
 
 impl PropertyIndex {
     /// Construct a fresh empty index (no disk I/O).
     pub fn new() -> Self {
         PropertyIndex::default()
+    }
+
+    /// Lazily load the index for a single `(label_id, col_id)` pair.
+    ///
+    /// Reads `nodes/{label_id}/col_{col_id}.bin` and the corresponding tombstone
+    /// column (`col_0`) from `store` and inserts `value → slot` mappings into
+    /// the in-memory B-tree for this pair.
+    ///
+    /// **Cache hit**: if this `(label_id, col_id)` pair has already been loaded
+    /// (including cases where the column had no indexable values), this method
+    /// returns immediately without any I/O.
+    ///
+    /// **No-op for col_id 0**: the tombstone column is not indexed.
+    ///
+    /// Errors are logged as warnings and suppressed — the caller falls back to
+    /// a full O(n) scan via `is_indexed` returning `false`.
+    pub fn build_for(&mut self, store: &NodeStore, label_id: u32, col_id: u32) -> Result<()> {
+        // col_0 is the tombstone column and is not a queryable property.
+        if col_id == 0 {
+            return Ok(());
+        }
+
+        let key = IndexKey { label_id, col_id };
+
+        // Cache hit — already loaded.
+        if self.loaded.contains(&key) {
+            return Ok(());
+        }
+
+        // Mark as loaded regardless of outcome so we don't retry on I/O errors.
+        self.loaded.insert(key);
+
+        // Read tombstone column (col_0) to skip deleted slots.
+        let tombstone_slots: HashSet<u32> = match store.read_col_all(label_id, 0) {
+            Ok(col0) => col0
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, &raw)| {
+                    if raw == TOMBSTONE {
+                        Some(slot as u32)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            Err(_) => HashSet::new(),
+        };
+
+        // Read the target column.
+        let raw_vals = match store.read_col_all(label_id, col_id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    label_id = label_id,
+                    col_id = col_id,
+                    error = ?e,
+                    "PropertyIndex::build_for: failed to read column; index disabled for this pair"
+                );
+                return Ok(());
+            }
+        };
+
+        let btree = self.index.entry(key).or_default();
+        for (slot, raw) in raw_vals.into_iter().enumerate() {
+            let slot = slot as u32;
+            if raw == ABSENT || tombstone_slots.contains(&slot) {
+                continue;
+            }
+            btree.entry(raw).or_default().push(slot);
+        }
+
+        Ok(())
     }
 
     /// Build the index by scanning all label/column files in `store`.
