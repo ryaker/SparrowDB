@@ -886,9 +886,33 @@ impl NodeStore {
             .map(|(col_id, v)| (col_id, self.decode_raw_value(v)))
             .collect())
     }
+
+    /// Read the entire contents of `col_{col_id}.bin` for `label_id` as a
+    /// flat `Vec<u64>`.  Returns an empty vec when the file does not exist yet.
+    ///
+    /// This is used by [`crate::property_index::PropertyIndex::build`] to scan
+    /// all slot values in one `fs::read` call rather than one `read_col_slot`
+    /// per node, making index construction O(n) rather than O(n * syscall-overhead).
+    pub fn read_col_all(&self, label_id: u32, col_id: u32) -> Result<Vec<u64>> {
+        let path = self.col_path(label_id, col_id);
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        // Interpret the byte slice as a flat array of little-endian u64s.
+        let count = bytes.len() / 8;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let offset = i * 8;
+            let v = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            out.push(v);
+        }
+        Ok(out)
+    }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────── ───────────────────────────────────────────────────────────────────
 
 /// Unpack `(label_id, slot)` from a [`NodeId`].
 pub fn unpack_node_id(node_id: NodeId) -> (u32, u32) {

@@ -18,6 +18,9 @@ pub mod csr;
 /// Node property column storage.
 pub mod node_store;
 
+/// In-memory B-tree property equality index (SPA-249).
+pub mod property_index;
+
 /// Edge delta log and CSR rebuild on checkpoint.
 pub mod edge_store;
 
