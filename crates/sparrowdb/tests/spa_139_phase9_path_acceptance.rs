@@ -63,9 +63,7 @@ fn varpath_range_1_to_3_correct_set() {
     }
 
     let result = db
-        .execute(
-            "MATCH (a:Node {name: 'Alice'})-[:LINK*1..3]->(b:Node) RETURN b.name",
-        )
+        .execute("MATCH (a:Node {name: 'Alice'})-[:LINK*1..3]->(b:Node) RETURN b.name")
         .expect("[:LINK*1..3] query must succeed");
 
     let names = col_strings(&result, 0);
@@ -115,14 +113,10 @@ fn varpath_with_endpoint_property_filter() {
     db.execute("CREATE (n:Node {name: 'Carol', active: false})")
         .unwrap();
 
-    db.execute(
-        "MATCH (a:Node {name: 'Alice'}), (b:Node {name: 'Bob'}) CREATE (a)-[:LINK]->(b)",
-    )
-    .unwrap();
-    db.execute(
-        "MATCH (a:Node {name: 'Bob'}), (b:Node {name: 'Carol'}) CREATE (a)-[:LINK]->(b)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:Node {name: 'Alice'}), (b:Node {name: 'Bob'}) CREATE (a)-[:LINK]->(b)")
+        .unwrap();
+    db.execute("MATCH (a:Node {name: 'Bob'}), (b:Node {name: 'Carol'}) CREATE (a)-[:LINK]->(b)")
+        .unwrap();
 
     let result = db
         .execute(
@@ -158,19 +152,13 @@ fn shortest_path_prefers_minimum_hops() {
     db.execute("CREATE (n:Node {name: 'C'})").unwrap();
 
     // Direct A→C
-    db.execute(
-        "MATCH (a:Node {name: 'A'}), (c:Node {name: 'C'}) CREATE (a)-[:LINK]->(c)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:Node {name: 'A'}), (c:Node {name: 'C'}) CREATE (a)-[:LINK]->(c)")
+        .unwrap();
     // Indirect A→B→C
-    db.execute(
-        "MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (a)-[:LINK]->(b)",
-    )
-    .unwrap();
-    db.execute(
-        "MATCH (b:Node {name: 'B'}), (c:Node {name: 'C'}) CREATE (b)-[:LINK]->(c)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (a)-[:LINK]->(b)")
+        .unwrap();
+    db.execute("MATCH (b:Node {name: 'B'}), (c:Node {name: 'C'}) CREATE (b)-[:LINK]->(c)")
+        .unwrap();
 
     let result = db
         .execute(
@@ -237,9 +225,7 @@ fn exists_filters_by_label_on_target() {
     .unwrap();
 
     let result = db
-        .execute(
-            "MATCH (n:Person) WHERE EXISTS { (n)-[:KNOWS]->(:Employee) } RETURN n.name",
-        )
+        .execute("MATCH (n:Person) WHERE EXISTS { (n)-[:KNOWS]->(:Employee) } RETURN n.name")
         .expect("EXISTS with label filter must succeed");
 
     assert_eq!(
@@ -269,8 +255,10 @@ fn exists_with_target_property_condition() {
 
     db.execute("CREATE (n:Manager {name: 'Alice'})").unwrap();
     db.execute("CREATE (n:Manager {name: 'Bob'})").unwrap();
-    db.execute("CREATE (p:Project {title: 'Alpha', status: 'active'})").unwrap();
-    db.execute("CREATE (p:Project {title: 'Beta', status: 'closed'})").unwrap();
+    db.execute("CREATE (p:Project {title: 'Alpha', status: 'active'})")
+        .unwrap();
+    db.execute("CREATE (p:Project {title: 'Beta', status: 'closed'})")
+        .unwrap();
 
     db.execute(
         "MATCH (m:Manager {name: 'Alice'}), (p:Project {title: 'Alpha'}) \
@@ -371,9 +359,7 @@ fn multi_pattern_match_then_create_rel() {
     .unwrap();
 
     let result = db
-        .execute(
-            "MATCH (s:Supplier)-[:SUPPLIES]->(p:Product) RETURN s.name, p.name",
-        )
+        .execute("MATCH (s:Supplier)-[:SUPPLIES]->(p:Product) RETURN s.name, p.name")
         .expect("traversal after multi-pattern MATCH…CREATE must succeed");
 
     assert_eq!(
@@ -410,7 +396,8 @@ fn three_hop_inline_chain() {
     let (_dir, db) = make_db();
 
     for name in &["Alpha", "Beta", "Gamma", "Delta"] {
-        db.execute(&format!("CREATE (n:Step {{name: '{name}'}})")).unwrap();
+        db.execute(&format!("CREATE (n:Step {{name: '{name}'}})"))
+            .unwrap();
     }
     for (src, dst) in &[("Alpha", "Beta"), ("Beta", "Gamma"), ("Gamma", "Delta")] {
         db.execute(&format!(
@@ -469,7 +456,8 @@ fn varpath_lower_bound_excludes_shallow_nodes() {
     let (_dir, db) = make_db();
 
     for name in &["Start", "Mid", "End"] {
-        db.execute(&format!("CREATE (n:Hop {{name: '{name}'}})")).unwrap();
+        db.execute(&format!("CREATE (n:Hop {{name: '{name}'}})"))
+            .unwrap();
     }
     for (src, dst) in &[("Start", "Mid"), ("Mid", "End")] {
         db.execute(&format!(
@@ -479,9 +467,7 @@ fn varpath_lower_bound_excludes_shallow_nodes() {
     }
 
     let result = db
-        .execute(
-            "MATCH (a:Hop {name: 'Start'})-[:JUMP*2..3]->(b:Hop) RETURN b.name",
-        )
+        .execute("MATCH (a:Hop {name: 'Start'})-[:JUMP*2..3]->(b:Hop) RETURN b.name")
         .expect("[:JUMP*2..3] must succeed");
 
     let names = col_strings(&result, 0);
