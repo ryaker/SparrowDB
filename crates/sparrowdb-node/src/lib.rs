@@ -39,7 +39,13 @@ pub struct SparrowDB {
     inner: ::sparrowdb::GraphDb,
 }
 
-// GraphDb uses Arc<DbInner> internally; cross-thread use is safe.
+// SAFETY: napi-rs requires `Send` on all `#[napi]` struct types.  `SparrowDB`
+// wraps `sparrowdb::GraphDb` which is a newtype over `Arc<DbInner>`.  Every
+// field of `DbInner` is `Send`: `PathBuf`, `AtomicU64`, `AtomicBool`,
+// `RwLock<VersionStore>`, `RwLock<NodeVersions>`, and `Option<[u8; 32]>`.
+// There are no raw pointers or `Rc<T>` fields anywhere in the chain.
+// `GraphDb` itself derives `Clone` via `Arc`-clone and is therefore genuinely
+// safe to transfer across threads.
 unsafe impl Send for SparrowDB {}
 
 #[napi]
@@ -106,6 +112,14 @@ pub struct ReadTx {
     inner: ::sparrowdb::ReadTx,
 }
 
+// SAFETY: napi-rs requires `Send` on all `#[napi]` struct types.  `ReadTx`
+// wraps `sparrowdb::ReadTx` which holds: `snapshot_txn_id: u64`,
+// `store: NodeStore` (a `PathBuf` + `HashMap<u32, u64>` — both `Send`), and
+// `inner: Arc<DbInner>` (see `SparrowDB` SAFETY note above).  No raw pointers
+// or `Rc<T>` are present anywhere in the ownership chain.  A `ReadTx` only
+// reads committed state and holds no exclusive resources, so cross-thread
+// transfer is safe as long as the caller does not share a single `ReadTx`
+// reference across threads simultaneously (i.e. `Send` but not `Sync`).
 unsafe impl Send for ReadTx {}
 
 #[napi]
@@ -145,13 +159,27 @@ pub struct WriteTx {
     inner: Option<::sparrowdb::WriteTx>,
 }
 
-// SAFETY: napi-rs requires Send on all #[napi] types.  WriteTx wraps an
-// Arc<DbInner> + WriteGuard (AtomicBool-backed).  We uphold safety by
-// documenting that WriteTx MUST NOT be transferred to a napi worker thread (e.g.
-// via AsyncTask); it is only safe to use from the same thread that opened it.
-// napi-rs currently does not guarantee single-threaded access for object methods
-// without explicit AsyncTask, so callers must not call beginWrite() inside an
-// async napi task.
+// SAFETY: napi-rs requires `Send` on all `#[napi]` struct types.  `WriteTx`
+// wraps `Option<sparrowdb::WriteTx>`.  `sparrowdb::WriteTx` contains:
+//   - `inner: Arc<DbInner>` — `Send` (see `SparrowDB` SAFETY note above)
+//   - `store: NodeStore`    — `Send` (`PathBuf` + `HashMap`, no raw pointers)
+//   - `catalog: Catalog`    — `Send` (`PathBuf` + `Vec` fields, no raw pointers)
+//   - `write_buf: WriteBuffer`           — `Send` (`HashMap` over owned values)
+//   - `wal_mutations: Vec<WalMutation>`  — `Send` (owned enum variants)
+//   - `dirty_nodes: HashSet<u64>`        — `Send`
+//   - `snapshot_txn_id: u64`             — `Send`
+//   - `_guard: WriteGuard`               — `Send` (holds `Arc<DbInner>`)
+//   - `committed: bool`                  — `Send`
+//   - `fulltext_pending: HashMap<String, FulltextIndex>` — `Send` (owned)
+//   - `pending_ops: Vec<PendingOp>`      — `Send` (owned enum variants)
+// No raw pointers or `Rc<T>` anywhere in the chain.
+//
+// Usage constraint: a `WriteTx` holds the exclusive database writer lock via
+// `WriteGuard` (an `AtomicBool` CAS).  It MUST NOT be passed to an async
+// napi `AsyncTask` worker, because doing so would allow multiple threads to
+// drive the same write transaction.  Callers must open and use `WriteTx` on
+// a single JS thread (the napi main thread or a dedicated worker that owns it
+// exclusively).
 unsafe impl Send for WriteTx {}
 
 #[napi]
