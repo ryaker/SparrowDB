@@ -54,6 +54,22 @@ enum Commands {
         #[arg(long)]
         db: PathBuf,
     },
+    /// Export the graph as a DOT (Graphviz) file for visualization.
+    ///
+    /// Writes a `digraph SparrowDB { ... }` to --output (or stdout when omitted).
+    /// To render as SVG: dot -Tsvg graph.dot -o graph.svg
+    ///
+    /// Example:
+    ///   sparrowdb visualize --db my.db --output graph.dot
+    ///   sparrowdb visualize --db my.db | dot -Tsvg -o graph.svg
+    Visualize {
+        /// Path to the database directory
+        #[arg(long)]
+        db: PathBuf,
+        /// Output file path.  When omitted the DOT source is written to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Open a database and serve Cypher queries via NDJSON on stdin/stdout.
     ///
     /// Request format (one JSON object per line on stdin):
@@ -83,6 +99,7 @@ fn main() {
         Commands::Checkpoint { db } => cmd_checkpoint(&db),
         Commands::Info { db } => cmd_info(&db),
         Commands::Import { neo4j_csv, db } => cmd_import(&db, &neo4j_csv),
+        Commands::Visualize { db, output } => cmd_visualize(&db, output.as_deref()),
         Commands::Serve { db, key } => cmd_serve(&db, key.as_deref()),
     };
 
@@ -383,6 +400,31 @@ fn cmd_import(
         "rel_types": rel_types_sorted,
     });
     println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+// ── Visualize ─────────────────────────────────────────────────────────────────
+
+fn cmd_visualize(
+    db_path: &std::path::Path,
+    output: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = sparrowdb::GraphDb::open(db_path)?;
+    let dot = db.export_dot()?;
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, &dot)?;
+            eprintln!(
+                "DOT graph written to {} ({} bytes)",
+                path.display(),
+                dot.len()
+            );
+        }
+        None => {
+            print!("{dot}");
+        }
+    }
     Ok(())
 }
 
