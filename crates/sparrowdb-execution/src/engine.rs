@@ -2654,12 +2654,44 @@ impl Engine {
         let index_candidate_slots: Option<Vec<u32>> =
             try_index_lookup_for_props(&node.props, label_id_u32, &self.prop_index);
 
+        // SPA-249 Phase 1b: when the inline-prop index has no candidates, try to
+        // use the property index for a WHERE-clause equality predicate
+        // (`WHERE n.prop = literal`).  The WHERE clause is still re-evaluated
+        // per slot for correctness.
+        let where_eq_candidate_slots: Option<Vec<u32>> = if index_candidate_slots.is_none() {
+            m.where_clause.as_ref().and_then(|wexpr| {
+                try_where_eq_index_lookup(wexpr, node.var.as_str(), label_id_u32, &self.prop_index)
+            })
+        } else {
+            None
+        };
+
+        // SPA-249 Phase 2: when neither equality path fired, try to use the
+        // property index for a WHERE-clause range predicate (`>`, `>=`, `<`, `<=`,
+        // or a compound AND of two half-open bounds on the same property).
+        let where_range_candidate_slots: Option<Vec<u32>> =
+            if index_candidate_slots.is_none() && where_eq_candidate_slots.is_none() {
+                m.where_clause.as_ref().and_then(|wexpr| {
+                    try_where_range_index_lookup(
+                        wexpr,
+                        node.var.as_str(),
+                        label_id_u32,
+                        &self.prop_index,
+                    )
+                })
+            } else {
+                None
+            };
+
         // SPA-251: when the equality index has no candidates (None), check
         // whether the WHERE clause is a simple CONTAINS or STARTS WITH predicate
         // on a labeled node property, and use the text index to narrow the slot
         // set.  The WHERE clause is always re-evaluated per slot afterward for
         // correctness (tombstone filtering, compound predicates, etc.).
-        let text_candidate_slots: Option<Vec<u32>> = if index_candidate_slots.is_none() {
+        let text_candidate_slots: Option<Vec<u32>> = if index_candidate_slots.is_none()
+            && where_eq_candidate_slots.is_none()
+            && where_range_candidate_slots.is_none()
+        {
             m.where_clause.as_ref().and_then(|wexpr| {
                 try_text_index_lookup(wexpr, node.var.as_str(), label_id_u32, &self.text_index)
             })
@@ -2676,6 +2708,20 @@ impl Engine {
                     label = %label,
                     candidates = slots.len(),
                     "SPA-249: property index fast path"
+                );
+                Box::new(slots.iter().map(|&s| s as u64))
+            } else if let Some(ref slots) = where_eq_candidate_slots {
+                tracing::debug!(
+                    label = %label,
+                    candidates = slots.len(),
+                    "SPA-249 Phase 1b: WHERE equality index fast path"
+                );
+                Box::new(slots.iter().map(|&s| s as u64))
+            } else if let Some(ref slots) = where_range_candidate_slots {
+                tracing::debug!(
+                    label = %label,
+                    candidates = slots.len(),
+                    "SPA-249 Phase 2: WHERE range index fast path"
                 );
                 Box::new(slots.iter().map(|&s| s as u64))
             } else if let Some(ref slots) = text_candidate_slots {
@@ -4301,11 +4347,15 @@ impl Engine {
     }
 
     /// Compatibility shim used by callers that do not need per-node label tracking.
-    fn get_node_neighbors_by_slot(&self, src_slot: u64, src_label_id: u32) -> Vec<u64> {
+    fn get_node_neighbors_by_slot(
+        &self,
+        src_slot: u64,
+        src_label_id: u32,
+        delta_all: &[sparrowdb_storage::edge_store::DeltaRecord],
+    ) -> Vec<u64> {
         let csr_neighbors: Vec<u64> = self.csr_neighbors_all(src_slot);
-        let delta_neighbors: Vec<u64> = self
-            .read_delta_all()
-            .into_iter()
+        let delta_neighbors: Vec<u64> = delta_all
+            .iter()
             .filter(|r| {
                 let r_src_label = (r.src.0 >> 32) as u32;
                 let r_src_slot = r.src.0 & 0xFFFF_FFFF;
@@ -4383,6 +4433,15 @@ impl Engine {
         let mut seen_pairs: std::collections::HashSet<(u64, u64, u32)> =
             std::collections::HashSet::new();
 
+        // Precompute label-id → name map once so that the hot path inside
+        // `for dst_slot in dst_nodes` does not call `list_labels()` per node.
+        let labels_by_id: std::collections::HashMap<u16, String> = self
+            .catalog
+            .list_labels()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
         for src_slot in 0..hwm_src {
             // SPA-254: check per-query deadline at every slot boundary.
             self.check_deadline()?;
@@ -4440,6 +4499,18 @@ impl Engine {
                     continue;
                 }
 
+                // Resolve the actual label name for this destination node so that
+                // labels(x) and label metadata work even when the pattern is unlabeled.
+                // Use the precomputed map to avoid calling list_labels() per node.
+                let resolved_dst_label_name: String = if !dst_label.is_empty() {
+                    dst_label.clone()
+                } else {
+                    labels_by_id
+                        .get(&(actual_label_id as u16))
+                        .cloned()
+                        .unwrap_or_default()
+                };
+
                 // Apply WHERE clause.
                 if let Some(ref where_expr) = m.where_clause {
                     let mut row_vals =
@@ -4464,10 +4535,12 @@ impl Engine {
                             Value::List(vec![Value::String(src_label.clone())]),
                         );
                     }
-                    if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
+                    // Use resolved_dst_label_name so labels(x) works even for unlabeled
+                    // destination patterns (dst_label is empty but actual_label_id is known).
+                    if !dst_node_pat.var.is_empty() && !resolved_dst_label_name.is_empty() {
                         row_vals.insert(
                             format!("{}.__labels__", dst_node_pat.var),
-                            Value::List(vec![Value::String(dst_label.clone())]),
+                            Value::List(vec![Value::String(resolved_dst_label_name.clone())]),
                         );
                     }
                     row_vals.extend(self.dollar_params());
@@ -4486,11 +4559,12 @@ impl Engine {
                 } else {
                     None
                 };
-                let dst_label_meta = if !dst_node_pat.var.is_empty() && !dst_label.is_empty() {
-                    Some((dst_node_pat.var.as_str(), dst_label.as_str()))
-                } else {
-                    None
-                };
+                let dst_label_meta =
+                    if !dst_node_pat.var.is_empty() && !resolved_dst_label_name.is_empty() {
+                        Some((dst_node_pat.var.as_str(), resolved_dst_label_name.as_str()))
+                    } else {
+                        None
+                    };
                 let row = project_hop_row(
                     &src_props,
                     &dst_props,
@@ -4829,6 +4903,8 @@ impl Engine {
         if src_slot == dst_slot {
             return Some(0);
         }
+        // Hoist delta read out of the BFS loop to avoid repeated I/O.
+        let delta_all = self.read_delta_all();
         let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
         visited.insert(src_slot);
         let mut frontier: Vec<u64> = vec![src_slot];
@@ -4836,7 +4912,8 @@ impl Engine {
         for depth in 1..=max_hops {
             let mut next_frontier: Vec<u64> = Vec::new();
             for &node_slot in &frontier {
-                let neighbors = self.get_node_neighbors_by_slot(node_slot, src_label_id);
+                let neighbors =
+                    self.get_node_neighbors_by_slot(node_slot, src_label_id, &delta_all);
                 for nb in neighbors {
                     if nb == dst_slot {
                         return Some(depth);
@@ -5329,6 +5406,193 @@ fn try_text_index_lookup(
     Some(slots)
 }
 
+/// SPA-249 Phase 1b: Try to use the property equality index for a WHERE-clause
+/// equality predicate of the form `n.prop = <literal>`.
+///
+/// Returns `Some(slots)` when:
+/// 1. The WHERE expression is a `BinOp` with `Eq`, one side being
+///    `PropAccess { var, prop }` where `var` == `node_var` and the other side
+///    being an inline-encodable `Literal` (Int or String ≤ 7 bytes).
+/// 2. The `(label_id, col_id)` pair is present in the index.
+///
+/// Returns `None` in all other cases so the caller falls back to a full scan.
+fn try_where_eq_index_lookup(
+    expr: &Expr,
+    node_var: &str,
+    label_id: u32,
+    prop_index: &sparrowdb_storage::property_index::PropertyIndex,
+) -> Option<Vec<u32>> {
+    let (left, op, right) = match expr {
+        Expr::BinOp { left, op, right } if matches!(op, BinOpKind::Eq) => {
+            (left.as_ref(), op, right.as_ref())
+        }
+        _ => return None,
+    };
+    let _ = op;
+
+    // Accept both `n.prop = literal` and `literal = n.prop`.
+    let (prop_name, lit) = if let Expr::PropAccess { var, prop } = left {
+        if var.as_str() == node_var {
+            (prop.as_str(), right)
+        } else {
+            return None;
+        }
+    } else if let Expr::PropAccess { var, prop } = right {
+        if var.as_str() == node_var {
+            (prop.as_str(), left)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let raw_value: u64 = match lit {
+        Expr::Literal(Literal::Int(n)) => StoreValue::Int64(*n).to_u64(),
+        Expr::Literal(Literal::String(s)) if s.len() <= 7 => {
+            StoreValue::Bytes(s.as_bytes().to_vec()).to_u64()
+        }
+        _ => return None,
+    };
+
+    let col_id = prop_name_to_col_id(prop_name);
+    if !prop_index.is_indexed(label_id, col_id) {
+        return None;
+    }
+    Some(prop_index.lookup(label_id, col_id, raw_value).to_vec())
+}
+
+/// SPA-249 Phase 2: Try to use the property range index for WHERE-clause range
+/// predicates (`>`, `>=`, `<`, `<=`) and compound AND range predicates.
+///
+/// Handles:
+/// - Single bound: `n.age > 30`, `n.age >= 18`, `n.age < 100`, `n.age <= 65`.
+/// - Compound AND with same prop and both bounds:
+///   `n.age >= 18 AND n.age <= 65`.
+///
+/// Returns `Some(slots)` when a range can be resolved via the index.
+/// Returns `None` to fall back to full scan.
+fn try_where_range_index_lookup(
+    expr: &Expr,
+    node_var: &str,
+    label_id: u32,
+    prop_index: &sparrowdb_storage::property_index::PropertyIndex,
+) -> Option<Vec<u32>> {
+    use sparrowdb_storage::property_index::sort_key;
+
+    /// Encode an integer literal to raw u64 (same as node_store).
+    fn encode_int(n: i64) -> u64 {
+        StoreValue::Int64(n).to_u64()
+    }
+
+    /// Extract a single (prop_name, lo, hi) range from a simple comparison.
+    /// Returns None if not a recognised range pattern.
+    #[allow(clippy::type_complexity)]
+    fn extract_single_bound<'a>(
+        expr: &'a Expr,
+        node_var: &'a str,
+    ) -> Option<(&'a str, Option<(u64, bool)>, Option<(u64, bool)>)> {
+        let (left, op, right) = match expr {
+            Expr::BinOp { left, op, right }
+                if matches!(
+                    op,
+                    BinOpKind::Gt | BinOpKind::Ge | BinOpKind::Lt | BinOpKind::Le
+                ) =>
+            {
+                (left.as_ref(), op, right.as_ref())
+            }
+            _ => return None,
+        };
+
+        // `n.prop OP literal`
+        if let (Expr::PropAccess { var, prop }, Expr::Literal(Literal::Int(n))) = (left, right) {
+            if var.as_str() != node_var {
+                return None;
+            }
+            let sk = sort_key(encode_int(*n));
+            let prop_name = prop.as_str();
+            return match op {
+                BinOpKind::Gt => Some((prop_name, Some((sk, false)), None)),
+                BinOpKind::Ge => Some((prop_name, Some((sk, true)), None)),
+                BinOpKind::Lt => Some((prop_name, None, Some((sk, false)))),
+                BinOpKind::Le => Some((prop_name, None, Some((sk, true)))),
+                _ => None,
+            };
+        }
+
+        // `literal OP n.prop` — flip the operator direction.
+        if let (Expr::Literal(Literal::Int(n)), Expr::PropAccess { var, prop }) = (left, right) {
+            if var.as_str() != node_var {
+                return None;
+            }
+            let sk = sort_key(encode_int(*n));
+            let prop_name = prop.as_str();
+            // `literal > n.prop` ↔ `n.prop < literal`
+            return match op {
+                BinOpKind::Gt => Some((prop_name, None, Some((sk, false)))),
+                BinOpKind::Ge => Some((prop_name, None, Some((sk, true)))),
+                BinOpKind::Lt => Some((prop_name, Some((sk, false)), None)),
+                BinOpKind::Le => Some((prop_name, Some((sk, true)), None)),
+                _ => None,
+            };
+        }
+
+        None
+    }
+
+    // Try compound AND: `lhs AND rhs` where both sides are range predicates on
+    // the same property.
+    if let Expr::BinOp {
+        left,
+        op: BinOpKind::And,
+        right,
+    } = expr
+    {
+        if let (Some((lp, llo, lhi)), Some((rp, rlo, rhi))) = (
+            extract_single_bound(left, node_var),
+            extract_single_bound(right, node_var),
+        ) {
+            if lp == rp {
+                let col_id = prop_name_to_col_id(lp);
+                if !prop_index.is_indexed(label_id, col_id) {
+                    return None;
+                }
+                // Merge the two half-open bounds: pick the most restrictive
+                // (largest lower bound, smallest upper bound).  Plain `.or()`
+                // is order-dependent and would silently accept a looser bound
+                // when both sides specify the same direction (e.g. `age > 10
+                // AND age > 20` must use `> 20`, not `> 10`).
+                let lo: Option<(u64, bool)> = match (llo, rlo) {
+                    (Some(a), Some(b)) => Some(std::cmp::max(a, b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                let hi: Option<(u64, bool)> = match (lhi, rhi) {
+                    (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                // Validate: we need at least one bound.
+                if lo.is_none() && hi.is_none() {
+                    return None;
+                }
+                return Some(prop_index.lookup_range(label_id, col_id, lo, hi));
+            }
+        }
+    }
+
+    // Try single bound.
+    if let Some((prop_name, lo, hi)) = extract_single_bound(expr, node_var) {
+        let col_id = prop_name_to_col_id(prop_name);
+        if !prop_index.is_indexed(label_id, col_id) {
+            return None;
+        }
+        return Some(prop_index.lookup_range(label_id, col_id, lo, hi));
+    }
+
+    None
+}
+
 /// Map a property name to a col_id via the canonical FNV-1a hash.
 ///
 /// All property names — including those that start with `col_` (e.g. `col_id`,
@@ -5366,6 +5630,11 @@ fn collect_col_ids_from_columns(column_names: &[String]) -> Vec<u32> {
     ids
 }
 
+/// Collect the set of column IDs referenced by `var` in `column_names`.
+///
+/// `_label_id` is accepted to keep call sites consistent and is reserved for
+/// future use (e.g. per-label schema lookups). It is intentionally unused in
+/// the current implementation which derives column IDs purely from column names.
 fn collect_col_ids_for_var(var: &str, column_names: &[String], _label_id: u32) -> Vec<u32> {
     let mut ids = Vec::new();
     for name in column_names {

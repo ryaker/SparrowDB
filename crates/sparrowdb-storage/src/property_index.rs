@@ -9,12 +9,26 @@
 //! ## Design
 //!
 //! A [`PropertyIndex`] is an in-memory structure keyed by `(label_id, col_id)`.
-//! For each such key it maintains a `BTreeMap<u64, Vec<u32>>` that maps the **raw
-//! stored u64** of a property value to the list of slot indices that hold that
-//! value.  This lets equality lookups run in O(log n) time and is valid for
-//! integers and inline strings (≤ 7 bytes); overflow strings are stored as a
+//! For each such key it maintains a `BTreeMap<u64, Vec<u32>>` that maps the **sort
+//! key** (see [`sort_key`]) of a property value to the list of slot indices that
+//! hold that value.  This lets equality lookups run in O(log n) time and is valid
+//! for integers and inline strings (≤ 7 bytes); overflow strings are stored as a
 //! heap pointer whose raw u64 is *unique per string*, so equality on the raw u64
 //! is equivalent to equality on the decoded string value.
+//!
+//! ### Sort-key transform for signed integers
+//!
+//! For `TAG_INT64` values (`tag byte = 0x00`) the 56-bit payload is two's-complement
+//! signed.  Raw `u64` ordering would place negative integers above positive ones
+//! (e.g. `-1` encodes as `0x00FF_FFFF_FFFF_FFFF`).  We fix this by flipping the
+//! sign bit of the 56-bit payload before inserting into the BTreeMap:
+//!
+//! ```text
+//! sort_key = raw ^ 0x0080_0000_0000_0000   (for TAG_INT64 only)
+//! ```
+//!
+//! The same transform is applied to query values in [`PropertyIndex::lookup`] and
+//! [`PropertyIndex::lookup_range`], so correctness is transparent to callers.
 //!
 //! ## Lifecycle
 //!
@@ -44,6 +58,33 @@ const TOMBSTONE: u64 = u64::MAX;
 
 /// Zero is the "absent / never written" sentinel in column files.
 const ABSENT: u64 = 0;
+
+/// Tag byte for signed 64-bit integers (upper byte of the stored u64).
+const INT64_TAG: u64 = 0x00;
+
+// ── Sort-key transform ─────────────────────────────────────────────────────────
+
+/// Map a raw stored `u64` value to a sort key suitable for BTreeMap ordering.
+///
+/// For `TAG_INT64` values the 56-bit payload is two's-complement signed, which
+/// means that in raw `u64` order negative numbers sort *above* positive ones
+/// (`-1 = 0x00FF_FFFF_FFFF_FFFF > 1 = 0x0000_0000_0000_0001`).  We fix this
+/// by flipping the sign bit (bit 55) of the payload so that:
+///   - The most-negative value maps to 0 (lowest key).
+///   - Zero maps to `0x0080_0000_0000_0000` (mid-point).
+///   - Positive values map above that.
+///
+/// All other tag bytes (strings, floats) are returned unchanged because their
+/// in-memory sort order is either not meaningful for range queries or they use
+/// a different encoding.
+#[inline]
+pub fn sort_key(raw: u64) -> u64 {
+    if (raw >> 56) == INT64_TAG {
+        raw ^ 0x0080_0000_0000_0000
+    } else {
+        raw
+    }
+}
 
 // ── Index key ─────────────────────────────────────────────────────────────────
 
@@ -135,7 +176,7 @@ impl PropertyIndex {
                     if raw == ABSENT || tombstone_slots.contains(&slot) {
                         continue;
                     }
-                    btree.entry(raw).or_default().push(slot);
+                    btree.entry(sort_key(raw)).or_default().push(slot);
                 }
             }
         }
@@ -154,9 +195,54 @@ impl PropertyIndex {
     pub fn lookup(&self, label_id: u32, col_id: u32, raw_value: u64) -> &[u32] {
         let key = IndexKey { label_id, col_id };
         match self.index.get(&key) {
-            Some(btree) => btree.get(&raw_value).map(|v| v.as_slice()).unwrap_or(&[]),
+            Some(btree) => btree
+                .get(&sort_key(raw_value))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
             None => &[],
         }
+    }
+
+    /// Look up all live node slots for `(label_id, col_id)` whose sort-key
+    /// falls within the specified range.
+    ///
+    /// `lo` and `hi` are `(sort_key_value, inclusive)` pairs; pass `None` for
+    /// an unbounded end.  The sort-key transform (see [`sort_key`]) must already
+    /// have been applied to the bound values by the caller — use
+    /// `sort_key(raw_value)` on each bound before calling this method.
+    ///
+    /// Returns an empty `Vec` when the column is not indexed or no values fall
+    /// in the range.  Callers must still apply tombstone filtering.
+    pub fn lookup_range(
+        &self,
+        label_id: u32,
+        col_id: u32,
+        lo: Option<(u64, bool)>,
+        hi: Option<(u64, bool)>,
+    ) -> Vec<u32> {
+        use std::ops::Bound;
+
+        let key = IndexKey { label_id, col_id };
+        let btree = match self.index.get(&key) {
+            Some(bt) => bt,
+            None => return vec![],
+        };
+
+        let lo_bound = match lo {
+            None => Bound::Unbounded,
+            Some((v, true)) => Bound::Included(v),
+            Some((v, false)) => Bound::Excluded(v),
+        };
+        let hi_bound = match hi {
+            None => Bound::Unbounded,
+            Some((v, true)) => Bound::Included(v),
+            Some((v, false)) => Bound::Excluded(v),
+        };
+
+        btree
+            .range((lo_bound, hi_bound))
+            .flat_map(|(_k, slots)| slots.iter().copied())
+            .collect()
     }
 
     /// Returns `true` when this `(label_id, col_id)` pair has been indexed.
@@ -176,7 +262,7 @@ impl PropertyIndex {
         self.index
             .entry(key)
             .or_default()
-            .entry(raw_value)
+            .entry(sort_key(raw_value))
             .or_default()
             .push(slot);
     }
@@ -191,17 +277,18 @@ impl PropertyIndex {
 
         // Remove slot from old bucket.
         if old_raw != ABSENT {
-            if let Some(slots) = btree.get_mut(&old_raw) {
+            let sk_old = sort_key(old_raw);
+            if let Some(slots) = btree.get_mut(&sk_old) {
                 slots.retain(|&s| s != slot);
                 if slots.is_empty() {
-                    btree.remove(&old_raw);
+                    btree.remove(&sk_old);
                 }
             }
         }
 
         // Insert into new bucket.
         if new_raw != ABSENT {
-            btree.entry(new_raw).or_default().push(slot);
+            btree.entry(sort_key(new_raw)).or_default().push(slot);
         }
     }
 
@@ -211,12 +298,13 @@ impl PropertyIndex {
         if raw_value == ABSENT {
             return;
         }
+        let sk = sort_key(raw_value);
         let key = IndexKey { label_id, col_id };
         if let Some(btree) = self.index.get_mut(&key) {
-            if let Some(slots) = btree.get_mut(&raw_value) {
+            if let Some(slots) = btree.get_mut(&sk) {
                 slots.retain(|&s| s != slot);
                 if slots.is_empty() {
-                    btree.remove(&raw_value);
+                    btree.remove(&sk);
                 }
             }
         }
