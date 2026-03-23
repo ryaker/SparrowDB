@@ -2560,10 +2560,9 @@ impl Engine {
                 // checkpoint).  Falls back to None gracefully when no
                 // checkpoint has been run yet so pre-checkpoint databases
                 // still return correct results via the delta log path.
-                let csr_bwd: Option<CsrBackward> =
-                    EdgeStore::open(&self.db_root, storage_rel_id)
-                        .and_then(|s| s.open_bwd())
-                        .ok();
+                let csr_bwd: Option<CsrBackward> = EdgeStore::open(&self.db_root, storage_rel_id)
+                    .and_then(|s| s.open_bwd())
+                    .ok();
 
                 // Scan the b-side (physical dst label = tbl_dst_label_id).
                 for b_slot in 0..hwm_bwd {
