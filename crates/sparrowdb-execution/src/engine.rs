@@ -66,6 +66,13 @@ pub struct Engine {
     /// - CONTAINS: linear scan avoids per-slot property-decode overhead.
     /// - STARTS WITH: binary-search prefix range — O(log n + k).
     pub text_index: TextIndex,
+    /// Optional per-query deadline (SPA-254).
+    ///
+    /// When `Some`, the engine checks this deadline at the top of each hot
+    /// scan / traversal loop iteration.  If `Instant::now() >= deadline`,
+    /// `Error::QueryTimeout` is returned immediately.  `None` means no
+    /// deadline (backward-compatible default).
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl Engine {
@@ -107,6 +114,7 @@ impl Engine {
             params: HashMap::new(),
             prop_index,
             text_index,
+            deadline: None,
         }
     }
 
@@ -133,6 +141,30 @@ impl Engine {
     pub fn with_params(mut self, params: HashMap<String, Value>) -> Self {
         self.params = params;
         self
+    }
+
+    /// Set a per-query deadline (SPA-254).
+    ///
+    /// The engine will return [`sparrowdb_common::Error::QueryTimeout`] if
+    /// `Instant::now() >= deadline` during any hot scan or traversal loop.
+    pub fn with_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// Check whether the per-query deadline has passed (SPA-254).
+    ///
+    /// Returns `Err(QueryTimeout)` if a deadline is set and has expired,
+    /// `Ok(())` otherwise.  Inline so the hot-path cost when `deadline` is
+    /// `None` compiles down to a single branch-not-taken.
+    #[inline]
+    fn check_deadline(&self) -> sparrowdb_common::Result<()> {
+        if let Some(dl) = self.deadline {
+            if std::time::Instant::now() >= dl {
+                return Err(sparrowdb_common::Error::QueryTimeout);
+            }
+        }
+        Ok(())
     }
 
     // ── Per-type CSR / delta helpers ─────────────────────────────────────────
@@ -868,6 +900,9 @@ impl Engine {
                 let mut pattern_rows: Vec<HashMap<String, NodeId>> = Vec::new();
 
                 for src_slot in 0..hwm_src {
+                    // SPA-254: check per-query deadline at every slot boundary.
+                    self.check_deadline()?;
+
                     let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
 
                     if self.is_node_tombstoned(src_node) {
@@ -1855,6 +1890,9 @@ impl Engine {
             };
 
         for slot in slot_iter {
+            // SPA-254: check per-query deadline at every slot boundary.
+            self.check_deadline()?;
+
             let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
             if slot < 1024 || slot % 10_000 == 0 {
                 tracing::trace!(slot = slot, node_id = node_id.0, "scan emit");
@@ -2045,6 +2083,9 @@ impl Engine {
             };
 
             for slot in 0..hwm {
+                // SPA-254: check per-query deadline at every slot boundary.
+                self.check_deadline()?;
+
                 let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
 
                 // Skip tombstoned nodes (SPA-164/SPA-216): use
@@ -2285,6 +2326,9 @@ impl Engine {
 
             // Scan source nodes for this label.
             for src_slot in 0..hwm_src {
+                // SPA-254: check per-query deadline at every slot boundary.
+                self.check_deadline()?;
+
                 let src_node = NodeId(((effective_src_label_id as u64) << 32) | src_slot);
                 let src_props = if !col_ids_src.is_empty() || !src_node_pat.props.is_empty() {
                     let all_needed: Vec<u32> = {
@@ -2912,6 +2956,9 @@ impl Engine {
 
         // Scan source nodes.
         for src_slot in 0..hwm_src {
+            // SPA-254: check per-query deadline at every slot boundary.
+            self.check_deadline()?;
+
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
             let src_needed: Vec<u32> = {
                 let mut v = vec![];
@@ -3143,6 +3190,9 @@ impl Engine {
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
         for src_slot in 0..hwm_src {
+            // SPA-254: check per-query deadline at every slot boundary.
+            self.check_deadline()?;
+
             let src_node_id = NodeId(((src_label_id as u64) << 32) | src_slot);
 
             // Skip tombstoned nodes.
@@ -3414,6 +3464,9 @@ impl Engine {
             std::collections::HashSet::new();
 
         for src_slot in 0..hwm_src {
+            // SPA-254: check per-query deadline at every slot boundary.
+            self.check_deadline()?;
+
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
 
             // Fetch source props (for filter + projection).
