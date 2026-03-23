@@ -4762,12 +4762,24 @@ fn deduplicate_rows(rows: &mut Vec<Vec<Value>>) {
     *rows = unique;
 }
 
-fn apply_order_by(rows: &mut [Vec<Value>], m: &MatchStatement, column_names: &[String]) {
-    if m.order_by.is_empty() {
-        return;
-    }
-    rows.sort_by(|a, b| {
-        for (expr, dir) in &m.order_by {
+/// Maximum rows to sort in-memory before spilling to disk (SPA-100).
+fn sort_spill_threshold() -> usize {
+    std::env::var("SPARROWDB_SORT_SPILL_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(crate::sort_spill::DEFAULT_ROW_THRESHOLD)
+}
+
+/// Build a sort key from a single row and the ORDER BY spec.
+fn make_sort_key(
+    row: &[Value],
+    order_by: &[(Expr, SortDir)],
+    column_names: &[String],
+) -> Vec<crate::sort_spill::SortKeyVal> {
+    use crate::sort_spill::{OrdValue, SortKeyVal};
+    order_by
+        .iter()
+        .map(|(expr, dir)| {
             let col_idx = match expr {
                 Expr::PropAccess { var, prop } => {
                     let key = format!("{var}.{prop}");
@@ -4776,22 +4788,66 @@ fn apply_order_by(rows: &mut [Vec<Value>], m: &MatchStatement, column_names: &[S
                 Expr::Var(v) => column_names.iter().position(|c| c == v.as_str()),
                 _ => None,
             };
-            if let Some(idx) = col_idx {
-                if idx < a.len() && idx < b.len() {
-                    let cmp = compare_values(&a[idx], &b[idx]);
-                    let cmp = if *dir == SortDir::Desc {
-                        cmp.reverse()
-                    } else {
-                        cmp
-                    };
-                    if cmp != std::cmp::Ordering::Equal {
-                        return cmp;
+            let val = col_idx
+                .and_then(|i| row.get(i))
+                .map(OrdValue::from_value)
+                .unwrap_or(OrdValue::Null);
+            match dir {
+                SortDir::Asc => SortKeyVal::Asc(val),
+                SortDir::Desc => SortKeyVal::Desc(std::cmp::Reverse(val)),
+            }
+        })
+        .collect()
+}
+
+fn apply_order_by(rows: &mut Vec<Vec<Value>>, m: &MatchStatement, column_names: &[String]) {
+    if m.order_by.is_empty() {
+        return;
+    }
+
+    let threshold = sort_spill_threshold();
+
+    if rows.len() <= threshold {
+        rows.sort_by(|a, b| {
+            for (expr, dir) in &m.order_by {
+                let col_idx = match expr {
+                    Expr::PropAccess { var, prop } => {
+                        let key = format!("{var}.{prop}");
+                        column_names.iter().position(|c| c == &key)
+                    }
+                    Expr::Var(v) => column_names.iter().position(|c| c == v.as_str()),
+                    _ => None,
+                };
+                if let Some(idx) = col_idx {
+                    if idx < a.len() && idx < b.len() {
+                        let cmp = compare_values(&a[idx], &b[idx]);
+                        let cmp = if *dir == SortDir::Desc {
+                            cmp.reverse()
+                        } else {
+                            cmp
+                        };
+                        if cmp != std::cmp::Ordering::Equal {
+                            return cmp;
+                        }
                     }
                 }
             }
+            std::cmp::Ordering::Equal
+        });
+    } else {
+        use crate::sort_spill::{SortableRow, SpillingSorter};
+        let mut sorter: SpillingSorter<SortableRow> = SpillingSorter::new();
+        for row in rows.drain(..) {
+            let key = make_sort_key(&row, &m.order_by, column_names);
+            if sorter.push(SortableRow { key, data: row }).is_err() {
+                return;
+            }
         }
-        std::cmp::Ordering::Equal
-    });
+        match sorter.finish() {
+            Ok(iter) => *rows = iter.map(|sr| sr.data).collect::<Vec<_>>(),
+            Err(_) => {}
+        }
+    }
 }
 
 fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {

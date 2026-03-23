@@ -11,3 +11,4 @@ categories = ["database", "data-structures"]
 
 [dependencies]
 crc32fast = { workspace = true }
+serde     = { workspace = true }
