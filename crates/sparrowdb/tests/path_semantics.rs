@@ -18,7 +18,11 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 }
 
 /// Count occurrences of a string value in column `col` of the result.
-fn count_in_col(result: &sparrowdb_execution::types::QueryResult, col: usize, needle: &str) -> usize {
+fn count_in_col(
+    result: &sparrowdb_execution::types::QueryResult,
+    col: usize,
+    needle: &str,
+) -> usize {
     result
         .rows
         .iter()
@@ -113,19 +117,14 @@ fn cycle_does_not_revisit_start() {
         .execute("MATCH (a:Cyc {name: 'A'})-[:HOP*1..4]->(b:Cyc) RETURN b.name")
         .expect("cycle *1..4 query must succeed");
 
-    let names = col_strings(&result, 0);
+    let mut names = col_strings(&result, 0);
+    names.sort();
 
-    assert!(
-        names.contains(&"B".to_string()),
-        "B must be reachable (depth 1); got: {names:?}"
-    );
-    assert!(
-        names.contains(&"C".to_string()),
-        "C must be reachable (depth 2); got: {names:?}"
-    );
-    assert!(
-        !names.contains(&"A".to_string()),
-        "A must NOT appear — that would revisit the start node; got: {names:?}"
+    // Exactly two results: B (depth 1) and C (depth 2). No duplicates, no A.
+    assert_eq!(
+        names,
+        vec!["B".to_string(), "C".to_string()],
+        "cycle *1..4 from A must yield exactly [B, C]; got: {names:?}"
     );
 }
 
