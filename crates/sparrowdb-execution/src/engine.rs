@@ -77,8 +77,10 @@ impl Engine {
         let prop_index = match catalog.list_labels() {
             Ok(labels) => {
                 // catalog returns (u16, String); PropertyIndex::build expects (u32, String).
-                let labels_u32: Vec<(u32, String)> =
-                    labels.into_iter().map(|(id, name)| (id as u32, name)).collect();
+                let labels_u32: Vec<(u32, String)> = labels
+                    .into_iter()
+                    .map(|(id, name)| (id as u32, name))
+                    .collect();
                 PropertyIndex::build(&store, &labels_u32)
             }
             Err(e) => {
