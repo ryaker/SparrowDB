@@ -22,6 +22,7 @@ use sparrowdb_storage::edge_store::{DeltaRecord, EdgeStore, RelTableId};
 use sparrowdb_storage::fulltext_index::FulltextIndex;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
 use sparrowdb_storage::property_index::PropertyIndex;
+use sparrowdb_storage::text_index::TextIndex;
 use sparrowdb_storage::wal::WalReplayer;
 
 use crate::types::{QueryResult, Value};
@@ -58,6 +59,13 @@ pub struct Engine {
     /// Built at `Engine::new` time by scanning all on-disk column files.
     /// Enables O(log n) equality-filter scans instead of O(n) full scans.
     pub prop_index: PropertyIndex,
+    /// In-memory text search index for CONTAINS and STARTS WITH (SPA-251).
+    ///
+    /// Built at `Engine::new` alongside `prop_index`.  Stores sorted
+    /// `(decoded_string, slot)` pairs per `(label_id, col_id)`.
+    /// - CONTAINS: linear scan avoids per-slot property-decode overhead.
+    /// - STARTS WITH: binary-search prefix range — O(log n + k).
+    pub text_index: TextIndex,
 }
 
 impl Engine {
@@ -74,18 +82,21 @@ impl Engine {
     ) -> Self {
         // SPA-249: build property equality index from on-disk column files.
         // Degrades gracefully on error — queries still work, just O(n).
-        let prop_index = match catalog.list_labels() {
+        let (prop_index, text_index) = match catalog.list_labels() {
             Ok(labels) => {
-                // catalog returns (u16, String); PropertyIndex::build expects (u32, String).
+                // catalog returns (u16, String); index builders expect (u32, String).
                 let labels_u32: Vec<(u32, String)> = labels
                     .into_iter()
                     .map(|(id, name)| (id as u32, name))
                     .collect();
-                PropertyIndex::build(&store, &labels_u32)
+                let pi = PropertyIndex::build(&store, &labels_u32);
+                // SPA-251: build text search index alongside property index.
+                let ti = TextIndex::build(&store, &labels_u32);
+                (pi, ti)
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "SPA-249: property index build failed; disabled");
-                PropertyIndex::new()
+                tracing::warn!(error = ?e, "SPA-249/SPA-251: index build failed; disabled");
+                (PropertyIndex::new(), TextIndex::new())
             }
         };
         Engine {
@@ -95,6 +106,7 @@ impl Engine {
             db_root: db_root.to_path_buf(),
             params: HashMap::new(),
             prop_index,
+            text_index,
         }
     }
 
@@ -1807,19 +1819,40 @@ impl Engine {
         let index_candidate_slots: Option<Vec<u32>> =
             try_index_lookup_for_props(&node.props, label_id_u32, &self.prop_index);
 
-        // Build an iterator over candidate slot values.  When the index narrows
-        // the set, iterate only those slots; otherwise iterate 0..hwm.
-        let slot_iter: Box<dyn Iterator<Item = u64>> = match index_candidate_slots {
-            Some(ref slots) => {
+        // SPA-251: when the equality index has no candidates (None), check
+        // whether the WHERE clause is a simple CONTAINS or STARTS WITH predicate
+        // on a labeled node property, and use the text index to narrow the slot
+        // set.  The WHERE clause is always re-evaluated per slot afterward for
+        // correctness (tombstone filtering, compound predicates, etc.).
+        let text_candidate_slots: Option<Vec<u32>> = if index_candidate_slots.is_none() {
+            m.where_clause.as_ref().and_then(|wexpr| {
+                try_text_index_lookup(wexpr, node.var.as_str(), label_id_u32, &self.text_index)
+            })
+        } else {
+            None
+        };
+
+        // Build an iterator over candidate slot values.  When the equality index
+        // or text index narrows the set, iterate only those slots; otherwise
+        // iterate 0..hwm.
+        let slot_iter: Box<dyn Iterator<Item = u64>> =
+            if let Some(ref slots) = index_candidate_slots {
                 tracing::debug!(
                     label = %label,
                     candidates = slots.len(),
-                    "SPA-249: index fast path"
+                    "SPA-249: property index fast path"
                 );
                 Box::new(slots.iter().map(|&s| s as u64))
-            }
-            None => Box::new(0..hwm),
-        };
+            } else if let Some(ref slots) = text_candidate_slots {
+                tracing::debug!(
+                    label = %label,
+                    candidates = slots.len(),
+                    "SPA-251: text index fast path"
+                );
+                Box::new(slots.iter().map(|&s| s as u64))
+            } else {
+                Box::new(0..hwm)
+            };
 
         for slot in slot_iter {
             let node_id = NodeId(((label_id_u32 as u64) << 32) | slot);
@@ -4191,6 +4224,59 @@ fn try_index_lookup_for_props(
         return None;
     }
     Some(prop_index.lookup(label_id, col_id, raw_value).to_vec())
+}
+
+/// SPA-251: Try to use the text index for a simple CONTAINS or STARTS WITH
+/// predicate in the WHERE clause.
+///
+/// Returns `Some(slots)` when:
+/// 1. The WHERE expression is a single `BinOp` with `Contains` or `StartsWith`.
+/// 2. The left operand is a `PropAccess { var, prop }` where `var` matches
+///    the node variable name (`node_var`).
+/// 3. The right operand is a `Literal::String`.
+/// 4. The `(label_id, col_id)` pair is present in the text index.
+///
+/// Returns `None` for compound predicates, non-string literals, or when the
+/// column has not been indexed — the caller falls back to a full O(n) scan.
+fn try_text_index_lookup(
+    expr: &Expr,
+    node_var: &str,
+    label_id: u32,
+    text_index: &TextIndex,
+) -> Option<Vec<u32>> {
+    let (left, op, right) = match expr {
+        Expr::BinOp { left, op, right }
+            if matches!(op, BinOpKind::Contains | BinOpKind::StartsWith) =>
+        {
+            (left.as_ref(), op, right.as_ref())
+        }
+        _ => return None,
+    };
+
+    // Left must be a property access on the node variable.
+    let prop_name = match left {
+        Expr::PropAccess { var, prop } if var.as_str() == node_var => prop.as_str(),
+        _ => return None,
+    };
+
+    // Right must be a string literal.
+    let pattern = match right {
+        Expr::Literal(Literal::String(s)) => s.as_str(),
+        _ => return None,
+    };
+
+    let col_id = prop_name_to_col_id(prop_name);
+    if !text_index.is_indexed(label_id, col_id) {
+        return None;
+    }
+
+    let slots = match op {
+        BinOpKind::Contains => text_index.lookup_contains(label_id, col_id, pattern),
+        BinOpKind::StartsWith => text_index.lookup_starts_with(label_id, col_id, pattern),
+        _ => return None,
+    };
+
+    Some(slots)
 }
 
 /// Map a property name to a col_id via the canonical FNV-1a hash.

@@ -21,6 +21,9 @@ pub mod node_store;
 /// In-memory B-tree property equality index (SPA-249).
 pub mod property_index;
 
+/// In-memory text search index for CONTAINS and STARTS WITH (SPA-251).
+pub mod text_index;
+
 /// Edge delta log and CSR rebuild on checkpoint.
 pub mod edge_store;
 
