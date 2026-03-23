@@ -93,6 +93,7 @@ impl WalWriter {
 
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;
@@ -100,14 +101,16 @@ impl WalWriter {
         // Write the version header byte at the start of a new segment.
         // For existing segments, seek to end to continue appending.
         let file_len = file.metadata()?.len();
-        if file_len == 0 {
+        let seg_offset = if file_len == 0 {
             // New segment — write the 1-byte version header.
             file.write_all(&[WAL_FORMAT_VERSION])?;
+            1
         } else {
             // Existing segment — seek to end for appending.
             use std::io::Seek;
             file.seek(std::io::SeekFrom::Start(seg_offset))?;
-        }
+            seg_offset
+        };
 
         Ok(Self {
             wal_dir: wal_dir.to_path_buf(),
@@ -145,7 +148,9 @@ impl WalWriter {
         let data = std::fs::read(&path)?;
 
         if data.is_empty() {
-            return Ok((last_seg, 0, 1));
+            return Err(sparrowdb_common::Error::Corruption(
+                "WAL segment is empty and missing the required version header".to_string(),
+            ));
         }
 
         // Validate the version header byte.
@@ -241,6 +246,7 @@ impl WalWriter {
         let path = segment_path(&self.wal_dir, self.seg_no);
         let mut new_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;

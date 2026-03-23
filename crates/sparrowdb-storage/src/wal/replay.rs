@@ -275,7 +275,8 @@ impl WalReplayer {
             let version = data[0];
             if version != WAL_FORMAT_VERSION {
                 return Err(Error::Corruption(format!(
-                    "WAL segment {seg_no} version mismatch: found {version}, expected {WAL_FORMAT_VERSION}."
+                    "WAL segment {seg_no} version mismatch: found {version}, expected {WAL_FORMAT_VERSION}. \
+                     This segment was written with an incompatible WAL format."
                 )));
             }
             // Records start at byte 1 (after the version header byte).
