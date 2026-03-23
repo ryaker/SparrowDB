@@ -17,7 +17,7 @@ use sparrowdb_cypher::ast::{
     Statement, UnionStatement, UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
-use sparrowdb_storage::csr::CsrForward;
+use sparrowdb_storage::csr::{CsrBackward, CsrForward};
 use sparrowdb_storage::edge_store::{DeltaRecord, EdgeStore, RelTableId};
 use sparrowdb_storage::fulltext_index::FulltextIndex;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
@@ -2550,11 +2550,19 @@ impl Engine {
                     }
                 }
 
-                // Read delta records for this rel table (edges in the forward
-                // direction b→a are stored as src=b, dst=a in the delta log).
+                // Read delta records for this rel table (physical edges stored
+                // as src=a, dst=b that we want to traverse in reverse b→a).
                 let delta_records_bwd = EdgeStore::open(&self.db_root, storage_rel_id)
                     .and_then(|s| s.read_delta())
                     .unwrap_or_default();
+
+                // Load the backward CSR for this rel table (written by
+                // checkpoint).  Falls back to None gracefully when no
+                // checkpoint has been run yet so pre-checkpoint databases
+                // still return correct results via the delta log path.
+                let csr_bwd: Option<CsrBackward> = EdgeStore::open(&self.db_root, storage_rel_id)
+                    .and_then(|s| s.open_bwd())
+                    .ok();
 
                 // Scan the b-side (physical dst label = tbl_dst_label_id).
                 for b_slot in 0..hwm_bwd {
@@ -2594,14 +2602,36 @@ impl Engine {
                         .map(|r| r.src.0 & 0xFFFF_FFFF)
                         .collect();
 
+                    // Also include checkpointed predecessors from the backward
+                    // CSR (populated after checkpoint; empty/None before first
+                    // checkpoint).  Combine with delta predecessors so that
+                    // undirected matching works for both pre- and post-checkpoint
+                    // databases.
+                    let csr_predecessors: &[u64] = csr_bwd
+                        .as_ref()
+                        .map(|c| c.predecessors(b_slot))
+                        .unwrap_or(&[]);
+                    let all_predecessors: Vec<u64> = csr_predecessors
+                        .iter()
+                        .copied()
+                        .chain(delta_predecessors.into_iter())
+                        .collect();
+
                     let mut seen_preds: HashSet<u64> = HashSet::new();
-                    for a_slot in delta_predecessors {
+                    for a_slot in all_predecessors {
                         if !seen_preds.insert(a_slot) {
                             continue;
                         }
-                        // Skip pairs already emitted in the forward pass
-                        // (forward emitted (a_slot, b_slot)).
-                        if seen_undirected.contains(&(a_slot, b_slot)) {
+                        // Skip pairs already emitted in the forward pass.
+                        // The backward row being emitted is (b_slot, a_slot) --
+                        // b is the node being scanned (physical dst of the edge),
+                        // a is its predecessor (physical src).
+                        // Only suppress this row if that exact reversed pair was
+                        // already produced by the forward pass (i.e. a physical
+                        // b->a edge was stored and traversed).
+                        // SPA-257: using (a_slot, b_slot) was wrong -- it
+                        // suppressed the legitimate backward traversal of a->b.
+                        if seen_undirected.contains(&(b_slot, a_slot)) {
                             continue;
                         }
 

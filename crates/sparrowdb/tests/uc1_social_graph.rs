@@ -4,6 +4,7 @@
 //! Acceptance check #4: two_hop_match_via_binary_asp_join
 
 use sparrowdb_catalog::catalog::Catalog;
+use sparrowdb_common::col_id_of;
 use sparrowdb_execution::engine::Engine;
 use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
@@ -17,36 +18,54 @@ fn setup_social_graph(dir: &std::path::Path) -> Engine {
         .expect("KNOWS rel table");
 
     let mut store = NodeStore::open(dir).expect("node store");
-    // col 0 = name (stored as i64 id: 1=Alice, 2=Bob, 3=Carol, 4=Dave, 5=Eve)
-    // col 1 = age
+    // Use col_id_of so the column ids match what the execution engine computes
+    // from Cypher property names (FNV-hashed).  Previously, raw integer literals
+    // 0 and 1 were used, which don't match col_id_of("col_0") / col_id_of("col_1").
+    let col_0 = col_id_of("col_0"); // name: 1=Alice, 2=Bob, 3=Carol, 4=Dave, 5=Eve
+    let col_1 = col_id_of("col_1"); // age
     let alice = store
         .create_node(
             person_id,
-            &[(0, StoreValue::Int64(1)), (1, StoreValue::Int64(30))],
+            &[
+                (col_0, StoreValue::Int64(1)),
+                (col_1, StoreValue::Int64(30)),
+            ],
         )
         .expect("Alice");
     let bob = store
         .create_node(
             person_id,
-            &[(0, StoreValue::Int64(2)), (1, StoreValue::Int64(25))],
+            &[
+                (col_0, StoreValue::Int64(2)),
+                (col_1, StoreValue::Int64(25)),
+            ],
         )
         .expect("Bob");
     let carol = store
         .create_node(
             person_id,
-            &[(0, StoreValue::Int64(3)), (1, StoreValue::Int64(35))],
+            &[
+                (col_0, StoreValue::Int64(3)),
+                (col_1, StoreValue::Int64(35)),
+            ],
         )
         .expect("Carol");
     let dave = store
         .create_node(
             person_id,
-            &[(0, StoreValue::Int64(4)), (1, StoreValue::Int64(28))],
+            &[
+                (col_0, StoreValue::Int64(4)),
+                (col_1, StoreValue::Int64(28)),
+            ],
         )
         .expect("Dave");
     let _eve = store
         .create_node(
             person_id,
-            &[(0, StoreValue::Int64(5)), (1, StoreValue::Int64(22))],
+            &[
+                (col_0, StoreValue::Int64(5)),
+                (col_1, StoreValue::Int64(22)),
+            ],
         )
         .expect("Eve");
 
