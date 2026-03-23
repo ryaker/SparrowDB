@@ -1232,6 +1232,8 @@ impl Engine {
         // Determine if this is a 2-hop query.
         let is_two_hop = m.pattern.len() == 1 && m.pattern[0].rels.len() == 2;
         let is_one_hop = m.pattern.len() == 1 && m.pattern[0].rels.len() == 1;
+        // N-hop (3+): generalised iterative traversal (SPA-252).
+        let is_n_hop = m.pattern.len() == 1 && m.pattern[0].rels.len() >= 3;
         // Detect variable-length path: single pattern with exactly 1 rel that has min_hops set.
         let is_var_len = m.pattern.len() == 1
             && m.pattern[0].rels.len() == 1
@@ -1249,6 +1251,8 @@ impl Engine {
             self.execute_two_hop(m, &column_names)
         } else if is_one_hop {
             self.execute_one_hop(m, &column_names)
+        } else if is_n_hop {
+            self.execute_n_hop(m, &column_names)
         } else if is_multi_pattern {
             self.execute_multi_pattern_scan(m, &column_names)
         } else if m.pattern[0].rels.is_empty() {
@@ -2746,10 +2750,12 @@ impl Engine {
             ids
         };
 
-        // Collect col_ids for src that are referenced by the WHERE clause, scoped to the src
-        // variable so that fof-only predicates do not cause spurious column fetches from src nodes.
+        // Collect col_ids for src: columns referenced in RETURN (for projection)
+        // plus columns referenced in WHERE for the src variable.
+        // SPA-252: projection columns must be included so that project_fof_row
+        // can resolve src-variable columns (e.g. `RETURN a.name` when src_var = "a").
         let col_ids_src_where: Vec<u32> = {
-            let mut ids = Vec::new();
+            let mut ids = collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
             if let Some(ref where_expr) = m.where_clause {
                 collect_col_ids_from_expr_for_var(where_expr, &src_node_pat.var, &mut ids);
             }
@@ -4626,6 +4632,12 @@ fn project_hop_row(
         .collect()
 }
 
+/// Project a single 2-hop result row.
+///
+/// For each return column of the form `var.prop`, looks up the property value
+/// from `src_props` when `var == src_var`, and from `fof_props` otherwise.
+/// This ensures that `RETURN a.name, c.name` correctly reads the source and
+/// destination node properties independently (SPA-252).
 fn project_fof_row(
     src_props: &[(u32, u64)],
     fof_props: &[(u32, u64)],
