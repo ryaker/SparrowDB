@@ -4146,6 +4146,161 @@ impl Engine {
     ///
     /// SPA-185: reads across all rel types (used by variable-length path
     /// traversal which does not currently filter on rel_type).
+    /// Return the labeled outgoing neighbors of `(src_slot, src_label_id)`.
+    ///
+    /// Each entry is `(dst_slot, dst_label_id)`.  The delta log encodes the full
+    /// NodeId in `r.dst`, so label_id is recovered precisely.  For CSR-only
+    /// destinations the label is looked up in the `node_label` hint map (built
+    /// from the delta by the caller); if absent, `src_label_id` is used as a
+    /// conservative fallback (correct for homogeneous graphs).
+    fn get_node_neighbors_labeled(
+        &self,
+        src_slot: u64,
+        src_label_id: u32,
+        delta_all: &[sparrowdb_storage::edge_store::DeltaRecord],
+        node_label: &std::collections::HashMap<(u64, u32), ()>,
+        all_label_ids: &[u32],
+    ) -> Vec<(u64, u32)> {
+        // ── CSR neighbors (slot only; label recovered by scanning all label HWMs
+        //    or falling back to src_label_id for homogeneous graphs) ────────────
+        let csr_slots: Vec<u64> = self.csr_neighbors_all(src_slot);
+
+        // ── Delta neighbors (full NodeId available) ───────────────────────────
+        // Use a map from (dst_slot, dst_label) to avoid duplicates when merging
+        // with CSR results.
+        let mut out: std::collections::HashMap<(u64, u32), ()> = std::collections::HashMap::new();
+
+        // Insert delta neighbors first — their labels are authoritative.
+        for r in delta_all.iter().filter(|r| {
+            let r_src_label = (r.src.0 >> 32) as u32;
+            let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+            r_src_label == src_label_id && r_src_slot == src_slot
+        }) {
+            let dst_slot = r.dst.0 & 0xFFFF_FFFF;
+            let dst_label = (r.dst.0 >> 32) as u32;
+            out.insert((dst_slot, dst_label), ());
+        }
+
+        // For each CSR slot, determine label: prefer a delta-confirmed label,
+        // else scan all known label ids to find one whose HWM covers that slot.
+        // If no label confirms it, fall back to src_label_id.
+        'csr: for dst_slot in csr_slots {
+            // Check if delta already gave us a label for this slot.
+            for &lid in all_label_ids {
+                if out.contains_key(&(dst_slot, lid)) {
+                    continue 'csr; // already recorded with correct label
+                }
+            }
+            // Try to determine the dst label from the delta node_label registry.
+            // node_label keys are (slot, label_id) pairs seen anywhere in delta.
+            let mut found = false;
+            for &lid in all_label_ids {
+                if node_label.contains_key(&(dst_slot, lid)) {
+                    out.insert((dst_slot, lid), ());
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                // No label info available — fallback to src_label_id (correct for
+                // homogeneous graphs, gracefully wrong for unmapped CSR-only nodes
+                // in heterogeneous graphs with no delta activity on those nodes).
+                out.insert((dst_slot, src_label_id), ());
+            }
+        }
+
+        out.into_keys().collect()
+    }
+
+    /// BFS traversal for variable-length path patterns `(src)-[:R*min..max]->(dst)`.
+    ///
+    /// Returns the set of `(dst_slot, dst_label_id)` pairs reachable from `src_slot`
+    /// in `[min_hops, max_hops]` hops.  Max is capped at 10 to prevent runaway
+    /// traversals on dense graphs.
+    ///
+    /// Fixes applied (SPA-268):
+    ///   Bug A — frontier tracks `(slot, label_id)` so depth-2+ nodes are expanded
+    ///            with their own label, not always the source's label.
+    ///   Bug B — `results.insert` is gated behind the `visited.insert` guard so a
+    ///            self-loop cannot insert the source back into results.
+    ///   Bug C — when `min_hops == 0` the source node is pre-seeded in results.
+    fn execute_variable_hops(
+        &self,
+        src_slot: u64,
+        src_label_id: u32,
+        min_hops: u32,
+        max_hops: u32,
+    ) -> Vec<(u64, u32)> {
+        const SAFETY_CAP: u32 = 10;
+        let max_hops = max_hops.min(SAFETY_CAP);
+
+        // Read the full delta once.  Build two auxiliary structures:
+        //   node_label  — set of (slot, label_id) pairs seen in any delta record
+        //   all_label_ids — de-duplicated list of label ids present in delta
+        let delta_all = self.read_delta_all();
+        let mut node_label: std::collections::HashMap<(u64, u32), ()> =
+            std::collections::HashMap::new();
+        for r in &delta_all {
+            let src_s = r.src.0 & 0xFFFF_FFFF;
+            let src_l = (r.src.0 >> 32) as u32;
+            node_label.insert((src_s, src_l), ());
+            let dst_s = r.dst.0 & 0xFFFF_FFFF;
+            let dst_l = (r.dst.0 >> 32) as u32;
+            node_label.insert((dst_s, dst_l), ());
+        }
+        let mut all_label_ids: Vec<u32> = node_label.keys().map(|&(_, l)| l).collect();
+        all_label_ids.sort_unstable();
+        all_label_ids.dedup();
+
+        // BFS state.
+        // visited  — set of (slot, label_id) pairs; prevents revisiting the same
+        //            node and guards against cross-label slot collisions.
+        // frontier — (slot, label_id) pairs at the current BFS depth.
+        // results  — (slot, label_id) pairs at depth >= min_hops.
+        let mut visited: std::collections::HashSet<(u64, u32)> = std::collections::HashSet::new();
+        visited.insert((src_slot, src_label_id));
+
+        // Bug C fix: zero-hop match includes the source node itself.
+        let mut results: std::collections::HashSet<(u64, u32)> = std::collections::HashSet::new();
+        if min_hops == 0 {
+            results.insert((src_slot, src_label_id));
+        }
+
+        // Bug A fix: frontier carries label_id so each node is expanded with the
+        // correct delta-log filter, regardless of depth.
+        let mut frontier: Vec<(u64, u32)> = vec![(src_slot, src_label_id)];
+
+        for depth in 1..=max_hops {
+            let mut next_frontier: Vec<(u64, u32)> = Vec::new();
+            for &(node_slot, node_label_id) in &frontier {
+                let neighbors = self.get_node_neighbors_labeled(
+                    node_slot,
+                    node_label_id,
+                    &delta_all,
+                    &node_label,
+                    &all_label_ids,
+                );
+                for (nb_slot, nb_label) in neighbors {
+                    // Bug B fix: gate results.insert behind visited.insert so
+                    // already-visited nodes (including self-loops) are excluded.
+                    if visited.insert((nb_slot, nb_label)) {
+                        next_frontier.push((nb_slot, nb_label));
+                        if depth >= min_hops {
+                            results.insert((nb_slot, nb_label));
+                        }
+                    }
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+
+        results.into_iter().collect()
+    }
+
+    /// Compatibility shim used by callers that do not need per-node label tracking.
     fn get_node_neighbors_by_slot(&self, src_slot: u64, src_label_id: u32) -> Vec<u64> {
         let csr_neighbors: Vec<u64> = self.csr_neighbors_all(src_slot);
         let delta_neighbors: Vec<u64> = self
@@ -4161,51 +4316,6 @@ impl Engine {
         let mut all: std::collections::HashSet<u64> = csr_neighbors.into_iter().collect();
         all.extend(delta_neighbors);
         all.into_iter().collect()
-    }
-
-    /// BFS traversal for variable-length path patterns `(src)-[:R*min..max]->(dst)`.
-    ///
-    /// Returns the set of destination slot-ids reachable from `src_slot` in
-    /// `[min_hops, max_hops]` hops.  Max is capped at 10 to prevent runaway
-    /// traversals on dense graphs.
-    fn execute_variable_hops(
-        &self,
-        src_slot: u64,
-        src_label_id: u32,
-        min_hops: u32,
-        max_hops: u32,
-    ) -> Vec<u64> {
-        const SAFETY_CAP: u32 = 10;
-        let max_hops = max_hops.min(SAFETY_CAP);
-
-        // BFS: frontier = nodes at the current depth.
-        // visited = all nodes ever enqueued (for cycle-avoidance).
-        // results = nodes at depth >= min_hops.
-        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        visited.insert(src_slot);
-        let mut frontier: Vec<u64> = vec![src_slot];
-        let mut results: std::collections::HashSet<u64> = std::collections::HashSet::new();
-
-        for depth in 1..=max_hops {
-            let mut next_frontier: Vec<u64> = Vec::new();
-            for &node_slot in &frontier {
-                let neighbors = self.get_node_neighbors_by_slot(node_slot, src_label_id);
-                for nb in neighbors {
-                    if visited.insert(nb) {
-                        next_frontier.push(nb);
-                    }
-                    if depth >= min_hops {
-                        results.insert(nb);
-                    }
-                }
-            }
-            if next_frontier.is_empty() {
-                break;
-            }
-            frontier = next_frontier;
-        }
-
-        results.into_iter().collect()
     }
 
     /// Execute a variable-length path query: `MATCH (a:L1)-[:R*M..N]->(b:L2) RETURN …`.
@@ -4233,15 +4343,22 @@ impl Engine {
             .catalog
             .get_label(&src_label)?
             .ok_or(sparrowdb_common::Error::NotFound)? as u32;
-        let dst_label_id = self
-            .catalog
-            .get_label(&dst_label)?
-            .ok_or(sparrowdb_common::Error::NotFound)? as u32;
+        // dst_label_id is None when the destination pattern has no label constraint.
+        let dst_label_id: Option<u32> = if dst_label.is_empty() {
+            None
+        } else {
+            Some(
+                self.catalog
+                    .get_label(&dst_label)?
+                    .ok_or(sparrowdb_common::Error::NotFound)? as u32,
+            )
+        };
 
         let hwm_src = self.store.hwm_for_label(src_label_id)?;
 
         let col_ids_src = collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
-        let col_ids_dst = collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id);
+        let col_ids_dst =
+            collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id.unwrap_or(0));
 
         // Build dst read set: projection columns + dst inline-prop filter columns +
         // WHERE-clause columns on the dst variable.  Mirrors the 1-hop code (SPA-224).
@@ -4260,7 +4377,10 @@ impl Engine {
         };
 
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        let mut seen_pairs: std::collections::HashSet<(u64, u64)> =
+        // Track (src_slot, dst_slot, dst_label_id) triples to avoid duplicate
+        // result rows.  Including dst_label_id prevents cross-label slot collisions
+        // in heterogeneous graphs where slot 0 of label A ≠ slot 0 of label B.
+        let mut seen_pairs: std::collections::HashSet<(u64, u64, u32)> =
             std::collections::HashSet::new();
 
         for src_slot in 0..hwm_src {
@@ -4289,15 +4409,27 @@ impl Engine {
                 continue;
             }
 
-            // BFS to find all reachable dst slots within [min_hops, max_hops].
-            let dst_slots = self.execute_variable_hops(src_slot, src_label_id, min_hops, max_hops);
+            // BFS to find all reachable (slot, label_id) pairs within [min_hops, max_hops].
+            let dst_nodes = self.execute_variable_hops(src_slot, src_label_id, min_hops, max_hops);
 
-            for dst_slot in dst_slots {
-                if !seen_pairs.insert((src_slot, dst_slot)) {
+            for (dst_slot, actual_label_id) in dst_nodes {
+                // When the destination pattern specifies a label, only include nodes
+                // whose actual label (recovered from the delta) matches.
+                if let Some(required_label) = dst_label_id {
+                    if actual_label_id != required_label {
+                        continue;
+                    }
+                }
+
+                // Use the actual label_id to construct the NodeId so that
+                // heterogeneous graph nodes are addressed correctly.
+                let resolved_dst_label_id = dst_label_id.unwrap_or(actual_label_id);
+
+                if !seen_pairs.insert((src_slot, dst_slot, actual_label_id)) {
                     continue;
                 }
 
-                let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
+                let dst_node = NodeId(((resolved_dst_label_id as u64) << 32) | dst_slot);
                 // SPA-224: read dst props using the full column set (projection +
                 // inline filter + WHERE), not just the projection set.  Without the
                 // filter columns the inline prop check below always fails silently
