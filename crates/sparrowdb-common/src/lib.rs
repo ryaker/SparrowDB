@@ -11,11 +11,15 @@ pub struct PageId(pub u64);
 pub struct TxnId(pub u64);
 
 /// Node identifier: upper 16 bits = label_id, lower 48 bits = slot_id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct NodeId(pub u64);
 
 /// Edge identifier: monotonic u64 sourced from the active metapage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct EdgeId(pub u64);
 
 /// All errors that SparrowDB can return.
