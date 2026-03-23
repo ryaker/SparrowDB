@@ -1206,13 +1206,10 @@ fn kms_q31_variable_length_path_traversal() {
 //
 // GAP-C: MERGE with relationship pattern not implemented (SPA-215 covers node MERGE only).
 // SparrowDB workaround in SparrowDBStorage: MATCH existence check + CREATE.
-// Test documents the gap — marked #[ignore].
+// SPA-233: MERGE relationship pattern implemented — test promoted from #[ignore].
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "GAP-C: MERGE (k)-[r:ABOUT]->(e) relationship pattern not yet supported. \
-            SPA-215 covers MERGE for nodes. Relationship MERGE needs a new sub-ticket. \
-            SparrowDBStorage.createAboutRelationships uses MATCH+CREATE workaround."]
 fn kms_q32_merge_relationship_pattern() {
     let (_dir, db) = make_db();
 

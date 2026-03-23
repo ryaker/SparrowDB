@@ -447,6 +447,7 @@ impl GraphDb {
         if Engine::is_mutation(&bound.inner) {
             match bound.inner {
                 Statement::Merge(ref m) => self.execute_merge(m),
+                Statement::MatchMergeRel(ref mm) => self.execute_match_merge_rel(mm),
                 Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
                 Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
                 // Standalone CREATE with edges — must go through WriteTx so
@@ -974,6 +975,144 @@ impl GraphDb {
         Ok(QueryResult::empty(vec![]))
     }
 
+    /// Execute `MATCH … MERGE (a)-[r:TYPE]->(b)`: find-or-create a relationship.
+    ///
+    /// Algorithm (SPA-233):
+    /// 1. MATCH the node patterns to get correlated (src, dst) NodeId pairs.
+    /// 2. For each pair, look up the rel-type in the catalog.  If the rel table
+    ///    does not exist yet, the relationship cannot exist → create it.
+    /// 3. If the rel table exists, scan the delta log and (if checkpointed) the
+    ///    CSR forward file to check whether a (src_slot, dst_slot) edge already
+    ///    exists for this rel type.
+    /// 4. If no existing edge is found, call `create_edge` to create it.
+    ///
+    /// The write lock is acquired before the scan so that no concurrent writer
+    /// can race between the existence check and the edge creation.
+    fn execute_match_merge_rel(
+        &self,
+        mm: &sparrowdb_cypher::ast::MatchMergeRelStatement,
+    ) -> Result<QueryResult> {
+        use sparrowdb_storage::edge_store::EdgeStore;
+
+        // Acquire the write lock first.
+        let mut tx = self.begin_write()?;
+
+        // Build an Engine for the read-scan phase.
+        let csrs = open_csr_map(&self.inner.path);
+        let engine = Engine::new(
+            NodeStore::open(&self.inner.path)?,
+            Catalog::open(&self.inner.path)?,
+            csrs,
+            &self.inner.path,
+        );
+
+        // Guard: reject reserved rel-type prefix used by internal system edges.
+        if mm.rel_type.starts_with("__SO_") {
+            return Err(Error::InvalidArgument(format!(
+                "relationship type '{}' is reserved",
+                mm.rel_type
+            )));
+        }
+
+        // Scan MATCH patterns to get correlated (src_var, dst_var) NodeId rows.
+        let matched_rows = engine.scan_match_merge_rel_rows(mm)?;
+        if matched_rows.is_empty() {
+            // No matched nodes → nothing to merge; this is a no-op (not an error).
+            return Ok(QueryResult::empty(vec![]));
+        }
+
+        for row in &matched_rows {
+            // Resolve the bound node IDs for this row.
+            let src = if mm.src_var.is_empty() {
+                // Anonymous source — cannot merge without a variable binding.
+                return Err(Error::InvalidArgument(
+                    "MERGE relationship pattern source variable is anonymous; \
+                     use a named variable bound by the MATCH clause"
+                        .into(),
+                ));
+            } else {
+                *row.get(&mm.src_var).ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "MERGE references unbound source variable: {}",
+                        mm.src_var
+                    ))
+                })?
+            };
+
+            let dst = if mm.dst_var.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "MERGE relationship pattern destination variable is anonymous; \
+                     use a named variable bound by the MATCH clause"
+                        .into(),
+                ));
+            } else {
+                *row.get(&mm.dst_var).ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "MERGE references unbound destination variable: {}",
+                        mm.dst_var
+                    ))
+                })?
+            };
+
+            // Derive label IDs from the packed NodeIds.
+            let src_label_id = (src.0 >> 32) as u16;
+            let dst_label_id = (dst.0 >> 32) as u16;
+            let src_slot = src.0 & 0xFFFF_FFFF;
+            let dst_slot = dst.0 & 0xFFFF_FFFF;
+
+            // Look up whether a rel table for this type already exists in the catalog.
+            // `get_rel_table` returns `Ok(None)` if no such table is registered yet,
+            // meaning no edge of this type can exist.
+            let catalog_rel_id_opt =
+                tx.catalog
+                    .get_rel_table(src_label_id, dst_label_id, &mm.rel_type)?;
+
+            let edge_already_exists = if let Some(catalog_rel_id) = catalog_rel_id_opt {
+                let rel_table_id = RelTableId(catalog_rel_id as u32);
+
+                if let Ok(store) = EdgeStore::open(&self.inner.path, rel_table_id) {
+                    // Check delta log.
+                    let in_delta = store
+                        .read_delta()?
+                        .iter()
+                        .any(|rec| rec.src.0 == src.0 && rec.dst.0 == dst.0);
+
+                    // Check CSR base (post-checkpoint edges).
+                    let in_csr = if let Ok(csr) = store.open_fwd() {
+                        csr.neighbors(src_slot).contains(&dst_slot)
+                    } else {
+                        false
+                    };
+
+                    // Also check pending (uncommitted in this same tx) edge creates.
+                    let in_pending = tx.pending_ops.iter().any(|op| {
+                        matches!(
+                            op,
+                            PendingOp::EdgeCreate {
+                                src: ps,
+                                dst: pd,
+                                rel_table_id: prt,
+                            } if *ps == src && *pd == dst && *prt == rel_table_id
+                        )
+                    });
+
+                    in_delta || in_csr || in_pending
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !edge_already_exists {
+                tx.create_edge(src, dst, &mm.rel_type, HashMap::new())?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(QueryResult::empty(vec![]))
+    }
+
     /// Create (or overwrite) a named full-text index.
     ///
     /// Creates the on-disk backing file for the named index so that
@@ -1288,6 +1427,85 @@ impl GraphDb {
                             ))
                         })?;
                         tx.create_edge(src, dst, &rel_pat.rel_type, HashMap::new())?;
+                    }
+                }
+                Ok(QueryResult::empty(vec![]))
+            }
+
+            Statement::MatchMergeRel(ref mm) => {
+                // Find-or-create relationship batch variant (SPA-233).
+                //
+                // NOTE: MATCH...MERGE in a batch reads committed on-disk state only;
+                // nodes/edges created earlier in the same batch are not visible to
+                // the MERGE existence check.  If in-batch visibility is required,
+                // flush the transaction to disk before issuing MATCH...MERGE.
+                let csrs = open_csr_map(&self.inner.path);
+                let engine = Engine::new(
+                    NodeStore::open(&self.inner.path)?,
+                    Catalog::open(&self.inner.path)?,
+                    csrs,
+                    &self.inner.path,
+                );
+                // Guard: reject reserved rel-type prefix used by internal system edges.
+                if mm.rel_type.starts_with("__SO_") {
+                    return Err(Error::InvalidArgument(format!(
+                        "relationship type '{}' is reserved",
+                        mm.rel_type
+                    )));
+                }
+                let matched_rows = engine.scan_match_merge_rel_rows(mm)?;
+                for row in &matched_rows {
+                    let src = *row.get(&mm.src_var).ok_or_else(|| {
+                        Error::InvalidArgument(format!(
+                            "MERGE references unbound source variable: {}",
+                            mm.src_var
+                        ))
+                    })?;
+                    let dst = *row.get(&mm.dst_var).ok_or_else(|| {
+                        Error::InvalidArgument(format!(
+                            "MERGE references unbound destination variable: {}",
+                            mm.dst_var
+                        ))
+                    })?;
+                    let src_label_id = (src.0 >> 32) as u16;
+                    let dst_label_id = (dst.0 >> 32) as u16;
+                    let src_slot = src.0 & 0xFFFF_FFFF;
+                    let dst_slot = dst.0 & 0xFFFF_FFFF;
+
+                    let catalog_rel_id_opt =
+                        tx.catalog
+                            .get_rel_table(src_label_id, dst_label_id, &mm.rel_type)?;
+
+                    let edge_exists = if let Some(crid) = catalog_rel_id_opt {
+                        let rtid = RelTableId(crid as u32);
+                        if let Ok(store) = EdgeStore::open(&self.inner.path, rtid) {
+                            let in_delta = store
+                                .read_delta()?
+                                .iter()
+                                .any(|rec| rec.src.0 == src.0 && rec.dst.0 == dst.0);
+                            let in_csr = if let Ok(csr) = store.open_fwd() {
+                                csr.neighbors(src_slot).contains(&dst_slot)
+                            } else {
+                                false
+                            };
+                            let in_pending = tx.pending_ops.iter().any(|op| {
+                                matches!(
+                                    op,
+                                    PendingOp::EdgeCreate {
+                                        src: ps, dst: pd, rel_table_id: prt,
+                                    } if *ps == src && *pd == dst && *prt == rtid
+                                )
+                            });
+                            in_delta || in_csr || in_pending
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !edge_exists {
+                        tx.create_edge(src, dst, &mm.rel_type, HashMap::new())?;
                     }
                 }
                 Ok(QueryResult::empty(vec![]))
