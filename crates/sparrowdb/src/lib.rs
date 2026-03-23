@@ -1260,9 +1260,11 @@ impl GraphDb {
 
     /// Export the graph as a DOT (Graphviz) string for visualization.
     ///
-    /// Queries all nodes and relationships and emits a `digraph` in the DOT
-    /// language.  The result can be piped through `dot -Tsvg` to produce an
-    /// SVG, or written to a `.dot` file for offline rendering.
+    /// Queries all nodes via Cypher and reads edges directly from storage so
+    /// that the output is correct regardless of whether the database has been
+    /// checkpointed (CSR) or not (delta log).  The result can be piped through
+    /// `dot -Tsvg` to produce an SVG, or written to a `.dot` file for offline
+    /// rendering.
     ///
     /// ## Example
     ///
@@ -1274,8 +1276,6 @@ impl GraphDb {
     /// // Then: dot -Tsvg graph.dot -o graph.svg
     /// ```
     pub fn export_dot(&self) -> Result<String> {
-        // ── Helpers ───────────────────────────────────────────────────────────
-
         /// Escape a string for use inside a DOT label (backslash + double-quote).
         fn dot_escape(s: &str) -> String {
             s.replace('\\', "\\\\").replace('"', "\\\"")
@@ -1305,57 +1305,78 @@ impl GraphDb {
             }
         }
 
-        // ── Query nodes ───────────────────────────────────────────────────────
-        // Broad unlabeled MATCH captures every node regardless of label.
+        let path = &self.inner.path;
+        let catalog = sparrowdb_catalog::catalog::Catalog::open(path)?;
+
+        // Query all nodes via Cypher — id(n) is reliably Int64 from node scans.
         let nodes =
             self.execute("MATCH (n) RETURN id(n) AS nid, labels(n) AS lbls, n.name AS nm")?;
 
-        // ── Query edges ───────────────────────────────────────────────────────
-        let edges =
-            self.execute("MATCH (a)-[r]->(b) RETURN id(a) AS src, type(r) AS rel, id(b) AS dst")?;
+        // Read edges directly from storage.
+        //
+        // The Cypher engine's project_hop_row does not expose id(a)/id(b) in
+        // hop patterns (SPA-149 follow-up), so we read the delta log
+        // (pre-checkpoint) and CSR (post-checkpoint) directly.
+        //
+        // NodeId encoding: (label_id as u64) << 32 | slot
+        // This is the same as the value returned by id(n) for node scans.
+        let rel_tables = catalog.list_rel_tables_with_ids();
+        let mut edge_triples: Vec<(i64, String, i64)> = Vec::new();
 
-        // ── Build DOT output ──────────────────────────────────────────────────
+        for (catalog_id, src_label_id, dst_label_id, rel_type) in &rel_tables {
+            let storage_rel_id = sparrowdb_storage::edge_store::RelTableId(*catalog_id as u32);
+
+            if let Ok(store) = sparrowdb_storage::edge_store::EdgeStore::open(path, storage_rel_id)
+            {
+                // Delta log: stores full NodeId pairs directly.
+                if let Ok(records) = store.read_delta() {
+                    for rec in records {
+                        edge_triples.push((rec.src.0 as i64, rel_type.clone(), rec.dst.0 as i64));
+                    }
+                }
+
+                // CSR: (src_slot, dst_slot) relative to label IDs.
+                if let Ok(csr) = store.open_fwd() {
+                    let n_nodes = csr.n_nodes();
+                    for src_slot in 0..n_nodes {
+                        let src_id = ((*src_label_id as u64) << 32 | src_slot) as i64;
+                        for &dst_slot in csr.neighbors(src_slot) {
+                            let dst_id = ((*dst_label_id as u64) << 32 | dst_slot) as i64;
+                            edge_triples.push((src_id, rel_type.clone(), dst_id));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build DOT output.
         let mut dot =
             String::from("digraph SparrowDB {\n  rankdir=LR;\n  node [shape=ellipse];\n\n");
 
         for row in &nodes.rows {
-            // row: [nid: Int64, lbls: List<String>, nm: String|Null]
             let node_id = match &row[0] {
                 sparrowdb_execution::types::Value::Int64(i) => *i,
-                _ => continue, // skip rows with null id (shouldn't happen)
+                _ => continue,
             };
             let label_str = fmt_val(&row[1]);
             let name_str = match &row[2] {
                 sparrowdb_execution::types::Value::Null => String::new(),
                 v => fmt_val(v),
             };
-
             let display_label = if name_str.is_empty() {
                 format!("{}\\nid={}", dot_escape(&label_str), node_id)
             } else {
                 format!("{}\\n{}", dot_escape(&label_str), dot_escape(&name_str))
             };
-
             dot.push_str(&format!("  n{node_id} [label=\"{display_label}\"];\n"));
         }
 
         dot.push('\n');
 
-        for row in &edges.rows {
-            // row: [src: Int64, rel: String, dst: Int64]
-            let src = match &row[0] {
-                sparrowdb_execution::types::Value::Int64(i) => *i,
-                _ => continue,
-            };
-            let rel = fmt_val(&row[1]);
-            let dst = match &row[2] {
-                sparrowdb_execution::types::Value::Int64(i) => *i,
-                _ => continue,
-            };
-
+        for (src_id, rel_type, dst_id) in &edge_triples {
             dot.push_str(&format!(
-                "  n{src} -> n{dst} [label=\"{}\"];\n",
-                dot_escape(&rel)
+                "  n{src_id} -> n{dst_id} [label=\"{}\"];\n",
+                dot_escape(rel_type)
             ));
         }
 
