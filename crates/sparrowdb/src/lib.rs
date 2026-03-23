@@ -478,6 +478,96 @@ impl GraphDb {
         }
     }
 
+    /// Execute a Cypher query with a per-query timeout (SPA-254).
+    ///
+    /// Identical to [`execute`](Self::execute) but sets a deadline of
+    /// `Instant::now() + timeout` before dispatching to the engine.  The
+    /// engine checks the deadline at the top of every hot scan / traversal
+    /// loop.  If the deadline passes before the query completes,
+    /// [`Error::QueryTimeout`] is returned.
+    ///
+    /// `execute_with_timeout` only supports read-only (`MATCH … RETURN`)
+    /// statements today; mutation statements are forwarded to the existing
+    /// write-transaction code path **without** a timeout (they typically
+    /// complete in O(1) writes and are not the source of runaway queries).
+    ///
+    /// # Example
+    /// ```no_run
+    /// use sparrowdb::GraphDb;
+    /// use std::time::Duration;
+    ///
+    /// let db = GraphDb::open(std::path::Path::new("/tmp/g.sparrow")).unwrap();
+    /// let result = db.execute_with_timeout(
+    ///     "MATCH (n:Person) RETURN n.name",
+    ///     Duration::from_secs(5),
+    /// );
+    /// match result {
+    ///     Ok(qr) => println!("{} rows", qr.rows.len()),
+    ///     Err(sparrowdb::Error::QueryTimeout) => eprintln!("query timed out"),
+    ///     Err(e) => eprintln!("error: {e}"),
+    /// }
+    /// ```
+    pub fn execute_with_timeout(
+        &self,
+        cypher: &str,
+        timeout: std::time::Duration,
+    ) -> Result<QueryResult> {
+        use sparrowdb_cypher::ast::Statement;
+        use sparrowdb_cypher::{bind, parse};
+
+        let stmt = parse(cypher)?;
+        let catalog_snap = Catalog::open(&self.inner.path)?;
+        let bound = bind(stmt, &catalog_snap)?;
+
+        // Delegate CHECKPOINT/OPTIMIZE immediately — no timeout needed.
+        match &bound.inner {
+            Statement::Checkpoint => {
+                self.checkpoint()?;
+                return Ok(QueryResult::empty(vec![]));
+            }
+            Statement::Optimize => {
+                self.optimize()?;
+                return Ok(QueryResult::empty(vec![]));
+            }
+            _ => {}
+        }
+
+        if Engine::is_mutation(&bound.inner) {
+            // Mutation statements go through the standard write-transaction
+            // path; they are not the source of runaway queries.
+            return match bound.inner {
+                Statement::Merge(ref m) => self.execute_merge(m),
+                Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
+                Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
+                Statement::Create(ref c) => self.execute_create_standalone(c),
+                _ => unreachable!(),
+            };
+        }
+
+        let _span = info_span!("sparrowdb.query_with_timeout").entered();
+        let deadline = std::time::Instant::now() + timeout;
+
+        let mut engine = {
+            let _open_span = info_span!("sparrowdb.open_engine").entered();
+            let csrs = open_csr_map(&self.inner.path);
+            Engine::new(
+                NodeStore::open(&self.inner.path)?,
+                catalog_snap,
+                csrs,
+                &self.inner.path,
+            )
+            .with_deadline(deadline)
+        };
+
+        let result = {
+            let _exec_span = info_span!("sparrowdb.execute").entered();
+            engine.execute_statement(bound.inner)?
+        };
+
+        tracing::debug!(rows = result.rows.len(), "query_with_timeout complete");
+        Ok(result)
+    }
+
     /// Internal: execute a standalone `CREATE (a)-[:R]->(b)` statement.
     ///
     /// Creates all declared nodes, then for each edge in the pattern looks up

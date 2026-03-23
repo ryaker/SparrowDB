@@ -53,6 +53,11 @@ pub enum Error {
     NodeHasEdges {
         node_id: u64,
     },
+    /// The per-query deadline was exceeded before the query could complete.
+    ///
+    /// Returned by [`GraphDb::execute_with_timeout`] when the supplied
+    /// [`std::time::Duration`] expires during scan or traversal.
+    QueryTimeout,
 }
 
 impl std::fmt::Display for Error {
@@ -82,6 +87,7 @@ impl std::fmt::Display for Error {
                 f,
                 "node {node_id} has attached edges and cannot be deleted without removing them first"
             ),
+            Error::QueryTimeout => write!(f, "query timeout: deadline exceeded"),
         }
     }
 }
