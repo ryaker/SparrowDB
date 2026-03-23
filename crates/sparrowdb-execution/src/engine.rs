@@ -12,9 +12,10 @@ use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
     BinOpKind, CallStatement, CreateStatement, Expr, ListPredicateKind, Literal,
-    MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement,
-    MatchWithStatement, Mutation, OptionalMatchStatement, PathPattern, ReturnItem, SortDir,
-    Statement, UnionStatement, UnwindStatement, WithClause,
+    MatchCreateStatement, MatchMergeRelStatement, MatchMutateStatement,
+    MatchOptionalMatchStatement, MatchStatement, MatchWithStatement, Mutation,
+    OptionalMatchStatement, PathPattern, ReturnItem, SortDir, Statement, UnionStatement,
+    UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::{CsrBackward, CsrForward};
@@ -248,11 +249,12 @@ impl Engine {
             // Mutation statements require a write transaction owned by the
             // caller (GraphDb). They are dispatched via the public helpers
             // below and should not reach execute_bound in normal use.
-            Statement::Merge(_) | Statement::MatchMutate(_) | Statement::MatchCreate(_) => {
-                Err(sparrowdb_common::Error::InvalidArgument(
-                    "mutation statements must be executed via execute_mutation".into(),
-                ))
-            }
+            Statement::Merge(_)
+            | Statement::MatchMergeRel(_)
+            | Statement::MatchMutate(_)
+            | Statement::MatchCreate(_) => Err(sparrowdb_common::Error::InvalidArgument(
+                "mutation statements must be executed via execute_mutation".into(),
+            )),
             Statement::OptionalMatch(om) => self.execute_optional_match(&om),
             Statement::MatchOptionalMatch(mom) => self.execute_match_optional_match(&mom),
             Statement::Union(u) => self.execute_union(u),
@@ -458,7 +460,10 @@ impl Engine {
     /// Used by `GraphDb::execute` to route the statement to the write path.
     pub fn is_mutation(stmt: &Statement) -> bool {
         match stmt {
-            Statement::Merge(_) | Statement::MatchMutate(_) | Statement::MatchCreate(_) => true,
+            Statement::Merge(_)
+            | Statement::MatchMergeRel(_)
+            | Statement::MatchMutate(_)
+            | Statement::MatchCreate(_) => true,
             // All standalone CREATE statements must go through the
             // write-transaction path to ensure WAL durability and correct
             // single-writer semantics, regardless of whether edges are present.
@@ -963,6 +968,26 @@ impl Engine {
         }
 
         Ok(accumulated)
+    }
+
+    /// Scan the MATCH patterns of a `MatchMergeRelStatement` and return
+    /// correlated `(variable → NodeId)` binding rows — identical semantics to
+    /// `scan_match_create_rows` but taking the MERGE form's match patterns.
+    pub fn scan_match_merge_rel_rows(
+        &self,
+        mm: &MatchMergeRelStatement,
+    ) -> Result<Vec<HashMap<String, NodeId>>> {
+        // Reuse scan_match_create_rows by wrapping the MERGE patterns in a
+        // MatchCreateStatement with an empty (no-op) CREATE body.
+        let proxy = MatchCreateStatement {
+            match_patterns: mm.match_patterns.clone(),
+            match_props: vec![],
+            create: CreateStatement {
+                nodes: vec![],
+                edges: vec![],
+            },
+        };
+        self.scan_match_create_rows(&proxy)
     }
 
     // ── UNWIND ─────────────────────────────────────────────────────────────────

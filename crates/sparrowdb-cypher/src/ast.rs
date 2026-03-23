@@ -251,6 +251,28 @@ pub struct MergeStatement {
     pub return_clause: Option<ReturnClause>,
 }
 
+/// MATCH … MERGE (a)-[r:TYPE]->(b) statement: find-or-create a relationship.
+///
+/// The MATCH clause binds node variables; the MERGE clause guarantees that
+/// exactly one relationship of the given type exists between those nodes.
+///
+/// `MATCH (a:Label {prop: val}), (b:Label {prop: val}) MERGE (a)-[r:TYPE]->(b)`
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchMergeRelStatement {
+    /// MATCH patterns used to bind the endpoint node variables.
+    pub match_patterns: Vec<PathPattern>,
+    /// Optional WHERE clause on the MATCH.
+    pub where_clause: Option<Expr>,
+    /// Variable bound to the left (source) node in the MERGE pattern.
+    pub src_var: String,
+    /// Variable bound to the relationship (may be empty for anonymous).
+    pub rel_var: String,
+    /// Relationship type to merge on.
+    pub rel_type: String,
+    /// Variable bound to the right (destination) node in the MERGE pattern.
+    pub dst_var: String,
+}
+
 /// A mutation clause appended after a MATCH: SET or DELETE.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mutation {
@@ -376,6 +398,8 @@ pub enum Statement {
     MatchWith(MatchWithStatement),
     Unwind(UnwindStatement),
     Merge(MergeStatement),
+    /// MATCH … MERGE (a)-[r:TYPE]->(b) — find-or-create a relationship (SPA-233).
+    MatchMergeRel(MatchMergeRelStatement),
     MatchMutate(MatchMutateStatement),
     OptionalMatch(OptionalMatchStatement),
     MatchOptionalMatch(MatchOptionalMatchStatement),

@@ -68,6 +68,13 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
         // CALL: procedure name and args are validated at execution time by the
         // procedure dispatcher.  No catalog lookups are required here.
         Statement::Call(_) => {}
+        // MATCH…MERGE relationship: validate the MATCH patterns (labels must
+        // exist); the rel type may not exist yet — merge_edge will create it.
+        Statement::MatchMergeRel(mm) => {
+            for pat in &mm.match_patterns {
+                bind_path_pattern(pat, catalog)?;
+            }
+        }
     }
     Ok(BoundStatement { inner: stmt })
 }

@@ -7,10 +7,10 @@ use sparrowdb_common::{Error, Result};
 
 use crate::ast::{
     BinOpKind, CallStatement, CreateStatement, EdgeDir, ExistsPattern, Expr, ListPredicateKind,
-    Literal, MatchCreateStatement, MatchMutateStatement, MatchOptionalMatchStatement,
-    MatchStatement, MergeStatement, Mutation, NodePattern, OptionalMatchStatement, PathPattern,
-    PropEntry, RelPattern, ReturnClause, ReturnItem, ShortestPathExpr, SortDir, Statement,
-    UnionStatement, UnwindStatement,
+    Literal, MatchCreateStatement, MatchMergeRelStatement, MatchMutateStatement,
+    MatchOptionalMatchStatement, MatchStatement, MergeStatement, Mutation, NodePattern,
+    OptionalMatchStatement, PathPattern, PropEntry, RelPattern, ReturnClause, ReturnItem,
+    ShortestPathExpr, SortDir, Statement, UnionStatement, UnwindStatement,
 };
 use crate::lexer::{tokenize, Token};
 
@@ -251,6 +251,10 @@ impl Parser {
                     }
                 }
             }
+            Token::Merge => {
+                // MATCH … MERGE (a)-[r:TYPE]->(b) — find-or-create relationship (SPA-233)
+                self.parse_match_merge_rel_tail(patterns, None)
+            }
             Token::With => {
                 // MATCH … WITH … RETURN pipeline
                 self.parse_with_pipeline(patterns, None)
@@ -270,6 +274,94 @@ impl Parser {
                 other
             ))),
         }
+    }
+
+    /// Parse the `MERGE (a)-[r:TYPE]->(b)` tail after a MATCH clause.
+    ///
+    /// Syntax: `MERGE (src_var)-[rel_var:REL_TYPE]->(dst_var)`
+    ///
+    /// The `ON CREATE SET …` clause is parsed and silently discarded
+    /// (relationship properties are not yet stored; SPA-233 scope).
+    fn parse_match_merge_rel_tail(
+        &mut self,
+        match_patterns: Vec<PathPattern>,
+        where_clause: Option<Expr>,
+    ) -> Result<Statement> {
+        self.expect_tok(&Token::Merge)?;
+
+        // Parse `(src_var ...)` — the source node pattern.
+        // We reuse parse_node_pattern which handles labels, props, and closing paren.
+        let src_node = self.parse_node_pattern()?;
+        let src_var = src_node.var;
+
+        // Expect `-[...]->` or `<-[...]-` relationship pattern.
+        // parse_rel_pattern itself consumes the leading `-` or `<-`.
+        if !matches!(self.peek(), Token::Dash | Token::Arrow | Token::LeftArrow) {
+            return Err(Error::InvalidArgument(format!(
+                "expected relationship pattern after node in MERGE, got {:?}",
+                self.peek()
+            )));
+        }
+        let rel_pat = self.parse_rel_pattern()?;
+        if rel_pat.dir != EdgeDir::Outgoing {
+            return Err(Error::InvalidArgument(
+                "MERGE relationship pattern must use outgoing direction: (a)-[r:TYPE]->(b)".into(),
+            ));
+        }
+
+        // Parse `(dst_var ...)` — the destination node pattern.
+        let dst_node = self.parse_node_pattern()?;
+        let dst_var = dst_node.var;
+
+        // Optional `ON CREATE SET …` / `ON MATCH SET …` clauses — parse and discard
+        // (relationship properties not stored in SPA-233 scope).
+        // `ON` is not a reserved keyword, so it arrives as Token::Ident("ON").
+        while matches!(self.peek(), Token::Ident(ref s) if s.eq_ignore_ascii_case("on")) {
+            self.advance(); // consume ON
+            self.skip_on_clause()?;
+        }
+
+        Ok(Statement::MatchMergeRel(MatchMergeRelStatement {
+            match_patterns,
+            where_clause,
+            src_var,
+            rel_var: rel_pat.var,
+            rel_type: rel_pat.rel_type,
+            dst_var,
+        }))
+    }
+
+    /// Skip an `ON CREATE SET …` or `ON MATCH SET …` clause after a MERGE.
+    ///
+    /// The token stream is positioned right after the `ON` identifier.
+    /// We consume tokens until we reach a top-level boundary: EOF, `;`, or
+    /// a new top-level clause keyword (RETURN, WITH, another MERGE, or a new
+    /// MATCH that is NOT preceded by CREATE/MATCH).
+    ///
+    /// Implementation: consume until we see `ON` (the next ON…SET clause)
+    /// or a true top-level keyword.  The SET clause itself contains arbitrary
+    /// expressions, so we skip all tokens until the next boundary.
+    fn skip_on_clause(&mut self) -> Result<()> {
+        // First skip the CREATE or MATCH keyword that follows ON.
+        match self.peek().clone() {
+            Token::Create | Token::Match => {
+                self.advance();
+            }
+            _ => {} // unexpected, but keep going
+        }
+        // Now consume the rest of the `SET var.prop = expr` (or whatever follows)
+        // until we hit a top-level boundary.
+        loop {
+            match self.peek().clone() {
+                Token::Eof | Token::Semicolon | Token::Return | Token::With | Token::Merge => break,
+                // Another `ON …` clause — stop here and let the outer loop handle it.
+                Token::Ident(ref s) if s.eq_ignore_ascii_case("on") => break,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+        Ok(())
     }
 
     // ── OPTIONAL MATCH (standalone) ───────────────────────────────────────────
