@@ -530,11 +530,8 @@ impl Engine {
 
         let label_id = match self.catalog.get_label(&label)? {
             Some(id) => id as u32,
-            None => {
-                return Err(sparrowdb_common::Error::InvalidArgument(format!(
-                    "unknown label: {label}"
-                )))
-            }
+            // SPA-266: unknown label → no nodes can match; return empty result.
+            None => return Ok(vec![]),
         };
 
         let hwm = self.store.hwm_for_label(label_id)?;
