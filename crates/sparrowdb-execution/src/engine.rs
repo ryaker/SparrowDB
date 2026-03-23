@@ -2680,9 +2680,24 @@ impl Engine {
         // use the property index for a WHERE-clause equality predicate
         // (`WHERE n.prop = literal`).  The WHERE clause is still re-evaluated
         // per slot for correctness.
+        //
+        // We pre-build the index for any single-equality WHERE prop so the lazy
+        // cache is populated before the immutable borrow below.
+        if index_candidate_slots.is_none() {
+            if let Some(wexpr) = m.where_clause.as_ref() {
+                for prop_name in where_clause_eq_prop_names(wexpr, node.var.as_str()) {
+                    let col_id = sparrowdb_common::col_id_of(prop_name);
+                    let _ =
+                        self.prop_index
+                            .borrow_mut()
+                            .build_for(&self.store, label_id_u32, col_id);
+                }
+            }
+        }
         let where_eq_candidate_slots: Option<Vec<u32>> = if index_candidate_slots.is_none() {
+            let prop_index_ref = self.prop_index.borrow();
             m.where_clause.as_ref().and_then(|wexpr| {
-                try_where_eq_index_lookup(wexpr, node.var.as_str(), label_id_u32, &self.prop_index)
+                try_where_eq_index_lookup(wexpr, node.var.as_str(), label_id_u32, &prop_index_ref)
             })
         } else {
             None
@@ -2691,14 +2706,28 @@ impl Engine {
         // SPA-249 Phase 2: when neither equality path fired, try to use the
         // property index for a WHERE-clause range predicate (`>`, `>=`, `<`, `<=`,
         // or a compound AND of two half-open bounds on the same property).
+        //
+        // Pre-build for any range-predicate WHERE props before the immutable borrow.
+        if index_candidate_slots.is_none() && where_eq_candidate_slots.is_none() {
+            if let Some(wexpr) = m.where_clause.as_ref() {
+                for prop_name in where_clause_range_prop_names(wexpr, node.var.as_str()) {
+                    let col_id = sparrowdb_common::col_id_of(prop_name);
+                    let _ =
+                        self.prop_index
+                            .borrow_mut()
+                            .build_for(&self.store, label_id_u32, col_id);
+                }
+            }
+        }
         let where_range_candidate_slots: Option<Vec<u32>> =
             if index_candidate_slots.is_none() && where_eq_candidate_slots.is_none() {
+                let prop_index_ref = self.prop_index.borrow();
                 m.where_clause.as_ref().and_then(|wexpr| {
                     try_where_range_index_lookup(
                         wexpr,
                         node.var.as_str(),
                         label_id_u32,
-                        &self.prop_index,
+                        &prop_index_ref,
                     )
                 })
             } else {
@@ -5426,6 +5455,78 @@ fn try_text_index_lookup(
     };
 
     Some(slots)
+}
+
+/// SPA-249 (lazy build): Extract all property names referenced in a WHERE-clause
+/// equality predicate (`n.prop = literal` or `literal = n.prop`) so the caller
+/// can pre-build the lazy index for those `(label_id, col_id)` pairs.
+///
+/// Returns an empty vec if the expression does not match the pattern.
+fn where_clause_eq_prop_names<'a>(expr: &'a Expr, node_var: &str) -> Vec<&'a str> {
+    let (left, right) = match expr {
+        Expr::BinOp {
+            left,
+            op: BinOpKind::Eq,
+            right,
+        } => (left.as_ref(), right.as_ref()),
+        _ => return vec![],
+    };
+    if let Expr::PropAccess { var, prop } = left {
+        if var.as_str() == node_var {
+            return vec![prop.as_str()];
+        }
+    }
+    if let Expr::PropAccess { var, prop } = right {
+        if var.as_str() == node_var {
+            return vec![prop.as_str()];
+        }
+    }
+    vec![]
+}
+
+/// SPA-249 (lazy build): Extract all property names referenced in a WHERE-clause
+/// range predicate (`n.prop > literal`, etc., or compound AND) so the caller
+/// can pre-build the lazy index for those `(label_id, col_id)` pairs.
+///
+/// Returns an empty vec if the expression does not match the pattern.
+fn where_clause_range_prop_names<'a>(expr: &'a Expr, node_var: &str) -> Vec<&'a str> {
+    let is_range_op = |op: &BinOpKind| {
+        matches!(
+            op,
+            BinOpKind::Gt | BinOpKind::Ge | BinOpKind::Lt | BinOpKind::Le
+        )
+    };
+
+    // Simple range: `n.prop OP literal` or `literal OP n.prop`.
+    if let Expr::BinOp { left, op, right } = expr {
+        if is_range_op(op) {
+            if let Expr::PropAccess { var, prop } = left.as_ref() {
+                if var.as_str() == node_var {
+                    return vec![prop.as_str()];
+                }
+            }
+            if let Expr::PropAccess { var, prop } = right.as_ref() {
+                if var.as_str() == node_var {
+                    return vec![prop.as_str()];
+                }
+            }
+            return vec![];
+        }
+    }
+
+    // Compound AND: `lhs AND rhs` — collect from both sides.
+    if let Expr::BinOp {
+        left,
+        op: BinOpKind::And,
+        right,
+    } = expr
+    {
+        let mut names: Vec<&'a str> = where_clause_range_prop_names(left, node_var);
+        names.extend(where_clause_range_prop_names(right, node_var));
+        return names;
+    }
+
+    vec![]
 }
 
 /// SPA-249 Phase 1b: Try to use the property equality index for a WHERE-clause

@@ -196,7 +196,9 @@ impl PropertyIndex {
             if raw == ABSENT || tombstone_slots.contains(&slot) {
                 continue;
             }
-            btree.entry(raw).or_default().push(slot);
+            // Apply the same sort_key transform used by `build` and `lookup`
+            // so that integer ordering and equality checks are consistent.
+            btree.entry(sort_key(raw)).or_default().push(slot);
         }
 
         Ok(())
