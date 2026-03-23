@@ -1,28 +1,13 @@
-//! Query execution engine.
-//!
-//! Converts a bound Cypher AST into an operator tree and executes it,
-//! returning a materialized `QueryResult`.
-
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-
-use tracing::info_span;
-
-use sparrowdb_catalog::catalog::Catalog;
-use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
-    BinOpKind, CallStatement, CreateStatement, Expr, ListPredicateKind, Literal,
-    MatchCreateStatement, MatchMergeRelStatement, MatchMutateStatement,
-    MatchOptionalMatchStatement, MatchStatement, MatchWithStatement, Mutation,
-    OptionalMatchStatement, PathPattern, ReturnItem, SortDir, Statement, UnionStatement,
-    UnwindStatement, WithClause,
+    BinaryOp, ClosingClause, CreateStatement, Expression, FunctionCall, Literal,
+    MatchCreateStatement, MatchMergeRelStatement, MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement, MatchWithStatement, Mutation,
+    OptionalMatchStatement, PathPattern, PipelineStage, PipelineStatement, ReturnItem, SortDir, Statement, UnionStatement, UnwindStatement, WithClause,
 };
 use sparrowdb_cypher::{bind, parse};
 use sparrowdb_storage::csr::{CsrBackward, CsrForward};
 use sparrowdb_storage::edge_store::{DeltaRecord, EdgeStore, RelTableId};
 use sparrowdb_storage::fulltext_index::FulltextIndex;
-use sparrowdb_storage::node_store::{NodeStore, Value as StoreValue};
-use sparrowdb_storage::property_index::PropertyIndex;
+
 use sparrowdb_storage::text_index::TextIndex;
 use sparrowdb_storage::wal::WalReplayer;
 

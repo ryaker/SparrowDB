@@ -1,24 +1,10 @@
-//! Recursive-descent Cypher parser.
-//!
-//! Entry point: [`parse`].  Returns `Err(...)` — never panics — for
-//! unsupported syntax.
-
-use sparrowdb_common::{Error, Result};
-
 use crate::ast::{
-    BinOpKind, CallStatement, CreateStatement, EdgeDir, ExistsPattern, Expr, ListPredicateKind,
-    Literal, MatchCreateStatement, MatchMergeRelStatement, MatchMutateStatement,
-    MatchOptionalMatchStatement, MatchStatement, MergeStatement, Mutation, NodePattern,
-    OptionalMatchStatement, PathPattern, PropEntry, RelPattern, ReturnClause, ReturnItem,
-    ShortestPathExpr, SortDir, Statement, UnionStatement, UnwindStatement,
+    BinaryOp, ClosingClause, CreateStatement, Expression, Literal, MatchCreateStatement, MatchMergeRelStatement, MatchMutateStatement,
+    MatchOptionalMatchStatement, MatchStatement, MergeStatement, Mutation, NodePattern, OptionalMatchStatement, PathPattern,
+    PipelineStage, PipelineStatement, PropEntry, RelPattern, ReturnClause, ReturnItem, ShortestPathExpr, SortDir, Statement, UnionStatement, UnwindStatement, WithClause, WithItem,
 };
 use crate::lexer::{tokenize, Token};
 
-/// Parse a Cypher statement string.  Returns `Err` for any unsupported or
-/// malformed input; never panics.
-pub fn parse(input: &str) -> Result<Statement> {
-    if input.trim().is_empty() {
-        return Err(Error::InvalidArgument("empty input".into()));
     }
     let tokens = tokenize(input)?;
     let mut p = Parser::new(tokens);
