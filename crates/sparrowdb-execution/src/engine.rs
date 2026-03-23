@@ -5922,7 +5922,49 @@ fn needs_node_ref_in_return(items: &[ReturnItem]) -> bool {
         matches!(&item.expr, Expr::FnCall { name, .. } if name.to_lowercase() == "id")
             || matches!(&item.expr, Expr::Var(_))
             || expr_needs_graph(&item.expr)
+            || expr_needs_eval_path(&item.expr)
     })
+}
+
+/// Returns `true` when the expression contains a scalar `FnCall` that cannot
+/// be resolved by the fast `project_row` column-name lookup.
+///
+/// `project_row` maps column names like `"n.name"` directly to stored property
+/// values.  Any function call such as `coalesce(n.missing, n.name)`,
+/// `toUpper(n.name)`, or `size(n.name)` produces a column name like
+/// `"coalesce(n.missing, n.name)"` which has no matching stored property.
+/// Those expressions must be evaluated via `eval_expr` on the full row map.
+///
+/// Aggregate functions (`count`, `sum`, etc.) are already handled via the
+/// `use_agg` flag; we exclude them here to avoid double-counting.
+fn expr_needs_eval_path(expr: &Expr) -> bool {
+    match expr {
+        Expr::FnCall { name, args } => {
+            let name_lc = name.to_lowercase();
+            // Aggregates are handled separately by use_agg.
+            if matches!(
+                name_lc.as_str(),
+                "count" | "sum" | "avg" | "min" | "max" | "collect"
+            ) {
+                return false;
+            }
+            // Any other FnCall (coalesce, toUpper, size, labels, type, id, etc.)
+            // needs the eval path.  We include id/labels/type here even though
+            // they are special-cased in eval_expr, because the fast project_row
+            // path cannot handle them at all.
+            let _ = args; // args not needed for this check
+            true
+        }
+        // Recurse into compound expressions that may contain FnCalls.
+        Expr::BinOp { left, right, .. } => {
+            expr_needs_eval_path(left) || expr_needs_eval_path(right)
+        }
+        Expr::And(l, r) | Expr::Or(l, r) => expr_needs_eval_path(l) || expr_needs_eval_path(r),
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            expr_needs_eval_path(inner)
+        }
+        _ => false,
+    }
 }
 
 /// Collect the variable names that appear as bare `Expr::Var` in a RETURN clause (SPA-213).
