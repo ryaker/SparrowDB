@@ -123,13 +123,10 @@ fn bench_create_node(c: &mut Criterion) {
     let mut group = c.benchmark_group("create");
     group.bench_function("create_node", |b| {
         // Fresh DB per iteration so storage growth doesn't skew results.
-        b.iter_with_setup(
-            || fresh_db(),
-            |(_dir, db)| {
-                db.execute("CREATE (n:Person {name: 'Bench', age: 30})")
-                    .expect("CREATE");
-            },
-        );
+        b.iter_with_setup(fresh_db, |(_dir, db)| {
+            db.execute("CREATE (n:Person {name: 'Bench', age: 30})")
+                .expect("CREATE");
+        });
     });
     group.finish();
 }
