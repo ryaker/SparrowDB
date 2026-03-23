@@ -77,7 +77,7 @@ SparrowDB is the right choice when:
 
 SparrowDB is *not* the right choice when:
 
-- **Multi-hop traversal is your primary workload.** 1-hop to 5-hop queries on high-fanout graphs (social networks, web graphs) is where Neo4j's battle-hardened CSR layout and parallel execution show. SparrowDB is 70-130x behind on those queries today. That gap narrows over time, but if deep traversal is your core workload, use Neo4j.
+- **Multi-hop traversal is your primary workload.** 1-hop to 5-hop queries on high-fanout graphs (social networks, web graphs) are where Neo4j's battle-hardened CSR layout and parallel execution show. SparrowDB is 70-130x behind on those queries today. That gap narrows over time, but if deep traversal is your core workload, use Neo4j.
 - **You need distributed writes across many nodes**, or your graph has billions of edges and requires horizontal sharding. Use Neo4j Aura or DGraph for that.
 
 ---
@@ -517,11 +517,11 @@ sparrowdb import --neo4j-csv nodes.csv,relationships.csv --db my.db
 
 ## Performance Characteristics
 
-### Benchmark Results — SNAP Facebook Dataset
+### Benchmark Results: SNAP Facebook Dataset
 
 Measured against Neo4j 5.x (server, JVM warmed). All figures are p50 latency in microseconds. Dataset: SNAP Facebook social graph.
 
-**The headline:** Indexed point lookups beat a running Neo4j server by 3x. No JVM. No server. No network hop.
+**The headline:** Indexed point lookups beat a running Neo4j server by 3x, with no JVM, no server process, and no network hop in the critical path.
 
 | Query | SparrowDB (µs) | Neo4j (µs) | Result |
 |-------|---------------|-----------|--------|
@@ -704,29 +704,24 @@ We ship fast. The API is stable enough to build on, but we're still adding featu
 - CLI tools
 - Neo4j APOC import
 
-**What's next (ordered by priority):**
-- WAL CRC32C integrity checksums (SPA-253)
-- HTTP/SSE transport layer (SPA-231)
-- Multi-label nodes `(n:A:B)` (SPA-200)
-- Publish SparrowOntology to crates.io (SPA-226)
-- Architecture doc
-
 Follow along: [github.com/ryaker/SparrowDB](https://github.com/ryaker/SparrowDB)
 
 ---
 
 ## Roadmap
 
-These are the active workstreams that will close the most meaningful gaps:
+These are the active workstreams that will close the most meaningful gaps, ordered by priority:
 
 | Ticket | Work | Why it matters |
 |--------|------|----------------|
 | SPA-272 | Degree cache for top-K degree queries | Q7 (Top-10 Degree) is 70x behind Neo4j today. A pre-computed degree index eliminates the full adjacency scan. |
 | SPA-253 | WAL CRC32C integrity checksums | Detects bit-rot and incomplete writes on crash. Required before 1.0. |
+| SPA-231 | HTTP/SSE transport layer | Enables remote access without embedding. |
+| SPA-200 | Multi-label nodes `(n:A:B)` | Matches standard Cypher semantics. |
 | SPA-226 | Publish SparrowOntology to crates.io | Makes the ontology layer reusable as a standalone dependency. |
-| — | Architecture doc | Detailed write-up of the storage layout, execution model, and CSR format to support contributors. |
+| -- | Architecture doc | Detailed write-up of the storage layout, execution model, and CSR format to support contributors. |
 
-The traversal gap (Q3-Q8) is also on the radar. The engine today is single-threaded and does not use a native CSR layout for adjacency walks. Parallel traversal and a tighter adjacency representation are the two structural changes that move those numbers.
+The traversal gap (Q3-Q8) is also on the radar. SparrowDB uses a CSR adjacency store on disk (see Architecture), but the current execution engine is single-threaded and does not exploit that layout for in-memory traversal walks. Parallel traversal and tighter runtime adjacency representation are the two structural changes that move those numbers.
 
 ---
 
