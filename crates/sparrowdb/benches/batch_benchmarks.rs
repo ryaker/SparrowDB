@@ -41,16 +41,13 @@ fn bench_100_individual_creates(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_write");
 
     group.bench_function("100_individual_creates", |b| {
-        b.iter_with_setup(
-            fresh_db,
-            |(_dir, db)| {
-                // Each call opens a WriteTx, fsyncs WAL, commits.
-                for i in 0..N {
-                    let q = format!("CREATE (n:BenchNode {{id: {i}}})", i = i);
-                    db.execute(&q).expect("individual create");
-                }
-            },
-        );
+        b.iter_with_setup(fresh_db, |(_dir, db)| {
+            // Each call opens a WriteTx, fsyncs WAL, commits.
+            for i in 0..N {
+                let q = format!("CREATE (n:BenchNode {{id: {i}}})", i = i);
+                db.execute(&q).expect("individual create");
+            }
+        });
     });
 
     group.finish();

@@ -1175,7 +1175,7 @@ impl GraphDb {
         }
     }
 
-        /// Return `(node_count, edge_count)` by summing the high-water marks
+    /// Return `(node_count, edge_count)` by summing the high-water marks
     /// across all catalog labels (nodes) and delta-log record counts across
     /// all registered relationship tables (edges).
     ///

@@ -2909,7 +2909,13 @@ impl Engine {
                     }
                 }
 
-                let row = project_fof_row(&fof_props, column_names, &fof_node_pat.var, &self.store);
+                let row = project_fof_row(
+                    &src_props,
+                    &fof_props,
+                    column_names,
+                    &src_node_pat.var,
+                    &self.store,
+                );
                 rows.push(row);
             }
         }
@@ -3003,7 +3009,11 @@ impl Engine {
                 if label.is_empty() {
                     None
                 } else {
-                    self.catalog.get_label(&label).ok().flatten().map(|id| id as u32)
+                    self.catalog
+                        .get_label(&label)
+                        .ok()
+                        .flatten()
+                        .map(|id| id as u32)
                 }
             })
             .collect();
@@ -3047,8 +3057,7 @@ impl Engine {
             // `frontier` holds (slot, accumulated_vals) pairs for the current
             // boundary of the traversal.  Each entry represents one in-progress
             // path; cloning ensures bindings are isolated across branches.
-            let mut frontier: Vec<(u64, HashMap<String, Value>)> =
-                vec![(src_slot, row_vals)];
+            let mut frontier: Vec<(u64, HashMap<String, Value>)> = vec![(src_slot, row_vals)];
 
             for hop_idx in 0..n_rels {
                 let next_node_pat = &pat.nodes[hop_idx + 1];
@@ -3085,8 +3094,7 @@ impl Engine {
                             NodeId(next_slot)
                         };
 
-                        let next_props =
-                            read_node_props(&self.store, next_node_id, next_col_ids)?;
+                        let next_props = read_node_props(&self.store, next_node_id, next_col_ids)?;
 
                         // Apply inline prop filter for this hop's destination node.
                         if !self.matches_prop_filter(&next_props, &next_node_pat.props) {
@@ -3158,7 +3166,11 @@ impl Engine {
             rows.truncate(lim as usize);
         }
 
-        tracing::debug!(rows = rows.len(), n_rels = n_rels, "n-hop traversal complete");
+        tracing::debug!(
+            rows = rows.len(),
+            n_rels = n_rels,
+            "n-hop traversal complete"
+        );
         Ok(QueryResult {
             columns: column_names.to_vec(),
             rows,
