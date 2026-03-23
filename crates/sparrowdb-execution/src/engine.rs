@@ -1713,11 +1713,17 @@ impl Engine {
         }
 
         let label = node.labels.first().cloned().unwrap_or_default();
-        let label_id = self
-            .catalog
-            .get_label(&label)?
-            .ok_or(sparrowdb_common::Error::NotFound)?;
-        let label_id_u32 = label_id as u32;
+        // SPA-245: unknown label → 0 rows (standard Cypher semantics, not an error).
+        let label_id = match self.catalog.get_label(&label)? {
+            Some(id) => id as u32,
+            None => {
+                return Ok(QueryResult {
+                    columns: column_names.to_vec(),
+                    rows: vec![],
+                })
+            }
+        };
+        let label_id_u32 = label_id;
 
         let hwm = self.store.hwm_for_label(label_id_u32)?;
         tracing::debug!(label = %label, hwm = hwm, "node scan start");
