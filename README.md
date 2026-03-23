@@ -8,6 +8,8 @@
 
 <p align="center">
   <a href="https://github.com/ryaker/SparrowDB/actions"><img src="https://github.com/ryaker/SparrowDB/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://crates.io/crates/sparrowdb"><img src="https://img.shields.io/crates/v/sparrowdb.svg" alt="crates.io" /></a>
+  <a href="https://docs.rs/sparrowdb"><img src="https://docs.rs/sparrowdb/badge.svg" alt="docs.rs" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT" /></a>
   <img src="https://img.shields.io/badge/language-Rust-orange.svg" alt="Rust" />
   <img src="https://img.shields.io/badge/bindings-Python%20%7C%20Node.js%20%7C%20Ruby-blue.svg" alt="Bindings" />
@@ -19,13 +21,22 @@ SparrowDB runs inside your process. Drop it into a Rust app, a Python script, or
 
 ## Install
 
+**Rust (crates.io)**
+
 ```toml
 # Cargo.toml
+[dependencies]
+sparrowdb = "0.1"
+```
+
+**Or from git (latest)**
+
+```toml
 [dependencies]
 sparrowdb = { git = "https://github.com/ryaker/SparrowDB" }
 ```
 
-Crates.io publication is planned for v0.1. Python and Node.js packages are available — see [docs/bindings.md](docs/bindings.md).
+Python and Node.js packages are available — see [docs/bindings.md](docs/bindings.md).
 
 ---
 
@@ -126,7 +137,7 @@ Full reference: [docs/cypher-reference.md](docs/cypher-reference.md)
 
 | Language | Install | Docs |
 |----------|---------|------|
-| **Rust** | `git` dependency (see above) | [docs/bindings.md#rust](docs/bindings.md#rust) |
+| **Rust** | `sparrowdb = "0.1"` (crates.io) | [docs/bindings.md#rust](docs/bindings.md#rust) |
 | **Python** | `pip install sparrowdb` (or maturin) | [docs/bindings.md#python](docs/bindings.md#python) |
 | **Node.js** | `npm install sparrowdb` | [docs/bindings.md#nodejs](docs/bindings.md#nodejs) |
 | **Ruby** | `gem install sparrowdb` (or rake compile) | [docs/bindings.md#ruby](docs/bindings.md#ruby) |
@@ -171,6 +182,20 @@ Tools exposed: `execute_cypher`, `checkpoint`, `info`.
 | [docs/cypher-reference.md](docs/cypher-reference.md) | Full Cypher support reference |
 | [docs/bindings.md](docs/bindings.md) | Rust, Python, Node.js, Ruby |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Contributor workflow, architecture |
+
+---
+
+## Performance
+
+SparrowDB is built for low-overhead, in-process graph workloads:
+
+| Technique | What it means |
+|-----------|---------------|
+| **Factorized execution** | Multi-hop traversals avoid materialising O(N²) intermediate rows — friend-of-friend queries stay fast at scale |
+| **B-tree property index** | Range predicates (`WHERE age > 30`) use a sorted B-tree, not full scans |
+| **Inverted text index** | Full-text search via `CALL db.index.fulltext.queryNodes` without an external search engine |
+| **WAL-backed durability** | Writes commit to the write-ahead log; no `fsync` storm on every property update |
+| **SWMR concurrency** | Single-writer, multiple-reader — readers never block writers; snapshot isolation at no extra cost |
 
 ---
 

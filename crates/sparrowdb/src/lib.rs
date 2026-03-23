@@ -1,3 +1,8 @@
+#![doc = include_str!("../../../README.md")]
+// Suppress rustdoc warnings for Markdown links that are valid on GitHub/docs.rs
+// but cannot be resolved as Rust item paths (e.g., [LICENSE], [docs/...]).
+#![allow(rustdoc::bare_urls)]
+#![allow(rustdoc::broken_intra_doc_links)]
 //! SparrowDB — top-level public API.
 //!
 //! ## Transaction model (Phase 5 — SWMR)
@@ -240,6 +245,9 @@ struct DbInner {
     versions: RwLock<VersionStore>,
     /// Per-node last-committed txn_id (write-write conflict detection, SPA-128).
     node_versions: RwLock<NodeVersions>,
+    /// Optional 32-byte encryption key (SPA-98).  When `Some`, WAL payloads
+    /// are encrypted with XChaCha20-Poly1305 via [`WalWriter::open_encrypted`].
+    encryption_key: Option<[u8; 32]>,
 }
 
 // ── Write-lock guard (SPA-181: replaces 'static transmute UB) ────────────────
@@ -302,6 +310,30 @@ impl GraphDb {
                 write_locked: AtomicBool::new(false),
                 versions: RwLock::new(VersionStore::default()),
                 node_versions: RwLock::new(NodeVersions::default()),
+                encryption_key: None,
+            }),
+        })
+    }
+
+    /// Open (or create) an encrypted SparrowDB database at `path` (SPA-98).
+    ///
+    /// WAL payloads are encrypted with XChaCha20-Poly1305 using `key`.
+    /// The same 32-byte key must be supplied on every subsequent open of this
+    /// database — opening with a wrong or missing key will cause WAL replay to
+    /// fail with [`Error::EncryptionAuthFailed`].
+    ///
+    /// # Errors
+    /// Returns an error if the directory cannot be created.
+    pub fn open_encrypted(path: &Path, key: [u8; 32]) -> Result<Self> {
+        std::fs::create_dir_all(path)?;
+        Ok(GraphDb {
+            inner: Arc::new(DbInner {
+                path: path.to_path_buf(),
+                current_txn_id: AtomicU64::new(0),
+                write_locked: AtomicBool::new(false),
+                versions: RwLock::new(VersionStore::default()),
+                node_versions: RwLock::new(NodeVersions::default()),
+                encryption_key: Some(key),
             }),
         })
     }
@@ -1225,6 +1257,111 @@ impl GraphDb {
 
         Ok((node_count, edge_count))
     }
+
+    /// Export the graph as a DOT (Graphviz) string for visualization.
+    ///
+    /// Queries all nodes and relationships and emits a `digraph` in the DOT
+    /// language.  The result can be piped through `dot -Tsvg` to produce an
+    /// SVG, or written to a `.dot` file for offline rendering.
+    ///
+    /// ## Example
+    ///
+    /// ```no_run
+    /// # use sparrowdb::GraphDb;
+    /// # let db = GraphDb::open(std::path::Path::new("/tmp/my.sparrow")).unwrap();
+    /// let dot = db.export_dot().unwrap();
+    /// std::fs::write("graph.dot", &dot).unwrap();
+    /// // Then: dot -Tsvg graph.dot -o graph.svg
+    /// ```
+    pub fn export_dot(&self) -> Result<String> {
+        // ── Helpers ───────────────────────────────────────────────────────────
+
+        /// Escape a string for use inside a DOT label (backslash + double-quote).
+        fn dot_escape(s: &str) -> String {
+            s.replace('\\', "\\\\").replace('"', "\\\"")
+        }
+
+        /// Format a `Value` as a human-readable string for DOT labels / edge
+        /// labels.  Falls back to the `Display` impl for most variants.
+        fn fmt_val(v: &sparrowdb_execution::types::Value) -> String {
+            match v {
+                sparrowdb_execution::types::Value::String(s) => s.clone(),
+                sparrowdb_execution::types::Value::Int64(i) => i.to_string(),
+                sparrowdb_execution::types::Value::List(items) => {
+                    // labels(n) returns a List of String items.
+                    items
+                        .iter()
+                        .filter_map(|it| {
+                            if let sparrowdb_execution::types::Value::String(s) = it {
+                                Some(s.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(":")
+                }
+                other => format!("{other}"),
+            }
+        }
+
+        // ── Query nodes ───────────────────────────────────────────────────────
+        // Broad unlabeled MATCH captures every node regardless of label.
+        let nodes =
+            self.execute("MATCH (n) RETURN id(n) AS nid, labels(n) AS lbls, n.name AS nm")?;
+
+        // ── Query edges ───────────────────────────────────────────────────────
+        let edges =
+            self.execute("MATCH (a)-[r]->(b) RETURN id(a) AS src, type(r) AS rel, id(b) AS dst")?;
+
+        // ── Build DOT output ──────────────────────────────────────────────────
+        let mut dot =
+            String::from("digraph SparrowDB {\n  rankdir=LR;\n  node [shape=ellipse];\n\n");
+
+        for row in &nodes.rows {
+            // row: [nid: Int64, lbls: List<String>, nm: String|Null]
+            let node_id = match &row[0] {
+                sparrowdb_execution::types::Value::Int64(i) => *i,
+                _ => continue, // skip rows with null id (shouldn't happen)
+            };
+            let label_str = fmt_val(&row[1]);
+            let name_str = match &row[2] {
+                sparrowdb_execution::types::Value::Null => String::new(),
+                v => fmt_val(v),
+            };
+
+            let display_label = if name_str.is_empty() {
+                format!("{}\\nid={}", dot_escape(&label_str), node_id)
+            } else {
+                format!("{}\\n{}", dot_escape(&label_str), dot_escape(&name_str))
+            };
+
+            dot.push_str(&format!("  n{node_id} [label=\"{display_label}\"];\n"));
+        }
+
+        dot.push('\n');
+
+        for row in &edges.rows {
+            // row: [src: Int64, rel: String, dst: Int64]
+            let src = match &row[0] {
+                sparrowdb_execution::types::Value::Int64(i) => *i,
+                _ => continue,
+            };
+            let rel = fmt_val(&row[1]);
+            let dst = match &row[2] {
+                sparrowdb_execution::types::Value::Int64(i) => *i,
+                _ => continue,
+            };
+
+            dot.push_str(&format!(
+                "  n{src} -> n{dst} [label=\"{}\"];\n",
+                dot_escape(&rel)
+            ));
+        }
+
+        dot.push_str("}\n");
+        Ok(dot)
+    }
 }
 
 /// Convenience wrapper — equivalent to [`GraphDb::open`].
@@ -1806,7 +1943,13 @@ impl WriteTx {
         // Step 4: WAL-first — write all mutation records and fsync before
         // touching any data page (SPA-184).  A crash between here and the end
         // of Step 6 is recoverable: WAL replay will re-apply the ops.
-        write_mutation_wal(&self.inner.path, new_id, &updates, &self.wal_mutations)?;
+        write_mutation_wal(
+            &self.inner.path,
+            new_id,
+            &updates,
+            &self.wal_mutations,
+            self.inner.encryption_key,
+        )?;
 
         // Step 5: Apply buffered structural operations to disk (SPA-181).
         // WAL is already durable at this point; a crash here is safe.
@@ -1907,6 +2050,7 @@ fn write_mutation_wal(
     txn_id: u64,
     updates: &[((u64, u32), StagedUpdate)],
     mutations: &[WalMutation],
+    encryption_key: Option<[u8; 32]>,
 ) -> Result<()> {
     // Nothing to record if there were no mutations or property updates.
     if updates.is_empty() && mutations.is_empty() {
@@ -1914,7 +2058,10 @@ fn write_mutation_wal(
     }
 
     let wal_dir = db_root.join("wal");
-    let mut wal = WalWriter::open(&wal_dir)?;
+    let mut wal = match encryption_key {
+        Some(key) => WalWriter::open_encrypted(&wal_dir, key)?,
+        None => WalWriter::open(&wal_dir)?,
+    };
     let txn = TxnId(txn_id);
 
     wal.append(WalRecordKind::Begin, txn, WalPayload::Empty)?;

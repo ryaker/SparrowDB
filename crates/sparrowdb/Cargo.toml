@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "SparrowDB — embedded property graph database with Cypher query support"
+description = "Embedded graph database with Cypher queries — no server, no subscription, no cloud"
+documentation = "https://docs.rs/sparrowdb"
+readme = "../../README.md"
 keywords = ["graph", "database", "cypher", "embedded", "nosql"]
 categories = ["database", "data-structures"]
 
