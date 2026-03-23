@@ -110,6 +110,36 @@ fn handle_request(req: JsonRpcRequest) -> JsonRpcResponse {
                     }
                 },
                 {
+                    "name": "add_property",
+                    "description": "Add or update a property on existing nodes matched by label and a filter property. Equivalent to MATCH (n:Label {match_prop: 'match_val'}) SET n.set_prop = set_val RETURN count(n) AS updated (SPA-229).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "db_path": {"type": "string"},
+                            "label": {
+                                "type": "string",
+                                "description": "Node label to match (e.g. \"Person\")"
+                            },
+                            "match_prop": {
+                                "type": "string",
+                                "description": "Property name to match on (e.g. \"id\")"
+                            },
+                            "match_val": {
+                                "type": "string",
+                                "description": "String value to match (e.g. \"alice\")"
+                            },
+                            "set_prop": {
+                                "type": "string",
+                                "description": "Property name to set (e.g. \"email\")"
+                            },
+                            "set_val": {
+                                "description": "New scalar value to assign (string, number, or boolean)"
+                            }
+                        },
+                        "required": ["db_path", "label", "match_prop", "match_val", "set_prop", "set_val"]
+                    }
+                },
+                {
                     "name": "checkpoint",
                     "description": "Flush WAL and compact the database",
                     "inputSchema": {
@@ -206,6 +236,66 @@ fn build_create_query(class_name: &str, props: &Value) -> Result<String, String>
     Ok(format!("CREATE (n:{}{})", class_name, props_clause))
 }
 
+/// Build a Cypher MATCH … SET query for the add_property tool.
+///
+/// Returns Err with a descriptive message when any argument is invalid
+/// (empty label, empty property names, unsupported value type).
+fn build_add_property_query(
+    label: &str,
+    match_prop: &str,
+    match_val: &str,
+    set_prop: &str,
+    set_val: &Value,
+) -> Result<String, String> {
+    if label.is_empty() {
+        return Err("add_property: label must not be empty".into());
+    }
+    if match_prop.is_empty() {
+        return Err("add_property: match_prop must not be empty".into());
+    }
+    if set_prop.is_empty() {
+        return Err("add_property: set_prop must not be empty".into());
+    }
+
+    let cypher_set_val = match set_val {
+        Value::String(s) => format!("'{}'", escape_cypher_string(s)),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => {
+            return Err("add_property: set_val is null; use a concrete scalar value".into())
+        }
+        Value::Array(_) => {
+            return Err(
+                "add_property: set_val is an array; only scalar values are supported".into(),
+            )
+        }
+        Value::Object(_) => {
+            return Err(
+                "add_property: set_val is a nested object; only scalar values are supported".into(),
+            )
+        }
+    };
+
+    Ok(format!(
+        "MATCH (n:{label} {{{match_prop}: '{match_val_escaped}'}}) SET n.{set_prop} = {cypher_set_val}",
+        label = label,
+        match_prop = match_prop,
+        match_val_escaped = escape_cypher_string(match_val),
+        set_prop = set_prop,
+        cypher_set_val = cypher_set_val,
+    ))
+}
+
+/// Build a Cypher MATCH count query to check how many nodes match.
+fn build_count_query(label: &str, match_prop: &str, match_val: &str) -> String {
+    format!(
+        "MATCH (n:{label} {{{match_prop}: '{match_val_escaped}'}}) RETURN count(n) AS cnt",
+        label = label,
+        match_prop = match_prop,
+        match_val_escaped = escape_cypher_string(match_val),
+    )
+}
+
 fn handle_tool_call(params: Option<Value>) -> Result<Value, Value> {
     let params = params.ok_or_else(|| json!({"code": -32602, "message": "Missing params"}))?;
     let tool_name = params["name"]
@@ -214,6 +304,97 @@ fn handle_tool_call(params: Option<Value>) -> Result<Value, Value> {
     let args = &params["arguments"];
 
     match tool_name {
+        "add_property" => {
+            let db_path = args["db_path"]
+                .as_str()
+                .ok_or_else(|| json!({"code": -32602, "message": "Missing db_path"}))?;
+            let label = args["label"]
+                .as_str()
+                .ok_or_else(|| json!({"code": -32602, "message": "Missing label"}))?;
+            let match_prop = args["match_prop"]
+                .as_str()
+                .ok_or_else(|| json!({"code": -32602, "message": "Missing match_prop"}))?;
+            let match_val = args["match_val"]
+                .as_str()
+                .ok_or_else(|| json!({"code": -32602, "message": "Missing match_val"}))?;
+            let set_prop = args["set_prop"]
+                .as_str()
+                .ok_or_else(|| json!({"code": -32602, "message": "Missing set_prop"}))?;
+            let set_val = &args["set_val"];
+
+            // Validate and build the SET query.
+            let set_query =
+                build_add_property_query(label, match_prop, match_val, set_prop, set_val)
+                    .map_err(|msg| json!({"code": -32602, "message": msg}))?;
+
+            let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path)).map_err(|e| {
+                json!({
+                    "code": -32000,
+                    "message": format!(
+                        "add_property: failed to open database at '{}': {}",
+                        db_path, e
+                    )
+                })
+            })?;
+
+            // Count how many nodes match before applying SET, so we can report
+            // zero-match without the caller having to inspect empty rows.
+            let count_query = build_count_query(label, match_prop, match_val);
+            let count_result = db.execute(&count_query).map_err(|e| {
+                json!({
+                    "code": -32000,
+                    "message": format!(
+                        "add_property: count query failed for label '{}': {}",
+                        label, e
+                    )
+                })
+            })?;
+
+            let matched: i64 = count_result
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| match v {
+                    sparrowdb_execution::types::Value::Int64(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0);
+
+            if matched == 0 {
+                return Ok(json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!(
+                            "add_property: 0 nodes matched (label: '{}', {}='{}'); property not set.",
+                            label, match_prop, match_val
+                        )
+                    }],
+                    "updated": 0
+                }));
+            }
+
+            // Apply the SET.
+            db.execute(&set_query).map_err(|e| {
+                json!({
+                    "code": -32000,
+                    "message": format!(
+                        "add_property: SET failed for label '{}': {}",
+                        label, e
+                    )
+                })
+            })?;
+
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "add_property: set '{}.{}' on {} node(s) matching {}='{}'.",
+                        label, set_prop, matched, match_prop, match_val
+                    )
+                }],
+                "updated": matched
+            }))
+        }
         "checkpoint" => {
             let db_path = args["db_path"]
                 .as_str()
