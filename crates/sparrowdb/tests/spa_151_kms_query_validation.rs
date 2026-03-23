@@ -893,9 +893,6 @@ fn kms_q23_count_star_with_label() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "GAP-K: undirected (n)-[:RELATED_TO]-(m) with count(m) GROUP BY n.id \
-            does not return both endpoints. know-003 (target-only node) is missing \
-            from results. Needs sub-ticket under SPA-151 for symmetric undirected agg."]
 fn kms_q24_undirected_relationship_count_per_node() {
     let (_dir, db) = make_db();
     setup_kms_graph(&db);
