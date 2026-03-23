@@ -150,7 +150,8 @@ fn checkpoint_and_optimize_clean_base() {
         let wal_dir = db_root.join("wal");
         let seg_path = sparrowdb_storage::wal::writer::segment_path(&wal_dir, 0);
         let data = fs::read(&seg_path).expect("WAL segment must exist");
-        let mut offset = 0usize;
+        // Skip the 1-byte WAL format version header.
+        let mut offset = 1usize;
         let mut kinds = Vec::new();
         while offset < data.len() {
             match WalRecord::decode(&data[offset..]) {

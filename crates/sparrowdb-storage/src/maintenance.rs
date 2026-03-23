@@ -295,7 +295,8 @@ mod tests {
         let seg_path = crate::wal::writer::segment_path(&wal_dir, 0);
         let data = fs::read(&seg_path).unwrap();
 
-        let mut offset = 0usize;
+        // Skip the 1-byte WAL format version header.
+        let mut offset = 1usize;
         let mut kinds = Vec::new();
         while offset < data.len() {
             match WalRecord::decode(&data[offset..]) {

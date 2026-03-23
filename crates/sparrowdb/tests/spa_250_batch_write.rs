@@ -161,7 +161,8 @@ fn batch_produces_single_wal_commit() {
             continue;
         }
         let data = std::fs::read(entry.path()).expect("read segment");
-        let mut offset = 0usize;
+        // Skip the 1-byte WAL format version header.
+        let mut offset = if data.is_empty() { 0usize } else { 1usize };
         while offset < data.len() {
             match WalRecord::decode(&data[offset..]) {
                 Ok((rec, consumed)) => {

@@ -29,7 +29,7 @@ use std::{
 
 use sparrowdb_common::{Lsn, Result, TxnId};
 
-use super::codec::{WalPayload, WalRecord, WalRecordKind};
+use super::codec::{WalPayload, WalRecord, WalRecordKind, WAL_FORMAT_VERSION};
 use crate::encryption::EncryptionContext;
 
 /// 64 MiB per segment.
@@ -91,7 +91,23 @@ impl WalWriter {
             f.set_len(seg_offset)?;
         }
 
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+
+        // Write the version header byte at the start of a new segment.
+        // For existing segments, seek to end to continue appending.
+        let file_len = file.metadata()?.len();
+        if file_len == 0 {
+            // New segment — write the 1-byte version header.
+            file.write_all(&[WAL_FORMAT_VERSION])?;
+        } else {
+            // Existing segment — seek to end for appending.
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(seg_offset))?;
+        }
 
         Ok(Self {
             wal_dir: wal_dir.to_path_buf(),
@@ -128,8 +144,23 @@ impl WalWriter {
         let path = segment_path(wal_dir, last_seg);
         let data = std::fs::read(&path)?;
 
+        if data.is_empty() {
+            return Ok((last_seg, 0, 1));
+        }
+
+        // Validate the version header byte.
+        let version = data[0];
+        if version != WAL_FORMAT_VERSION {
+            return Err(sparrowdb_common::Error::Corruption(format!(
+                "WAL segment version mismatch: found version {version}, expected {WAL_FORMAT_VERSION}. \
+                 This database was written with an incompatible WAL format (CRC32 vs CRC32C). \
+                 The database cannot be opened."
+            )));
+        }
+
         // Scan records to find offset and max LSN.
-        let mut offset = 0usize;
+        // Records start at byte 1 (after the version header byte).
+        let mut offset = 1usize;
         let mut max_lsn = 0u64;
         while offset < data.len() {
             match WalRecord::decode(&data[offset..]) {
@@ -202,12 +233,20 @@ impl WalWriter {
 
     /// Rotate to a new segment file.
     fn rotate(&mut self) -> Result<()> {
-        // Pad remaining bytes to zero (no-op for append-only files — we just move on).
+        // Flush the current segment before rotating.
         self.file.flush()?;
         self.seg_no += 1;
-        self.seg_offset = 0;
+        // Start at byte 1 — after the version header byte.
+        self.seg_offset = 1;
         let path = segment_path(&self.wal_dir, self.seg_no);
-        self.file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut new_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        // Write the version header byte on the new segment.
+        new_file.write_all(&[WAL_FORMAT_VERSION])?;
+        self.file = new_file;
         Ok(())
     }
 

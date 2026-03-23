@@ -14,7 +14,6 @@ categories = ["database", "filesystem"]
 [dependencies]
 sparrowdb-common  = { workspace = true }
 crc32c            = { workspace = true }
-crc32fast         = { workspace = true }
 chacha20poly1305  = { workspace = true }
 rand              = { workspace = true }
 tracing           = { workspace = true }

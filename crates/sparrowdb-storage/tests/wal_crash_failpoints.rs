@@ -409,8 +409,15 @@ fn test_wal_segment_golden_fixture() {
     let data = std::fs::read(&fixture_path)
         .unwrap_or_else(|e| panic!("Failed to read golden fixture {:?}: {}", fixture_path, e));
 
-    // Decode all records.
-    let mut offset = 0usize;
+    // Validate and skip the 1-byte WAL format version header.
+    use sparrowdb_storage::wal::codec::WAL_FORMAT_VERSION;
+    assert_eq!(
+        data[0], WAL_FORMAT_VERSION,
+        "golden fixture must have version byte {WAL_FORMAT_VERSION}"
+    );
+
+    // Decode all records (starting after the version header byte).
+    let mut offset = 1usize;
     let mut records = Vec::new();
     while offset < data.len() {
         // Skip zero-padding.
