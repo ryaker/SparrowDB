@@ -194,7 +194,7 @@ Packing: `node_id = (label_id as u64) << 32 | slot as u64`.
 
 This layout means `NodeId` values are not globally sequential. Two nodes with the same slot index but different label IDs have different `NodeId` values. The execution engine unpacks the label_id and slot separately when accessing column files or CSR adjacency data.
 
-Note: the doc comment in `sparrowdb-common` describes the layout as "upper 16 bits = label_id, lower 48 bits = slot_id". This is incorrect. The actual code throughout the execution engine and node store uses a 32/32 split. The practical effect is that label IDs are capped at `u32::MAX` and slot counts per label are capped at `u32::MAX` (roughly 4 billion nodes per label).
+Note: the doc comment in `sparrowdb-common` describes the layout as "upper 16 bits = label_id, lower 48 bits = slot_id". This is incorrect. The actual code throughout the execution engine and node store uses a 32/32 split. The practical effect is that while 32 bits are reserved for the label ID, the catalog currently generates `u16` IDs, so the effective cap is `u16::MAX`. Slot counts per label are capped at `u32::MAX` (roughly 4 billion nodes per label).
 
 ---
 

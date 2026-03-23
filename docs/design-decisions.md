@@ -34,7 +34,7 @@ These have non-obvious tradeoffs, correctness risks, or design decisions that wi
 - What's the expected speedup on SNAP Facebook (4M edges) with 8 cores? If it's 2x due to synchronization overhead, is it worth the complexity?
 
 **Prompt for extended reasoning:**
-> "Given SparrowDB's SWMR transaction model, interior-mutability execution engine (RefCell-based), and CSR+delta-log storage, design the minimal-invasive parallelization strategy for BFS frontier expansion using Rayon. What must be cloned per-thread vs shared? What are the correctness invariants that must hold? Show the expected speedup model for a scale-free graph with mean degree 22."
+> "Given SparrowDB's SWMR transaction model, interior-mutability execution engine (RefCell-based), and CSR+delta-log storage, design the minimal-invasive parallelization strategy for BFS frontier expansion using Rayon. What must be cloned per-thread vs shared? What are the correctness invariants that must hold? Show the expected speedup model for a scale-free graph with mean degree 22 and diameter 7."
 
 ---
 
