@@ -122,10 +122,7 @@ fn add_property_updates_multiple_nodes() {
     );
     for row in &with_tier.rows {
         let val = row[0].to_string();
-        assert!(
-            val.contains("gold"),
-            "expected tier='gold', got: {val}"
-        );
+        assert!(val.contains("gold"), "expected tier='gold', got: {val}");
     }
 
     // Verify Dave (inactive) does NOT have tier set to gold.
@@ -133,7 +130,12 @@ fn add_property_updates_multiple_nodes() {
         .execute("MATCH (n:Person {name: 'Dave'}) RETURN n.tier")
         .expect("MATCH Dave tier");
     // Dave's tier should be null (not set).
-    let dave_tier = dave.rows.first().and_then(|r| r.first()).map(|v| v.to_string()).unwrap_or_default();
+    let dave_tier = dave
+        .rows
+        .first()
+        .and_then(|r| r.first())
+        .map(|v| v.to_string())
+        .unwrap_or_default();
     assert!(
         !dave_tier.contains("gold"),
         "Dave (inactive) must not have tier='gold', got: {dave_tier}"

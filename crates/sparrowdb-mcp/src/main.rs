@@ -262,9 +262,7 @@ fn build_add_property_query(
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Null => {
-            return Err(
-                "add_property: set_val is null; use a concrete scalar value".into(),
-            )
+            return Err("add_property: set_val is null; use a concrete scalar value".into())
         }
         Value::Array(_) => {
             return Err(
@@ -273,8 +271,7 @@ fn build_add_property_query(
         }
         Value::Object(_) => {
             return Err(
-                "add_property: set_val is a nested object; only scalar values are supported"
-                    .into(),
+                "add_property: set_val is a nested object; only scalar values are supported".into(),
             )
         }
     };
