@@ -15,7 +15,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io::{BufReader, BufWriter, Read, Write};
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sparrowdb_common::{Error, Result};
 use tempfile::NamedTempFile;
 
@@ -299,6 +299,128 @@ impl<T: Ord + DeserializeOwned> Iterator for MergeIter<T> {
         }
 
         Some(row)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SortableRow — pre-computed sort key + row payload (SPA-100).
+// ---------------------------------------------------------------------------
+
+use crate::types::Value;
+
+/// `Ord`-safe wrapper for a single ORDER BY key value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrdValue {
+    Null,
+    Bool(bool),
+    Int64(i64),
+    Float64(u64),
+    String(String),
+    Other,
+}
+
+impl OrdValue {
+    pub fn from_value(v: &Value) -> Self {
+        match v {
+            Value::Null => OrdValue::Null,
+            Value::Bool(b) => OrdValue::Bool(*b),
+            Value::Int64(i) => OrdValue::Int64(*i),
+            Value::Float64(f) => OrdValue::Float64(f.to_bits()),
+            Value::String(s) => OrdValue::String(s.clone()),
+            _ => OrdValue::Other,
+        }
+    }
+
+    fn discriminant(&self) -> u8 {
+        match self {
+            OrdValue::Null => 0,
+            OrdValue::Bool(_) => 1,
+            OrdValue::Int64(_) => 2,
+            OrdValue::Float64(_) => 3,
+            OrdValue::String(_) => 4,
+            OrdValue::Other => 5,
+        }
+    }
+}
+
+impl PartialOrd for OrdValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrdValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (OrdValue::Null, OrdValue::Null) => std::cmp::Ordering::Equal,
+            (OrdValue::Bool(a), OrdValue::Bool(b)) => a.cmp(b),
+            (OrdValue::Int64(a), OrdValue::Int64(b)) => a.cmp(b),
+            (OrdValue::Float64(a), OrdValue::Float64(b)) => {
+                let ord_bits = |bits: u64| -> u64 {
+                    if bits >> 63 == 1 {
+                        !bits
+                    } else {
+                        bits | (1u64 << 63)
+                    }
+                };
+                ord_bits(*a).cmp(&ord_bits(*b))
+            }
+            (OrdValue::String(a), OrdValue::String(b)) => a.cmp(b),
+            _ => self.discriminant().cmp(&other.discriminant()),
+        }
+    }
+}
+
+/// A single ORDER BY key entry that encodes direction in the variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortKeyVal {
+    Asc(OrdValue),
+    Desc(Reverse<OrdValue>),
+}
+
+impl PartialOrd for SortKeyVal {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SortKeyVal {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (SortKeyVal::Asc(a), SortKeyVal::Asc(b)) => a.cmp(b),
+            (SortKeyVal::Desc(a), SortKeyVal::Desc(b)) => a.cmp(b),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
+/// Row wrapped with a pre-computed sort key for use with `SpillingSorter`.
+///
+/// `Ord` is defined by `key` only; `data` is the payload and ignored during
+/// comparison so that the k-way merge produces a correctly-ordered result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SortableRow {
+    pub key: Vec<SortKeyVal>,
+    pub data: Vec<Value>,
+}
+
+impl PartialEq for SortableRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for SortableRow {}
+
+impl PartialOrd for SortableRow {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SortableRow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
     }
 }
 
