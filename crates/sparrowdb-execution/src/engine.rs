@@ -5478,9 +5478,7 @@ fn try_text_index_lookup(
 /// the given node variable.
 fn where_clause_text_prop_names<'a>(expr: &'a Expr, node_var: &str) -> Vec<&'a str> {
     let left = match expr {
-        Expr::BinOp { left, op, right: _ }
-            if matches!(op, BinOpKind::Contains | BinOpKind::StartsWith) =>
-        {
+        Expr::BinOp { left, op: BinOpKind::Contains | BinOpKind::StartsWith, right: _ } => {
             left.as_ref()
         }
         _ => return vec![],
