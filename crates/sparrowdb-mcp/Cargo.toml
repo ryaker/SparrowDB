@@ -14,5 +14,6 @@ path = "src/main.rs"
 
 [dependencies]
 sparrowdb = { workspace = true }
+sparrowdb-execution = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
