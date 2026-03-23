@@ -29,8 +29,8 @@
 //!           parsed; SPA-155 confirmed UNWIND+RETURN works but UNWIND+MATCH is not.
 //!   GAP-H: `n.type IN ['ContextTrigger','ToolRoute']` combined with
 //!           `labels(n)` filtering — compound label+property filter pattern.
-//!   GAP-I: `CALL ... YIELD node, score` — only `node` YIELD column supported;
-//!           `score` column raises InvalidArgument error.
+//!   GAP-I: FIXED (SPA-239) — `CALL ... YIELD node, score` now supported;
+//!           `score` returns a normalised relevance float in [0.0, 1.0].
 //!   GAP-J: `coalesce(missing_prop, name, 'default')` — coalesce does not skip
 //!           Null from a missing property and falls through to Null rather than
 //!           the next non-null argument.
@@ -660,9 +660,6 @@ fn kms_q17_about_relationship_to_organization() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "GAP-I: CALL db.index.fulltext.queryNodes YIELD node, score — \
-            'score' YIELD column not implemented (only 'node' supported). \
-            SPA-170 implements the procedure; score ranking needs a sub-ticket under SPA-151."]
 fn kms_q18_fulltext_search_call_procedure() {
     let (_dir, db) = make_db();
 
@@ -1209,13 +1206,10 @@ fn kms_q31_variable_length_path_traversal() {
 //
 // GAP-C: MERGE with relationship pattern not implemented (SPA-215 covers node MERGE only).
 // SparrowDB workaround in SparrowDBStorage: MATCH existence check + CREATE.
-// Test documents the gap — marked #[ignore].
+// SPA-233: MERGE relationship pattern implemented — test promoted from #[ignore].
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "GAP-C: MERGE (k)-[r:ABOUT]->(e) relationship pattern not yet supported. \
-            SPA-215 covers MERGE for nodes. Relationship MERGE needs a new sub-ticket. \
-            SparrowDBStorage.createAboutRelationships uses MATCH+CREATE workaround."]
 fn kms_q32_merge_relationship_pattern() {
     let (_dir, db) = make_db();
 

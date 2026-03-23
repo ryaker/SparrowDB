@@ -83,17 +83,46 @@ impl FulltextIndex {
     ///
     /// Results are deduplicated; order is unspecified.
     pub fn search(&self, query: &str) -> Vec<u64> {
-        let mut seen = std::collections::BTreeSet::new();
-        let mut result = Vec::new();
-        for term in tokenize(query) {
-            if let Some(ids) = self.entries.get(&term) {
+        self.search_with_scores(query)
+            .into_iter()
+            .map(|(id, _score)| id)
+            .collect()
+    }
+
+    /// Search for `query` — returns `(node_id, score)` pairs for every matching
+    /// node, sorted by descending score then ascending node id for determinism.
+    ///
+    /// Score is the number of distinct query terms that matched the node,
+    /// normalised to `[0.0, 1.0]` by dividing by the total number of unique
+    /// query terms.  A single-term query always yields score `1.0` for every
+    /// hit.  This is a simple term-frequency approximation — suitable for
+    /// ranking without full BM25 bookkeeping.
+    pub fn search_with_scores(&self, query: &str) -> Vec<(u64, f64)> {
+        let terms = tokenize(query);
+        let total_terms = terms.len().max(1) as f64;
+
+        // Count how many distinct query terms match each node.
+        let mut hit_counts: HashMap<u64, usize> = HashMap::new();
+        for term in &terms {
+            if let Some(ids) = self.entries.get(term.as_str()) {
                 for &id in ids {
-                    if seen.insert(id) {
-                        result.push(id);
-                    }
+                    *hit_counts.entry(id).or_insert(0) += 1;
                 }
             }
         }
+
+        // Convert hit counts to normalised scores.
+        let mut result: Vec<(u64, f64)> = hit_counts
+            .into_iter()
+            .map(|(id, count)| (id, count as f64 / total_terms))
+            .collect();
+
+        // Sort: descending score, then ascending node id for determinism.
+        result.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         result
     }
 
