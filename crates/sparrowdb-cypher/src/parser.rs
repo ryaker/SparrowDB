@@ -1036,8 +1036,10 @@ impl Parser {
         self.expect_tok(&Token::As)?;
         let alias = self.expect_ident()?;
 
-        // If the next token is WITH, this is a pipeline: UNWIND … WITH … RETURN (SPA-134).
-        if matches!(self.peek(), Token::With) {
+        // If the next token is WITH or MATCH, this is a pipeline:
+        //   UNWIND … WITH … RETURN  (SPA-134)
+        //   UNWIND … MATCH … RETURN (SPA-237)
+        if matches!(self.peek(), Token::With | Token::Match) {
             return self.parse_pipeline_continuation(None, None, Some((expr, alias)), vec![]);
         }
 
