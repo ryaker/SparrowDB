@@ -2673,6 +2673,23 @@ impl Engine {
         // requires a cross-product join across all patterns.
         let is_multi_pattern = m.pattern.len() > 1 && m.pattern.iter().all(|p| p.rels.is_empty());
 
+        // ── Q7 degree-cache fast-path (SPA-272 wiring) ────────────────────────
+        // Detect `MATCH (n:Label) RETURN … ORDER BY out_degree(n) DESC LIMIT k`
+        // and short-circuit to `top_k_by_degree` — O(N log k) vs full edge scan.
+        // Preconditions: single node pattern, no rels, no WHERE, DESC LIMIT set.
+        if !is_var_len
+            && !is_two_hop
+            && !is_one_hop
+            && !is_n_hop
+            && !is_multi_pattern
+            && m.pattern.len() == 1
+            && m.pattern[0].rels.is_empty()
+        {
+            if let Some(result) = self.try_degree_sort_fastpath(m, &column_names)? {
+                return Ok(result);
+            }
+        }
+
         if is_var_len {
             self.execute_variable_length(m, &column_names)
         } else if is_two_hop {
@@ -2689,6 +2706,165 @@ impl Engine {
             // Multi-pattern or complex query — fallback to sequential execution.
             self.execute_scan(m, &column_names)
         }
+    }
+
+    // ── Q7 degree-cache fast-path (SPA-272 Cypher wiring) ─────────────────────
+    //
+    // Detects `MATCH (n:Label) RETURN … ORDER BY out_degree(n) DESC LIMIT k`
+    // and answers it directly from the pre-computed DegreeCache without scanning
+    // edges.  Returns `None` when the pattern does not qualify; the caller then
+    // falls through to the normal execution path.
+    //
+    // Qualifying conditions:
+    //   1. Exactly one label on the node pattern.
+    //   2. No WHERE clause (no post-filter that would change cardinality).
+    //   3. No inline prop filters on the node pattern.
+    //   4. ORDER BY has exactly one key: `out_degree(n)` or `degree(n)` DESC.
+    //   5. LIMIT is Some(k) with k > 0.
+    //   6. The variable in the ORDER BY call matches the node pattern variable.
+    fn try_degree_sort_fastpath(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<Option<QueryResult>> {
+        use sparrowdb_cypher::ast::SortDir;
+
+        let pat = &m.pattern[0];
+        let node = &pat.nodes[0];
+
+        // Condition 1: exactly one label.
+        let label = match node.labels.first() {
+            Some(l) => l.clone(),
+            None => return Ok(None),
+        };
+
+        // Condition 2: no WHERE clause.
+        if m.where_clause.is_some() {
+            return Ok(None);
+        }
+
+        // Condition 3: no inline prop filters.
+        if !node.props.is_empty() {
+            return Ok(None);
+        }
+
+        // Condition 4: ORDER BY has exactly one key that is out_degree(var) or degree(var) DESC.
+        if m.order_by.len() != 1 {
+            return Ok(None);
+        }
+        let (sort_expr, sort_dir) = &m.order_by[0];
+        if *sort_dir != SortDir::Desc {
+            return Ok(None);
+        }
+        let order_var = match sort_expr {
+            Expr::FnCall { name, args } => {
+                let name_lc = name.to_lowercase();
+                if name_lc != "out_degree" && name_lc != "degree" {
+                    return Ok(None);
+                }
+                match args.first() {
+                    Some(Expr::Var(v)) => v.clone(),
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        // Condition 5: LIMIT must be set and > 0.
+        let k = match m.limit {
+            Some(k) if k > 0 => k as usize,
+            _ => return Ok(None),
+        };
+
+        // Condition 6: ORDER BY variable must match the node pattern variable.
+        let node_var = node.var.as_str();
+        if !order_var.is_empty() && !node_var.is_empty() && order_var != node_var {
+            return Ok(None);
+        }
+
+        // All conditions met — resolve label_id and call the cache.
+        let label_id = match self.snapshot.catalog.get_label(&label)? {
+            Some(id) => id as u32,
+            None => {
+                return Ok(Some(QueryResult {
+                    columns: column_names.to_vec(),
+                    rows: vec![],
+                }))
+            }
+        };
+
+        tracing::debug!(
+            label = %label,
+            k = k,
+            "SPA-272: degree-cache fast-path activated"
+        );
+
+        let top_k = self.top_k_by_degree(label_id, k)?;
+
+        // Apply SKIP if present.
+        let skip = m.skip.unwrap_or(0) as usize;
+        let top_k = if skip >= top_k.len() {
+            &[][..]
+        } else {
+            &top_k[skip..]
+        };
+
+        // Build result rows.  For each (slot, degree) project the RETURN clause.
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(top_k.len());
+        for &(slot, degree) in top_k {
+            let node_id = NodeId(((label_id as u64) << 32) | slot);
+
+            // Skip tombstoned nodes (deleted nodes may still appear in cache).
+            if self.is_node_tombstoned(node_id) {
+                continue;
+            }
+
+            // Fetch all properties we might need for RETURN projection.
+            let all_col_ids: Vec<u32> = collect_col_ids_from_columns(column_names);
+            let nullable_props = self
+                .snapshot
+                .store
+                .get_node_raw_nullable(node_id, &all_col_ids)?;
+            let props: Vec<(u32, u64)> = nullable_props
+                .iter()
+                .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
+                .collect();
+
+            // Project the RETURN columns.
+            let row: Vec<Value> = column_names
+                .iter()
+                .map(|col_name| {
+                    // Resolve out_degree(var) / degree(var) → degree value.
+                    let degree_col_name_out = format!("out_degree({node_var})");
+                    let degree_col_name_deg = format!("degree({node_var})");
+                    if col_name == &degree_col_name_out
+                        || col_name == &degree_col_name_deg
+                        || col_name == "degree"
+                        || col_name == "out_degree"
+                    {
+                        return Value::Int64(degree as i64);
+                    }
+                    // Resolve property accesses: "var.prop" or "prop".
+                    let prop = col_name
+                        .split_once('.')
+                        .map(|(_, p)| p)
+                        .unwrap_or(col_name.as_str());
+                    let col_id = prop_name_to_col_id(prop);
+                    props
+                        .iter()
+                        .find(|(c, _)| *c == col_id)
+                        .map(|(_, v)| decode_raw_val(*v, &self.snapshot.store))
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
+
+            rows.push(row);
+        }
+
+        Ok(Some(QueryResult {
+            columns: column_names.to_vec(),
+            rows,
+        }))
     }
 
     // ── OPTIONAL MATCH (standalone) ───────────────────────────────────────────
