@@ -1118,7 +1118,7 @@ impl Parser {
         let dst_var = dst_node.var;
 
         // Optional `ON CREATE SET …` / `ON MATCH SET …` clauses — parse and discard.
-        while matches!(self.peek(), Token::Ident(ref s) if s.eq_ignore_ascii_case("on")) {
+        while matches!(self.peek(), Token::On) {
             self.advance(); // consume ON
             self.skip_on_clause()?;
         }
@@ -1135,7 +1135,7 @@ impl Parser {
 
     /// Skip an `ON CREATE SET …` or `ON MATCH SET …` clause after a MERGE.
     fn skip_on_clause(&mut self) -> Result<()> {
-        match self.peek().clone() {
+        match self.peek() {
             Token::Create | Token::Match => {
                 self.advance();
             }
@@ -1147,9 +1147,13 @@ impl Parser {
             }
         }
         loop {
-            match self.peek().clone() {
-                Token::Eof | Token::Semicolon | Token::Return | Token::With | Token::Merge => break,
-                Token::Ident(ref s) if s.eq_ignore_ascii_case("on") => break,
+            match self.peek() {
+                Token::Eof
+                | Token::Semicolon
+                | Token::Return
+                | Token::With
+                | Token::Merge
+                | Token::On => break,
                 _ => {
                     self.advance();
                 }
