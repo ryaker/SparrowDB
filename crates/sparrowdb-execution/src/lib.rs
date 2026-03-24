@@ -10,7 +10,7 @@ pub mod parallel_bfs;
 pub mod sort_spill;
 pub mod types;
 
-pub use engine::Engine;
+pub use engine::{DegreeStats, Engine};
 pub use json::{query_result_to_json, value_to_json};
 pub use operators::UnwindOperator;
 pub use types::{FactorizedChunk, QueryResult, Value, VectorGroup};

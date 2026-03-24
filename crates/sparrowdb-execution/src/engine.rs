@@ -91,6 +91,42 @@ impl DegreeCache {
     }
 }
 
+// ── DegreeStats (SPA-273) ─────────────────────────────────────────────────────
+
+/// Per-relationship-type degree statistics collected at engine open time.
+///
+/// Built once from CSR forward files (checkpointed edges) by scanning every
+/// source slot's out-degree for each relationship type.  Delta-log edges are
+/// included via the same `delta_all` scan already performed for `DegreeCache`.
+///
+/// Used by future join-order heuristics: `mean()` gives an estimate of how
+/// many hops a traversal on this relationship type will produce per source node.
+#[derive(Debug, Default, Clone)]
+pub struct DegreeStats {
+    /// Minimum out-degree seen across all source nodes for this rel type.
+    pub min: u32,
+    /// Maximum out-degree seen across all source nodes for this rel type.
+    pub max: u32,
+    /// Sum of all per-node out-degrees (numerator of the mean).
+    pub total: u64,
+    /// Number of source nodes contributing to `total` (denominator of the mean).
+    pub count: u64,
+}
+
+impl DegreeStats {
+    /// Mean out-degree for this relationship type.
+    ///
+    /// Returns `1.0` when no edges exist to avoid division-by-zero and because
+    /// an unknown degree is conservatively assumed to be at least 1.
+    pub fn mean(&self) -> f64 {
+        if self.count == 0 {
+            1.0
+        } else {
+            self.total as f64 / self.count as f64
+        }
+    }
+}
+
 /// Tri-state result for relationship table lookup.
 ///
 /// Distinguishes three cases that previously both returned `Option::None` from
@@ -123,6 +159,13 @@ pub struct ReadSnapshot {
     /// Used by the planner to estimate cardinality without re-scanning the
     /// node store's high-water-mark file on every query.
     pub label_row_counts: HashMap<LabelId, usize>,
+    /// Per-relationship-type out-degree statistics (SPA-273).
+    ///
+    /// Keyed by `RelTableId` (u32).  Built eagerly at engine open time from
+    /// CSR forward files.  Used by future join-order heuristics to estimate
+    /// how many neighbor hops a traversal on a given relationship type will
+    /// produce.
+    pub rel_degree_stats: HashMap<u32, DegreeStats>,
 }
 
 /// The execution engine holds references to the storage layer.
@@ -217,12 +260,44 @@ impl Engine {
         };
         let degree_cache = DegreeCache::build(&csrs, &delta_all);
 
+        // SPA-273: build per-rel-type degree stats from CSR forward files.
+        // For each relationship type (CSR), iterate every source slot and
+        // accumulate min/max/total/count statistics.
+        let rel_degree_stats: HashMap<u32, DegreeStats> = csrs
+            .iter()
+            .map(|(&rel_table_id, csr)| {
+                let mut stats = DegreeStats::default();
+                let mut first = true;
+                for slot in 0..csr.n_nodes() {
+                    let deg = csr.neighbors(slot).len() as u32;
+                    if deg > 0 {
+                        if first {
+                            stats.min = deg;
+                            stats.max = deg;
+                            first = false;
+                        } else {
+                            if deg < stats.min {
+                                stats.min = deg;
+                            }
+                            if deg > stats.max {
+                                stats.max = deg;
+                            }
+                        }
+                        stats.total += deg as u64;
+                        stats.count += 1;
+                    }
+                }
+                (rel_table_id, stats)
+            })
+            .collect();
+
         let snapshot = ReadSnapshot {
             store,
             catalog,
             csrs,
             db_root: db_root.to_path_buf(),
             label_row_counts: HashMap::new(),
+            rel_degree_stats,
         };
 
         Engine {
@@ -3090,13 +3165,36 @@ impl Engine {
                     .build_for(&self.snapshot.store, label_id_u32, col_id);
         }
 
+        // SPA-273: selectivity threshold — if the index would return more than
+        // 10% of all rows for this label, it's cheaper to do a full scan and
+        // avoid the extra slot-set construction overhead.  We use `hwm` as the
+        // denominator (high-water mark = total allocated slots, which is an
+        // upper bound on live row count).  When hwm == 0 the threshold never
+        // fires (no rows exist).
+        let selectivity_threshold: u64 = if hwm > 0 { (hwm / 10).max(1) } else { u64::MAX };
+
         // SPA-249: try to use the property equality index when there is exactly
         // one inline prop filter with an inline-encodable literal value.
         // Overflow strings (> 7 bytes) cannot be indexed, so they fall back to
         // full scan.  A WHERE clause is always applied per-slot afterward.
+        //
+        // SPA-273: discard candidates when they exceed the selectivity threshold
+        // (index would scan >10% of rows — full scan is preferred).
         let index_candidate_slots: Option<Vec<u32>> = {
             let prop_index_ref = self.prop_index.borrow();
-            try_index_lookup_for_props(&node.props, label_id_u32, &prop_index_ref)
+            let candidates = try_index_lookup_for_props(&node.props, label_id_u32, &prop_index_ref);
+            match candidates {
+                Some(ref slots) if slots.len() as u64 > selectivity_threshold => {
+                    tracing::debug!(
+                        label = %label,
+                        candidates = slots.len(),
+                        threshold = selectivity_threshold,
+                        "SPA-273: index exceeds selectivity threshold — falling back to full scan"
+                    );
+                    None
+                }
+                other => other,
+            }
         };
 
         // SPA-249 Phase 1b: when the inline-prop index has no candidates, try to
@@ -3118,11 +3216,25 @@ impl Engine {
                 }
             }
         }
+        // SPA-273: apply the same selectivity threshold to WHERE-clause equality
+        // index candidates.
         let where_eq_candidate_slots: Option<Vec<u32>> = if index_candidate_slots.is_none() {
             let prop_index_ref = self.prop_index.borrow();
-            m.where_clause.as_ref().and_then(|wexpr| {
+            let candidates = m.where_clause.as_ref().and_then(|wexpr| {
                 try_where_eq_index_lookup(wexpr, node.var.as_str(), label_id_u32, &prop_index_ref)
-            })
+            });
+            match candidates {
+                Some(ref slots) if slots.len() as u64 > selectivity_threshold => {
+                    tracing::debug!(
+                        label = %label,
+                        candidates = slots.len(),
+                        threshold = selectivity_threshold,
+                        "SPA-273: WHERE-eq index exceeds selectivity threshold — falling back to full scan"
+                    );
+                    None
+                }
+                other => other,
+            }
         } else {
             None
         };
