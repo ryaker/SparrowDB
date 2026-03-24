@@ -68,7 +68,10 @@ pub struct DbStats {
     pub total_bytes: u64,
     /// Bytes consumed by node column files for each label.
     pub bytes_per_label: std::collections::HashMap<String, u64>,
-    /// Number of live nodes per label (high-water mark).
+    /// High-water mark (HWM) per label — the highest slot index allocated for
+    /// that label, plus one.  Soft-deleted nodes whose slots have not yet been
+    /// reclaimed by compaction are still included in this count.  The value
+    /// converges to the true live-node count once compaction / GC runs.
     pub node_count_per_label: std::collections::HashMap<String, u64>,
     /// Total edges across all relationship types (delta log + CSR).
     pub edge_count: u64,
@@ -435,6 +438,14 @@ impl GraphDb {
     /// Return a storage-size snapshot for this database (SPA-171).
     ///
     /// Pure read — no locks acquired, no writes performed.
+    ///
+    /// # Best-effort semantics
+    ///
+    /// Filesystem entries that cannot be read (missing directories, permission
+    /// errors, partially corrupt files) are silently skipped.  The returned
+    /// snapshot may therefore undercount bytes or edges if the database
+    /// directory is in an inconsistent state.  Callers that need exact
+    /// accounting should treat the reported values as a lower bound.
     pub fn stats(&self) -> Result<DbStats> {
         let db_root = &self.inner.path;
         let catalog = Catalog::open(db_root)?;

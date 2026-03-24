@@ -563,6 +563,15 @@ impl Engine {
     }
 
     /// Implementation of `CALL db.stats()` (SPA-171).
+    ///
+    /// Returns metric/value rows for `total_bytes`, `wal_bytes`, `edge_count`,
+    /// and per-label `nodes.<Label>` and `label_bytes.<Label>`.
+    ///
+    /// `nodes.<Label>` reports the per-label high-water mark (HWM), not the
+    /// live-node count.  Tombstoned slots are included until compaction runs.
+    ///
+    /// Filesystem entries that cannot be read are silently skipped; values may
+    /// be lower bounds when the database directory is partially inaccessible.
     fn call_db_stats(&self, c: &CallStatement) -> Result<QueryResult> {
         if !c.args.is_empty() {
             return Err(sparrowdb_common::Error::InvalidArgument(
