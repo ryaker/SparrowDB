@@ -26,6 +26,7 @@ use sparrowdb_common::{Error, Result};
 ///
 /// Memory-maps (or copies) the entire file into a flat byte buffer, then provides
 /// zero-copy slice access to neighbor lists.
+#[derive(Clone)]
 pub struct CsrForward {
     n_nodes: u64,
     offsets: Vec<u64>,   // length = n_nodes + 1
