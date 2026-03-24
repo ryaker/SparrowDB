@@ -425,6 +425,7 @@ impl Engine {
         match c.procedure.as_str() {
             "db.index.fulltext.queryNodes" => self.call_fulltext_query_nodes(c),
             "db.schema" => self.call_db_schema(c),
+            "db.stats" => self.call_db_stats(c),
             other => Err(sparrowdb_common::Error::InvalidArgument(format!(
                 "unknown procedure: {other}"
             ))),
@@ -559,6 +560,117 @@ impl Engine {
         }
 
         Ok(QueryResult { columns, rows })
+    }
+
+    /// Implementation of `CALL db.stats()` (SPA-171).
+    fn call_db_stats(&self, c: &CallStatement) -> Result<QueryResult> {
+        if !c.args.is_empty() {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "db.stats requires exactly 0 arguments".into(),
+            ));
+        }
+        let db_root = &self.db_root;
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+
+        rows.push(vec![
+            Value::String("total_bytes".to_owned()),
+            Value::Int64(dir_size_bytes(db_root) as i64),
+        ]);
+
+        let mut wal_bytes: u64 = 0;
+        if let Ok(es) = std::fs::read_dir(db_root.join("wal")) {
+            for e in es.flatten() {
+                let n = e.file_name();
+                let ns = n.to_string_lossy();
+                if ns.starts_with("segment-") && ns.ends_with(".wal") {
+                    if let Ok(m) = e.metadata() {
+                        wal_bytes += m.len();
+                    }
+                }
+            }
+        }
+        rows.push(vec![
+            Value::String("wal_bytes".to_owned()),
+            Value::Int64(wal_bytes as i64),
+        ]);
+
+        const DR: u64 = 20; // DeltaRecord: src(8) + dst(8) + rel_id(4) = 20 bytes
+        let mut edge_count: u64 = 0;
+        if let Ok(ts) = std::fs::read_dir(db_root.join("edges")) {
+            for t in ts.flatten() {
+                if !t.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let rd = t.path();
+                if let Ok(m) = std::fs::metadata(rd.join("delta.log")) {
+                    edge_count += m.len().checked_div(DR).unwrap_or(0);
+                }
+                let fp = rd.join("base.fwd.csr");
+                if fp.exists() {
+                    if let Ok(b) = std::fs::read(&fp) {
+                        if let Ok(csr) = sparrowdb_storage::csr::CsrForward::decode(&b) {
+                            edge_count += csr.n_edges();
+                        }
+                    }
+                }
+            }
+        }
+        rows.push(vec![
+            Value::String("edge_count".to_owned()),
+            Value::Int64(edge_count as i64),
+        ]);
+
+        for (label_id, label_name) in self.catalog.list_labels()? {
+            let lid = label_id as u32;
+            let hwm = self.store.hwm_for_label(lid).unwrap_or(0);
+            rows.push(vec![
+                Value::String(format!("nodes.{label_name}")),
+                Value::Int64(hwm as i64),
+            ]);
+            let mut lb: u64 = 0;
+            if let Ok(es) = std::fs::read_dir(db_root.join("nodes").join(lid.to_string())) {
+                for e in es.flatten() {
+                    if let Ok(m) = e.metadata() {
+                        lb += m.len();
+                    }
+                }
+            }
+            rows.push(vec![
+                Value::String(format!("label_bytes.{label_name}")),
+                Value::Int64(lb as i64),
+            ]);
+        }
+
+        let columns = vec!["metric".to_owned(), "value".to_owned()];
+        let yield_cols: Vec<String> = if c.yield_columns.is_empty() {
+            columns.clone()
+        } else {
+            c.yield_columns.clone()
+        };
+        for col in &yield_cols {
+            if col != "metric" && col != "value" {
+                return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                    "unsupported YIELD column for db.stats: {col}"
+                )));
+            }
+        }
+        let idxs: Vec<usize> = yield_cols
+            .iter()
+            .map(|c| if c == "metric" { 0 } else { 1 })
+            .collect();
+        let projected: Vec<Vec<Value>> = rows
+            .into_iter()
+            .map(|r| idxs.iter().map(|&i| r[i].clone()).collect())
+            .collect();
+        let (fc, fr) = if let Some(ref ret) = c.return_clause {
+            self.project_call_return(ret, &yield_cols, projected)?
+        } else {
+            (yield_cols, projected)
+        };
+        Ok(QueryResult {
+            columns: fc,
+            rows: fr,
+        })
     }
 
     /// Project a RETURN clause over rows produced by a CALL statement.
@@ -7110,6 +7222,24 @@ fn finalize_aggregate(kind: &AggKind, vals: &[Value]) -> Value {
         AggKind::Collect => Value::List(vals.to_vec()),
         AggKind::Key => Value::Null,
     }
+}
+
+// ── Storage-size helpers (SPA-171) ────────────────────────────────────────────
+
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let mut total: u64 = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            total += dir_size_bytes(&p);
+        } else if let Ok(m) = std::fs::metadata(&p) {
+            total += m.len();
+        }
+    }
+    total
 }
 
 // ── CALL helpers ─────────────────────────────────────────────────────────────

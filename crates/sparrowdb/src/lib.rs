@@ -58,6 +58,24 @@ pub use sparrowdb_common::Error;
 
 /// Convenience alias: `std::result::Result<T, sparrowdb::Error>`.
 pub use sparrowdb_common::Result;
+
+// ── DbStats ───────────────────────────────────────────────────────────────────
+
+/// Storage-size snapshot returned by [`GraphDb::stats`] (SPA-171).
+#[derive(Debug, Clone, Default)]
+pub struct DbStats {
+    /// Total bytes on disk across all database files.
+    pub total_bytes: u64,
+    /// Bytes consumed by node column files for each label.
+    pub bytes_per_label: std::collections::HashMap<String, u64>,
+    /// Number of live nodes per label (high-water mark).
+    pub node_count_per_label: std::collections::HashMap<String, u64>,
+    /// Total edges across all relationship types (delta log + CSR).
+    pub edge_count: u64,
+    /// Bytes used by all WAL segment files under `wal/`.
+    pub wal_bytes: u64,
+}
+
 use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
 use sparrowdb_storage::maintenance::MaintenanceEngine;
@@ -412,6 +430,69 @@ impl GraphDb {
             collect_maintenance_params(&catalog, &node_store, &self.inner.path);
         let engine = MaintenanceEngine::new(&self.inner.path);
         engine.optimize(&rel_table_ids, n_nodes)
+    }
+
+    /// Return a storage-size snapshot for this database (SPA-171).
+    ///
+    /// Pure read — no locks acquired, no writes performed.
+    pub fn stats(&self) -> Result<DbStats> {
+        let db_root = &self.inner.path;
+        let catalog = Catalog::open(db_root)?;
+        let node_store = NodeStore::open(db_root)?;
+        let mut stats = DbStats::default();
+
+        for (label_id, label_name) in catalog.list_labels()? {
+            let lid = label_id as u32;
+            stats.node_count_per_label.insert(
+                label_name.clone(),
+                node_store.hwm_for_label(lid).unwrap_or(0),
+            );
+            let mut lb: u64 = 0;
+            if let Ok(es) = std::fs::read_dir(db_root.join("nodes").join(lid.to_string())) {
+                for e in es.flatten() {
+                    if let Ok(m) = e.metadata() {
+                        lb += m.len();
+                    }
+                }
+            }
+            stats.bytes_per_label.insert(label_name, lb);
+        }
+
+        if let Ok(es) = std::fs::read_dir(db_root.join("wal")) {
+            for e in es.flatten() {
+                let n = e.file_name();
+                let ns = n.to_string_lossy();
+                if ns.starts_with("segment-") && ns.ends_with(".wal") {
+                    if let Ok(m) = e.metadata() {
+                        stats.wal_bytes += m.len();
+                    }
+                }
+            }
+        }
+
+        const DR: u64 = 20; // DeltaRecord: src(8) + dst(8) + rel_id(4) = 20 bytes
+        if let Ok(ts) = std::fs::read_dir(db_root.join("edges")) {
+            for t in ts.flatten() {
+                if !t.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let rd = t.path();
+                if let Ok(m) = std::fs::metadata(rd.join("delta.log")) {
+                    stats.edge_count += m.len().checked_div(DR).unwrap_or(0);
+                }
+                let fp = rd.join("base.fwd.csr");
+                if fp.exists() {
+                    if let Ok(b) = std::fs::read(&fp) {
+                        if let Ok(csr) = CsrForward::decode(&b) {
+                            stats.edge_count += csr.n_edges();
+                        }
+                    }
+                }
+            }
+        }
+
+        stats.total_bytes = dir_size_bytes(db_root);
+        Ok(stats)
     }
 
     /// Execute a Cypher query.
@@ -2700,6 +2781,24 @@ fn open_csr_map(path: &Path) -> HashMap<u32, CsrForward> {
     map
 }
 
+// ── Storage-size helpers (SPA-171) ────────────────────────────────────────────
+
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            total += dir_size_bytes(&p);
+        } else if let Ok(m) = std::fs::metadata(&p) {
+            total += m.len();
+        }
+    }
+    total
+}
+
 // ── Reserved label/type protection (SPA-208) ──────────────────────────────────
 
 /// Returns `true` if `label` starts with the reserved `__SO_` prefix.
@@ -2938,10 +3037,112 @@ mod tests {
 
         for _ in 0..5 {
             let tx = db.begin_write().expect("lock must be free");
-            // Concurrent attempt must fail.
             assert!(matches!(db.begin_write(), Err(Error::WriterBusy)));
             drop(tx);
-            // After drop lock is free again.
         }
+    }
+
+    // ── SPA-171: GraphDb::stats() ─────────────────────────────────────────────
+
+    #[test]
+    fn stats_empty_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.edge_count, 0);
+        assert_eq!(stats.node_count_per_label.len(), 0);
+        assert_eq!(stats.wal_bytes, 0);
+    }
+
+    #[test]
+    fn stats_after_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+        // Create two nodes and one edge via low-level API.
+        let (src, dst) = {
+            let mut tx = db.begin_write().unwrap();
+            let a = tx.create_node(0, &[]).unwrap();
+            let b = tx.create_node(0, &[]).unwrap();
+            tx.commit().unwrap();
+            (a, b)
+        };
+        {
+            let mut tx = db.begin_write().unwrap();
+            tx.create_edge(src, dst, "KNOWS", std::collections::HashMap::new())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        // Also create a labeled node via Cypher so catalog has a label entry.
+        db.execute("CREATE (n:Person {name: 'Alice'})").unwrap();
+        let stats = db.stats().unwrap();
+        assert!(
+            stats
+                .node_count_per_label
+                .get("Person")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert_eq!(
+            stats.edge_count, 1,
+            "expected 1 edge, got {}",
+            stats.edge_count
+        );
+        assert!(stats.wal_bytes > 0);
+        assert!(stats.total_bytes >= stats.wal_bytes);
+        assert!(stats.bytes_per_label.get("Person").copied().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn call_db_stats_cypher() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+        db.execute("CREATE (n:Widget {name: 'w1'})").unwrap();
+        let result = db.execute("CALL db.stats() YIELD metric, value").unwrap();
+        assert_eq!(result.columns, vec!["metric", "value"]);
+        assert!(!result.rows.is_empty());
+        let metrics: std::collections::HashMap<_, _> = result
+            .rows
+            .iter()
+            .filter_map(|row| match (&row[0], &row[1]) {
+                (sparrowdb_execution::Value::String(m), sparrowdb_execution::Value::Int64(v)) => {
+                    Some((m.clone(), *v))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(metrics.contains_key("total_bytes"));
+        assert!(metrics.contains_key("wal_bytes"));
+        assert!(metrics.contains_key("edge_count"));
+        assert!(metrics.contains_key("nodes.Widget"));
+        assert!(metrics.contains_key("label_bytes.Widget"));
+        assert!(metrics["total_bytes"] > 0);
+    }
+
+    #[test]
+    fn stats_edge_count_after_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+        let (n1, n2) = {
+            let mut tx = db.begin_write().unwrap();
+            let a = tx.create_node(0, &[]).unwrap();
+            let b = tx.create_node(0, &[]).unwrap();
+            tx.commit().unwrap();
+            (a, b)
+        };
+        {
+            let mut tx = db.begin_write().unwrap();
+            tx.create_edge(n1, n2, "LINK", std::collections::HashMap::new())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let before = db.stats().unwrap();
+        assert!(
+            before.edge_count > 0,
+            "edge_count must be > 0 before checkpoint"
+        );
+        db.checkpoint().unwrap();
+        let after = db.stats().unwrap();
+        assert_eq!(after.edge_count, before.edge_count);
     }
 }
