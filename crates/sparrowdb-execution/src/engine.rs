@@ -2918,6 +2918,210 @@ impl Engine {
         }))
     }
 
+    // ── COUNT(f) + ORDER BY alias DESC LIMIT k fast-path (SPA-272 / Q7) ────────
+    //
+    // Detects 1-hop aggregation queries of the shape:
+    //
+    //   MATCH (n:Label)-[:TYPE]->(f:Label2)
+    //   RETURN n.prop, COUNT(f) AS alias
+    //   ORDER BY alias DESC LIMIT k
+    //
+    // and answers them directly from the pre-computed DegreeCache without
+    // scanning edges or grouping rows.  Returns `None` when the pattern does
+    // not qualify; the caller falls through to the normal execution path.
+    //
+    // Qualifying conditions:
+    //   1. Single 1-hop pattern with outgoing direction, no WHERE clause,
+    //      no inline prop filters on either node.
+    //   2. Exactly 2 RETURN items: one property access `n.prop` (group key)
+    //      and one `COUNT(var)` where `var` matches the destination variable.
+    //   3. ORDER BY is `Expr::Var(alias)` DESC where alias == COUNT's alias.
+    //   4. LIMIT is Some(k) with k > 0.
+    fn try_count_agg_degree_fastpath(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<Option<QueryResult>> {
+        use sparrowdb_cypher::ast::EdgeDir;
+
+        let pat = &m.pattern[0];
+        // Must be a 1-hop pattern.
+        if pat.nodes.len() != 2 || pat.rels.len() != 1 {
+            return Ok(None);
+        }
+        let src_node = &pat.nodes[0];
+        let dst_node = &pat.nodes[1];
+        let rel = &pat.rels[0];
+
+        // Outgoing direction only.
+        if rel.dir != EdgeDir::Outgoing {
+            return Ok(None);
+        }
+
+        // No WHERE clause.
+        if m.where_clause.is_some() {
+            return Ok(None);
+        }
+
+        // No inline prop filters on either node.
+        if !src_node.props.is_empty() || !dst_node.props.is_empty() {
+            return Ok(None);
+        }
+
+        // Source must have a label.
+        let src_label = match src_node.labels.first() {
+            Some(l) if !l.is_empty() => l.clone(),
+            _ => return Ok(None),
+        };
+
+        // Exactly 2 RETURN items.
+        let items = &m.return_clause.items;
+        if items.len() != 2 {
+            return Ok(None);
+        }
+
+        // Identify which item is COUNT(dst_var) and which is the group key (n.prop).
+        let dst_var = &dst_node.var;
+        let src_var = &src_node.var;
+
+        let (prop_col_name, count_alias) = {
+            let mut prop_col: Option<String> = None;
+            let mut count_al: Option<String> = None;
+
+            for item in items {
+                match &item.expr {
+                    Expr::FnCall { name, args }
+                        if name.to_lowercase() == "count" && args.len() == 1 =>
+                    {
+                        // COUNT(f) — arg must be the destination variable.
+                        if let Some(Expr::Var(v)) = args.first() {
+                            if v == dst_var {
+                                count_al = item
+                                    .alias
+                                    .clone()
+                                    .or_else(|| Some(format!("COUNT({})", v)));
+                            } else {
+                                return Ok(None);
+                            }
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                    Expr::PropAccess { var, prop } => {
+                        // n.prop — must reference the source variable.
+                        if var == src_var {
+                            prop_col = Some(prop.clone());
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                    _ => return Ok(None),
+                }
+            }
+
+            match (prop_col, count_al) {
+                (Some(pc), Some(ca)) => (pc, ca),
+                _ => return Ok(None),
+            }
+        };
+
+        // ORDER BY must be a single Var matching the COUNT alias, DESC.
+        if m.order_by.len() != 1 {
+            return Ok(None);
+        }
+        let (sort_expr, sort_dir) = &m.order_by[0];
+        if *sort_dir != SortDir::Desc {
+            return Ok(None);
+        }
+        match sort_expr {
+            Expr::Var(v) if *v == count_alias => {}
+            _ => return Ok(None),
+        }
+
+        // LIMIT must be set and > 0.
+        let k = match m.limit {
+            Some(k) if k > 0 => k as usize,
+            _ => return Ok(None),
+        };
+
+        // ── All conditions met — execute via DegreeCache. ──────────────────
+
+        let label_id = match self.snapshot.catalog.get_label(&src_label)? {
+            Some(id) => id as u32,
+            None => {
+                return Ok(Some(QueryResult {
+                    columns: column_names.to_vec(),
+                    rows: vec![],
+                }));
+            }
+        };
+
+        tracing::debug!(
+            label = %src_label,
+            k = k,
+            count_alias = %count_alias,
+            "SPA-272: COUNT-agg degree-cache fast-path activated (Q7 shape)"
+        );
+
+        let top_k = self.top_k_by_degree(label_id, k)?;
+
+        // Apply SKIP if present.
+        let skip = m.skip.unwrap_or(0) as usize;
+        let top_k = if skip >= top_k.len() {
+            &[][..]
+        } else {
+            &top_k[skip..]
+        };
+
+        // Resolve the property column ID for the group key.
+        let prop_col_id = prop_name_to_col_id(&prop_col_name);
+
+        // Build result rows. For each (slot, degree), look up n.prop and emit.
+        // Skip degree-0 nodes: a 1-hop MATCH only produces rows for nodes with
+        // at least one neighbor, so COUNT(f) is always >= 1 in the normal path.
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(top_k.len());
+        for &(slot, degree) in top_k {
+            if degree == 0 {
+                continue;
+            }
+
+            let node_id = NodeId(((label_id as u64) << 32) | slot);
+
+            // Skip tombstoned nodes.
+            if self.is_node_tombstoned(node_id) {
+                continue;
+            }
+
+            // Fetch the property for the group key (nullable path so missing
+            // columns return NULL instead of a NotFound error).
+            let prop_raw = read_node_props(&self.snapshot.store, node_id, &[prop_col_id])?;
+            let prop_val = prop_raw
+                .iter()
+                .find(|(c, _)| *c == prop_col_id)
+                .map(|(_, v)| decode_raw_val(*v, &self.snapshot.store))
+                .unwrap_or(Value::Null);
+
+            // Project in the same order as column_names.
+            let row: Vec<Value> = column_names
+                .iter()
+                .map(|col| {
+                    if col == &count_alias {
+                        Value::Int64(degree as i64)
+                    } else {
+                        prop_val.clone()
+                    }
+                })
+                .collect();
+
+            rows.push(row);
+        }
+
+        Ok(Some(QueryResult {
+            columns: column_names.to_vec(),
+            rows,
+        }))
+    }
+
     // ── OPTIONAL MATCH (standalone) ───────────────────────────────────────────
 
     /// Execute `OPTIONAL MATCH pattern RETURN …`.
@@ -3958,6 +4162,14 @@ impl Engine {
     // ── 1-hop traversal: (a)-[:R]->(f) ───────────────────────────────────────
 
     fn execute_one_hop(&self, m: &MatchStatement, column_names: &[String]) -> Result<QueryResult> {
+        // ── Q7 COUNT-agg degree-cache fast-path (SPA-272) ─────────────────────
+        // Try to short-circuit `MATCH (n)-[:R]->(f) RETURN n.prop, COUNT(f) AS
+        // alias ORDER BY alias DESC LIMIT k` via DegreeCache before falling
+        // through to the full scan + aggregate path.
+        if let Some(result) = self.try_count_agg_degree_fastpath(m, column_names)? {
+            return Ok(result);
+        }
+
         let pat = &m.pattern[0];
         let src_node_pat = &pat.nodes[0];
         let dst_node_pat = &pat.nodes[1];
