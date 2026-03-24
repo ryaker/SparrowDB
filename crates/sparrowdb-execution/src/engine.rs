@@ -32,7 +32,8 @@ use crate::types::{QueryResult, Value};
 
 /// Pre-computed out-degree for every node slot across all relationship types.
 ///
-/// Built eagerly at engine-open time by scanning:
+/// Built **lazily** on first call to [`Engine::top_k_by_degree`] or
+/// [`Engine::out_degree`] by scanning:
 /// 1. CSR forward files (checkpointed edges) — contribution per slot from offsets.
 /// 2. Delta log records (uncheckpointed edges) — each `DeltaRecord.src` increments
 ///    the source slot's count.
@@ -43,6 +44,9 @@ use crate::types::{QueryResult, Value};
 /// Lookup is O(1).  [`Engine::top_k_by_degree`] uses this cache to answer
 /// "top-k highest-degree nodes of label L" in O(N log k) where N is the
 /// label's node count (HWM), rather than O(N × E) full edge scans.
+///
+/// Queries that never call `top_k_by_degree` (e.g. point lookups, scans,
+/// hop traversals) pay zero cost: no CSR iteration, no delta-log reads.
 #[derive(Debug, Default)]
 pub struct DegreeCache {
     /// Maps slot → total out-degree across all relationship types.
@@ -203,10 +207,14 @@ pub struct Engine {
     /// Pre-computed out-degree for every node slot across all relationship types
     /// (SPA-272).
     ///
-    /// Built eagerly in [`Engine::new`] by scanning all CSR forward files and all
-    /// delta-log records.  Provides O(1) degree lookup for
-    /// [`Engine::top_k_by_degree`].
-    pub degree_cache: DegreeCache,
+    /// Initialized **lazily** on first call to [`Engine::top_k_by_degree`] or
+    /// [`Engine::out_degree`].  Queries that never need degree information
+    /// (point lookups, full scans, hop traversals) pay zero cost at engine-open
+    /// time: no CSR iteration, no delta-log I/O.
+    ///
+    /// `RefCell` provides interior mutability so the cache can be populated
+    /// from `&self` methods without changing the signature of `top_k_by_degree`.
+    pub degree_cache: std::cell::RefCell<Option<DegreeCache>>,
     /// Set of `(label_id, col_id)` pairs that carry a UNIQUE constraint (SPA-234).
     ///
     /// Populated by `CREATE CONSTRAINT ON (n:Label) ASSERT n.property IS UNIQUE`.
@@ -240,25 +248,31 @@ impl Engine {
         // Queries with no text predicates (COUNT(*), hop traversals, property
         // lookups) pay zero TextIndex I/O cost.
         //
-        // SPA-272 (degree cache): built eagerly from CSR forward files + all
-        // delta-log records so that top-k degree queries are O(1) per node.
-        let delta_all: Vec<DeltaRecord> = {
-            let ids = catalog.list_rel_table_ids();
-            if ids.is_empty() {
-                EdgeStore::open(db_root, RelTableId(0))
-                    .and_then(|s| s.read_delta())
-                    .unwrap_or_default()
-            } else {
-                ids.into_iter()
-                    .flat_map(|(id, _, _, _)| {
-                        EdgeStore::open(db_root, RelTableId(id as u32))
-                            .and_then(|s| s.read_delta())
-                            .unwrap_or_default()
-                    })
-                    .collect()
-            }
-        };
-        let degree_cache = DegreeCache::build(&csrs, &delta_all);
+        // SPA-272 / perf fix: DegreeCache is now initialized lazily on first
+        // call to top_k_by_degree() or out_degree().  Queries that never need
+        // degree information (point lookups, full scans, hop traversals) pay
+        // zero cost at engine-open time: no CSR iteration, no delta-log I/O.
+        //
+        // SPA-Q1-perf: build label_row_counts ONCE at Engine::new() by reading
+        // each label's high-water-mark from the NodeStore HWM file (an O(1)
+        // in-memory map lookup after the first call per label).  Previously this
+        // map was left empty and only populated via the write path, so every
+        // read query started with an empty map, forcing the planner to fall back
+        // to per-scan HWM reads on every execution.  Now the snapshot carries a
+        // pre-populated map; the write path continues to increment it on creation.
+        let label_row_counts: HashMap<LabelId, usize> = catalog
+            .list_labels()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(lid, _name)| {
+                let hwm = store.hwm_for_label(lid as u32).unwrap_or(0);
+                if hwm > 0 {
+                    Some((lid, hwm as usize))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // SPA-273: build per-rel-type degree stats from CSR forward files.
         // For each relationship type (CSR), iterate every source slot and
@@ -296,7 +310,7 @@ impl Engine {
             catalog,
             csrs,
             db_root: db_root.to_path_buf(),
-            label_row_counts: HashMap::new(),
+            label_row_counts,
             rel_degree_stats,
         };
 
@@ -306,7 +320,7 @@ impl Engine {
             prop_index: std::cell::RefCell::new(PropertyIndex::new()),
             text_index: std::cell::RefCell::new(TextIndex::new()),
             deadline: None,
-            degree_cache,
+            degree_cache: std::cell::RefCell::new(None),
             unique_constraints: HashSet::new(),
         }
     }
@@ -437,6 +451,55 @@ impl Engine {
         out
     }
 
+    /// Ensure the [`DegreeCache`] is populated, building it lazily on first call.
+    ///
+    /// Reads all delta-log records for every known rel type and scans every CSR
+    /// forward file to tally out-degrees per source slot.  Subsequent calls are
+    /// O(1) — the cache is stored in `self.degree_cache` and reused.
+    ///
+    /// Called automatically by [`top_k_by_degree`] and [`out_degree`].
+    /// Queries that never call those methods (point lookups, full scans,
+    /// hop traversals) pay **zero** cost.
+    fn ensure_degree_cache(&self) {
+        let mut guard = self.degree_cache.borrow_mut();
+        if guard.is_some() {
+            return; // already built
+        }
+
+        // Read all delta-log records (uncheckpointed edges).
+        let delta_all: Vec<DeltaRecord> = {
+            let ids = self.snapshot.catalog.list_rel_table_ids();
+            if ids.is_empty() {
+                EdgeStore::open(&self.snapshot.db_root, RelTableId(0))
+                    .and_then(|s| s.read_delta())
+                    .unwrap_or_default()
+            } else {
+                ids.into_iter()
+                    .flat_map(|(id, _, _, _)| {
+                        EdgeStore::open(&self.snapshot.db_root, RelTableId(id as u32))
+                            .and_then(|s| s.read_delta())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            }
+        };
+
+        *guard = Some(DegreeCache::build(&self.snapshot.csrs, &delta_all));
+    }
+
+    /// Return the total out-degree for `slot` across all relationship types.
+    ///
+    /// Triggers lazy initialization of the [`DegreeCache`] on first call.
+    /// Returns `0` for slots with no outgoing edges.
+    pub fn out_degree(&self, slot: u64) -> u32 {
+        self.ensure_degree_cache();
+        self.degree_cache
+            .borrow()
+            .as_ref()
+            .expect("degree_cache populated by ensure_degree_cache")
+            .out_degree(slot)
+    }
+
     /// Return the top-`k` nodes of `label_id` ordered by out-degree descending.
     ///
     /// Each element of the returned `Vec` is `(slot, out_degree)`.  Ties in
@@ -445,6 +508,8 @@ impl Engine {
     /// Returns an empty `Vec` when `k == 0` or the label has no nodes.
     ///
     /// Uses [`DegreeCache`] for O(1) per-node lookups (SPA-272).
+    /// The cache is built lazily on first call — queries that never call this
+    /// method pay zero cost.
     pub fn top_k_by_degree(&self, label_id: u32, k: usize) -> Result<Vec<(u64, u32)>> {
         if k == 0 {
             return Ok(vec![]);
@@ -454,8 +519,14 @@ impl Engine {
             return Ok(vec![]);
         }
 
+        self.ensure_degree_cache();
+        let cache = self.degree_cache.borrow();
+        let cache = cache
+            .as_ref()
+            .expect("degree_cache populated by ensure_degree_cache");
+
         let mut pairs: Vec<(u64, u32)> = (0..hwm)
-            .map(|slot| (slot, self.degree_cache.out_degree(slot)))
+            .map(|slot| (slot, cache.out_degree(slot)))
             .collect();
 
         // Sort descending by degree; break ties by ascending slot for determinism.
