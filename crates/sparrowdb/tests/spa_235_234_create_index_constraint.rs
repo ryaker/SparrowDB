@@ -146,6 +146,16 @@ fn unique_constraint_rejects_duplicate_within_same_statement() {
         msg.contains("unique") || msg.contains("constraint") || msg.contains("violation"),
         "error message should mention constraint violation, got: {msg}"
     );
+
+    // Atomicity: no :Item nodes must have been committed despite the error.
+    let count_result = db
+        .execute("MATCH (n:Item) RETURN n.sku")
+        .expect("count query must succeed");
+    assert!(
+        count_result.rows.is_empty(),
+        "failed CREATE must be fully atomic — no :Item nodes should be present, got {:?}",
+        count_result.rows
+    );
 }
 
 // ── SPA-234 Test 6: Different values on constrained label all pass ─────────────
