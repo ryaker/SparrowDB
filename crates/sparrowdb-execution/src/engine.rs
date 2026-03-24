@@ -412,7 +412,9 @@ impl Engine {
             Statement::Checkpoint | Statement::Optimize => Ok(QueryResult::empty(vec![])),
             Statement::Call(c) => self.execute_call(&c),
             Statement::Pipeline(p) => self.execute_pipeline(&p),
-            Statement::CreateIndex { label, property } => self.execute_create_index(&label, &property),
+            Statement::CreateIndex { label, property } => {
+                self.execute_create_index(&label, &property)
+            }
             Statement::CreateConstraint { .. } => Ok(QueryResult::empty(vec![])),
         }
     }
@@ -1251,9 +1253,14 @@ impl Engine {
     }
 
     fn execute_create_index(&mut self, label: &str, property: &str) -> Result<QueryResult> {
-        let label_id: u32 = match self.catalog.get_label(label)? { Some(id) => id as u32, None => return Ok(QueryResult::empty(vec![])) };
+        let label_id: u32 = match self.catalog.get_label(label)? {
+            Some(id) => id as u32,
+            None => return Ok(QueryResult::empty(vec![])),
+        };
         let col_id = col_id_of(property);
-        self.prop_index.borrow_mut().build_for(&self.store, label_id, col_id)?;
+        self.prop_index
+            .borrow_mut()
+            .build_for(&self.store, label_id, col_id)?;
         Ok(QueryResult::empty(vec![]))
     }
 

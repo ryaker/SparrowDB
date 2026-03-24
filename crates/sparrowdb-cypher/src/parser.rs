@@ -1162,8 +1162,14 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_tok(&Token::Create)?;
-        if matches!(self.peek(), Token::Index) { self.advance(); return self.parse_create_index(); }
-        if matches!(self.peek(), Token::Constraint) { self.advance(); return self.parse_create_constraint(); }
+        if matches!(self.peek(), Token::Index) {
+            self.advance();
+            return self.parse_create_index();
+        }
+        if matches!(self.peek(), Token::Constraint) {
+            self.advance();
+            return self.parse_create_constraint();
+        }
         let body = self.parse_create_body()?;
         Ok(Statement::Create(body))
     }
@@ -1185,7 +1191,12 @@ impl Parser {
         self.expect_tok(&Token::RParen)?;
         match self.advance().clone() {
             Token::Assert => {}
-            other => return Err(Error::InvalidArgument(format!("expected ASSERT, got {:?}", other))),
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "expected ASSERT, got {:?}",
+                    other
+                )))
+            }
         }
         let _prop_var = self.expect_ident()?;
         self.expect_tok(&Token::Dot)?;
@@ -1193,7 +1204,12 @@ impl Parser {
         self.expect_tok(&Token::Is)?;
         match self.advance().clone() {
             Token::Ident(ref s) if s.eq_ignore_ascii_case("UNIQUE") => {}
-            other => return Err(Error::InvalidArgument(format!("expected UNIQUE, got {:?}", other))),
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "expected UNIQUE, got {:?}",
+                    other
+                )))
+            }
         }
         Ok(Statement::CreateConstraint { label, property })
     }

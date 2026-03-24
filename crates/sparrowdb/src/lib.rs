@@ -587,9 +587,16 @@ impl GraphDb {
     /// and the edge is appended to the WAL (SPA-182).
     fn register_unique_constraint(&self, label: &str, property: &str) -> Result<QueryResult> {
         let catalog_snap = sparrowdb_catalog::catalog::Catalog::open(&self.inner.path)?;
-        let label_id: u32 = match catalog_snap.get_label(label)? { Some(id) => id as u32, None => return Ok(QueryResult::empty(vec![])) };
+        let label_id: u32 = match catalog_snap.get_label(label)? {
+            Some(id) => id as u32,
+            None => return Ok(QueryResult::empty(vec![])),
+        };
         let col_id = sparrowdb_common::col_id_of(property);
-        self.inner.unique_constraints.write().unwrap().insert((label_id, col_id));
+        self.inner
+            .unique_constraints
+            .write()
+            .unwrap()
+            .insert((label_id, col_id));
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -759,7 +766,9 @@ impl GraphDb {
         let bound = bind(stmt, &catalog_snap)?;
 
         use sparrowdb_cypher::ast::Statement;
-        if let Statement::CreateConstraint { label, property } = &bound.inner { return self.register_unique_constraint(label, property); }
+        if let Statement::CreateConstraint { label, property } = &bound.inner {
+            return self.register_unique_constraint(label, property);
+        }
         if Engine::is_mutation(&bound.inner) {
             // Route mutations through params-aware helpers (SPA-218).
             use sparrowdb_cypher::ast::Statement as Stmt;
@@ -904,13 +913,21 @@ impl GraphDb {
         if let Some(ref ret) = m.return_clause {
             use sparrowdb_cypher::ast::Expr;
             type ExecValue = sparrowdb_execution::Value;
-            let var = if m.var.is_empty() { "n" } else { m.var.as_str() };
-            let return_props: Vec<String> = ret.items.iter()
+            let var = if m.var.is_empty() {
+                "n"
+            } else {
+                m.var.as_str()
+            };
+            let return_props: Vec<String> = ret
+                .items
+                .iter()
                 .filter_map(|item| match &item.expr {
                     Expr::PropAccess { var: v, prop } if v.as_str() == var => Some(prop.clone()),
                     _ => None,
-                }).collect();
-            let return_col_ids: Vec<u32> = return_props.iter().map(|name| fnv1a_col_id(name)).collect();
+                })
+                .collect();
+            let return_col_ids: Vec<u32> =
+                return_props.iter().map(|name| fnv1a_col_id(name)).collect();
             let store = NodeStore::open(&self.inner.path)?;
             let stored = store.get_node(node_id, &return_col_ids).unwrap_or_default();
             let mut row_vals: HashMap<String, ExecValue> = HashMap::new();
@@ -919,15 +936,26 @@ impl GraphDb {
                     row_vals.insert(format!("{var}.{prop_name}"), storage_value_to_exec(val));
                 }
             }
-            let columns: Vec<String> = ret.items.iter()
-                .map(|item| item.alias.clone().unwrap_or_else(|| match &item.expr {
-                    Expr::PropAccess { var: v, prop } => format!("{v}.{prop}"),
-                    Expr::Var(v) => v.clone(),
-                    _ => "?".to_string(),
-                })).collect();
-            let row: Vec<ExecValue> = ret.items.iter()
-                .map(|item| eval_expr_merge(&item.expr, &row_vals)).collect();
-            return Ok(QueryResult { columns, rows: vec![row] });
+            let columns: Vec<String> = ret
+                .items
+                .iter()
+                .map(|item| {
+                    item.alias.clone().unwrap_or_else(|| match &item.expr {
+                        Expr::PropAccess { var: v, prop } => format!("{v}.{prop}"),
+                        Expr::Var(v) => v.clone(),
+                        _ => "?".to_string(),
+                    })
+                })
+                .collect();
+            let row: Vec<ExecValue> = ret
+                .items
+                .iter()
+                .map(|item| eval_expr_merge(&item.expr, &row_vals))
+                .collect();
+            return Ok(QueryResult {
+                columns,
+                rows: vec![row],
+            });
         }
         Ok(QueryResult::empty(vec![]))
     }
@@ -1692,7 +1720,6 @@ impl GraphDb {
 
         Ok((node_count, edge_count))
     }
-
 
     /// Return all node label names currently registered in the catalog (SPA-209).
     ///

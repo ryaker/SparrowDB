@@ -199,14 +199,14 @@ fn unwind_param_regression() {
     assert!(names.contains(&Value::String("Bob".into())));
 }
 
-
 #[test]
 fn parameterized_merge_creates_node() {
     let (_dir, db) = make_db();
     db.execute_with_params(
         "MERGE (n:Person {name: $name})",
         params(&[("name", Value::String("Alice".into()))]),
-    ).expect("parameterized MERGE must succeed");
+    )
+    .expect("parameterized MERGE must succeed");
     let result = db.execute("MATCH (n:Person) RETURN n.name").expect("MATCH");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], Value::String("Alice".into()));
@@ -216,8 +216,10 @@ fn parameterized_merge_creates_node() {
 fn parameterized_merge_is_idempotent() {
     let (_dir, db) = make_db();
     let p = params(&[("name", Value::String("Alice".into()))]);
-    db.execute_with_params("MERGE (n:Person {name: $name})", p.clone()).expect("first");
-    db.execute_with_params("MERGE (n:Person {name: $name})", p).expect("second");
+    db.execute_with_params("MERGE (n:Person {name: $name})", p.clone())
+        .expect("first");
+    db.execute_with_params("MERGE (n:Person {name: $name})", p)
+        .expect("second");
     let result = db.execute("MATCH (n:Person) RETURN n.name").expect("MATCH");
     assert_eq!(result.rows.len(), 1);
 }
@@ -228,8 +230,11 @@ fn parameterized_merge_with_integer_param() {
     db.execute_with_params(
         "MERGE (n:Counter {value: $val})",
         params(&[("val", Value::Int64(42))]),
-    ).expect("MERGE with integer param");
-    let result = db.execute("MATCH (n:Counter) RETURN n.value").expect("MATCH");
+    )
+    .expect("MERGE with integer param");
+    let result = db
+        .execute("MATCH (n:Counter) RETURN n.value")
+        .expect("MATCH");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], Value::Int64(42));
 }
@@ -244,12 +249,19 @@ fn parameterized_merge_missing_param_returns_error() {
 #[test]
 fn parameterized_set_updates_property() {
     let (_dir, db) = make_db();
-    db.execute("CREATE (:Person {name: 'Alice', age: 0})").unwrap();
+    db.execute("CREATE (:Person {name: 'Alice', age: 0})")
+        .unwrap();
     db.execute_with_params(
         "MATCH (n:Person {name: $name}) SET n.age = $age",
-        params(&[("name", Value::String("Alice".into())), ("age", Value::Int64(30))]),
-    ).expect("parameterized SET");
-    let result = db.execute("MATCH (n:Person {name: 'Alice'}) RETURN n.age").expect("MATCH");
+        params(&[
+            ("name", Value::String("Alice".into())),
+            ("age", Value::Int64(30)),
+        ]),
+    )
+    .expect("parameterized SET");
+    let result = db
+        .execute("MATCH (n:Person {name: 'Alice'}) RETURN n.age")
+        .expect("MATCH");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], Value::Int64(30));
 }

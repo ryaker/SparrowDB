@@ -279,8 +279,10 @@ fn labels_returns_all_registered_labels() {
 #[test]
 fn labels_survives_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
-    { let db = sparrowdb::open(dir.path()).expect("open");
-      db.execute("CREATE (n:Animal {name: 'Cat'})").unwrap(); }
+    {
+        let db = sparrowdb::open(dir.path()).expect("open");
+        db.execute("CREATE (n:Animal {name: 'Cat'})").unwrap();
+    }
     let db2 = sparrowdb::open(dir.path()).expect("reopen");
     let labels = db2.labels().expect("labels() after reopen");
     assert!(labels.contains(&"Animal".to_string()));
@@ -289,23 +291,30 @@ fn labels_survives_reopen() {
 #[test]
 fn relationship_types_empty_db_returns_empty_vec() {
     let (_dir, db) = make_db();
-    let types = db.relationship_types().expect("relationship_types() must not error");
+    let types = db
+        .relationship_types()
+        .expect("relationship_types() must not error");
     assert!(types.is_empty());
 }
 
 #[test]
 fn relationship_types_returns_registered_types() {
     let (_dir, db) = make_db();
-    db.execute("CREATE (a:Person {name: 'A'})-[:KNOWS]->(b:Person {name: 'B'})").unwrap();
-    let types = db.relationship_types().expect("relationship_types() must succeed");
+    db.execute("CREATE (a:Person {name: 'A'})-[:KNOWS]->(b:Person {name: 'B'})")
+        .unwrap();
+    let types = db
+        .relationship_types()
+        .expect("relationship_types() must succeed");
     assert!(types.contains(&"KNOWS".to_string()));
 }
 
 #[test]
 fn relationship_types_deduplicates_same_type() {
     let (_dir, db) = make_db();
-    db.execute("CREATE (a:Person {name: 'A'})-[:KNOWS]->(b:Person {name: 'B'})").unwrap();
-    db.execute("CREATE (x:Animal {name: 'X'})-[:KNOWS]->(y:Animal {name: 'Y'})").unwrap();
+    db.execute("CREATE (a:Person {name: 'A'})-[:KNOWS]->(b:Person {name: 'B'})")
+        .unwrap();
+    db.execute("CREATE (x:Animal {name: 'X'})-[:KNOWS]->(y:Animal {name: 'Y'})")
+        .unwrap();
     let types = db.relationship_types().expect("relationship_types()");
     let count = types.iter().filter(|t| t.as_str() == "KNOWS").count();
     assert_eq!(count, 1);
