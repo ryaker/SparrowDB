@@ -118,14 +118,10 @@ fn rel_degree_stats_populated_after_checkpoint() {
     db.execute("CREATE (a:Member {id: 1})").expect("CREATE a");
     db.execute("CREATE (b:Member {id: 2})").expect("CREATE b");
     db.execute("CREATE (c:Member {id: 3})").expect("CREATE c");
-    db.execute(
-        "MATCH (a:Member {id:1}),(b:Member {id:2}) CREATE (a)-[:FOLLOWS]->(b)",
-    )
-    .expect("edge a→b");
-    db.execute(
-        "MATCH (a:Member {id:1}),(b:Member {id:3}) CREATE (a)-[:FOLLOWS]->(b)",
-    )
-    .expect("edge a→c");
+    db.execute("MATCH (a:Member {id:1}),(b:Member {id:2}) CREATE (a)-[:FOLLOWS]->(b)")
+        .expect("edge a→b");
+    db.execute("MATCH (a:Member {id:1}),(b:Member {id:3}) CREATE (a)-[:FOLLOWS]->(b)")
+        .expect("edge a→c");
 
     db.checkpoint().expect("checkpoint");
 
