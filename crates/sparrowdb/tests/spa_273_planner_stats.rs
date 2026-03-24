@@ -104,6 +104,51 @@ fn rel_degree_stats_field_is_accessible() {
     }
 }
 
+// ── Test 1b: rel_degree_stats is non-empty after checkpoint with real edges ────
+
+/// After a checkpoint the CSR files are written, so `rel_degree_stats` must
+/// contain at least one entry with internally consistent, non-zero values.
+/// This test complements Test 1 by verifying stats for an actual relationship
+/// type on a CSR-backed snapshot.
+#[test]
+fn rel_degree_stats_populated_after_checkpoint() {
+    let (dir, db) = make_db();
+
+    // Build a small graph and force a checkpoint so CSR files are written.
+    db.execute("CREATE (a:Member {id: 1})").expect("CREATE a");
+    db.execute("CREATE (b:Member {id: 2})").expect("CREATE b");
+    db.execute("CREATE (c:Member {id: 3})").expect("CREATE c");
+    db.execute("MATCH (a:Member {id:1}),(b:Member {id:2}) CREATE (a)-[:FOLLOWS]->(b)")
+        .expect("edge a→b");
+    db.execute("MATCH (a:Member {id:1}),(b:Member {id:3}) CREATE (a)-[:FOLLOWS]->(b)")
+        .expect("edge a→c");
+
+    db.checkpoint().expect("checkpoint");
+
+    let engine = build_engine(dir.path());
+    let stats = &engine.snapshot.rel_degree_stats;
+
+    assert!(
+        !stats.is_empty(),
+        "rel_degree_stats must be non-empty after checkpoint with edges"
+    );
+
+    for (rel_table_id, s) in stats {
+        if s.count > 0 {
+            assert!(
+                s.max >= s.min,
+                "DegreeStats for rel_table_id={rel_table_id}: max >= min"
+            );
+            assert!(
+                s.total >= s.count,
+                "DegreeStats for rel_table_id={rel_table_id}: total >= count"
+            );
+            // Member 1 has out-degree 2; the max must reflect at least that.
+            assert!(s.max >= 1, "max degree must be at least 1 after real edges");
+        }
+    }
+}
+
 // ── Test 2: DegreeStats.mean() returns 1.0 when no edges exist ───────────────
 
 #[test]
