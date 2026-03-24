@@ -8,7 +8,7 @@ use std::path::Path;
 
 use tracing::info_span;
 
-use sparrowdb_catalog::catalog::Catalog;
+use sparrowdb_catalog::catalog::{Catalog, LabelId};
 use sparrowdb_common::{col_id_of, NodeId, Result};
 use sparrowdb_cypher::ast::{
     BinOpKind, CallStatement, CreateStatement, Expr, ListPredicateKind, Literal,
@@ -107,15 +107,27 @@ enum RelTableLookup {
     NotFound,
 }
 
-/// The execution engine holds references to the storage layer.
-pub struct Engine {
+/// Immutable snapshot of storage state required to execute a read query.
+///
+/// Groups the fields that are needed for read-only access to the graph so they
+/// can eventually be cloned/shared across parallel executor threads without
+/// bundling the mutable per-query state that lives in [`Engine`].
+pub struct ReadSnapshot {
     pub store: NodeStore,
     pub catalog: Catalog,
     /// Per-relationship-type CSR forward files, keyed by `RelTableId` (u32).
-    /// Replaces the old single `csr: CsrForward` field so that different
-    /// relationship types use separate edge tables (SPA-185).
     pub csrs: HashMap<u32, CsrForward>,
     pub db_root: std::path::PathBuf,
+    /// Cached live node count per label, updated on every node creation.
+    ///
+    /// Used by the planner to estimate cardinality without re-scanning the
+    /// node store's high-water-mark file on every query.
+    pub label_row_counts: HashMap<LabelId, usize>,
+}
+
+/// The execution engine holds references to the storage layer.
+pub struct Engine {
+    pub snapshot: ReadSnapshot,
     /// Runtime query parameters supplied by the caller (e.g. `$name` → Value).
     pub params: HashMap<String, Value>,
     /// In-memory B-tree property equality index (SPA-249).
@@ -152,6 +164,13 @@ pub struct Engine {
     /// delta-log records.  Provides O(1) degree lookup for
     /// [`Engine::top_k_by_degree`].
     pub degree_cache: DegreeCache,
+    /// Set of `(label_id, col_id)` pairs that carry a UNIQUE constraint (SPA-234).
+    ///
+    /// Populated by `CREATE CONSTRAINT ON (n:Label) ASSERT n.property IS UNIQUE`.
+    /// Checked in `execute_create` before writing each node: if the property
+    /// value already exists in `prop_index` for that `(label_id, col_id)`, the
+    /// insert is rejected with `Error::InvalidArgument`.
+    pub unique_constraints: HashSet<(u32, u32)>,
 }
 
 impl Engine {
@@ -198,16 +217,22 @@ impl Engine {
         };
         let degree_cache = DegreeCache::build(&csrs, &delta_all);
 
-        Engine {
+        let snapshot = ReadSnapshot {
             store,
             catalog,
             csrs,
             db_root: db_root.to_path_buf(),
+            label_row_counts: HashMap::new(),
+        };
+
+        Engine {
+            snapshot,
             params: HashMap::new(),
             prop_index: std::cell::RefCell::new(PropertyIndex::new()),
             text_index: std::cell::RefCell::new(TextIndex::new()),
             deadline: None,
             degree_cache,
+            unique_constraints: HashSet::new(),
         }
     }
 
@@ -278,6 +303,7 @@ impl Engine {
             return RelTableLookup::All;
         }
         match self
+            .snapshot
             .catalog
             .get_rel_table(src_label_id as u16, dst_label_id as u16, rel_type)
             .ok()
@@ -293,7 +319,7 @@ impl Engine {
     /// Returns an empty `Vec` if the rel type has not been registered yet, or
     /// if the delta file does not exist.
     fn read_delta_for(&self, rel_table_id: u32) -> Vec<sparrowdb_storage::edge_store::DeltaRecord> {
-        EdgeStore::open(&self.db_root, RelTableId(rel_table_id))
+        EdgeStore::open(&self.snapshot.db_root, RelTableId(rel_table_id))
             .and_then(|s| s.read_delta())
             .unwrap_or_default()
     }
@@ -302,16 +328,16 @@ impl Engine {
     ///
     /// Used by code paths that traverse edges without a type filter.
     fn read_delta_all(&self) -> Vec<sparrowdb_storage::edge_store::DeltaRecord> {
-        let ids = self.catalog.list_rel_table_ids();
+        let ids = self.snapshot.catalog.list_rel_table_ids();
         if ids.is_empty() {
             // No rel types in catalog yet; fall back to table-id 0 (legacy).
-            return EdgeStore::open(&self.db_root, RelTableId(0))
+            return EdgeStore::open(&self.snapshot.db_root, RelTableId(0))
                 .and_then(|s| s.read_delta())
                 .unwrap_or_default();
         }
         ids.into_iter()
             .flat_map(|(id, _, _, _)| {
-                EdgeStore::open(&self.db_root, RelTableId(id as u32))
+                EdgeStore::open(&self.snapshot.db_root, RelTableId(id as u32))
                     .and_then(|s| s.read_delta())
                     .unwrap_or_default()
             })
@@ -320,7 +346,8 @@ impl Engine {
 
     /// Return neighbor slots from the CSR for a given src slot and rel table.
     fn csr_neighbors(&self, rel_table_id: u32, src_slot: u64) -> Vec<u64> {
-        self.csrs
+        self.snapshot
+            .csrs
             .get(&rel_table_id)
             .map(|csr| csr.neighbors(src_slot).to_vec())
             .unwrap_or_default()
@@ -329,7 +356,7 @@ impl Engine {
     /// Return neighbor slots merged across **all** registered rel types.
     fn csr_neighbors_all(&self, src_slot: u64) -> Vec<u64> {
         let mut out: Vec<u64> = Vec::new();
-        for csr in self.csrs.values() {
+        for csr in self.snapshot.csrs.values() {
             out.extend_from_slice(csr.neighbors(src_slot));
         }
         out
@@ -347,7 +374,7 @@ impl Engine {
         if k == 0 {
             return Ok(vec![]);
         }
-        let hwm = self.store.hwm_for_label(label_id)?;
+        let hwm = self.snapshot.store.hwm_for_label(label_id)?;
         if hwm == 0 {
             return Ok(vec![]);
         }
@@ -374,7 +401,7 @@ impl Engine {
 
         let bound = {
             let _bind_span = info_span!("sparrowdb.bind").entered();
-            bind(stmt, &self.catalog)?
+            bind(stmt, &self.snapshot.catalog)?
         };
 
         {
@@ -415,7 +442,9 @@ impl Engine {
             Statement::CreateIndex { label, property } => {
                 self.execute_create_index(&label, &property)
             }
-            Statement::CreateConstraint { .. } => Ok(QueryResult::empty(vec![])),
+            Statement::CreateConstraint { label, property } => {
+                self.execute_create_constraint(&label, &property)
+            }
         }
     }
 
@@ -460,7 +489,7 @@ impl Engine {
 
         // Open the fulltext index (read-only; no flush on this path).
         // `FulltextIndex::open` validates the name for path traversal.
-        let index = FulltextIndex::open(&self.db_root, &index_name)?;
+        let index = FulltextIndex::open(&self.snapshot.db_root, &index_name)?;
         let node_ids = index.search(&query);
 
         // Determine which column names to project.
@@ -519,13 +548,13 @@ impl Engine {
         ];
 
         // Collect property names per label_id and rel_type from the WAL.
-        let wal_dir = self.db_root.join("wal");
+        let wal_dir = self.snapshot.db_root.join("wal");
         let schema = WalReplayer::scan_schema(&wal_dir)?;
 
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
         // Node labels — from catalog.
-        let labels = self.catalog.list_labels()?;
+        let labels = self.snapshot.catalog.list_labels()?;
         for (label_id, label_name) in &labels {
             let mut prop_names: Vec<String> = schema
                 .node_props
@@ -542,7 +571,7 @@ impl Engine {
         }
 
         // Relationship types — from catalog.
-        let rel_tables = self.catalog.list_rel_tables()?;
+        let rel_tables = self.snapshot.catalog.list_rel_tables()?;
         // Deduplicate by rel_type name since the same type can appear across multiple src/dst pairs.
         let mut seen_rel_types: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -582,7 +611,7 @@ impl Engine {
                 "db.stats requires exactly 0 arguments".into(),
             ));
         }
-        let db_root = &self.db_root;
+        let db_root = &self.snapshot.db_root;
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
         rows.push(vec![
@@ -633,9 +662,9 @@ impl Engine {
             Value::Int64(edge_count as i64),
         ]);
 
-        for (label_id, label_name) in self.catalog.list_labels()? {
+        for (label_id, label_name) in self.snapshot.catalog.list_labels()? {
             let lid = label_id as u32;
-            let hwm = self.store.hwm_for_label(lid).unwrap_or(0);
+            let hwm = self.snapshot.store.hwm_for_label(lid).unwrap_or(0);
             rows.push(vec![
                 Value::String(format!("nodes.{label_name}")),
                 Value::Int64(hwm as i64),
@@ -724,7 +753,7 @@ impl Engine {
             let projected: Vec<Value> = ret
                 .items
                 .iter()
-                .map(|item| eval_call_expr(&item.expr, &env, &self.store))
+                .map(|item| eval_call_expr(&item.expr, &env, &self.snapshot.store))
                 .collect();
             out_rows.push(projected);
         }
@@ -776,13 +805,13 @@ impl Engine {
         let node_pat = &pat.nodes[0];
         let label = node_pat.labels.first().cloned().unwrap_or_default();
 
-        let label_id = match self.catalog.get_label(&label)? {
+        let label_id = match self.snapshot.catalog.get_label(&label)? {
             Some(id) => id as u32,
             // SPA-266: unknown label → no nodes can match; return empty result.
             None => return Ok(vec![]),
         };
 
-        let hwm = self.store.hwm_for_label(label_id)?;
+        let hwm = self.snapshot.store.hwm_for_label(label_id)?;
 
         // Collect prop filter col_ids.
         let filter_col_ids: Vec<u32> = node_pat
@@ -809,19 +838,20 @@ impl Engine {
                 continue;
             }
 
-            let props = read_node_props(&self.store, node_id, &all_col_ids)?;
+            let props = read_node_props(&self.snapshot.store, node_id, &all_col_ids)?;
 
             if !matches_prop_filter_static(
                 &props,
                 &node_pat.props,
                 &self.dollar_params(),
-                &self.store,
+                &self.snapshot.store,
             ) {
                 continue;
             }
 
             if let Some(ref where_expr) = mm.where_clause {
-                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
+                let mut row_vals =
+                    build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
                 row_vals.extend(self.dollar_params());
                 if !self.eval_where_graph(where_expr, &row_vals) {
                     continue;
@@ -849,7 +879,7 @@ impl Engine {
     /// logged as warnings and also treated as "not tombstoned" so that
     /// transient storage issues do not suppress valid nodes during a scan.
     fn is_node_tombstoned(&self, node_id: NodeId) -> bool {
-        match self.store.get_node_raw(node_id, &[0u32]) {
+        match self.snapshot.store.get_node_raw(node_id, &[0u32]) {
             Ok(col0) => col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX),
             Err(sparrowdb_common::Error::NotFound) => false,
             Err(e) => {
@@ -878,10 +908,13 @@ impl Engine {
         if props.is_empty() {
             return true;
         }
-        match self.store.get_node_raw(node_id, filter_col_ids) {
-            Ok(raw_props) => {
-                matches_prop_filter_static(&raw_props, props, &self.dollar_params(), &self.store)
-            }
+        match self.snapshot.store.get_node_raw(node_id, filter_col_ids) {
+            Ok(raw_props) => matches_prop_filter_static(
+                &raw_props,
+                props,
+                &self.dollar_params(),
+                &self.snapshot.store,
+            ),
             Err(_) => false,
         }
     }
@@ -910,7 +943,7 @@ impl Engine {
                 }
 
                 let label = node_pat.labels.first().cloned().unwrap_or_default();
-                let label_id: u32 = match self.catalog.get_label(&label)? {
+                let label_id: u32 = match self.snapshot.catalog.get_label(&label)? {
                     Some(id) => id as u32,
                     None => {
                         // Label not found → no matching nodes for this variable.
@@ -919,7 +952,7 @@ impl Engine {
                     }
                 };
 
-                let hwm = self.store.hwm_for_label(label_id)?;
+                let hwm = self.snapshot.store.hwm_for_label(label_id)?;
 
                 // Collect col_ids needed for inline prop filtering.
                 let filter_col_ids: Vec<u32> = node_pat
@@ -934,7 +967,7 @@ impl Engine {
 
                     // Skip tombstoned nodes (col_0 == u64::MAX).
                     // Treat a missing-file error as "not tombstoned".
-                    match self.store.get_node_raw(node_id, &[0u32]) {
+                    match self.snapshot.store.get_node_raw(node_id, &[0u32]) {
                         Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
                             continue;
                         }
@@ -943,13 +976,13 @@ impl Engine {
 
                     // Apply inline prop filter if any.
                     if !node_pat.props.is_empty() {
-                        match self.store.get_node_raw(node_id, &filter_col_ids) {
+                        match self.snapshot.store.get_node_raw(node_id, &filter_col_ids) {
                             Ok(props) => {
                                 if !matches_prop_filter_static(
                                     &props,
                                     &node_pat.props,
                                     &self.dollar_params(),
-                                    &self.store,
+                                    &self.snapshot.store,
                                 ) {
                                     continue;
                                 }
@@ -1015,14 +1048,15 @@ impl Engine {
                     // labels so that unlabeled MATCH patterns find nodes of
                     // any type (instead of silently returning empty).
                     let scan_label_ids: Vec<u32> = if node_pat.labels.is_empty() {
-                        self.catalog
+                        self.snapshot
+                            .catalog
                             .list_labels()?
                             .into_iter()
                             .map(|(id, _)| id as u32)
                             .collect()
                     } else {
                         let label = node_pat.labels.first().cloned().unwrap_or_default();
-                        match self.catalog.get_label(&label)? {
+                        match self.snapshot.catalog.get_label(&label)? {
                             Some(id) => vec![id as u32],
                             None => {
                                 // No nodes can match → entire MATCH yields nothing.
@@ -1039,7 +1073,7 @@ impl Engine {
 
                     let mut matching_ids: Vec<NodeId> = Vec::new();
                     for label_id in scan_label_ids {
-                        let hwm = self.store.hwm_for_label(label_id)?;
+                        let hwm = self.snapshot.store.hwm_for_label(label_id)?;
                         for slot in 0..hwm {
                             let node_id = NodeId(((label_id as u64) << 32) | slot);
 
@@ -1095,11 +1129,11 @@ impl Engine {
                 let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
                 let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
 
-                let src_label_id: u32 = match self.catalog.get_label(&src_label)? {
+                let src_label_id: u32 = match self.snapshot.catalog.get_label(&src_label)? {
                     Some(id) => id as u32,
                     None => return Ok(vec![]),
                 };
-                let dst_label_id: u32 = match self.catalog.get_label(&dst_label)? {
+                let dst_label_id: u32 = match self.snapshot.catalog.get_label(&dst_label)? {
                     Some(id) => id as u32,
                     None => return Ok(vec![]),
                 };
@@ -1141,7 +1175,7 @@ impl Engine {
                     adj
                 };
 
-                let hwm_src = self.store.hwm_for_label(src_label_id)?;
+                let hwm_src = self.snapshot.store.hwm_for_label(src_label_id)?;
 
                 // Pairs yielded by this pattern for cross-join below.
                 let mut pattern_rows: Vec<HashMap<String, NodeId>> = Vec::new();
@@ -1348,9 +1382,9 @@ impl Engine {
                 )));
             }
 
-            let label_id: u32 = match self.catalog.get_label(&label)? {
+            let label_id: u32 = match self.snapshot.catalog.get_label(&label)? {
                 Some(id) => id as u32,
-                None => self.catalog.create_label(&label)? as u32,
+                None => self.snapshot.catalog.create_label(&label)? as u32,
             };
 
             // Convert AST props to (col_id, StoreValue) pairs.
@@ -1368,20 +1402,87 @@ impl Engine {
                 })
                 .collect();
 
-            self.store.create_node(label_id, &props)?;
+            // SPA-234: enforce UNIQUE constraints declared via
+            // `CREATE CONSTRAINT ON (n:Label) ASSERT n.property IS UNIQUE`.
+            // For each constrained (label_id, col_id) pair, check whether the
+            // incoming value already exists in the property index.  If so,
+            // return a constraint-violation error before writing the node.
+            for (col_id, store_val) in &props {
+                if self.unique_constraints.contains(&(label_id, *col_id)) {
+                    let raw = store_val.to_u64();
+                    let existing = self
+                        .prop_index
+                        .borrow()
+                        .lookup(label_id, *col_id, raw)
+                        .to_vec();
+                    if !existing.is_empty() {
+                        return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                            "unique constraint violation: label \"{label}\" already has a node with the same value for this property"
+                        )));
+                    }
+                }
+            }
+
+            let node_id = self.snapshot.store.create_node(label_id, &props)?;
+            // SPA-234: after writing, insert new values into the prop_index so
+            // that subsequent creates in the same session also respect the
+            // UNIQUE constraint (the index may be stale if built before this
+            // node was written).
+            {
+                let slot =
+                    sparrowdb_storage::property_index::PropertyIndex::node_id_to_slot(node_id);
+                let mut idx = self.prop_index.borrow_mut();
+                for (col_id, store_val) in &props {
+                    if self.unique_constraints.contains(&(label_id, *col_id)) {
+                        idx.insert(label_id, *col_id, slot, store_val.to_u64());
+                    }
+                }
+            }
+            // Update cached row count for the planner (SPA-new).
+            *self
+                .snapshot
+                .label_row_counts
+                .entry(label_id as LabelId)
+                .or_insert(0) += 1;
         }
         Ok(QueryResult::empty(vec![]))
     }
 
     fn execute_create_index(&mut self, label: &str, property: &str) -> Result<QueryResult> {
-        let label_id: u32 = match self.catalog.get_label(label)? {
+        let label_id: u32 = match self.snapshot.catalog.get_label(label)? {
             Some(id) => id as u32,
             None => return Ok(QueryResult::empty(vec![])),
         };
         let col_id = col_id_of(property);
         self.prop_index
             .borrow_mut()
-            .build_for(&self.store, label_id, col_id)?;
+            .build_for(&self.snapshot.store, label_id, col_id)?;
+        Ok(QueryResult::empty(vec![]))
+    }
+
+    /// Execute `CREATE CONSTRAINT ON (n:Label) ASSERT n.property IS UNIQUE` (SPA-234).
+    ///
+    /// Records `(label_id, col_id)` in `self.unique_constraints` so that
+    /// subsequent `execute_create` calls reject duplicate values.  Also builds
+    /// the backing prop-index for that pair (needed to check existence cheaply).
+    /// If the label does not yet exist in the catalog it is auto-created so that
+    /// later `CREATE` statements can register against the constraint.
+    fn execute_create_constraint(&mut self, label: &str, property: &str) -> Result<QueryResult> {
+        let label_id: u32 = match self.snapshot.catalog.get_label(label)? {
+            Some(id) => id as u32,
+            None => self.snapshot.catalog.create_label(label)? as u32,
+        };
+        let col_id = col_id_of(property);
+
+        // Build the property index for this (label_id, col_id) pair so that
+        // uniqueness checks in execute_create can use O(log n) lookups.
+        self.prop_index
+            .borrow_mut()
+            .build_for(&self.snapshot.store, label_id, col_id)?;
+
+        // Register the constraint.
+        self.unique_constraints.insert((label_id, col_id));
+
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1967,12 +2068,16 @@ impl Engine {
         let var_name = node.var.as_str();
         let label = node.labels.first().cloned().unwrap_or_default();
 
-        let label_id = match self.catalog.get_label(&label)? {
+        let label_id = match self.snapshot.catalog.get_label(&label)? {
             Some(id) => id as u32,
             None => return Ok(vec![]),
         };
-        let hwm = self.store.hwm_for_label(label_id)?;
-        let col_ids: Vec<u32> = self.store.col_ids_for_label(label_id).unwrap_or_default();
+        let hwm = self.snapshot.store.hwm_for_label(label_id)?;
+        let col_ids: Vec<u32> = self
+            .snapshot
+            .store
+            .col_ids_for_label(label_id)
+            .unwrap_or_default();
 
         let mut result: Vec<HashMap<String, Value>> = Vec::new();
         for slot in 0..hwm {
@@ -1980,14 +2085,14 @@ impl Engine {
             if self.is_node_tombstoned(node_id) {
                 continue;
             }
-            let props = match self.store.get_node_raw(node_id, &col_ids) {
+            let props = match self.snapshot.store.get_node_raw(node_id, &col_ids) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
             if !self.matches_prop_filter(&props, &node.props) {
                 continue;
             }
-            let mut row_vals = build_row_vals(&props, var_name, &col_ids, &self.store);
+            let mut row_vals = build_row_vals(&props, var_name, &col_ids, &self.snapshot.store);
             // Always inject NodeRef for EXISTS and next-stage MATCH.
             row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
             row_vals.insert(format!("{var_name}.__node_id__"), Value::NodeRef(node_id));
@@ -2035,12 +2140,16 @@ impl Engine {
         let var_name = node.var.as_str();
         let label = node.labels.first().cloned().unwrap_or_default();
 
-        let label_id = match self.catalog.get_label(&label)? {
+        let label_id = match self.snapshot.catalog.get_label(&label)? {
             Some(id) => id as u32,
             None => return Ok(vec![]),
         };
-        let hwm = self.store.hwm_for_label(label_id)?;
-        let col_ids: Vec<u32> = self.store.col_ids_for_label(label_id).unwrap_or_default();
+        let hwm = self.snapshot.store.hwm_for_label(label_id)?;
+        let col_ids: Vec<u32> = self
+            .snapshot
+            .store
+            .col_ids_for_label(label_id)
+            .unwrap_or_default();
 
         let mut result: Vec<HashMap<String, Value>> = Vec::new();
         let params = self.dollar_params();
@@ -2049,7 +2158,7 @@ impl Engine {
             if self.is_node_tombstoned(node_id) {
                 continue;
             }
-            let props = match self.store.get_node_raw(node_id, &col_ids) {
+            let props = match self.snapshot.store.get_node_raw(node_id, &col_ids) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
@@ -2059,7 +2168,7 @@ impl Engine {
                 continue;
             }
 
-            let mut row_vals = build_row_vals(&props, var_name, &col_ids, &self.store);
+            let mut row_vals = build_row_vals(&props, var_name, &col_ids, &self.snapshot.store);
             // Merge binding variables so upstream aliases remain in scope.
             row_vals.extend(binding.clone());
             row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
@@ -2097,20 +2206,22 @@ impl Engine {
         let src_label = src_pat.labels.first().cloned().unwrap_or_default();
         let dst_label = dst_pat.labels.first().cloned().unwrap_or_default();
 
-        let src_label_id = match self.catalog.get_label(&src_label)? {
+        let src_label_id = match self.snapshot.catalog.get_label(&src_label)? {
             Some(id) => id as u32,
             None => return Ok(vec![]),
         };
-        let dst_label_id = match self.catalog.get_label(&dst_label)? {
+        let dst_label_id = match self.snapshot.catalog.get_label(&dst_label)? {
             Some(id) => id as u32,
             None => return Ok(vec![]),
         };
 
         let src_col_ids: Vec<u32> = self
+            .snapshot
             .store
             .col_ids_for_label(src_label_id)
             .unwrap_or_default();
         let dst_col_ids: Vec<u32> = self
+            .snapshot
             .store
             .col_ids_for_label(dst_label_id)
             .unwrap_or_default();
@@ -2125,14 +2236,14 @@ impl Engine {
             if let Some(Value::NodeRef(nid)) = bound_src {
                 vec![*nid]
             } else {
-                let hwm = self.store.hwm_for_label(src_label_id)?;
+                let hwm = self.snapshot.store.hwm_for_label(src_label_id)?;
                 let mut cands = Vec::new();
                 for slot in 0..hwm {
                     let node_id = NodeId(((src_label_id as u64) << 32) | slot);
                     if self.is_node_tombstoned(node_id) {
                         continue;
                     }
-                    if let Ok(props) = self.store.get_node_raw(node_id, &src_col_ids) {
+                    if let Ok(props) = self.snapshot.store.get_node_raw(node_id, &src_col_ids) {
                         if self.matches_prop_filter_with_binding(
                             &props,
                             &src_pat.props,
@@ -2176,7 +2287,7 @@ impl Engine {
                 if self.is_node_tombstoned(dst_id) {
                     continue;
                 }
-                if let Ok(dst_props) = self.store.get_node_raw(dst_id, &dst_col_ids) {
+                if let Ok(dst_props) = self.snapshot.store.get_node_raw(dst_id, &dst_col_ids) {
                     if !self.matches_prop_filter_with_binding(
                         &dst_props,
                         &dst_pat.props,
@@ -2186,16 +2297,21 @@ impl Engine {
                         continue;
                     }
                     let src_props = self
+                        .snapshot
                         .store
                         .get_node_raw(src_id, &src_col_ids)
                         .unwrap_or_default();
-                    let mut row_vals =
-                        build_row_vals(&src_props, &src_pat.var, &src_col_ids, &self.store);
+                    let mut row_vals = build_row_vals(
+                        &src_props,
+                        &src_pat.var,
+                        &src_col_ids,
+                        &self.snapshot.store,
+                    );
                     row_vals.extend(build_row_vals(
                         &dst_props,
                         &dst_pat.var,
                         &dst_col_ids,
-                        &self.store,
+                        &self.snapshot.store,
                     ));
                     // Merge upstream bindings.
                     row_vals.extend(binding.clone());
@@ -2249,7 +2365,7 @@ impl Engine {
                 other => eval_expr(other, params),
             };
 
-            let stored_val = stored_raw.map(|raw| decode_raw_val(raw, &self.store));
+            let stored_val = stored_raw.map(|raw| decode_raw_val(raw, &self.snapshot.store));
             let matches = match (stored_val, &filter_val) {
                 (Some(Value::String(a)), Value::String(b)) => &a == b,
                 (Some(Value::Int64(a)), Value::Int64(b)) => a == *b,
@@ -2285,11 +2401,12 @@ impl Engine {
             let var_name = node.var.as_str();
             let label = node.labels.first().cloned().unwrap_or_default();
             let label_id = self
+                .snapshot
                 .catalog
                 .get_label(&label)?
                 .ok_or(sparrowdb_common::Error::NotFound)?;
             let label_id_u32 = label_id as u32;
-            let hwm = self.store.hwm_for_label(label_id_u32)?;
+            let hwm = self.snapshot.store.hwm_for_label(label_id_u32)?;
 
             // Collect col_ids needed by WHERE + WITH projections + inline prop filters.
             let mut all_col_ids: Vec<u32> = Vec::new();
@@ -2314,11 +2431,12 @@ impl Engine {
                 if self.is_node_tombstoned(node_id) {
                     continue;
                 }
-                let props = read_node_props(&self.store, node_id, &all_col_ids)?;
+                let props = read_node_props(&self.snapshot.store, node_id, &all_col_ids)?;
                 if !self.matches_prop_filter(&props, &node.props) {
                     continue;
                 }
-                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
+                let mut row_vals =
+                    build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
                 // SPA-134: inject NodeRef so eval_exists_subquery can resolve the
                 // source node ID when EXISTS { } appears in MATCH WHERE or WITH WHERE.
                 row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
@@ -2476,7 +2594,7 @@ impl Engine {
         }
         let lead_node_pat = &mom.match_patterns[0].nodes[0];
         let lead_label = lead_node_pat.labels.first().cloned().unwrap_or_default();
-        let lead_label_id = match self.catalog.get_label(&lead_label)? {
+        let lead_label_id = match self.snapshot.catalog.get_label(&lead_label)? {
             Some(id) => id as u32,
             None => {
                 // The leading MATCH is non-optional: unknown label → 0 rows (not null).
@@ -2502,7 +2620,7 @@ impl Engine {
             ids
         };
 
-        let lead_hwm = self.store.hwm_for_label(lead_label_id)?;
+        let lead_hwm = self.snapshot.store.hwm_for_label(lead_label_id)?;
         let lead_var = lead_node_pat.var.as_str();
 
         // Collect lead rows as (slot, props) pairs.
@@ -2514,12 +2632,13 @@ impl Engine {
             if self.is_node_tombstoned(node_id) {
                 continue;
             }
-            let props = read_node_props(&self.store, node_id, &lead_all_col_ids)?;
+            let props = read_node_props(&self.snapshot.store, node_id, &lead_all_col_ids)?;
             if !self.matches_prop_filter(&props, &lead_node_pat.props) {
                 continue;
             }
             if let Some(ref wexpr) = mom.match_where {
-                let mut row_vals = build_row_vals(&props, lead_var, &lead_all_col_ids, &self.store);
+                let mut row_vals =
+                    build_row_vals(&props, lead_var, &lead_all_col_ids, &self.snapshot.store);
                 row_vals.extend(self.dollar_params());
                 if !self.eval_where_graph(wexpr, &row_vals) {
                     continue;
@@ -2543,8 +2662,12 @@ impl Engine {
         let mut result_rows: Vec<Vec<Value>> = Vec::new();
 
         for (lead_slot, lead_props) in &lead_rows {
-            let lead_row_vals =
-                build_row_vals(lead_props, lead_var, &lead_all_col_ids, &self.store);
+            let lead_row_vals = build_row_vals(
+                lead_props,
+                lead_var,
+                &lead_all_col_ids,
+                &self.snapshot.store,
+            );
 
             // Attempt the optional sub-pattern.
             // We only support the common case:
@@ -2561,10 +2684,11 @@ impl Engine {
 
                 // Destination label — if not found, treat as 0 (no matches).
                 let opt_dst_label = opt_dst_pat.labels.first().cloned().unwrap_or_default();
-                let opt_dst_label_id: Option<u32> = match self.catalog.get_label(&opt_dst_label) {
-                    Ok(Some(id)) => Some(id as u32),
-                    _ => None,
-                };
+                let opt_dst_label_id: Option<u32> =
+                    match self.snapshot.catalog.get_label(&opt_dst_label) {
+                        Ok(Some(id)) => Some(id as u32),
+                        _ => None,
+                    };
 
                 self.optional_one_hop_sub_rows(
                     *lead_slot,
@@ -2703,11 +2827,11 @@ impl Engine {
                 continue;
             }
             let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
-            let dst_props = read_node_props(&self.store, dst_node, &col_ids_dst)?;
+            let dst_props = read_node_props(&self.snapshot.store, dst_node, &col_ids_dst)?;
             if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
                 continue;
             }
-            let row_vals = build_row_vals(&dst_props, dst_var, &col_ids_dst, &self.store);
+            let row_vals = build_row_vals(&dst_props, dst_var, &col_ids_dst, &self.snapshot.store);
             sub_rows.push(row_vals);
         }
 
@@ -2739,7 +2863,7 @@ impl Engine {
                 continue;
             }
             let label = node.labels.first().cloned().unwrap_or_default();
-            let label_id = match self.catalog.get_label(&label)? {
+            let label_id = match self.snapshot.catalog.get_label(&label)? {
                 Some(id) => id as u32,
                 None => return Ok(QueryResult::empty(column_names.to_vec())),
             };
@@ -2749,7 +2873,7 @@ impl Engine {
                 .map(|p| prop_name_to_col_id(&p.key))
                 .collect();
             let params = self.dollar_params();
-            let hwm = self.store.hwm_for_label(label_id)?;
+            let hwm = self.snapshot.store.hwm_for_label(label_id)?;
             let mut candidates: Vec<NodeId> = Vec::new();
             for slot in 0..hwm {
                 let node_id = NodeId(((label_id as u64) << 32) | slot);
@@ -2758,8 +2882,15 @@ impl Engine {
                 }
                 if filter_col_ids.is_empty() {
                     candidates.push(node_id);
-                } else if let Ok(raw_props) = self.store.get_node_raw(node_id, &filter_col_ids) {
-                    if matches_prop_filter_static(&raw_props, &node.props, &params, &self.store) {
+                } else if let Ok(raw_props) =
+                    self.snapshot.store.get_node_raw(node_id, &filter_col_ids)
+                {
+                    if matches_prop_filter_static(
+                        &raw_props,
+                        &node.props,
+                        &params,
+                        &self.snapshot.store,
+                    ) {
                         candidates.push(node_id);
                     }
                 }
@@ -2782,8 +2913,13 @@ impl Engine {
                     row.insert(format!("{var}.__node_id__"), Value::NodeRef(node_id));
                     // Also store properties under "var.col_N" keys for eval_expr PropAccess.
                     let label_id = (node_id.0 >> 32) as u32;
-                    let label_col_ids = self.store.col_ids_for_label(label_id).unwrap_or_default();
+                    let label_col_ids = self
+                        .snapshot
+                        .store
+                        .col_ids_for_label(label_id)
+                        .unwrap_or_default();
                     let nullable = self
+                        .snapshot
                         .store
                         .get_node_raw_nullable(node_id, &label_col_ids)
                         .unwrap_or_default();
@@ -2791,7 +2927,7 @@ impl Engine {
                         if let Some(raw) = opt_raw {
                             row.insert(
                                 format!("{var}.col_{col_id}"),
-                                decode_raw_val(raw, &self.store),
+                                decode_raw_val(raw, &self.snapshot.store),
                             );
                         }
                     }
@@ -2844,7 +2980,7 @@ impl Engine {
 
         let label = node.labels.first().cloned().unwrap_or_default();
         // SPA-245: unknown label → 0 rows (standard Cypher semantics, not an error).
-        let label_id = match self.catalog.get_label(&label)? {
+        let label_id = match self.snapshot.catalog.get_label(&label)? {
             Some(id) => id as u32,
             None => {
                 return Ok(QueryResult {
@@ -2855,7 +2991,7 @@ impl Engine {
         };
         let label_id_u32 = label_id;
 
-        let hwm = self.store.hwm_for_label(label_id_u32)?;
+        let hwm = self.snapshot.store.hwm_for_label(label_id_u32)?;
         tracing::debug!(label = %label, hwm = hwm, "node scan start");
 
         // Collect all col_ids we need: RETURN columns + WHERE clause columns +
@@ -2895,7 +3031,7 @@ impl Engine {
         // Collect them once before the scan loop so we can build a Value::Map per node.
         let bare_vars = bare_var_names_in_return(&m.return_clause.items);
         let all_label_col_ids: Vec<u32> = if !bare_vars.is_empty() {
-            self.store.col_ids_for_label(label_id_u32)?
+            self.snapshot.store.col_ids_for_label(label_id_u32)?
         } else {
             vec![]
         };
@@ -2910,10 +3046,10 @@ impl Engine {
         for p in &node.props {
             let col_id = sparrowdb_common::col_id_of(&p.key);
             // Errors are suppressed inside build_for; index falls back to full scan.
-            let _ = self
-                .prop_index
-                .borrow_mut()
-                .build_for(&self.store, label_id_u32, col_id);
+            let _ =
+                self.prop_index
+                    .borrow_mut()
+                    .build_for(&self.snapshot.store, label_id_u32, col_id);
         }
 
         // SPA-249: try to use the property equality index when there is exactly
@@ -2936,10 +3072,11 @@ impl Engine {
             if let Some(wexpr) = m.where_clause.as_ref() {
                 for prop_name in where_clause_eq_prop_names(wexpr, node.var.as_str()) {
                     let col_id = sparrowdb_common::col_id_of(prop_name);
-                    let _ =
-                        self.prop_index
-                            .borrow_mut()
-                            .build_for(&self.store, label_id_u32, col_id);
+                    let _ = self.prop_index.borrow_mut().build_for(
+                        &self.snapshot.store,
+                        label_id_u32,
+                        col_id,
+                    );
                 }
             }
         }
@@ -2961,10 +3098,11 @@ impl Engine {
             if let Some(wexpr) = m.where_clause.as_ref() {
                 for prop_name in where_clause_range_prop_names(wexpr, node.var.as_str()) {
                     let col_id = sparrowdb_common::col_id_of(prop_name);
-                    let _ =
-                        self.prop_index
-                            .borrow_mut()
-                            .build_for(&self.store, label_id_u32, col_id);
+                    let _ = self.prop_index.borrow_mut().build_for(
+                        &self.snapshot.store,
+                        label_id_u32,
+                        col_id,
+                    );
                 }
             }
         }
@@ -3000,9 +3138,11 @@ impl Engine {
             if let Some(wexpr) = m.where_clause.as_ref() {
                 for prop_name in where_clause_text_prop_names(wexpr, node.var.as_str()) {
                     let col_id = sparrowdb_common::col_id_of(prop_name);
-                    self.text_index
-                        .borrow_mut()
-                        .build_for(&self.store, label_id_u32, col_id);
+                    self.text_index.borrow_mut().build_for(
+                        &self.snapshot.store,
+                        label_id_u32,
+                        col_id,
+                    );
                 }
             }
         }
@@ -3078,7 +3218,10 @@ impl Engine {
             // for this node) are omitted from the row map rather than surfacing
             // as Err(NotFound).  Absent columns will evaluate to Value::Null in
             // eval_expr, enabling correct IS NULL / IS NOT NULL semantics.
-            let nullable_props = self.store.get_node_raw_nullable(node_id, &all_col_ids)?;
+            let nullable_props = self
+                .snapshot
+                .store
+                .get_node_raw_nullable(node_id, &all_col_ids)?;
             let props: Vec<(u32, u64)> = nullable_props
                 .iter()
                 .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
@@ -3092,7 +3235,8 @@ impl Engine {
             // Apply WHERE clause.
             let var_name = node.var.as_str();
             if let Some(ref where_expr) = m.where_clause {
-                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
+                let mut row_vals =
+                    build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
                 // Inject label metadata so labels(n) works in WHERE.
                 if !var_name.is_empty() && !label.is_empty() {
                     row_vals.insert(
@@ -3113,7 +3257,8 @@ impl Engine {
 
             if use_eval_path {
                 // Build eval_expr-compatible map for aggregation / id() path.
-                let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
+                let mut row_vals =
+                    build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
                 // Inject label metadata for aggregation.
                 if !var_name.is_empty() && !label.is_empty() {
                     row_vals.insert(
@@ -3127,6 +3272,7 @@ impl Engine {
                     // Also keep NodeRef under __node_id__ so id(n) continues to work.
                     if bare_vars.contains(&var_name.to_string()) && !all_label_col_ids.is_empty() {
                         let all_nullable = self
+                            .snapshot
                             .store
                             .get_node_raw_nullable(node_id, &all_label_col_ids)?;
                         let all_props: Vec<(u32, u64)> = all_nullable
@@ -3135,7 +3281,7 @@ impl Engine {
                             .collect();
                         row_vals.insert(
                             var_name.to_string(),
-                            build_node_map(&all_props, &self.store),
+                            build_node_map(&all_props, &self.snapshot.store),
                         );
                     } else {
                         row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
@@ -3153,7 +3299,7 @@ impl Engine {
                     &all_col_ids,
                     var_name,
                     &label,
-                    &self.store,
+                    &self.snapshot.store,
                 );
                 rows.push(row);
             }
@@ -3201,7 +3347,7 @@ impl Engine {
         m: &MatchStatement,
         column_names: &[String],
     ) -> Result<QueryResult> {
-        let all_labels = self.catalog.list_labels()?;
+        let all_labels = self.snapshot.catalog.list_labels()?;
         tracing::debug!(label_count = all_labels.len(), "label-less full scan start");
 
         let pat = &m.pattern[0];
@@ -3237,12 +3383,12 @@ impl Engine {
 
         for (label_id, label_name) in &all_labels {
             let label_id_u32 = *label_id as u32;
-            let hwm = self.store.hwm_for_label(label_id_u32)?;
+            let hwm = self.snapshot.store.hwm_for_label(label_id_u32)?;
             tracing::debug!(label = %label_name, hwm = hwm, "label-less scan: label slot");
 
             // SPA-213: read all col_ids for this label once per label.
             let all_label_col_ids_here: Vec<u32> = if !bare_vars_all.is_empty() {
-                self.store.col_ids_for_label(label_id_u32)?
+                self.snapshot.store.col_ids_for_label(label_id_u32)?
             } else {
                 vec![]
             };
@@ -3260,7 +3406,10 @@ impl Engine {
                     continue;
                 }
 
-                let nullable_props = self.store.get_node_raw_nullable(node_id, &all_col_ids)?;
+                let nullable_props = self
+                    .snapshot
+                    .store
+                    .get_node_raw_nullable(node_id, &all_col_ids)?;
                 let props: Vec<(u32, u64)> = nullable_props
                     .iter()
                     .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
@@ -3273,7 +3422,8 @@ impl Engine {
 
                 // Apply WHERE clause.
                 if let Some(ref where_expr) = m.where_clause {
-                    let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
+                    let mut row_vals =
+                        build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
                     if !var_name.is_empty() {
                         row_vals.insert(
                             format!("{}.__labels__", var_name),
@@ -3288,7 +3438,8 @@ impl Engine {
                 }
 
                 if use_eval_path_all {
-                    let mut row_vals = build_row_vals(&props, var_name, &all_col_ids, &self.store);
+                    let mut row_vals =
+                        build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
                     if !var_name.is_empty() {
                         row_vals.insert(
                             format!("{}.__labels__", var_name),
@@ -3299,6 +3450,7 @@ impl Engine {
                             && !all_label_col_ids_here.is_empty()
                         {
                             let all_nullable = self
+                                .snapshot
                                 .store
                                 .get_node_raw_nullable(node_id, &all_label_col_ids_here)?;
                             let all_props: Vec<(u32, u64)> = all_nullable
@@ -3307,7 +3459,7 @@ impl Engine {
                                 .collect();
                             row_vals.insert(
                                 var_name.to_string(),
-                                build_node_map(&all_props, &self.store),
+                                build_node_map(&all_props, &self.snapshot.store),
                             );
                         } else {
                             row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
@@ -3323,7 +3475,7 @@ impl Engine {
                         &all_col_ids,
                         var_name,
                         label_name,
-                        &self.store,
+                        &self.snapshot.store,
                     );
                     rows.push(row);
                 }
@@ -3377,12 +3529,18 @@ impl Engine {
         let src_label_id_opt: Option<u32> = if src_label.is_empty() {
             None
         } else {
-            self.catalog.get_label(&src_label)?.map(|id| id as u32)
+            self.snapshot
+                .catalog
+                .get_label(&src_label)?
+                .map(|id| id as u32)
         };
         let dst_label_id_opt: Option<u32> = if dst_label.is_empty() {
             None
         } else {
-            self.catalog.get_label(&dst_label)?.map(|id| id as u32)
+            self.snapshot
+                .catalog
+                .get_label(&dst_label)?
+                .map(|id| id as u32)
         };
 
         // Build the list of rel tables to scan.
@@ -3396,7 +3554,7 @@ impl Engine {
         //
         // SPA-195: this also fixes the previous hardcoded RelTableId(0) bug —
         // every rel table now reads from its own correctly-named delta log file.
-        let all_rel_tables = self.catalog.list_rel_tables_with_ids();
+        let all_rel_tables = self.snapshot.catalog.list_rel_tables_with_ids();
         let rel_tables_to_scan: Vec<(u64, u32, u32, String)> = all_rel_tables
             .into_iter()
             .filter(|(_, sid, did, rt)| {
@@ -3417,7 +3575,7 @@ impl Engine {
 
         // Pre-compute label name lookup for unlabeled patterns.
         let label_id_to_name: Vec<(u16, String)> = if src_label.is_empty() || dst_label.is_empty() {
-            self.catalog.list_labels().unwrap_or_default()
+            self.snapshot.catalog.list_labels().unwrap_or_default()
         } else {
             vec![]
         };
@@ -3454,7 +3612,7 @@ impl Engine {
                 dst_label.as_str()
             };
 
-            let hwm_src = match self.store.hwm_for_label(effective_src_label_id) {
+            let hwm_src = match self.snapshot.store.hwm_for_label(effective_src_label_id) {
                 Ok(h) => h,
                 Err(_) => continue,
             };
@@ -3485,7 +3643,7 @@ impl Engine {
             // Read ALL delta records for this specific rel table once (outside
             // the per-src-slot loop) so we open the file only once per table.
             let delta_records_all = {
-                let edge_store = EdgeStore::open(&self.db_root, storage_rel_id);
+                let edge_store = EdgeStore::open(&self.snapshot.db_root, storage_rel_id);
                 edge_store.and_then(|s| s.read_delta()).unwrap_or_default()
             };
 
@@ -3506,7 +3664,7 @@ impl Engine {
                         }
                         v
                     };
-                    self.store.get_node_raw(src_node, &all_needed)?
+                    self.snapshot.store.get_node_raw(src_node, &all_needed)?
                 } else {
                     vec![]
                 };
@@ -3532,6 +3690,7 @@ impl Engine {
                 // builds a per-table map keyed by catalog_rel_id, so each rel
                 // type's checkpointed edges are found under its own key.
                 let csr_neighbors: &[u64] = self
+                    .snapshot
                     .csrs
                     .get(&u32::try_from(*catalog_rel_id).expect("rel_table_id overflowed u32"))
                     .map(|c| c.neighbors(src_slot))
@@ -3563,7 +3722,7 @@ impl Engine {
                             }
                             v
                         };
-                        self.store.get_node_raw(dst_node, &all_needed)?
+                        self.snapshot.store.get_node_raw(dst_node, &all_needed)?
                     } else {
                         vec![]
                     };
@@ -3585,13 +3744,13 @@ impl Engine {
                             &src_props,
                             &src_node_pat.var,
                             &col_ids_src,
-                            &self.store,
+                            &self.snapshot.store,
                         );
                         row_vals.extend(build_row_vals(
                             &dst_props,
                             &dst_node_pat.var,
                             &col_ids_dst,
-                            &self.store,
+                            &self.snapshot.store,
                         ));
                         // Inject relationship metadata so type(r) works in WHERE.
                         if !rel_pat.var.is_empty() {
@@ -3624,13 +3783,13 @@ impl Engine {
                             &src_props,
                             &src_node_pat.var,
                             &col_ids_src,
-                            &self.store,
+                            &self.snapshot.store,
                         );
                         row_vals.extend(build_row_vals(
                             &dst_props,
                             &dst_node_pat.var,
                             &col_ids_dst,
-                            &self.store,
+                            &self.snapshot.store,
                         ));
                         // Inject relationship and label metadata for aggregate path.
                         if !rel_pat.var.is_empty() {
@@ -3702,7 +3861,7 @@ impl Engine {
                             rel_var_type,
                             src_label_meta,
                             dst_label_meta,
-                            &self.store,
+                            &self.snapshot.store,
                         );
                         rows.push(row);
                     }
@@ -3743,7 +3902,7 @@ impl Engine {
                     dst_label.as_str()
                 };
 
-                let hwm_bwd = match self.store.hwm_for_label(bwd_scan_label_id) {
+                let hwm_bwd = match self.snapshot.store.hwm_for_label(bwd_scan_label_id) {
                     Ok(h) => h,
                     Err(_) => continue,
                 };
@@ -3761,7 +3920,7 @@ impl Engine {
 
                 // Read delta records for this rel table (physical edges stored
                 // as src=a, dst=b that we want to traverse in reverse b→a).
-                let delta_records_bwd = EdgeStore::open(&self.db_root, storage_rel_id)
+                let delta_records_bwd = EdgeStore::open(&self.snapshot.db_root, storage_rel_id)
                     .and_then(|s| s.read_delta())
                     .unwrap_or_default();
 
@@ -3769,9 +3928,10 @@ impl Engine {
                 // checkpoint).  Falls back to None gracefully when no
                 // checkpoint has been run yet so pre-checkpoint databases
                 // still return correct results via the delta log path.
-                let csr_bwd: Option<CsrBackward> = EdgeStore::open(&self.db_root, storage_rel_id)
-                    .and_then(|s| s.open_bwd())
-                    .ok();
+                let csr_bwd: Option<CsrBackward> =
+                    EdgeStore::open(&self.snapshot.db_root, storage_rel_id)
+                        .and_then(|s| s.open_bwd())
+                        .ok();
 
                 // Scan the b-side (physical dst label = tbl_dst_label_id).
                 for b_slot in 0..hwm_bwd {
@@ -3787,7 +3947,7 @@ impl Engine {
                             }
                             v
                         };
-                        self.store.get_node_raw(b_node, &all_needed)?
+                        self.snapshot.store.get_node_raw(b_node, &all_needed)?
                     } else {
                         vec![]
                     };
@@ -3856,7 +4016,7 @@ impl Engine {
                                 }
                                 v
                             };
-                            self.store.get_node_raw(a_node, &all_needed)?
+                            self.snapshot.store.get_node_raw(a_node, &all_needed)?
                         } else {
                             vec![]
                         };
@@ -3871,13 +4031,13 @@ impl Engine {
                                 &b_props,
                                 &src_node_pat.var,
                                 &col_ids_src,
-                                &self.store,
+                                &self.snapshot.store,
                             );
                             row_vals.extend(build_row_vals(
                                 &a_props,
                                 &dst_node_pat.var,
                                 &col_ids_dst,
-                                &self.store,
+                                &self.snapshot.store,
                             ));
                             if !rel_pat.var.is_empty() {
                                 row_vals.insert(
@@ -3912,13 +4072,13 @@ impl Engine {
                                 &b_props,
                                 &src_node_pat.var,
                                 &col_ids_src,
-                                &self.store,
+                                &self.snapshot.store,
                             );
                             row_vals.extend(build_row_vals(
                                 &a_props,
                                 &dst_node_pat.var,
                                 &col_ids_dst,
-                                &self.store,
+                                &self.snapshot.store,
                             ));
                             if !rel_pat.var.is_empty() {
                                 row_vals.insert(
@@ -3986,7 +4146,7 @@ impl Engine {
                                 rel_var_type,
                                 src_label_meta,
                                 dst_label_meta,
-                                &self.store,
+                                &self.snapshot.store,
                             );
                             rows.push(row);
                         }
@@ -4038,15 +4198,17 @@ impl Engine {
         let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
         let fof_label = fof_node_pat.labels.first().cloned().unwrap_or_default();
         let src_label_id = self
+            .snapshot
             .catalog
             .get_label(&src_label)?
             .ok_or(sparrowdb_common::Error::NotFound)? as u32;
         let fof_label_id = self
+            .snapshot
             .catalog
             .get_label(&fof_label)?
             .ok_or(sparrowdb_common::Error::NotFound)? as u32;
 
-        let hwm_src = self.store.hwm_for_label(src_label_id)?;
+        let hwm_src = self.snapshot.store.hwm_for_label(src_label_id)?;
         tracing::debug!(src_label = %src_label, fof_label = %fof_label, hwm_src = hwm_src, "two-hop traversal start");
 
         // Collect col_ids for fof: projected columns plus any columns referenced by prop filters.
@@ -4102,9 +4264,15 @@ impl Engine {
         // AspJoin requires a single &CsrForward; we construct a combined one
         // rather than using an arbitrary first entry.
         let merged_csr = {
-            let max_nodes = self.csrs.values().map(|c| c.n_nodes()).max().unwrap_or(0);
+            let max_nodes = self
+                .snapshot
+                .csrs
+                .values()
+                .map(|c| c.n_nodes())
+                .max()
+                .unwrap_or(0);
             let mut edges: Vec<(u64, u64)> = Vec::new();
-            for csr in self.csrs.values() {
+            for csr in self.snapshot.csrs.values() {
                 for src in 0..csr.n_nodes() {
                     for &dst in csr.neighbors(src) {
                         edges.push((src, dst));
@@ -4141,7 +4309,7 @@ impl Engine {
                 v
             };
 
-            let src_props = read_node_props(&self.store, src_node, &src_needed)?;
+            let src_props = read_node_props(&self.snapshot.store, src_node, &src_needed)?;
 
             // Apply src inline prop filter.
             if !self.matches_prop_filter(&src_props, &src_node_pat.props) {
@@ -4180,7 +4348,7 @@ impl Engine {
 
             for fof_slot in fof_slots {
                 let fof_node = NodeId(((fof_label_id as u64) << 32) | fof_slot);
-                let fof_props = read_node_props(&self.store, fof_node, &col_ids_fof)?;
+                let fof_props = read_node_props(&self.snapshot.store, fof_node, &col_ids_fof)?;
 
                 // Apply fof inline prop filter.
                 if !self.matches_prop_filter(&fof_props, &fof_node_pat.props) {
@@ -4193,13 +4361,13 @@ impl Engine {
                         &src_props,
                         &src_node_pat.var,
                         &col_ids_src_where,
-                        &self.store,
+                        &self.snapshot.store,
                     );
                     row_vals.extend(build_row_vals(
                         &fof_props,
                         &fof_node_pat.var,
                         &col_ids_fof,
-                        &self.store,
+                        &self.snapshot.store,
                     ));
                     // Inject label metadata so labels(n) works in WHERE.
                     if !src_node_pat.var.is_empty() && !src_label.is_empty() {
@@ -4238,7 +4406,7 @@ impl Engine {
                     &fof_props,
                     column_names,
                     &src_node_pat.var,
-                    &self.store,
+                    &self.snapshot.store,
                 );
                 rows.push(row);
             }
@@ -4333,7 +4501,8 @@ impl Engine {
                 if label.is_empty() {
                     None
                 } else {
-                    self.catalog
+                    self.snapshot
+                        .catalog
                         .get_label(&label)
                         .ok()
                         .flatten()
@@ -4347,7 +4516,7 @@ impl Engine {
             Some(id) => id,
             None => return Err(sparrowdb_common::Error::Unimplemented),
         };
-        let hwm_src = self.store.hwm_for_label(src_label_id)?;
+        let hwm_src = self.snapshot.store.hwm_for_label(src_label_id)?;
 
         // We read all delta edges once up front to avoid repeated file I/O.
         let delta_all = self.read_delta_all();
@@ -4365,7 +4534,8 @@ impl Engine {
                 continue;
             }
 
-            let src_props = read_node_props(&self.store, src_node_id, &col_ids_per_node[0])?;
+            let src_props =
+                read_node_props(&self.snapshot.store, src_node_id, &col_ids_per_node[0])?;
 
             // Apply inline prop filter for the source node.
             if !self.matches_prop_filter(&src_props, &pat.nodes[0].props) {
@@ -4377,7 +4547,7 @@ impl Engine {
             if !pat.nodes[0].var.is_empty() {
                 for &(col_id, raw) in &src_props {
                     let key = format!("{}.col_{col_id}", pat.nodes[0].var);
-                    row_vals.insert(key, decode_raw_val(raw, &self.store));
+                    row_vals.insert(key, decode_raw_val(raw, &self.snapshot.store));
                 }
             }
 
@@ -4421,7 +4591,8 @@ impl Engine {
                             NodeId(next_slot)
                         };
 
-                        let next_props = read_node_props(&self.store, next_node_id, next_col_ids)?;
+                        let next_props =
+                            read_node_props(&self.snapshot.store, next_node_id, next_col_ids)?;
 
                         // Apply inline prop filter for this hop's destination node.
                         if !self.matches_prop_filter(&next_props, &next_node_pat.props) {
@@ -4434,7 +4605,7 @@ impl Engine {
                         if !next_node_pat.var.is_empty() {
                             for &(col_id, raw) in &next_props {
                                 let key = format!("{}.col_{col_id}", next_node_pat.var);
-                                new_vals.insert(key, decode_raw_val(raw, &self.store));
+                                new_vals.insert(key, decode_raw_val(raw, &self.snapshot.store));
                             }
                         }
 
@@ -4753,6 +4924,7 @@ impl Engine {
         let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
 
         let src_label_id = self
+            .snapshot
             .catalog
             .get_label(&src_label)?
             .ok_or(sparrowdb_common::Error::NotFound)? as u32;
@@ -4761,13 +4933,14 @@ impl Engine {
             None
         } else {
             Some(
-                self.catalog
+                self.snapshot
+                    .catalog
                     .get_label(&dst_label)?
                     .ok_or(sparrowdb_common::Error::NotFound)? as u32,
             )
         };
 
-        let hwm_src = self.store.hwm_for_label(src_label_id)?;
+        let hwm_src = self.snapshot.store.hwm_for_label(src_label_id)?;
 
         let col_ids_src = collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
         let col_ids_dst =
@@ -4799,6 +4972,7 @@ impl Engine {
         // Precompute label-id → name map once so that the hot path inside
         // `for dst_slot in dst_nodes` does not call `list_labels()` per node.
         let labels_by_id: std::collections::HashMap<u16, String> = self
+            .snapshot
             .catalog
             .list_labels()
             .unwrap_or_default()
@@ -4848,7 +5022,7 @@ impl Engine {
                 }
                 v
             };
-            let src_props = read_node_props(&self.store, src_node, &src_all_col_ids)?;
+            let src_props = read_node_props(&self.snapshot.store, src_node, &src_all_col_ids)?;
 
             if !self.matches_prop_filter(&src_props, &src_node_pat.props) {
                 continue;
@@ -4886,7 +5060,7 @@ impl Engine {
                 // inline filter + WHERE), not just the projection set.  Without the
                 // filter columns the inline prop check below always fails silently
                 // when the dst variable is not referenced in RETURN.
-                let dst_props = read_node_props(&self.store, dst_node, &dst_all_col_ids)?;
+                let dst_props = read_node_props(&self.snapshot.store, dst_node, &dst_all_col_ids)?;
 
                 if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
                     continue;
@@ -4906,13 +5080,17 @@ impl Engine {
 
                 // Apply WHERE clause.
                 if let Some(ref where_expr) = m.where_clause {
-                    let mut row_vals =
-                        build_row_vals(&src_props, &src_node_pat.var, &col_ids_src, &self.store);
+                    let mut row_vals = build_row_vals(
+                        &src_props,
+                        &src_node_pat.var,
+                        &col_ids_src,
+                        &self.snapshot.store,
+                    );
                     row_vals.extend(build_row_vals(
                         &dst_props,
                         &dst_node_pat.var,
                         &col_ids_dst,
-                        &self.store,
+                        &self.snapshot.store,
                     ));
                     // Inject relationship metadata so type(r) works in WHERE.
                     if !rel_pat.var.is_empty() {
@@ -4967,7 +5145,7 @@ impl Engine {
                     rel_var_type,
                     src_label_meta,
                     dst_label_meta,
-                    &self.store,
+                    &self.snapshot.store,
                 );
                 rows.push(row);
             }
@@ -5011,7 +5189,7 @@ impl Engine {
         props: &[(u32, u64)],
         filters: &[sparrowdb_cypher::ast::PropEntry],
     ) -> bool {
-        matches_prop_filter_static(props, filters, &self.dollar_params(), &self.store)
+        matches_prop_filter_static(props, filters, &self.dollar_params(), &self.snapshot.store)
     }
 
     /// Build a map of runtime parameters keyed with a `$` prefix,
@@ -5077,9 +5255,9 @@ impl Engine {
                     .or_else(|| vals.get(&format!("{var}.__node_id__")))
                 {
                     let col_id = prop_name_to_col_id(prop);
-                    if let Ok(props) = self.store.get_node_raw(*node_id, &[col_id]) {
+                    if let Ok(props) = self.snapshot.store.get_node_raw(*node_id, &[col_id]) {
                         if let Some(&(_, raw)) = props.iter().find(|(c, _)| *c == col_id) {
-                            return decode_raw_val(raw, &self.store);
+                            return decode_raw_val(raw, &self.snapshot.store);
                         }
                     }
                 }
@@ -5122,7 +5300,8 @@ impl Engine {
         let dst_label_id_opt: Option<u32> = if dst_label.is_empty() {
             None
         } else {
-            self.catalog
+            self.snapshot
+                .catalog
                 .get_label(dst_label)
                 .ok()
                 .flatten()
@@ -5167,7 +5346,7 @@ impl Engine {
         for dst_slot in all_nb {
             if let Some(did) = dst_label_id_opt {
                 let probe_id = NodeId(((did as u64) << 32) | dst_slot);
-                if self.store.get_node_raw(probe_id, &[]).is_err() {
+                if self.snapshot.store.get_node_raw(probe_id, &[]).is_err() {
                     continue;
                 }
                 if !dst_pat.props.is_empty() {
@@ -5176,14 +5355,14 @@ impl Engine {
                         .iter()
                         .map(|p| prop_name_to_col_id(&p.key))
                         .collect();
-                    match self.store.get_node_raw(probe_id, &col_ids) {
+                    match self.snapshot.store.get_node_raw(probe_id, &col_ids) {
                         Ok(props) => {
                             let params = self.dollar_params();
                             if !matches_prop_filter_static(
                                 &props,
                                 &dst_pat.props,
                                 &params,
-                                &self.store,
+                                &self.snapshot.store,
                             ) {
                                 continue;
                             }
@@ -5226,7 +5405,7 @@ impl Engine {
                 (label_id, slot)
             } else {
                 // Fall back to label lookup + property scan.
-                let label_id = match self.catalog.get_label(&sp.src_label) {
+                let label_id = match self.snapshot.catalog.get_label(&sp.src_label) {
                     Ok(Some(id)) => id as u32,
                     _ => return Value::Null,
                 };
@@ -5239,7 +5418,7 @@ impl Engine {
         let dst_slot = if let Some(nid) = self.resolve_node_id_from_var(&sp.dst_var, vals) {
             nid.0 & 0xFFFF_FFFF
         } else {
-            let dst_label_id = match self.catalog.get_label(&sp.dst_label) {
+            let dst_label_id = match self.snapshot.catalog.get_label(&sp.dst_label) {
                 Ok(Some(id)) => id as u32,
                 _ => return Value::Null,
             };
@@ -5264,13 +5443,13 @@ impl Engine {
         if props.is_empty() {
             return None;
         }
-        let hwm = self.store.hwm_for_label(label_id).ok()?;
+        let hwm = self.snapshot.store.hwm_for_label(label_id).ok()?;
         let col_ids: Vec<u32> = props.iter().map(|p| prop_name_to_col_id(&p.key)).collect();
         let params = self.dollar_params();
         for slot in 0..hwm {
             let node_id = NodeId(((label_id as u64) << 32) | slot);
-            if let Ok(raw_props) = self.store.get_node_raw(node_id, &col_ids) {
-                if matches_prop_filter_static(&raw_props, props, &params, &self.store) {
+            if let Ok(raw_props) = self.snapshot.store.get_node_raw(node_id, &col_ids) {
+                if matches_prop_filter_static(&raw_props, props, &params, &self.snapshot.store) {
                     return Some(slot);
                 }
             }
