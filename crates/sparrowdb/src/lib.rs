@@ -678,10 +678,14 @@ impl GraphDb {
     /// write transaction so the relationship type is registered in the catalog
     /// and the edge is appended to the WAL (SPA-182).
     fn register_unique_constraint(&self, label: &str, property: &str) -> Result<QueryResult> {
-        let catalog_snap = sparrowdb_catalog::catalog::Catalog::open(&self.inner.path)?;
-        let label_id: u32 = match catalog_snap.get_label(label)? {
+        // SPA-234: auto-create label if absent so the constraint is registered
+        // even before any nodes of this label exist.  Subsequent CREATE
+        // statements look up the label_id from the persisted catalog and compare
+        // against the same unique_constraints set.
+        let mut catalog = sparrowdb_catalog::catalog::Catalog::open(&self.inner.path)?;
+        let label_id: u32 = match catalog.get_label(label)? {
             Some(id) => id as u32,
-            None => return Ok(QueryResult::empty(vec![])),
+            None => catalog.create_label(label)? as u32,
         };
         let col_id = sparrowdb_common::col_id_of(property);
         self.inner
@@ -778,6 +782,13 @@ impl GraphDb {
                 .collect::<Result<Vec<_>>>()?;
 
             // SPA-234: enforce UNIQUE constraints before writing.
+            //
+            // We compare decoded Values rather than raw u64 heap pointers.
+            // Strings longer than 7 bytes are stored as store-specific heap
+            // pointers: the same string written by two different NodeStore
+            // handles produces two different raw u64 values.  Decoding each
+            // stored raw u64 back to Value and comparing is correct for all
+            // value types (inline integers/short strings AND heap-overflow strings).
             {
                 let constraints = self.inner.unique_constraints.read().unwrap();
                 if !constraints.is_empty() {
@@ -785,10 +796,17 @@ impl GraphDb {
                     for (prop_name, val) in &named_props {
                         let col_id = sparrowdb_common::col_id_of(prop_name);
                         if constraints.contains(&(label_id, col_id)) {
-                            let mut pidx = sparrowdb_storage::property_index::PropertyIndex::new();
-                            pidx.build_for(&check_store, label_id, col_id)?;
-                            let raw = check_store.encode_value(val)?;
-                            if !pidx.lookup(label_id, col_id, raw).is_empty() {
+                            // ABSENT = 0 (never written); TOMBSTONE = u64::MAX (deleted).
+                            let existing_raws = check_store
+                                .read_col_all(label_id, col_id)
+                                .unwrap_or_default();
+                            let conflict = existing_raws.iter().any(|&raw| {
+                                if raw == 0 || raw == u64::MAX {
+                                    return false;
+                                }
+                                check_store.decode_raw_value(raw) == *val
+                            });
+                            if conflict {
                                 return Err(sparrowdb_common::Error::InvalidArgument(format!(
                                     "UNIQUE constraint violation: label \"{label}\" already has a node with {prop_name} = {:?}", val
                                 )));
