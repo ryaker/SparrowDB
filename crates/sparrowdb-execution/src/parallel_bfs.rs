@@ -36,13 +36,9 @@ pub fn parallel_reachability_bfs<F>(
 where
     F: Fn(u64) -> Vec<u64> + Send + Sync,
 {
-    let visited = Arc::new(Mutex::new(HashSet::<u64>::new()));
-    {
-        let mut v = visited.lock().unwrap();
-        for &n in &start_nodes {
-            v.insert(n);
-        }
-    }
+    let visited = Arc::new(Mutex::new(
+        start_nodes.iter().copied().collect::<HashSet<_>>(),
+    ));
 
     let mut frontier = start_nodes;
     let mut hop = 0usize;
@@ -60,7 +56,10 @@ where
         hop += 1;
     }
 
-    let v = visited.lock().unwrap().clone();
+    let v = visited
+        .lock()
+        .expect("visited mutex should not be poisoned")
+        .clone();
     ReachabilityResult { visited: v }
 }
 
@@ -69,6 +68,17 @@ where
 struct PathState {
     path: Vec<u64>,
     path_set: HashSet<u64>, // for O(1) cycle check
+}
+
+/// Shared context threaded through recursive DFS calls; avoids exceeding the
+/// clippy `too_many_arguments` limit on `dfs_enumerate`.
+struct DfsContext<'a, F> {
+    min_hops: usize,
+    max_hops: usize,
+    limit: usize,
+    get_neighbors: &'a F,
+    results: &'a Arc<Mutex<Vec<Vec<u64>>>>,
+    done: &'a Arc<AtomicBool>,
 }
 
 /// Parallel path enumeration DFS.
@@ -87,7 +97,7 @@ struct PathState {
 /// - `start_nodes`: seed nodes for path exploration
 /// - `min_hops`: minimum path length (paths shorter than this are not emitted)
 /// - `max_hops`: maximum path length (DFS does not recurse deeper)
-/// - `limit`: early-termination cap on total results collected
+/// - `limit`: early-termination cap on total results collected; `0` returns immediately
 /// - `get_neighbors`: closure returning outgoing neighbor IDs for a given node ID
 pub fn parallel_path_enumeration_dfs<F>(
     start_nodes: Vec<u64>,
@@ -99,6 +109,10 @@ pub fn parallel_path_enumeration_dfs<F>(
 where
     F: Fn(u64) -> Vec<u64> + Send + Sync,
 {
+    if limit == 0 {
+        return Vec::new();
+    }
+
     let results = Arc::new(Mutex::new(Vec::<Vec<u64>>::new()));
     let done = Arc::new(AtomicBool::new(false));
 
@@ -112,66 +126,60 @@ where
             path: vec![start],
             path_set: initial_path_set,
         };
-        dfs_enumerate(
-            initial,
-            0,
+        let ctx = DfsContext {
             min_hops,
             max_hops,
             limit,
-            &get_neighbors,
-            &results,
-            &done,
-        );
+            get_neighbors: &get_neighbors,
+            results: &results,
+            done: &done,
+        };
+        dfs_enumerate(initial, 0, &ctx);
     });
 
-    Arc::try_unwrap(results).unwrap().into_inner().unwrap()
+    Arc::try_unwrap(results)
+        .expect("results Arc should be uniquely owned after parallel traversal")
+        .into_inner()
+        .expect("results Mutex should not be poisoned")
 }
 
-fn dfs_enumerate<F>(
-    state: PathState,
-    depth: usize,
-    min_hops: usize,
-    max_hops: usize,
-    limit: usize,
-    get_neighbors: &F,
-    results: &Arc<Mutex<Vec<Vec<u64>>>>,
-    done: &Arc<AtomicBool>,
-) where
+fn dfs_enumerate<F>(state: PathState, depth: usize, ctx: &DfsContext<'_, F>)
+where
     F: Fn(u64) -> Vec<u64> + Send + Sync,
 {
-    if done.load(Ordering::Relaxed) {
+    if ctx.done.load(Ordering::Relaxed) {
         return;
     }
 
-    if depth >= min_hops {
-        let mut r = results.lock().unwrap();
+    if depth >= ctx.min_hops {
+        let mut r = ctx
+            .results
+            .lock()
+            .expect("results Mutex should not be poisoned");
+        // Re-check limit under the lock: concurrent tasks may have filled the
+        // buffer between the `done` pre-check above and acquiring the lock here.
+        if r.len() >= ctx.limit {
+            ctx.done.store(true, Ordering::Relaxed);
+            return;
+        }
         r.push(state.path.clone());
-        if r.len() >= limit {
-            done.store(true, Ordering::Relaxed);
+        if r.len() >= ctx.limit {
+            ctx.done.store(true, Ordering::Relaxed);
             return;
         }
     }
 
-    if depth >= max_hops {
+    if depth >= ctx.max_hops {
         return;
     }
 
     let current = *state.path.last().unwrap();
-    for neighbor in get_neighbors(current) {
+    for neighbor in (ctx.get_neighbors)(current) {
         if !state.path_set.contains(&neighbor) {
             let mut next_state = state.clone();
             next_state.path.push(neighbor);
             next_state.path_set.insert(neighbor);
-            dfs_enumerate(
-                next_state,
-                depth + 1,
-                min_hops,
-                max_hops,
-                limit,
-                get_neighbors,
-                results,
-                done,
-            );
+            dfs_enumerate(next_state, depth + 1, ctx);
         }
     }
 }
