@@ -13,6 +13,7 @@ members = [
     "crates/sparrowdb-node",
     "crates/sparrowdb-metrics",
     "crates/sparrowdb-bench",
+    "crates/sparrowdb-ruby",
 ]
 
 [workspace.package]

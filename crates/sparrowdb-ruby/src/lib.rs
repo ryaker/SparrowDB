@@ -263,9 +263,8 @@ impl RbWriteTx {
         match self.inner.borrow_mut().take() {
             Some(tx) => Ok(tx.commit().map_err(db_err)?.0),
             None => {
-                let ruby = Ruby::get().map_err(|e| {
-                    MagnusError::new(sparrow_error(), e.to_string())
-                })?;
+                let ruby =
+                    Ruby::get().map_err(|e| MagnusError::new(sparrow_error(), e.to_string()))?;
                 Err(MagnusError::new(
                     ruby.exception_runtime_error(),
                     "transaction already committed or rolled back",
