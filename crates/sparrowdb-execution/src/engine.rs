@@ -4776,10 +4776,8 @@ impl Engine {
         node_label: &std::collections::HashSet<(u64, u32)>,
         all_label_ids: &[u32],
         neighbors_buf: &mut std::collections::HashSet<(u64, u32)>,
+        use_reachability: bool,
     ) -> Vec<(u64, u32)> {
-        /// Maximum number of result entries returned per source node.
-        /// Prevents unbounded memory growth on highly-connected graphs.
-        const PATH_RESULT_CAP: usize = 100_000;
         const SAFETY_CAP: u32 = 10;
         let max_hops = max_hops.min(SAFETY_CAP);
 
@@ -4793,85 +4791,125 @@ impl Engine {
             }
         }
 
-        // Iterative DFS with backtracking.
-        //
-        // Each stack frame is `(node_slot, node_label_id, depth, neighbors)`.
-        // The `neighbors` vec holds all outgoing neighbors of `node`; we consume
-        // them one by one with `pop()`.  When the vec is empty we backtrack by
-        // popping the frame and removing the node from `path_visited`.
-        //
-        // `path_visited` tracks nodes on the *current path* only (not globally),
-        // so nodes that appear in two separate paths (e.g. diamond D) are each
-        // visited once per path, yielding one result entry per path.
-        //
-        // Layout:
-        //   stack[i] = (slot, label, depth_of_slot, remaining_neighbors)
-        // where depth_of_slot is the 1-based hop distance from src to this node.
-        type Frame = (u64, u32, u32, Vec<(u64, u32)>);
+        if use_reachability {
+            // ── Reachability BFS (existential fast-path, issue #165) ──────────────────
+            //
+            // Global visited set: each node is enqueued at most once.
+            // O(V + E) — correct when RETURN DISTINCT is present and no path
+            // variable is bound, so per-path enumeration is not needed.
+            let mut global_visited: std::collections::HashSet<(u64, u32)> =
+                std::collections::HashSet::new();
+            global_visited.insert((src_slot, src_label_id));
 
-        // Per-path visited set — (slot, label_id) to handle heterogeneous graphs.
-        let mut path_visited: std::collections::HashSet<(u64, u32)> =
-            std::collections::HashSet::new();
-        path_visited.insert((src_slot, src_label_id));
+            let mut frontier: std::collections::VecDeque<(u64, u32, u32)> =
+                std::collections::VecDeque::new();
+            frontier.push_back((src_slot, src_label_id, 0));
 
-        // Build neighbors of source.
-        self.get_node_neighbors_labeled(
-            src_slot,
-            src_label_id,
-            delta_all,
-            node_label,
-            all_label_ids,
-            neighbors_buf,
-        );
-        let src_nbrs: Vec<(u64, u32)> = neighbors_buf.iter().copied().collect();
-
-        // Push the source frame at depth 1 (the neighbors are the hop-1 candidates).
-        let mut stack: Vec<Frame> = vec![(src_slot, src_label_id, 1, src_nbrs)];
-
-        while let Some(frame) = stack.last_mut() {
-            let (_, _, depth, ref mut nbrs) = *frame;
-
-            match nbrs.pop() {
-                None => {
-                    // All neighbors exhausted — backtrack.
-                    let (popped_slot, popped_label, popped_depth, _) = stack.pop().unwrap();
-                    // Remove this node from path_visited only if it was added when we
-                    // entered it (depth > 1; the source is seeded before the loop).
-                    if popped_depth > 1 {
-                        path_visited.remove(&(popped_slot, popped_label));
+            while let Some((cur_slot, cur_label, depth)) = frontier.pop_front() {
+                if depth >= max_hops {
+                    continue;
+                }
+                self.get_node_neighbors_labeled(
+                    cur_slot,
+                    cur_label,
+                    delta_all,
+                    node_label,
+                    all_label_ids,
+                    neighbors_buf,
+                );
+                for (nb_slot, nb_label) in neighbors_buf.iter().copied().collect::<Vec<_>>() {
+                    if global_visited.insert((nb_slot, nb_label)) {
+                        let nb_depth = depth + 1;
+                        if nb_depth >= min_hops {
+                            results.push((nb_slot, nb_label));
+                        }
+                        frontier.push_back((nb_slot, nb_label, nb_depth));
                     }
                 }
-                Some((nb_slot, nb_label)) => {
-                    // Skip nodes already on the current path (simple path constraint).
-                    if path_visited.contains(&(nb_slot, nb_label)) {
-                        continue;
-                    }
+            }
+        } else {
+            // ── Enumerative DFS (full path semantics) ─────────────────────────────────
+            //
+            // Maximum number of result entries returned per source node.
+            // Prevents unbounded memory growth on highly-connected graphs.
+            const PATH_RESULT_CAP: usize = 100_000;
 
-                    // Emit if depth is within the result window.
-                    if depth >= min_hops {
-                        results.push((nb_slot, nb_label));
-                        if results.len() >= PATH_RESULT_CAP {
-                            eprintln!(
-                                "sparrowdb: variable-length path result cap ({PATH_RESULT_CAP}) \
-                                 hit; truncating results.  Consider a tighter *M..N bound."
-                            );
-                            return results;
+            // Each stack frame is `(node_slot, node_label_id, depth, neighbors)`.
+            // The `neighbors` vec holds all outgoing neighbors of `node`; we consume
+            // them one by one with `pop()`.  When the vec is empty we backtrack by
+            // popping the frame and removing the node from `path_visited`.
+            //
+            // `path_visited` tracks nodes on the *current path* only (not globally),
+            // so nodes that appear in two separate paths (e.g. diamond D) are each
+            // visited once per path, yielding one result entry per path.
+            type Frame = (u64, u32, u32, Vec<(u64, u32)>);
+
+            // Per-path visited set — (slot, label_id) to handle heterogeneous graphs.
+            let mut path_visited: std::collections::HashSet<(u64, u32)> =
+                std::collections::HashSet::new();
+            path_visited.insert((src_slot, src_label_id));
+
+            // Build neighbors of source.
+            self.get_node_neighbors_labeled(
+                src_slot,
+                src_label_id,
+                delta_all,
+                node_label,
+                all_label_ids,
+                neighbors_buf,
+            );
+            let src_nbrs: Vec<(u64, u32)> = neighbors_buf.iter().copied().collect();
+
+            // Push the source frame at depth 1 (the neighbors are the hop-1 candidates).
+            let mut stack: Vec<Frame> = vec![(src_slot, src_label_id, 1, src_nbrs)];
+
+            while let Some(frame) = stack.last_mut() {
+                let (_, _, depth, ref mut nbrs) = *frame;
+
+                match nbrs.pop() {
+                    None => {
+                        // All neighbors exhausted — backtrack.
+                        let (popped_slot, popped_label, popped_depth, _) = stack.pop().unwrap();
+                        // Remove this node from path_visited only if it was added when we
+                        // entered it (depth > 1; the source is seeded before the loop).
+                        if popped_depth > 1 {
+                            path_visited.remove(&(popped_slot, popped_label));
                         }
                     }
+                    Some((nb_slot, nb_label)) => {
+                        // Skip nodes already on the current path (simple path constraint).
+                        if path_visited.contains(&(nb_slot, nb_label)) {
+                            continue;
+                        }
 
-                    // Recurse deeper if max_hops not yet reached.
-                    if depth < max_hops {
-                        path_visited.insert((nb_slot, nb_label));
-                        self.get_node_neighbors_labeled(
-                            nb_slot,
-                            nb_label,
-                            delta_all,
-                            node_label,
-                            all_label_ids,
-                            neighbors_buf,
-                        );
-                        let next_nbrs: Vec<(u64, u32)> = neighbors_buf.iter().copied().collect();
-                        stack.push((nb_slot, nb_label, depth + 1, next_nbrs));
+                        // Emit if depth is within the result window.
+                        if depth >= min_hops {
+                            results.push((nb_slot, nb_label));
+                            if results.len() >= PATH_RESULT_CAP {
+                                eprintln!(
+                                    "sparrowdb: variable-length path result cap \
+                                     ({PATH_RESULT_CAP}) hit; truncating results.  \
+                                     Consider RETURN DISTINCT or a tighter *M..N bound."
+                                );
+                                return results;
+                            }
+                        }
+
+                        // Recurse deeper if max_hops not yet reached.
+                        if depth < max_hops {
+                            path_visited.insert((nb_slot, nb_label));
+                            self.get_node_neighbors_labeled(
+                                nb_slot,
+                                nb_label,
+                                delta_all,
+                                node_label,
+                                all_label_ids,
+                                neighbors_buf,
+                            );
+                            let next_nbrs: Vec<(u64, u32)> =
+                                neighbors_buf.iter().copied().collect();
+                            stack.push((nb_slot, nb_label, depth + 1, next_nbrs));
+                        }
                     }
                 }
             }
@@ -5031,6 +5069,9 @@ impl Engine {
             // BFS to find all reachable (slot, label_id) pairs within [min_hops, max_hops].
             // delta_all, node_label, all_label_ids, and neighbors_buf are hoisted out of
             // this loop (SPA-275) and reused across all source nodes.
+            // Use reachability BFS when RETURN DISTINCT is present and no path variable
+            // is bound (issue #165). Otherwise use enumerative DFS for full path semantics.
+            let use_reachability = m.distinct && rel_pat.var.is_empty();
             let dst_nodes = self.execute_variable_hops(
                 src_slot,
                 src_label_id,
@@ -5040,6 +5081,7 @@ impl Engine {
                 &node_label,
                 &all_label_ids,
                 &mut neighbors_buf,
+                use_reachability,
             );
 
             for (dst_slot, actual_label_id) in dst_nodes {
