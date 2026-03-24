@@ -2,6 +2,7 @@
 //!
 //! Public API re-exported from the LDBC SNB loader module.
 
+pub mod ic_queries;
 pub mod ldbc;
 
 // Re-export the most-used items at crate root for convenience.
