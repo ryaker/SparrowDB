@@ -57,30 +57,36 @@ fn build_engine(db_path: &std::path::Path) -> Engine {
 
 // ── Test 1: rel_degree_stats field is accessible on the snapshot ───────────────
 
-/// Verify that `rel_degree_stats` exists on `ReadSnapshot` and is a valid
-/// `HashMap<u32, DegreeStats>`.
+/// Verify that `rel_degree_stats` exists on `ReadSnapshot`, is populated after
+/// a checkpoint, and that every entry is internally consistent.
 ///
-/// Note: `rel_degree_stats` is built from CSR forward files at engine-open
-/// time.  CSR files are written at checkpoint time (not immediately after each
-/// edge CREATE).  In this test we verify the field is accessible and that a
-/// fresh database (no checkpoint yet) produces an empty or zero-entry map —
-/// which is the correct behavior: no CSR file = no stats yet.
+/// CSR files (which back `rel_degree_stats`) are written at checkpoint time.
+/// We must create at least one edge and call `checkpoint()` before building the
+/// engine; otherwise the CSR map is empty and the loop body is unreachable.
 #[test]
 fn rel_degree_stats_field_is_accessible() {
     let (dir, db) = make_db();
 
-    // Create some nodes and edges — they go into the delta log initially.
+    // Create two nodes and a relationship between them.
     db.execute("CREATE (a:Person {id: 1})").expect("CREATE a");
     db.execute("CREATE (b:Person {id: 2})").expect("CREATE b");
+    db.execute("MATCH (a:Person {id: 1}), (b:Person {id: 2}) CREATE (a)-[:KNOWS]->(b)")
+        .expect("CREATE edge");
+
+    // Checkpoint so the CSR forward file is written to disk.
+    db.checkpoint().expect("checkpoint");
 
     let engine = build_engine(dir.path());
     let stats = &engine.snapshot.rel_degree_stats;
 
-    // The field must be accessible and be a HashMap.
-    // Before any checkpoint, CSR files may not exist, so the map may be empty.
-    // That is correct and expected behavior.
+    // After a checkpoint with at least one edge, the stats map must be non-empty.
+    assert!(
+        !stats.is_empty(),
+        "rel_degree_stats must be populated when checkpointed relationships exist"
+    );
+
+    // Every entry present must have internally consistent values.
     for (rel_table_id, s) in stats {
-        // Any entry that is present must have internally consistent values.
         if s.count > 0 {
             assert!(
                 s.max >= s.min,
