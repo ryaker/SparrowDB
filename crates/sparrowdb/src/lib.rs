@@ -276,6 +276,18 @@ struct DbInner {
     /// transactions invalidate it via `clear()` on commit so the next read
     /// re-populates from the updated column files.
     prop_index: RwLock<sparrowdb_storage::property_index::PropertyIndex>,
+    /// Shared catalog cache (SPA-188).
+    ///
+    /// Read queries clone from this to avoid re-parsing the TLV catalog file
+    /// on every query.  DDL operations (label/rel-type creation, constraints)
+    /// refresh the cache via `invalidate_catalog()`.
+    catalog: RwLock<Catalog>,
+    /// Cached per-type CSR forward map (SPA-189).
+    ///
+    /// Populated at `GraphDb::open` time and cloned into each `Engine`
+    /// instance.  Invalidated after CHECKPOINT / OPTIMIZE since those compact
+    /// the delta log into new CSR base files.
+    csr_map: RwLock<HashMap<u32, CsrForward>>,
 }
 
 // ── Write-lock guard (SPA-181: replaces 'static transmute UB) ────────────────
@@ -331,6 +343,7 @@ impl GraphDb {
     /// Open (or create) a SparrowDB database at `path`.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
+        let catalog = Catalog::open(path)?;
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -341,6 +354,8 @@ impl GraphDb {
                 encryption_key: None,
                 unique_constraints: RwLock::new(HashSet::new()),
                 prop_index: RwLock::new(sparrowdb_storage::property_index::PropertyIndex::new()),
+                catalog: RwLock::new(catalog),
+                csr_map: RwLock::new(open_csr_map(path)),
             }),
         })
     }
@@ -356,6 +371,7 @@ impl GraphDb {
     /// Returns an error if the directory cannot be created.
     pub fn open_encrypted(path: &Path, key: [u8; 32]) -> Result<Self> {
         std::fs::create_dir_all(path)?;
+        let catalog = Catalog::open(path)?;
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -366,6 +382,8 @@ impl GraphDb {
                 encryption_key: Some(key),
                 unique_constraints: RwLock::new(HashSet::new()),
                 prop_index: RwLock::new(sparrowdb_storage::property_index::PropertyIndex::new()),
+                catalog: RwLock::new(catalog),
+                csr_map: RwLock::new(open_csr_map(path)),
             }),
         })
     }
@@ -380,6 +398,45 @@ impl GraphDb {
             .write()
             .expect("prop_index RwLock poisoned")
             .clear();
+    }
+
+    /// Refresh the shared catalog cache from disk (SPA-188).
+    ///
+    /// Called after DDL operations (label/rel-type creation, constraints) so
+    /// the next read query sees the updated schema without re-parsing the TLV
+    /// file itself.
+    fn invalidate_catalog(&self) {
+        if let Ok(fresh) = Catalog::open(&self.inner.path) {
+            *self.inner.catalog.write().expect("catalog RwLock poisoned") = fresh;
+        }
+    }
+
+    /// Clone the cached catalog for use in a single query (SPA-188).
+    fn catalog_snapshot(&self) -> Catalog {
+        self.inner
+            .catalog
+            .read()
+            .expect("catalog RwLock poisoned")
+            .clone()
+    }
+
+    /// Refresh the cached CSR forward map from disk (SPA-189).
+    ///
+    /// Called after CHECKPOINT / OPTIMIZE since those compact the delta log
+    /// into new CSR base files.  Regular writes do NOT need this because
+    /// the delta log is read separately by the engine.
+    fn invalidate_csr_map(&self) {
+        *self.inner.csr_map.write().expect("csr_map RwLock poisoned") =
+            open_csr_map(&self.inner.path);
+    }
+
+    /// Clone the cached CSR map for use in a single query (SPA-189).
+    fn cached_csr_map(&self) -> HashMap<u32, CsrForward> {
+        self.inner
+            .csr_map
+            .read()
+            .expect("csr_map RwLock poisoned")
+            .clone()
     }
 
     /// Open a read-only snapshot transaction.
@@ -407,6 +464,8 @@ impl GraphDb {
         let guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         let snapshot_txn_id = self.inner.current_txn_id.load(Ordering::Acquire);
         let store = NodeStore::open(&self.inner.path)?;
+        // WriteTx opens a fresh catalog from disk because it may create labels
+        // or rel types, and needs the latest on-disk state to avoid ID conflicts.
         let catalog = Catalog::open(&self.inner.path)?;
         Ok(WriteTx {
             inner: Arc::clone(&self.inner),
@@ -433,12 +492,14 @@ impl GraphDb {
     /// single-threaded callers and avoids unbounded waits on multi-threaded ones.
     pub fn checkpoint(&self) -> Result<()> {
         let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
-        let catalog = Catalog::open(&self.inner.path)?;
+        let catalog = self.catalog_snapshot();
         let node_store = NodeStore::open(&self.inner.path)?;
         let (rel_table_ids, n_nodes) =
             collect_maintenance_params(&catalog, &node_store, &self.inner.path);
         let engine = MaintenanceEngine::new(&self.inner.path);
-        engine.checkpoint(&rel_table_ids, n_nodes)
+        engine.checkpoint(&rel_table_ids, n_nodes)?;
+        self.invalidate_csr_map();
+        Ok(())
     }
 
     /// Run an OPTIMIZE: same as CHECKPOINT but additionally sorts each source
@@ -451,12 +512,14 @@ impl GraphDb {
     /// single-threaded callers and avoids unbounded waits on multi-threaded ones.
     pub fn optimize(&self) -> Result<()> {
         let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
-        let catalog = Catalog::open(&self.inner.path)?;
+        let catalog = self.catalog_snapshot();
         let node_store = NodeStore::open(&self.inner.path)?;
         let (rel_table_ids, n_nodes) =
             collect_maintenance_params(&catalog, &node_store, &self.inner.path);
         let engine = MaintenanceEngine::new(&self.inner.path);
-        engine.optimize(&rel_table_ids, n_nodes)
+        engine.optimize(&rel_table_ids, n_nodes)?;
+        self.invalidate_csr_map();
+        Ok(())
     }
 
     /// Return a storage-size snapshot for this database (SPA-171).
@@ -472,7 +535,7 @@ impl GraphDb {
     /// accounting should treat the reported values as a lower bound.
     pub fn stats(&self) -> Result<DbStats> {
         let db_root = &self.inner.path;
-        let catalog = Catalog::open(db_root)?;
+        let catalog = self.catalog_snapshot();
         let node_store = NodeStore::open(db_root)?;
         let mut stats = DbStats::default();
 
@@ -542,7 +605,7 @@ impl GraphDb {
         use sparrowdb_cypher::{bind, parse};
 
         let stmt = parse(cypher)?;
-        let catalog_snap = Catalog::open(&self.inner.path)?;
+        let catalog_snap = self.catalog_snapshot();
         let bound = bind(stmt, &catalog_snap)?;
 
         // SPA-189: wire CHECKPOINT and OPTIMIZE to their real implementations
@@ -578,7 +641,7 @@ impl GraphDb {
 
             let mut engine = {
                 let _open_span = info_span!("sparrowdb.open_engine").entered();
-                let csrs = open_csr_map(&self.inner.path);
+                let csrs = self.cached_csr_map();
                 Engine::new_with_cached_index(
                     NodeStore::open(&self.inner.path)?,
                     catalog_snap,
@@ -639,7 +702,7 @@ impl GraphDb {
         use sparrowdb_cypher::{bind, parse};
 
         let stmt = parse(cypher)?;
-        let catalog_snap = Catalog::open(&self.inner.path)?;
+        let catalog_snap = self.catalog_snapshot();
         let bound = bind(stmt, &catalog_snap)?;
 
         // Delegate CHECKPOINT/OPTIMIZE immediately — no timeout needed.
@@ -675,7 +738,7 @@ impl GraphDb {
 
         let mut engine = {
             let _open_span = info_span!("sparrowdb.open_engine").entered();
-            let csrs = open_csr_map(&self.inner.path);
+            let csrs = self.cached_csr_map();
             Engine::new_with_cached_index(
                 NodeStore::open(&self.inner.path)?,
                 catalog_snap,
@@ -719,7 +782,11 @@ impl GraphDb {
         let mut catalog = sparrowdb_catalog::catalog::Catalog::open(&self.inner.path)?;
         let label_id: u32 = match catalog.get_label(label)? {
             Some(id) => id as u32,
-            None => catalog.create_label(label)? as u32,
+            None => {
+                let id = catalog.create_label(label)? as u32;
+                self.invalidate_catalog();
+                id
+            }
         };
         let col_id = sparrowdb_common::col_id_of(property);
         self.inner
@@ -895,6 +962,7 @@ impl GraphDb {
 
         tx.commit()?;
         self.invalidate_prop_index();
+        self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -927,7 +995,7 @@ impl GraphDb {
         use sparrowdb_cypher::{bind, parse};
 
         let stmt = parse(cypher)?;
-        let catalog_snap = Catalog::open(&self.inner.path)?;
+        let catalog_snap = self.catalog_snapshot();
         let bound = bind(stmt, &catalog_snap)?;
 
         use sparrowdb_cypher::ast::Statement;
@@ -952,7 +1020,7 @@ impl GraphDb {
 
         let mut engine = {
             let _open_span = info_span!("sparrowdb.open_engine").entered();
-            let csrs = open_csr_map(&self.inner.path);
+            let csrs = self.cached_csr_map();
             Engine::new_with_cached_index(
                 NodeStore::open(&self.inner.path)?,
                 catalog_snap,
@@ -985,6 +1053,7 @@ impl GraphDb {
         let node_id = tx.merge_node(&m.label, props.clone())?;
         tx.commit()?;
         self.invalidate_prop_index();
+        self.invalidate_catalog();
 
         // If the statement has a RETURN clause, project the merged node's properties.
         if let Some(ref ret) = m.return_clause {
@@ -1080,6 +1149,7 @@ impl GraphDb {
         let node_id = tx.merge_node(&m.label, props.clone())?;
         tx.commit()?;
         self.invalidate_prop_index();
+        self.invalidate_catalog();
         if let Some(ref ret) = m.return_clause {
             use sparrowdb_cypher::ast::Expr;
             type ExecValue = sparrowdb_execution::Value;
@@ -1137,10 +1207,10 @@ impl GraphDb {
         params: &HashMap<String, sparrowdb_execution::Value>,
     ) -> Result<QueryResult> {
         let mut tx = self.begin_write()?;
-        let csrs = open_csr_map(&self.inner.path);
+        let csrs = self.cached_csr_map();
         let engine = Engine::new(
             NodeStore::open(&self.inner.path)?,
-            Catalog::open(&self.inner.path)?,
+            self.catalog_snapshot(),
             csrs,
             &self.inner.path,
         );
@@ -1163,6 +1233,7 @@ impl GraphDb {
         }
         tx.commit()?;
         self.invalidate_prop_index();
+        self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1183,10 +1254,10 @@ impl GraphDb {
         // transaction was opened against.  Because we hold the write lock,
         // the data on disk cannot change between this scan and the mutations
         // below.
-        let csrs = open_csr_map(&self.inner.path);
+        let csrs = self.cached_csr_map();
         let engine = Engine::new(
             NodeStore::open(&self.inner.path)?,
-            Catalog::open(&self.inner.path)?,
+            self.catalog_snapshot(),
             csrs,
             &self.inner.path,
         );
@@ -1214,6 +1285,7 @@ impl GraphDb {
 
         tx.commit()?;
         self.invalidate_prop_index();
+        self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1238,10 +1310,10 @@ impl GraphDb {
         let mut tx = self.begin_write()?;
 
         // Build an Engine for the read-scan phase.
-        let csrs = open_csr_map(&self.inner.path);
+        let csrs = self.cached_csr_map();
         let engine = Engine::new(
             NodeStore::open(&self.inner.path)?,
-            Catalog::open(&self.inner.path)?,
+            self.catalog_snapshot(),
             csrs,
             &self.inner.path,
         );
@@ -1297,6 +1369,7 @@ impl GraphDb {
 
         tx.commit()?;
         self.invalidate_prop_index();
+        self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1323,10 +1396,10 @@ impl GraphDb {
         let mut tx = self.begin_write()?;
 
         // Build an Engine for the read-scan phase.
-        let csrs = open_csr_map(&self.inner.path);
+        let csrs = self.cached_csr_map();
         let engine = Engine::new(
             NodeStore::open(&self.inner.path)?,
-            Catalog::open(&self.inner.path)?,
+            self.catalog_snapshot(),
             csrs,
             &self.inner.path,
         );
@@ -1436,6 +1509,7 @@ impl GraphDb {
 
         tx.commit()?;
         self.invalidate_prop_index();
+        self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1518,11 +1592,11 @@ impl GraphDb {
 
         // Pre-parse and bind all queries before acquiring the writer lock.
         // A syntax or bind error fails fast without ever locking.
+        let catalog_snap = self.catalog_snapshot();
         let bound_stmts: Vec<_> = queries
             .iter()
             .map(|q| {
                 let stmt = parse(q)?;
-                let catalog_snap = Catalog::open(&self.inner.path)?;
                 bind(stmt, &catalog_snap)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1562,11 +1636,11 @@ impl GraphDb {
                 self.execute_batch_mutation(bound.inner, &mut tx)?
             } else {
                 // Read-only statement: execute against current snapshot.
-                let csrs = open_csr_map(&self.inner.path);
-                let catalog_snap = Catalog::open(&self.inner.path)?;
+                let csrs = self.cached_csr_map();
+                let batch_catalog = self.catalog_snapshot();
                 let mut engine = Engine::new(
                     NodeStore::open(&self.inner.path)?,
-                    catalog_snap,
+                    batch_catalog,
                     csrs,
                     &self.inner.path,
                 );
@@ -1578,6 +1652,7 @@ impl GraphDb {
         // Single fsync commit — all mutations land in one WAL transaction.
         tx.commit()?;
         self.invalidate_prop_index();
+        self.invalidate_catalog();
 
         // Merge early (CHECKPOINT/OPTIMIZE) and mutation results in order.
         let final_results = results
@@ -1705,10 +1780,10 @@ impl GraphDb {
             }
 
             Statement::MatchMutate(ref mm) => {
-                let csrs = open_csr_map(&self.inner.path);
+                let csrs = self.cached_csr_map();
                 let engine = Engine::new(
                     NodeStore::open(&self.inner.path)?,
-                    Catalog::open(&self.inner.path)?,
+                    self.catalog_snapshot(),
                     csrs,
                     &self.inner.path,
                 );
@@ -1736,10 +1811,10 @@ impl GraphDb {
                 if mc.create.edges.is_empty() {
                     return Err(Error::Unimplemented);
                 }
-                let csrs = open_csr_map(&self.inner.path);
+                let csrs = self.cached_csr_map();
                 let engine = Engine::new(
                     NodeStore::open(&self.inner.path)?,
-                    Catalog::open(&self.inner.path)?,
+                    self.catalog_snapshot(),
                     csrs,
                     &self.inner.path,
                 );
@@ -1769,10 +1844,10 @@ impl GraphDb {
                 // nodes/edges created earlier in the same batch are not visible to
                 // the MERGE existence check.  If in-batch visibility is required,
                 // flush the transaction to disk before issuing MATCH...MERGE.
-                let csrs = open_csr_map(&self.inner.path);
+                let csrs = self.cached_csr_map();
                 let engine = Engine::new(
                     NodeStore::open(&self.inner.path)?,
-                    Catalog::open(&self.inner.path)?,
+                    self.catalog_snapshot(),
                     csrs,
                     &self.inner.path,
                 );
@@ -1858,7 +1933,7 @@ impl GraphDb {
     /// compaction / GC is implemented.
     pub fn db_counts(&self) -> Result<(u64, u64)> {
         let path = &self.inner.path;
-        let catalog = Catalog::open(path)?;
+        let catalog = self.catalog_snapshot();
         let node_store = NodeStore::open(path)?;
 
         // Node count: sum hwm_for_label across every registered label.
@@ -1901,7 +1976,7 @@ impl GraphDb {
     /// Labels are registered automatically the first time a node with that label
     /// is created. The returned list is ordered by insertion (i.e. by `LabelId`).
     pub fn labels(&self) -> Result<Vec<String>> {
-        let catalog = Catalog::open(&self.inner.path)?;
+        let catalog = self.catalog_snapshot();
         Ok(catalog
             .list_labels()?
             .into_iter()
@@ -1913,7 +1988,7 @@ impl GraphDb {
     ///
     /// The returned list is deduplicated and sorted alphabetically.
     pub fn relationship_types(&self) -> Result<Vec<String>> {
-        let catalog = Catalog::open(&self.inner.path)?;
+        let catalog = self.catalog_snapshot();
         let mut types: Vec<String> = catalog
             .list_rel_tables()?
             .into_iter()
@@ -1945,7 +2020,7 @@ impl GraphDb {
             return Ok(vec![]);
         }
         let path = &self.inner.path;
-        let catalog = Catalog::open(path)?;
+        let catalog = self.catalog_snapshot();
         let label_id: u32 = match catalog.get_label(label)? {
             Some(id) => id as u32,
             None => return Ok(vec![]),
@@ -2003,7 +2078,7 @@ impl GraphDb {
         }
 
         let path = &self.inner.path;
-        let catalog = sparrowdb_catalog::catalog::Catalog::open(path)?;
+        let catalog = self.catalog_snapshot();
 
         // Query all nodes via Cypher — id(n) is reliably Int64 from node scans.
         let nodes =
@@ -2738,6 +2813,12 @@ impl WriteTx {
             if let Err(e) = idx.flush() {
                 tracing::error!(index = %name, error = %e, "fulltext index flush failed post-commit; index may be stale until next write");
             }
+        }
+
+        // Step 11: Refresh the shared catalog cache so subsequent reads see
+        // any labels / rel types created in this transaction (SPA-188).
+        if let Ok(fresh) = Catalog::open(&self.inner.path) {
+            *self.inner.catalog.write().expect("catalog RwLock poisoned") = fresh;
         }
 
         self.committed = true;

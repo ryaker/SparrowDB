@@ -19,6 +19,7 @@ pub type LabelId = u16;
 pub type RelTableId = u64;
 
 /// The catalog, loaded from (and persisted to) a TLV file.
+#[derive(Clone)]
 pub struct Catalog {
     /// Path to the TLV catalog file.
     path: PathBuf,
