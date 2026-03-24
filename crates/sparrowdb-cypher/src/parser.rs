@@ -170,6 +170,10 @@ impl Parser {
             Token::Then => Ok("then".into()),
             Token::Else => Ok("else".into()),
             Token::End => Ok("end".into()),
+            Token::Index => Ok("index".into()),
+            Token::On => Ok("on".into()),
+            Token::Constraint => Ok("constraint".into()),
+            Token::Assert => Ok("assert".into()),
             other => Err(Error::InvalidArgument(format!(
                 "expected property name, got {:?}",
                 other
@@ -1158,8 +1162,40 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_tok(&Token::Create)?;
+        if matches!(self.peek(), Token::Index) { self.advance(); return self.parse_create_index(); }
+        if matches!(self.peek(), Token::Constraint) { self.advance(); return self.parse_create_constraint(); }
         let body = self.parse_create_body()?;
         Ok(Statement::Create(body))
+    }
+    fn parse_create_index(&mut self) -> Result<Statement> {
+        self.expect_tok(&Token::On)?;
+        self.expect_tok(&Token::Colon)?;
+        let label = self.expect_ident()?;
+        self.expect_tok(&Token::LParen)?;
+        let property = self.expect_ident()?;
+        self.expect_tok(&Token::RParen)?;
+        Ok(Statement::CreateIndex { label, property })
+    }
+    fn parse_create_constraint(&mut self) -> Result<Statement> {
+        self.expect_tok(&Token::On)?;
+        self.expect_tok(&Token::LParen)?;
+        let _var = self.expect_ident()?;
+        self.expect_tok(&Token::Colon)?;
+        let label = self.expect_ident()?;
+        self.expect_tok(&Token::RParen)?;
+        match self.advance().clone() {
+            Token::Assert => {}
+            other => return Err(Error::InvalidArgument(format!("expected ASSERT, got {:?}", other))),
+        }
+        let _prop_var = self.expect_ident()?;
+        self.expect_tok(&Token::Dot)?;
+        let property = self.expect_ident()?;
+        self.expect_tok(&Token::Is)?;
+        match self.advance().clone() {
+            Token::Ident(ref s) if s.eq_ignore_ascii_case("UNIQUE") => {}
+            other => return Err(Error::InvalidArgument(format!("expected UNIQUE, got {:?}", other))),
+        }
+        Ok(Statement::CreateConstraint { label, property })
     }
 
     // ── UNWIND ────────────────────────────────────────────────────────────────

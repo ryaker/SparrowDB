@@ -54,6 +54,10 @@ pub enum Token {
     Then,
     Else,
     End,
+    Index,
+    On,
+    Constraint,
+    Assert,
 
     // Punctuation
     LParen,    // (
@@ -357,6 +361,10 @@ fn keyword_or_ident(word: String) -> Token {
         "THEN" => Token::Then,
         "ELSE" => Token::Else,
         "END" => Token::End,
+        "INDEX" => Token::Index,
+        "ON" => Token::On,
+        "CONSTRAINT" => Token::Constraint,
+        "ASSERT" => Token::Assert,
         _ => Token::Ident(word),
     }
 }
