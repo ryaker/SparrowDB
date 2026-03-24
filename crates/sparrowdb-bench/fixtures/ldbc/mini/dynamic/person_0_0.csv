@@ -1,0 +1,11 @@
+id|firstName|lastName|gender|birthday|creationDate|locationIP|browserUsed
+1|Alice|Smith|female|1990-01-15|2010-03-17T13:32:10.447+0000|192.168.0.1|Chrome
+2|Bob|Jones|male|1985-06-22|2010-04-22T11:22:05.100+0000|192.168.0.2|Firefox
+3|Carol|White|female|1992-09-05|2011-01-10T09:15:33.200+0000|192.168.0.3|Safari
+4|Dave|Brown|male|1988-12-01|2011-05-25T16:44:21.000+0000|192.168.0.4|Chrome
+5|Eve|Davis|female|1995-03-28|2012-07-14T08:30:00.000+0000|192.168.0.5|Firefox
+6|Frank|Miller|male|1983-11-17|2010-08-03T14:20:15.300+0000|192.168.0.6|Chrome
+7|Grace|Wilson|female|1991-07-09|2011-10-28T10:10:10.000+0000|192.168.0.7|Safari
+8|Henry|Taylor|male|1987-04-30|2010-12-01T17:00:00.000+0000|192.168.0.8|Firefox
+9|Iris|Anderson|female|1993-02-14|2012-02-20T12:45:00.000+0000|192.168.0.9|Chrome
+10|Jack|Thomas|male|1980-08-08|2010-06-15T09:00:00.000+0000|192.168.0.10|Safari
