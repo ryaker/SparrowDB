@@ -165,11 +165,55 @@ pub struct ReadSnapshot {
     pub label_row_counts: HashMap<LabelId, usize>,
     /// Per-relationship-type out-degree statistics (SPA-273).
     ///
-    /// Keyed by `RelTableId` (u32).  Built eagerly at engine open time from
-    /// CSR forward files.  Used by future join-order heuristics to estimate
-    /// how many neighbor hops a traversal on a given relationship type will
-    /// produce.
-    pub rel_degree_stats: HashMap<u32, DegreeStats>,
+    /// Keyed by `RelTableId` (u32).  Initialized **lazily** on first access
+    /// via [`ReadSnapshot::rel_degree_stats`].  Simple traversal queries
+    /// (Q3, Q4) that never consult the planner heuristics pay zero CSR-scan
+    /// cost.  The scan is only triggered when a query actually needs degree
+    /// statistics (e.g. join-order planning).
+    ///
+    /// `OnceLock` is used instead of `OnceCell` so that `ReadSnapshot` remains
+    /// `Sync` and can safely be shared across parallel BFS threads.
+    rel_degree_stats: std::sync::OnceLock<HashMap<u32, DegreeStats>>,
+}
+
+impl ReadSnapshot {
+    /// Return per-relationship-type out-degree statistics, computing them on
+    /// first call and caching the result for all subsequent calls.
+    ///
+    /// The CSR forward scan is only triggered once per `ReadSnapshot` instance,
+    /// and only when a caller actually needs degree statistics.  Queries that
+    /// never access this (e.g. simple traversals Q3/Q4) pay zero overhead.
+    pub fn rel_degree_stats(&self) -> &HashMap<u32, DegreeStats> {
+        self.rel_degree_stats.get_or_init(|| {
+            self.csrs
+                .iter()
+                .map(|(&rel_table_id, csr)| {
+                    let mut stats = DegreeStats::default();
+                    let mut first = true;
+                    for slot in 0..csr.n_nodes() {
+                        let deg = csr.neighbors(slot).len() as u32;
+                        if deg > 0 {
+                            if first {
+                                stats.min = deg;
+                                stats.max = deg;
+                                first = false;
+                            } else {
+                                if deg < stats.min {
+                                    stats.min = deg;
+                                }
+                                if deg > stats.max {
+                                    stats.max = deg;
+                                }
+                            }
+                            stats.total += deg as u64;
+                            stats.count += 1;
+                        }
+                    }
+                    (rel_table_id, stats)
+                })
+                .collect()
+        })
+    }
 }
 
 /// The execution engine holds references to the storage layer.
@@ -274,44 +318,16 @@ impl Engine {
             })
             .collect();
 
-        // SPA-273: build per-rel-type degree stats from CSR forward files.
-        // For each relationship type (CSR), iterate every source slot and
-        // accumulate min/max/total/count statistics.
-        let rel_degree_stats: HashMap<u32, DegreeStats> = csrs
-            .iter()
-            .map(|(&rel_table_id, csr)| {
-                let mut stats = DegreeStats::default();
-                let mut first = true;
-                for slot in 0..csr.n_nodes() {
-                    let deg = csr.neighbors(slot).len() as u32;
-                    if deg > 0 {
-                        if first {
-                            stats.min = deg;
-                            stats.max = deg;
-                            first = false;
-                        } else {
-                            if deg < stats.min {
-                                stats.min = deg;
-                            }
-                            if deg > stats.max {
-                                stats.max = deg;
-                            }
-                        }
-                        stats.total += deg as u64;
-                        stats.count += 1;
-                    }
-                }
-                (rel_table_id, stats)
-            })
-            .collect();
-
+        // SPA-273 (lazy): rel_degree_stats is now computed on first access via
+        // ReadSnapshot::rel_degree_stats().  Simple traversal queries (Q3/Q4)
+        // that never consult degree statistics pay zero CSR-scan overhead here.
         let snapshot = ReadSnapshot {
             store,
             catalog,
             csrs,
             db_root: db_root.to_path_buf(),
             label_row_counts,
-            rel_degree_stats,
+            rel_degree_stats: std::sync::OnceLock::new(),
         };
 
         Engine {
