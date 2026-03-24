@@ -1135,7 +1135,7 @@ impl Parser {
 
     /// Skip an `ON CREATE SET …` or `ON MATCH SET …` clause after a MERGE.
     fn skip_on_clause(&mut self) -> Result<()> {
-        match self.peek().clone() {
+        match self.peek() {
             Token::Create | Token::Match => {
                 self.advance();
             }
@@ -1147,9 +1147,8 @@ impl Parser {
             }
         }
         loop {
-            match self.peek().clone() {
-                Token::Eof | Token::Semicolon | Token::Return | Token::With | Token::Merge => break,
-                Token::On => break,
+            match self.peek() {
+                Token::Eof | Token::Semicolon | Token::Return | Token::With | Token::Merge | Token::On => break,
                 _ => {
                     self.advance();
                 }
