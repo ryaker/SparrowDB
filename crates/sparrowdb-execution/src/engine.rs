@@ -3092,11 +3092,9 @@ impl Engine {
                 continue;
             }
 
-            // Fetch the property for the group key.
-            let prop_raw = self
-                .snapshot
-                .store
-                .get_node_raw(node_id, &[prop_col_id])?;
+            // Fetch the property for the group key (nullable path so missing
+            // columns return NULL instead of a NotFound error).
+            let prop_raw = read_node_props(&self.snapshot.store, node_id, &[prop_col_id])?;
             let prop_val = prop_raw
                 .iter()
                 .find(|(c, _)| *c == prop_col_id)
