@@ -6,6 +6,7 @@ pub mod join;
 pub mod join_spill;
 pub mod json;
 pub mod operators;
+pub mod parallel_bfs;
 pub mod sort_spill;
 pub mod types;
 
