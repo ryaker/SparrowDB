@@ -466,14 +466,11 @@ fn parse_hex_key(hex: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         .into());
     }
     let mut key = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let hi = (chunk[0] as char)
-            .to_digit(16)
-            .ok_or_else(|| format!("invalid hex digit '{}' in --key", chunk[0] as char))?;
-        let lo = (chunk[1] as char)
-            .to_digit(16)
-            .ok_or_else(|| format!("invalid hex digit '{}' in --key", chunk[1] as char))?;
-        key[i] = (hi as u8) << 4 | lo as u8;
+    for i in 0..32 {
+        let start = i * 2;
+        let end = start + 2;
+        key[i] = u8::from_str_radix(&hex[start..end], 16)
+            .map_err(|_| format!("invalid hex sequence '{}' in --key", &hex[start..end]))?;
     }
     Ok(key)
 }
