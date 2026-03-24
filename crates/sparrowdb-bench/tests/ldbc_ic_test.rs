@@ -36,12 +36,8 @@ fn ic1_returns_friends_of_alice_within_3_hops() {
     );
 
     let last_names: Vec<&str> = results.iter().map(|r: &PersonName| r.1.as_str()).collect();
-    let mut sorted = last_names.clone();
-    sorted.sort();
-    assert_eq!(
-        last_names, sorted,
-        "IC1: results should be sorted by lastName"
-    );
+    let is_sorted = last_names.windows(2).all(|w| w[0] <= w[1]);
+    assert!(is_sorted, "IC1: results should be sorted by lastName");
 
     assert!(
         results.len() <= 20,
