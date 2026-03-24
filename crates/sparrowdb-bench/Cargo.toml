@@ -1,0 +1,29 @@
+[package]
+name = "sparrowdb-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Benchmarks and data loaders for SparrowDB (LDBC SNB, etc.)"
+publish = false
+
+[lib]
+name = "sparrowdb_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ldbc-load"
+path = "src/main.rs"
+
+[dependencies]
+sparrowdb = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+csv = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+sparrowdb = { workspace = true }
+sparrowdb-execution = { workspace = true }

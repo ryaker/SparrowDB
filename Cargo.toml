@@ -12,6 +12,7 @@ members = [
     "crates/sparrowdb-mcp",
     "crates/sparrowdb-node",
     "crates/sparrowdb-metrics",
+    "crates/sparrowdb-bench",
 ]
 
 [workspace.package]
@@ -45,6 +46,7 @@ bincode           = "1"
 clap              = { version = "4", features = ["derive"] }
 tracing           = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+csv               = "1"
 
 [profile.dev]
 opt-level = 0
