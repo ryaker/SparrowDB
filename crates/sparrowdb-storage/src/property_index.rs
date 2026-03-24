@@ -114,7 +114,7 @@ pub struct IndexKey {
 /// Use [`PropertyIndex::build_for`] to load a specific column on demand, or
 /// [`PropertyIndex::build`] for an upfront full build.  Then use
 /// [`PropertyIndex::lookup`] for O(log n) equality queries.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct PropertyIndex {
     /// `index[(label_id, col_id)][raw_value] = [slot, ...]`
     index: std::collections::HashMap<IndexKey, BTreeMap<u64, Vec<u32>>>,
@@ -128,6 +128,15 @@ impl PropertyIndex {
     /// Construct a fresh empty index (no disk I/O).
     pub fn new() -> Self {
         PropertyIndex::default()
+    }
+
+    /// Reset the index to empty, discarding all cached column data.
+    ///
+    /// Used by `GraphDb` to invalidate the shared property-index cache after
+    /// a write transaction commits (the on-disk column files may have changed).
+    pub fn clear(&mut self) {
+        self.index.clear();
+        self.loaded.clear();
     }
 
     /// Lazily load the index for a single `(label_id, col_id)` pair.

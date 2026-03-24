@@ -269,6 +269,13 @@ struct DbInner {
     /// are encrypted with XChaCha20-Poly1305 via [`WalWriter::open_encrypted`].
     encryption_key: Option<[u8; 32]>,
     unique_constraints: RwLock<HashSet<(u32, u32)>>,
+    /// Shared property-index cache (SPA-187).
+    ///
+    /// Read queries clone from this at `Engine::new_with_cached_index` time and
+    /// write their lazily-populated index back after execution.  Write
+    /// transactions invalidate it via `clear()` on commit so the next read
+    /// re-populates from the updated column files.
+    prop_index: RwLock<sparrowdb_storage::property_index::PropertyIndex>,
 }
 
 // ── Write-lock guard (SPA-181: replaces 'static transmute UB) ────────────────
@@ -333,6 +340,7 @@ impl GraphDb {
                 node_versions: RwLock::new(NodeVersions::default()),
                 encryption_key: None,
                 unique_constraints: RwLock::new(HashSet::new()),
+                prop_index: RwLock::new(sparrowdb_storage::property_index::PropertyIndex::new()),
             }),
         })
     }
@@ -357,8 +365,19 @@ impl GraphDb {
                 node_versions: RwLock::new(NodeVersions::default()),
                 encryption_key: Some(key),
                 unique_constraints: RwLock::new(HashSet::new()),
+                prop_index: RwLock::new(sparrowdb_storage::property_index::PropertyIndex::new()),
             }),
         })
+    }
+
+    /// Invalidate the shared property-index cache (SPA-187).
+    ///
+    /// Called after every write-transaction commit so the next read query
+    /// re-populates from the updated column files on disk.
+    fn invalidate_prop_index(&self) {
+        if let Ok(mut guard) = self.inner.prop_index.write() {
+            guard.clear();
+        }
     }
 
     /// Open a read-only snapshot transaction.
@@ -558,11 +577,12 @@ impl GraphDb {
             let mut engine = {
                 let _open_span = info_span!("sparrowdb.open_engine").entered();
                 let csrs = open_csr_map(&self.inner.path);
-                Engine::new(
+                Engine::new_with_cached_index(
                     NodeStore::open(&self.inner.path)?,
                     catalog_snap,
                     csrs,
                     &self.inner.path,
+                    Some(&self.inner.prop_index),
                 )
             };
 
@@ -570,6 +590,9 @@ impl GraphDb {
                 let _exec_span = info_span!("sparrowdb.execute").entered();
                 engine.execute_statement(bound.inner)?
             };
+
+            // Write lazily-loaded columns back to the shared cache.
+            engine.write_back_prop_index(&self.inner.prop_index);
 
             tracing::debug!(rows = result.rows.len(), "query complete");
             Ok(result)
@@ -651,11 +674,12 @@ impl GraphDb {
         let mut engine = {
             let _open_span = info_span!("sparrowdb.open_engine").entered();
             let csrs = open_csr_map(&self.inner.path);
-            Engine::new(
+            Engine::new_with_cached_index(
                 NodeStore::open(&self.inner.path)?,
                 catalog_snap,
                 csrs,
                 &self.inner.path,
+                Some(&self.inner.prop_index),
             )
             .with_deadline(deadline)
         };
@@ -664,6 +688,8 @@ impl GraphDb {
             let _exec_span = info_span!("sparrowdb.execute").entered();
             engine.execute_statement(bound.inner)?
         };
+
+        engine.write_back_prop_index(&self.inner.prop_index);
 
         tracing::debug!(rows = result.rows.len(), "query_with_timeout complete");
         Ok(result)
@@ -866,6 +892,7 @@ impl GraphDb {
         }
 
         tx.commit()?;
+        self.invalidate_prop_index();
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -924,11 +951,12 @@ impl GraphDb {
         let mut engine = {
             let _open_span = info_span!("sparrowdb.open_engine").entered();
             let csrs = open_csr_map(&self.inner.path);
-            Engine::new(
+            Engine::new_with_cached_index(
                 NodeStore::open(&self.inner.path)?,
                 catalog_snap,
                 csrs,
                 &self.inner.path,
+                Some(&self.inner.prop_index),
             )
             .with_params(params)
         };
@@ -937,6 +965,8 @@ impl GraphDb {
             let _exec_span = info_span!("sparrowdb.execute").entered();
             engine.execute_statement(bound.inner)?
         };
+
+        engine.write_back_prop_index(&self.inner.prop_index);
 
         tracing::debug!(rows = result.rows.len(), "query_with_params complete");
         Ok(result)
@@ -952,6 +982,7 @@ impl GraphDb {
         let mut tx = self.begin_write()?;
         let node_id = tx.merge_node(&m.label, props.clone())?;
         tx.commit()?;
+        self.invalidate_prop_index();
 
         // If the statement has a RETURN clause, project the merged node's properties.
         if let Some(ref ret) = m.return_clause {
@@ -1046,6 +1077,7 @@ impl GraphDb {
         let mut tx = self.begin_write()?;
         let node_id = tx.merge_node(&m.label, props.clone())?;
         tx.commit()?;
+        self.invalidate_prop_index();
         if let Some(ref ret) = m.return_clause {
             use sparrowdb_cypher::ast::Expr;
             type ExecValue = sparrowdb_execution::Value;
@@ -1128,6 +1160,7 @@ impl GraphDb {
             }
         }
         tx.commit()?;
+        self.invalidate_prop_index();
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1178,6 +1211,7 @@ impl GraphDb {
         }
 
         tx.commit()?;
+        self.invalidate_prop_index();
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1260,6 +1294,7 @@ impl GraphDb {
         }
 
         tx.commit()?;
+        self.invalidate_prop_index();
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1398,6 +1433,7 @@ impl GraphDb {
         }
 
         tx.commit()?;
+        self.invalidate_prop_index();
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1539,6 +1575,7 @@ impl GraphDb {
 
         // Single fsync commit — all mutations land in one WAL transaction.
         tx.commit()?;
+        self.invalidate_prop_index();
 
         // Merge early (CHECKPOINT/OPTIMIZE) and mutation results in order.
         let final_results = results
