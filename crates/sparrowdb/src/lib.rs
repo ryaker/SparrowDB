@@ -1885,6 +1885,37 @@ impl GraphDb {
         Ok(types)
     }
 
+    /// Return the top-`limit` nodes of the given `label` ordered by out-degree
+    /// descending (SPA-168).
+    ///
+    /// Each element of the returned `Vec` is `(node_id, out_degree)`.  Ties are
+    /// broken by ascending node id for determinism.
+    ///
+    /// This is an O(N log k) operation backed by the pre-computed
+    /// [`DegreeCache`](sparrowdb_execution::DegreeCache) — no edge scan is
+    /// performed at query time.
+    ///
+    /// Returns an empty `Vec` when `limit == 0`, the label is unknown, or the
+    /// label has no nodes.
+    ///
+    /// # Errors
+    /// Propagates I/O errors from opening the node store, CSR files, or
+    /// catalog.
+    pub fn top_degree_nodes(&self, label: &str, limit: usize) -> Result<Vec<(u64, u32)>> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let path = &self.inner.path;
+        let catalog = Catalog::open(path)?;
+        let label_id: u32 = match catalog.get_label(label)? {
+            Some(id) => id as u32,
+            None => return Ok(vec![]),
+        };
+        let csrs = open_csr_map(path);
+        let engine = Engine::new(NodeStore::open(path)?, catalog, csrs, path);
+        engine.top_k_by_degree(label_id, limit)
+    }
+
     /// Export the graph as a DOT (Graphviz) string for visualization.
     ///
     /// Queries all nodes via Cypher and reads edges directly from storage so
