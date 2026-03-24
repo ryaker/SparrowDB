@@ -247,6 +247,7 @@ struct DbInner {
     /// Optional 32-byte encryption key (SPA-98).  When `Some`, WAL payloads
     /// are encrypted with XChaCha20-Poly1305 via [`WalWriter::open_encrypted`].
     encryption_key: Option<[u8; 32]>,
+    unique_constraints: RwLock<HashSet<(u32, u32)>>,
 }
 
 // ── Write-lock guard (SPA-181: replaces 'static transmute UB) ────────────────
@@ -310,6 +311,7 @@ impl GraphDb {
                 versions: RwLock::new(VersionStore::default()),
                 node_versions: RwLock::new(NodeVersions::default()),
                 encryption_key: None,
+                unique_constraints: RwLock::new(HashSet::new()),
             }),
         })
     }
@@ -333,6 +335,7 @@ impl GraphDb {
                 versions: RwLock::new(VersionStore::default()),
                 node_versions: RwLock::new(NodeVersions::default()),
                 encryption_key: Some(key),
+                unique_constraints: RwLock::new(HashSet::new()),
             }),
         })
     }
@@ -440,6 +443,9 @@ impl GraphDb {
                 self.optimize()?;
                 return Ok(QueryResult::empty(vec![]));
             }
+            Statement::CreateConstraint { label, property } => {
+                return self.register_unique_constraint(label, property);
+            }
             _ => {}
         }
 
@@ -529,6 +535,9 @@ impl GraphDb {
                 self.optimize()?;
                 return Ok(QueryResult::empty(vec![]));
             }
+            Statement::CreateConstraint { label, property } => {
+                return self.register_unique_constraint(label, property);
+            }
             _ => {}
         }
 
@@ -576,6 +585,21 @@ impl GraphDb {
     /// relationship patterns, because edge creation must be routed through a
     /// write transaction so the relationship type is registered in the catalog
     /// and the edge is appended to the WAL (SPA-182).
+    fn register_unique_constraint(&self, label: &str, property: &str) -> Result<QueryResult> {
+        let catalog_snap = sparrowdb_catalog::catalog::Catalog::open(&self.inner.path)?;
+        let label_id: u32 = match catalog_snap.get_label(label)? {
+            Some(id) => id as u32,
+            None => return Ok(QueryResult::empty(vec![])),
+        };
+        let col_id = sparrowdb_common::col_id_of(property);
+        self.inner
+            .unique_constraints
+            .write()
+            .unwrap()
+            .insert((label_id, col_id));
+        Ok(QueryResult::empty(vec![]))
+    }
+
     fn execute_create_standalone(
         &self,
         create: &sparrowdb_cypher::ast::CreateStatement,
@@ -661,6 +685,27 @@ impl GraphDb {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
+            // SPA-234: enforce UNIQUE constraints before writing.
+            {
+                let constraints = self.inner.unique_constraints.read().unwrap();
+                if !constraints.is_empty() {
+                    let check_store = NodeStore::open(&self.inner.path)?;
+                    for (prop_name, val) in &named_props {
+                        let col_id = sparrowdb_common::col_id_of(prop_name);
+                        if constraints.contains(&(label_id, col_id)) {
+                            let mut pidx = sparrowdb_storage::property_index::PropertyIndex::new();
+                            pidx.build_for(&check_store, label_id, col_id)?;
+                            let raw = check_store.encode_value(val)?;
+                            if !pidx.lookup(label_id, col_id, raw).is_empty() {
+                                return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                                    "UNIQUE constraint violation: label \"{label}\" already has a node with {prop_name} = {:?}", val
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+
             let node_id = tx.create_node_named(label_id, &named_props)?;
 
             // Record the binding so edge patterns can resolve (src_var, dst_var).
@@ -720,16 +765,22 @@ impl GraphDb {
         let catalog_snap = Catalog::open(&self.inner.path)?;
         let bound = bind(stmt, &catalog_snap)?;
 
+        use sparrowdb_cypher::ast::Statement;
+        if let Statement::CreateConstraint { label, property } = &bound.inner {
+            return self.register_unique_constraint(label, property);
+        }
         if Engine::is_mutation(&bound.inner) {
-            // Mutation executors (execute_merge, execute_match_mutate, execute_match_create)
-            // call expr_to_value which maps Literal::Param(_) → Int64(0), so any $param
-            // in a MERGE/SET/CREATE would be silently written as 0/null rather than the
-            // supplied value.  Fail fast until mutation parameter binding is implemented.
-            return Err(Error::InvalidArgument(
-                "execute_with_params does not support mutation statements (MERGE/SET/CREATE); \
-                 use execute() for mutations without parameters"
-                    .into(),
-            ));
+            // Route mutations through params-aware helpers (SPA-218).
+            use sparrowdb_cypher::ast::Statement as Stmt;
+            return match bound.inner {
+                Stmt::Merge(ref m) => self.execute_merge_with_params(m, &params),
+                Stmt::MatchMutate(ref mm) => self.execute_match_mutate_with_params(mm, &params),
+                _ => Err(Error::InvalidArgument(
+                    "execute_with_params: parameterized MATCH...CREATE and standalone CREATE \
+                     are not yet supported; use MERGE or MATCH...SET with $params"
+                        .into(),
+                )),
+            };
         }
 
         let _span = info_span!("sparrowdb.query_with_params").entered();
@@ -839,6 +890,108 @@ impl GraphDb {
             });
         }
 
+        Ok(QueryResult::empty(vec![]))
+    }
+
+    /// Params-aware MERGE with $param support (SPA-218).
+    fn execute_merge_with_params(
+        &self,
+        m: &sparrowdb_cypher::ast::MergeStatement,
+        params: &HashMap<String, sparrowdb_execution::Value>,
+    ) -> Result<QueryResult> {
+        let props: HashMap<String, Value> = m
+            .props
+            .iter()
+            .map(|pe| {
+                let val = expr_to_value_with_params(&pe.value, params)?;
+                Ok((pe.key.clone(), val))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let mut tx = self.begin_write()?;
+        let node_id = tx.merge_node(&m.label, props.clone())?;
+        tx.commit()?;
+        if let Some(ref ret) = m.return_clause {
+            use sparrowdb_cypher::ast::Expr;
+            type ExecValue = sparrowdb_execution::Value;
+            let var = if m.var.is_empty() {
+                "n"
+            } else {
+                m.var.as_str()
+            };
+            let return_props: Vec<String> = ret
+                .items
+                .iter()
+                .filter_map(|item| match &item.expr {
+                    Expr::PropAccess { var: v, prop } if v.as_str() == var => Some(prop.clone()),
+                    _ => None,
+                })
+                .collect();
+            let return_col_ids: Vec<u32> =
+                return_props.iter().map(|name| fnv1a_col_id(name)).collect();
+            let store = NodeStore::open(&self.inner.path)?;
+            let stored = store.get_node(node_id, &return_col_ids).unwrap_or_default();
+            let mut row_vals: HashMap<String, ExecValue> = HashMap::new();
+            for (prop_name, col_id) in return_props.iter().zip(return_col_ids.iter()) {
+                if let Some((_, val)) = stored.iter().find(|(c, _)| c == col_id) {
+                    row_vals.insert(format!("{var}.{prop_name}"), storage_value_to_exec(val));
+                }
+            }
+            let columns: Vec<String> = ret
+                .items
+                .iter()
+                .map(|item| {
+                    item.alias.clone().unwrap_or_else(|| match &item.expr {
+                        Expr::PropAccess { var: v, prop } => format!("{v}.{prop}"),
+                        Expr::Var(v) => v.clone(),
+                        _ => "?".to_string(),
+                    })
+                })
+                .collect();
+            let row: Vec<ExecValue> = ret
+                .items
+                .iter()
+                .map(|item| eval_expr_merge(&item.expr, &row_vals))
+                .collect();
+            return Ok(QueryResult {
+                columns,
+                rows: vec![row],
+            });
+        }
+        Ok(QueryResult::empty(vec![]))
+    }
+
+    /// Params-aware MATCH...SET with $param support (SPA-218).
+    fn execute_match_mutate_with_params(
+        &self,
+        mm: &sparrowdb_cypher::ast::MatchMutateStatement,
+        params: &HashMap<String, sparrowdb_execution::Value>,
+    ) -> Result<QueryResult> {
+        let mut tx = self.begin_write()?;
+        let csrs = open_csr_map(&self.inner.path);
+        let engine = Engine::new(
+            NodeStore::open(&self.inner.path)?,
+            Catalog::open(&self.inner.path)?,
+            csrs,
+            &self.inner.path,
+        );
+        let matching_ids = engine.scan_match_mutate(mm)?;
+        if matching_ids.is_empty() {
+            return Ok(QueryResult::empty(vec![]));
+        }
+        match &mm.mutation {
+            sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
+                let sv = expr_to_value_with_params(value, params)?;
+                for node_id in matching_ids {
+                    tx.set_property(node_id, prop, sv.clone())?;
+                }
+            }
+            sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                for node_id in matching_ids {
+                    tx.delete_node(node_id)?;
+                }
+            }
+        }
+        tx.commit()?;
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1215,6 +1368,9 @@ impl GraphDb {
                     self.optimize()?;
                     early_results[i] = Some(QueryResult::empty(vec![]));
                 }
+                Statement::CreateConstraint { label, property } => {
+                    early_results[i] = Some(self.register_unique_constraint(label, property)?);
+                }
                 _ => {}
             }
         }
@@ -1563,6 +1719,34 @@ impl GraphDb {
             .sum();
 
         Ok((node_count, edge_count))
+    }
+
+    /// Return all node label names currently registered in the catalog (SPA-209).
+    ///
+    /// Labels are registered automatically the first time a node with that label
+    /// is created. The returned list is ordered by insertion (i.e. by `LabelId`).
+    pub fn labels(&self) -> Result<Vec<String>> {
+        let catalog = Catalog::open(&self.inner.path)?;
+        Ok(catalog
+            .list_labels()?
+            .into_iter()
+            .map(|(_id, name)| name)
+            .collect())
+    }
+
+    /// Return all relationship type names currently registered in the catalog (SPA-209).
+    ///
+    /// The returned list is deduplicated and sorted alphabetically.
+    pub fn relationship_types(&self) -> Result<Vec<String>> {
+        let catalog = Catalog::open(&self.inner.path)?;
+        let mut types: Vec<String> = catalog
+            .list_rel_tables()?
+            .into_iter()
+            .map(|(_src, _dst, rel_type)| rel_type)
+            .collect();
+        types.sort();
+        types.dedup();
+        Ok(types)
     }
 
     /// Export the graph as a DOT (Graphviz) string for visualization.
@@ -2542,6 +2726,50 @@ fn expr_to_value(expr: &sparrowdb_cypher::ast::Expr) -> Value {
     use sparrowdb_cypher::ast::Expr;
     match expr {
         Expr::Literal(lit) => literal_to_value(lit),
+        _ => Value::Int64(0),
+    }
+}
+
+fn literal_to_value_with_params(
+    lit: &sparrowdb_cypher::ast::Literal,
+    params: &HashMap<String, sparrowdb_execution::Value>,
+) -> Result<Value> {
+    use sparrowdb_cypher::ast::Literal;
+    match lit {
+        Literal::Int(n) => Ok(Value::Int64(*n)),
+        Literal::Float(f) => Ok(Value::Float(*f)),
+        Literal::Bool(b) => Ok(Value::Int64(if *b { 1 } else { 0 })),
+        Literal::String(s) => Ok(Value::Bytes(s.as_bytes().to_vec())),
+        Literal::Null => Ok(Value::Int64(0)),
+        Literal::Param(p) => match params.get(p.as_str()) {
+            Some(v) => Ok(exec_value_to_storage(v)),
+            None => Err(Error::InvalidArgument(format!(
+                "parameter ${p} was referenced in the query but not supplied"
+            ))),
+        },
+    }
+}
+
+fn expr_to_value_with_params(
+    expr: &sparrowdb_cypher::ast::Expr,
+    params: &HashMap<String, sparrowdb_execution::Value>,
+) -> Result<Value> {
+    use sparrowdb_cypher::ast::Expr;
+    match expr {
+        Expr::Literal(lit) => literal_to_value_with_params(lit, params),
+        _ => Err(Error::InvalidArgument(
+            "property value must be a literal or $parameter".into(),
+        )),
+    }
+}
+
+fn exec_value_to_storage(v: &sparrowdb_execution::Value) -> Value {
+    use sparrowdb_execution::Value as EV;
+    match v {
+        EV::Int64(n) => Value::Int64(*n),
+        EV::Float64(f) => Value::Float(*f),
+        EV::Bool(b) => Value::Int64(if *b { 1 } else { 0 }),
+        EV::String(s) => Value::Bytes(s.as_bytes().to_vec()),
         _ => Value::Int64(0),
     }
 }

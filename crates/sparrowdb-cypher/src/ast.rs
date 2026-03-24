@@ -479,4 +479,14 @@ pub enum Statement {
     Call(CallStatement),
     /// Multi-clause pipeline: MATCH/UNWIND … WITH … MATCH … WITH … RETURN (SPA-134).
     Pipeline(PipelineStatement),
+    /// `CREATE INDEX ON :Label(property)` — build a property index (SPA-235).
+    CreateIndex {
+        label: String,
+        property: String,
+    },
+    /// `CREATE CONSTRAINT ON (n:Label) ASSERT n.property IS UNIQUE` (SPA-234).
+    CreateConstraint {
+        label: String,
+        property: String,
+    },
 }

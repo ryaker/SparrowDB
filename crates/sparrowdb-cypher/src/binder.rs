@@ -73,6 +73,7 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
         Statement::Call(_) => {}
         // Pipeline: label binding is deferred to execution time (SPA-134).
         Statement::Pipeline(_) => {}
+        Statement::CreateIndex { .. } | Statement::CreateConstraint { .. } => {}
     }
     Ok(BoundStatement { inner: stmt })
 }
