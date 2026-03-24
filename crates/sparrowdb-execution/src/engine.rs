@@ -280,6 +280,20 @@ impl Engine {
         csrs: HashMap<u32, CsrForward>,
         db_root: &Path,
     ) -> Self {
+        Self::new_with_cached_index(store, catalog, csrs, db_root, None)
+    }
+
+    /// Create an engine, optionally seeding the property index from a shared
+    /// cache.  When `cached_index` is `Some`, the index is cloned out of the
+    /// `RwLock` at construction time so the engine can use `RefCell` internally
+    /// without holding the lock.
+    pub fn new_with_cached_index(
+        store: NodeStore,
+        catalog: Catalog,
+        csrs: HashMap<u32, CsrForward>,
+        db_root: &Path,
+        cached_index: Option<&std::sync::RwLock<PropertyIndex>>,
+    ) -> Self {
         // SPA-249 (lazy fix): property index is built on demand per
         // (label_id, col_id) pair via PropertyIndex::build_for, called from
         // execute_scan just before the first lookup for that pair.  Queries
@@ -330,10 +344,17 @@ impl Engine {
             rel_degree_stats: std::sync::OnceLock::new(),
         };
 
+        // If a shared cached index was provided, clone it out so we start
+        // with pre-loaded columns.  Otherwise start fresh.
+        let idx = cached_index
+            .and_then(|lock| lock.read().ok())
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
         Engine {
             snapshot,
             params: HashMap::new(),
-            prop_index: std::cell::RefCell::new(PropertyIndex::new()),
+            prop_index: std::cell::RefCell::new(idx),
             text_index: std::cell::RefCell::new(TextIndex::new()),
             deadline: None,
             degree_cache: std::cell::RefCell::new(None),
@@ -373,6 +394,20 @@ impl Engine {
     pub fn with_deadline(mut self, deadline: std::time::Instant) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// Merge the engine's lazily-populated property index into the shared cache
+    /// so that future read queries can skip I/O for columns we already loaded.
+    ///
+    /// Uses union/merge semantics: only columns not yet present in the shared
+    /// cache are added.  This prevents last-writer-wins races when multiple
+    /// concurrent read queries write back to the shared cache simultaneously.
+    ///
+    /// Called from `GraphDb` read paths after `execute_statement`.
+    pub fn write_back_prop_index(&self, shared: &std::sync::RwLock<PropertyIndex>) {
+        if let Ok(mut guard) = shared.write() {
+            guard.merge_from(&self.prop_index.borrow());
+        }
     }
 
     /// Check whether the per-query deadline has passed (SPA-254).
