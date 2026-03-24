@@ -228,7 +228,7 @@ pub fn load_node_file(
         id_map.insert(label, &ldbc_id, node_id);
         count += 1;
 
-        if count % BATCH_SIZE as u64 == 0 {
+        if count.is_multiple_of(BATCH_SIZE as u64) {
             tx.commit()?;
             tx = db.begin_write()?;
             eprintln!("[ldbc-load]   ... {count} {label} nodes written");
@@ -288,7 +288,7 @@ pub fn load_edge_file(
             }
         }
 
-        if count % BATCH_SIZE as u64 == 0 && count > 0 {
+        if count.is_multiple_of(BATCH_SIZE as u64) && count > 0 {
             tx.commit()?;
             tx = db.begin_write()?;
             eprintln!("[ldbc-load]   ... {count} {rel_type} edges written");
