@@ -424,14 +424,13 @@ fn fn_range(args: Vec<Value>) -> Result<Value> {
         ));
     }
     let mut values = Vec::new();
+    let mut i = start;
     if step > 0 {
-        let mut i = start;
         while i <= end {
             values.push(Value::Int64(i));
             i += step;
         }
     } else {
-        let mut i = start;
         while i >= end {
             values.push(Value::Int64(i));
             i += step;

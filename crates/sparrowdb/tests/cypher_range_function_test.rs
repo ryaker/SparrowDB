@@ -45,6 +45,23 @@ fn test_range_with_step() {
     assert_eq!(result.rows[0][0], expected);
 }
 
+// ── Range with negative step ─────────────────────────────────────────────────
+
+#[test]
+fn test_range_with_negative_step() {
+    let (_dir, db) = make_db();
+    let result = db.execute("RETURN range(5, 1, -1)").unwrap();
+    assert_eq!(result.rows.len(), 1);
+    let expected = Value::List(vec![
+        Value::Int64(5),
+        Value::Int64(4),
+        Value::Int64(3),
+        Value::Int64(2),
+        Value::Int64(1),
+    ]);
+    assert_eq!(result.rows[0][0], expected);
+}
+
 // ── Range in UNWIND ─────────────────────────────────────────────────────────
 
 #[test]

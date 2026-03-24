@@ -2855,8 +2855,7 @@ impl Engine {
                     let degree_col_name_deg = format!("degree({node_var})");
                     if col_name == &degree_col_name_out
                         || col_name == &degree_col_name_deg
-                        || col_name == "degree"
-                        || col_name == "out_degree"
+                        || matches!(col_name.as_str(), "degree" | "out_degree")
                     {
                         return Value::Int64(degree as i64);
                     }
