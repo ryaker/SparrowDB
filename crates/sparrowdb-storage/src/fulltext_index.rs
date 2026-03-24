@@ -28,9 +28,6 @@ use sparrowdb_common::{Error, Result};
 /// A full-text index for one named index configuration.
 #[derive(Debug)]
 pub struct FulltextIndex {
-    /// Logical name of this index.
-    #[allow(dead_code)]
-    name: String,
     /// Path of the `.fti` backing file.
     file_path: PathBuf,
     /// In-memory inverted index: term → BTreeSet<NodeId as u64>.
@@ -60,7 +57,6 @@ impl FulltextIndex {
         };
 
         Ok(FulltextIndex {
-            name: name.to_owned(),
             file_path,
             entries,
             dirty: false,

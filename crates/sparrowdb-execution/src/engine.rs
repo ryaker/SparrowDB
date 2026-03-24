@@ -1407,15 +1407,35 @@ impl Engine {
             // For each constrained (label_id, col_id) pair, check whether the
             // incoming value already exists in the property index.  If so,
             // return a constraint-violation error before writing the node.
+            //
+            // Only inline-encodable types (Int64 and short Bytes ≤ 7 bytes)
+            // are checked via the prop_index fast path.  Float values and
+            // long strings require heap storage and cannot be encoded with
+            // to_u64(); for those types we return an explicit error rather
+            // than panicking (StoreValue::Float::to_u64 is documented to
+            // panic for heap-backed values).
             for (col_id, store_val) in &props {
                 if self.unique_constraints.contains(&(label_id, *col_id)) {
-                    let raw = store_val.to_u64();
-                    let existing = self
+                    let raw = match store_val {
+                        StoreValue::Int64(_) => store_val.to_u64(),
+                        StoreValue::Bytes(b) if b.len() <= 7 => store_val.to_u64(),
+                        StoreValue::Bytes(_) => {
+                            return Err(sparrowdb_common::Error::InvalidArgument(
+                                "UNIQUE constraints on string values longer than 7 bytes are not yet supported".into(),
+                            ));
+                        }
+                        StoreValue::Float(_) => {
+                            return Err(sparrowdb_common::Error::InvalidArgument(
+                                "UNIQUE constraints on float values are not yet supported".into(),
+                            ));
+                        }
+                    };
+                    if !self
                         .prop_index
                         .borrow()
                         .lookup(label_id, *col_id, raw)
-                        .to_vec();
-                    if !existing.is_empty() {
+                        .is_empty()
+                    {
                         return Err(sparrowdb_common::Error::InvalidArgument(format!(
                             "unique constraint violation: label \"{label}\" already has a node with the same value for this property"
                         )));
@@ -1434,7 +1454,14 @@ impl Engine {
                 let mut idx = self.prop_index.borrow_mut();
                 for (col_id, store_val) in &props {
                     if self.unique_constraints.contains(&(label_id, *col_id)) {
-                        idx.insert(label_id, *col_id, slot, store_val.to_u64());
+                        // Only insert inline-encodable values; Float/long Bytes
+                        // were already rejected above before create_node was called.
+                        let raw = match store_val {
+                            StoreValue::Int64(_) => store_val.to_u64(),
+                            StoreValue::Bytes(b) if b.len() <= 7 => store_val.to_u64(),
+                            _ => continue,
+                        };
+                        idx.insert(label_id, *col_id, slot, raw);
                     }
                 }
             }

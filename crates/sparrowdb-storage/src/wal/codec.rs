@@ -573,7 +573,7 @@ impl WalRecord {
 ///
 /// Uses hardware acceleration (SSE4.2 / ARM CRC32C instructions) when
 /// available via the `crc32c` crate.
-pub fn compute_crc32c(data: &[u8]) -> u32 {
+pub(crate) fn compute_crc32c(data: &[u8]) -> u32 {
     crc32c::crc32c(data)
 }
 
