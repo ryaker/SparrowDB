@@ -8,8 +8,12 @@ use sparrowdb::GraphDb;
 use sparrowdb_execution::Value;
 use std::collections::HashMap;
 
+// ── Result types ──────────────────────────────────────────────────────────────
+
 /// A (firstName, lastName) pair returned by IC1 and IC2.
 pub type PersonName = (String, String);
+
+// ── Helper: extract String from a query Value ─────────────────────────────────
 
 fn value_to_string(v: &Value) -> String {
     match v {
@@ -38,6 +42,8 @@ fn rows_to_person_names(result: sparrowdb::QueryResult) -> Vec<PersonName> {
         .collect()
 }
 
+// ── IC1 — Friends within 3 hops named X ──────────────────────────────────────
+
 /// **IC1** — Find all persons reachable within 1–3 KNOWS hops from any person
 /// named `first_name`, where the friend's first name differs from the start
 /// person's first name.
@@ -62,6 +68,8 @@ pub fn ic1_friends_named(db: &GraphDb, first_name: &str) -> sparrowdb::Result<Ve
     Ok(rows_to_person_names(result))
 }
 
+// ── IC2 — Recent messages by friends (simplified: returns friend names) ────────
+
 /// **IC2** — Find direct friends of a person identified by `person_id`
 /// (the LDBC integer id stored as `ldbc_id`).
 ///
@@ -79,7 +87,10 @@ pub fn ic2_recent_friends(db: &GraphDb, person_id: i64) -> sparrowdb::Result<Vec
     Ok(rows_to_person_names(result))
 }
 
-/// **IC3** — Friends in countries X and Y. (Stub)
+// ── IC3–IC14 stubs ────────────────────────────────────────────────────────────
+
+/// **IC3** — Friends and friends-of-friends that have been to countries X and Y.
+/// (Stub — not yet implemented.)
 pub fn ic3_friends_in_countries(
     _db: &GraphDb,
     _person_id: i64,
@@ -87,110 +98,121 @@ pub fn ic3_friends_in_countries(
     _country_y: &str,
     _duration_days: i64,
 ) -> sparrowdb::Result<Vec<PersonName>> {
-    // TODO(SPA-146/IC3)
+    // TODO(SPA-146/IC3): implement friends-in-countries query
     Ok(Vec::new())
 }
 
-/// **IC4** — Top tags of recent posts by friends. (Stub)
+/// **IC4** — Top tags of recent posts by friends.
+/// (Stub — not yet implemented.)
 pub fn ic4_top_tags(
     _db: &GraphDb,
     _person_id: i64,
     _start_date: &str,
     _duration_days: i64,
 ) -> sparrowdb::Result<Vec<(String, i64)>> {
-    // TODO(SPA-146/IC4)
+    // TODO(SPA-146/IC4): implement top-tags query
     Ok(Vec::new())
 }
 
-/// **IC5** — Forums with recent activity from friends. (Stub)
+/// **IC5** — Forums with recent activity from friends.
+/// (Stub — not yet implemented.)
 pub fn ic5_forums_with_friends(
     _db: &GraphDb,
     _person_id: i64,
     _min_date: &str,
 ) -> sparrowdb::Result<Vec<(String, i64)>> {
-    // TODO(SPA-146/IC5)
+    // TODO(SPA-146/IC5): implement forums-with-friends query
     Ok(Vec::new())
 }
 
-/// **IC6** — Tag co-occurrence among friends. (Stub)
+/// **IC6** — Tags for posts in a given forum that friends have liked.
+/// (Stub — not yet implemented.)
 pub fn ic6_tag_co_occurrence(
     _db: &GraphDb,
     _person_id: i64,
     _tag_name: &str,
 ) -> sparrowdb::Result<Vec<(String, i64)>> {
-    // TODO(SPA-146/IC6)
+    // TODO(SPA-146/IC6): implement tag-co-occurrence query
     Ok(Vec::new())
 }
 
-/// **IC7** — Latest likes on the person's messages. (Stub)
+/// **IC7** — Latest likes on the person's messages.
+/// (Stub — not yet implemented.)
 pub fn ic7_latest_likes(_db: &GraphDb, _person_id: i64) -> sparrowdb::Result<Vec<PersonName>> {
-    // TODO(SPA-146/IC7)
+    // TODO(SPA-146/IC7): implement latest-likes query
     Ok(Vec::new())
 }
 
-/// **IC8** — Replies to the person's messages. (Stub)
+/// **IC8** — Replies to the person's messages.
+/// (Stub — not yet implemented.)
 pub fn ic8_replies(_db: &GraphDb, _person_id: i64) -> sparrowdb::Result<Vec<PersonName>> {
-    // TODO(SPA-146/IC8)
+    // TODO(SPA-146/IC8): implement replies query
     Ok(Vec::new())
 }
 
-/// **IC9** — Recent posts by friends. (Stub)
+/// **IC9** — Recent posts by friends.
+/// (Stub — not yet implemented.)
 pub fn ic9_recent_posts_by_friends(
     _db: &GraphDb,
     _person_id: i64,
     _max_date: &str,
 ) -> sparrowdb::Result<Vec<(PersonName, String)>> {
-    // TODO(SPA-146/IC9)
+    // TODO(SPA-146/IC9): implement recent-posts-by-friends query
     Ok(Vec::new())
 }
 
-/// **IC10** — Friend recommendations by birthday. (Stub)
+/// **IC10** — Friends with similar interests (same birthday month/day window).
+/// (Stub — not yet implemented.)
 pub fn ic10_friend_recommendations(
     _db: &GraphDb,
     _person_id: i64,
     _month: i64,
 ) -> sparrowdb::Result<Vec<PersonName>> {
-    // TODO(SPA-146/IC10)
+    // TODO(SPA-146/IC10): implement friend-recommendations query
     Ok(Vec::new())
 }
 
-/// **IC11** — Friends by job history. (Stub)
+/// **IC11** — Friends that worked at a given company before a given year.
+/// (Stub — not yet implemented.)
 pub fn ic11_job_referral(
     _db: &GraphDb,
     _person_id: i64,
     _country_name: &str,
     _work_from_year: i64,
 ) -> sparrowdb::Result<Vec<PersonName>> {
-    // TODO(SPA-146/IC11)
+    // TODO(SPA-146/IC11): implement job-referral query
     Ok(Vec::new())
 }
 
-/// **IC12** — Expert search by tag class. (Stub)
+/// **IC12** — Friends who replied to posts with a given tag class.
+/// (Stub — not yet implemented.)
 pub fn ic12_expert_search(
     _db: &GraphDb,
     _person_id: i64,
     _tag_class_name: &str,
 ) -> sparrowdb::Result<Vec<(PersonName, i64)>> {
-    // TODO(SPA-146/IC12)
+    // TODO(SPA-146/IC12): implement expert-search query
     Ok(Vec::new())
 }
 
-/// **IC13** — Shortest path via KNOWS. (Stub)
+/// **IC13** — Shortest path between two persons via KNOWS.
+/// (Stub — not yet implemented.)
 pub fn ic13_shortest_path(
     _db: &GraphDb,
     _person1_id: i64,
     _person2_id: i64,
 ) -> sparrowdb::Result<i64> {
-    // TODO(SPA-146/IC13)
+    // TODO(SPA-146/IC13): implement shortest-path query (requires BFS/path support)
     Ok(-1)
 }
 
-/// **IC14** — Weighted shortest path via KNOWS. (Stub)
+/// **IC14** — Weighted shortest path between two persons via KNOWS.
+/// (Stub — not yet implemented.)
 pub fn ic14_weighted_path(
     _db: &GraphDb,
     _person1_id: i64,
     _person2_id: i64,
 ) -> sparrowdb::Result<Vec<i64>> {
-    // TODO(SPA-146/IC14)
+    // TODO(SPA-146/IC14): implement weighted-shortest-path query
     Ok(Vec::new())
 }

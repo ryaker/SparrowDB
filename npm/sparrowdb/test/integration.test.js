@@ -346,4 +346,11 @@ describe('DISTINCT aggregation — SPA-172 regression', () => {
     const r = db.execute('MATCH (n:Tag) RETURN COUNT(DISTINCT n.name) AS uniq')
     assert.equal(Number(r.rows[0]['uniq']), 2, 'should count 2 distinct names')
   })
+
+  it('RETURN DISTINCT deduplicates repeated values', () => {
+    // SPA-172 fix: RETURN DISTINCT must eliminate duplicate rows.
+    // 'red' appears twice; DISTINCT should collapse it to one row.
+    const r = db.execute('MATCH (n:Tag) RETURN DISTINCT n.name')
+    assert.equal(r.rows.length, 2, 'should return 2 distinct names (red, blue)')
+  })
 })

@@ -2188,10 +2188,13 @@ impl Parser {
         self.expect_tok(&Token::Call)?;
 
         // Parse dotted procedure name: ident (. ident)*
-        let mut proc_name = self.expect_ident()?;
+        // Use advance_as_prop_name for all segments so that keyword tokens like
+        // `index` (Token::Index) are accepted within the dotted path
+        // (e.g. `db.index.fulltext.queryNodes`).
+        let mut proc_name = self.advance_as_prop_name()?;
         while matches!(self.peek(), Token::Dot) {
             self.advance(); // consume '.'
-            let part = self.expect_ident()?;
+            let part = self.advance_as_prop_name()?;
             proc_name.push('.');
             proc_name.push_str(&part);
         }
