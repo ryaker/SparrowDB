@@ -173,6 +173,45 @@ jobs:
             echo "No Python tests yet — skipping pytest (tests/python/ not found)"
           fi
 
+  # ── Node.js binding integration tests ─────────────────────────────────────
+  node-bindings:
+    name: Node.js binding integration tests
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build sparrowdb-node (.node binary)
+        run: |
+          cargo build --release -p sparrowdb-node
+          # Rename the platform artifact to the generic sparrowdb.node that
+          # index.js's fallback chain looks for.
+          ARTIFACT=$(ls target/release/libsparrowdb_node.so \
+                        target/release/libsparrowdb_node.dylib \
+                        target/release/sparrowdb_node.dll \
+                        2>/dev/null | head -1)
+          if [ -z "$ARTIFACT" ]; then
+            echo "ERROR: could not find compiled sparrowdb-node artifact" >&2
+            ls target/release/ >&2
+            exit 1
+          fi
+          cp "$ARTIFACT" npm/sparrowdb/sparrowdb.node
+          echo "Copied $ARTIFACT → npm/sparrowdb/sparrowdb.node"
+
+      - name: Run Node.js integration tests
+        run: node --test npm/sparrowdb/test/integration.test.js
+
   # ── Golden fixture integrity ───────────────────────────────────────────────
   fixtures:
     name: Golden fixture round-trips
