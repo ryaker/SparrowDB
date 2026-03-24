@@ -77,7 +77,7 @@ fn rel_degree_stats_field_is_accessible() {
     db.checkpoint().expect("checkpoint");
 
     let engine = build_engine(dir.path());
-    let stats = &engine.snapshot.rel_degree_stats;
+    let stats = engine.snapshot.rel_degree_stats();
 
     // After a checkpoint with at least one edge, the stats map must be non-empty.
     assert!(
@@ -126,7 +126,7 @@ fn rel_degree_stats_populated_after_checkpoint() {
     db.checkpoint().expect("checkpoint");
 
     let engine = build_engine(dir.path());
-    let stats = &engine.snapshot.rel_degree_stats;
+    let stats = engine.snapshot.rel_degree_stats();
 
     assert!(
         !stats.is_empty(),
