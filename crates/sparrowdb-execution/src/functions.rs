@@ -406,11 +406,9 @@ fn fn_rand(args: Vec<Value>) -> Result<Value> {
 
 // ── SPA-142: List functions ───────────────────────────────────────────────────
 
-/// `range(start, end[, step])` — returns the size of the range as `Int64`.
+/// `range(start, end[, step])` — returns a list of integers.
 ///
-/// openCypher `range()` returns a list; SparrowDB's `Value` has no `List`
-/// variant yet.  We return the element count here.  The primary use-case
-/// `UNWIND range(1,5) AS x` is handled separately in `eval_list_expr`.
+/// Matches openCypher semantics: `range(0, 5)` returns `[0,1,2,3,4,5]`.
 fn fn_range(args: Vec<Value>) -> Result<Value> {
     expect_min_arity("range", &args, 2)?;
     let start = as_int("range", &args[0])?;
@@ -425,19 +423,21 @@ fn fn_range(args: Vec<Value>) -> Result<Value> {
             "range(): step must not be zero".into(),
         ));
     }
-    // Count elements.
-    let count = if step > 0 {
-        if end >= start {
-            ((end - start) / step + 1).max(0)
-        } else {
-            0
+    let mut values = Vec::new();
+    if step > 0 {
+        let mut i = start;
+        while i <= end {
+            values.push(Value::Int64(i));
+            i += step;
         }
-    } else if end <= start {
-        ((start - end) / (-step) + 1).max(0)
     } else {
-        0
-    };
-    Ok(Value::Int64(count))
+        let mut i = start;
+        while i >= end {
+            values.push(Value::Int64(i));
+            i += step;
+        }
+    }
+    Ok(Value::List(values))
 }
 
 /// `head(list)` — first element of a list-like value.
