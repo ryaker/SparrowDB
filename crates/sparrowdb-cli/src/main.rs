@@ -466,10 +466,10 @@ fn parse_hex_key(hex: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         .into());
     }
     let mut key = [0u8; 32];
-    for i in 0..32 {
+    for (i, byte) in key.iter_mut().enumerate() {
         let start = i * 2;
         let end = start + 2;
-        key[i] = u8::from_str_radix(&hex[start..end], 16)
+        *byte = u8::from_str_radix(&hex[start..end], 16)
             .map_err(|_| format!("invalid hex sequence '{}' in --key", &hex[start..end]))?;
     }
     Ok(key)
