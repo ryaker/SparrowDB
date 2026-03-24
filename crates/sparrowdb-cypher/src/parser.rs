@@ -1148,7 +1148,12 @@ impl Parser {
         }
         loop {
             match self.peek() {
-                Token::Eof | Token::Semicolon | Token::Return | Token::With | Token::Merge | Token::On => break,
+                Token::Eof
+                | Token::Semicolon
+                | Token::Return
+                | Token::With
+                | Token::Merge
+                | Token::On => break,
                 _ => {
                     self.advance();
                 }
