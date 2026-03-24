@@ -187,3 +187,22 @@ jobs:
         run: |
           cargo test --workspace --test fixtures -- --nocapture \
             2>&1 || echo "No fixture tests yet — will add per phase"
+
+  # ── Ruby bindings (compile check) ─────────────────────────────────────────
+  ruby-bindings:
+    name: Ruby Bindings (compile check)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Ruby 3.3 with dev headers
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      - name: Compile sparrowdb-ruby
+        run: cargo check -p sparrowdb-ruby
