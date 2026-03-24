@@ -399,6 +399,23 @@ impl PropertyIndex {
         }
     }
 
+    /// Return the number of distinct values stored in the index for
+    /// `(label_id, col_id)`.
+    ///
+    /// Each unique raw-encoded value is one BTree key, so this equals the
+    /// cardinality (number of distinct values) seen at index-build time.
+    ///
+    /// Returns `0` if the column has not been indexed yet (i.e. `build_for`
+    /// has not been called for this pair).  Callers should ensure the index
+    /// has been built before calling this method.
+    pub fn n_distinct(&self, label_id: u32, col_id: u32) -> usize {
+        let key = IndexKey { label_id, col_id };
+        match self.index.get(&key) {
+            Some(btree) => btree.len(),
+            None => 0,
+        }
+    }
+
     /// Convert a `NodeId` to the corresponding slot index for this label.
     #[inline]
     pub fn node_id_to_slot(node_id: NodeId) -> u32 {
