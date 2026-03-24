@@ -682,6 +682,12 @@ impl GraphDb {
         // even before any nodes of this label exist.  Subsequent CREATE
         // statements look up the label_id from the persisted catalog and compare
         // against the same unique_constraints set.
+        //
+        // Acquire the writer lock so that catalog mutations here cannot race
+        // with an active WriteTx that also holds an open Catalog handle.
+        // Both paths derive next_label_id from their own in-memory counter, so
+        // concurrent catalog writes without this guard can assign duplicate IDs.
+        let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         let mut catalog = sparrowdb_catalog::catalog::Catalog::open(&self.inner.path)?;
         let label_id: u32 = match catalog.get_label(label)? {
             Some(id) => id as u32,
@@ -789,6 +795,12 @@ impl GraphDb {
             // handles produces two different raw u64 values.  Decoding each
             // stored raw u64 back to Value and comparing is correct for all
             // value types (inline integers/short strings AND heap-overflow strings).
+            //
+            // We check both the committed on-disk values (via check_store) AND
+            // nodes already buffered in tx.pending_ops (but not yet committed).
+            // Without the pending-ops check, two nodes with the same constrained
+            // value in one CREATE statement would both pass the on-disk check and
+            // then be committed together, violating the constraint.
             {
                 let constraints = self.inner.unique_constraints.read().unwrap();
                 if !constraints.is_empty() {
@@ -796,17 +808,31 @@ impl GraphDb {
                     for (prop_name, val) in &named_props {
                         let col_id = sparrowdb_common::col_id_of(prop_name);
                         if constraints.contains(&(label_id, col_id)) {
-                            // ABSENT = 0 (never written); TOMBSTONE = u64::MAX (deleted).
-                            let existing_raws = check_store
-                                .read_col_all(label_id, col_id)
-                                .unwrap_or_default();
-                            let conflict = existing_raws.iter().any(|&raw| {
+                            // Check committed on-disk values.
+                            // Propagate I/O errors — silencing them would disable
+                            // the constraint check on read failure.
+                            let existing_raws = check_store.read_col_all(label_id, col_id)?;
+                            let conflict_on_disk = existing_raws.iter().any(|&raw| {
                                 if raw == 0 || raw == u64::MAX {
                                     return false;
                                 }
                                 check_store.decode_raw_value(raw) == *val
                             });
-                            if conflict {
+                            // Check nodes buffered earlier in this same statement.
+                            let conflict_in_tx = tx.pending_ops.iter().any(|op| match op {
+                                PendingOp::NodeCreate {
+                                    label_id: pending_label_id,
+                                    props,
+                                    ..
+                                } => {
+                                    *pending_label_id == label_id
+                                        && props.iter().any(|(existing_col_id, existing_val)| {
+                                            *existing_col_id == col_id && *existing_val == *val
+                                        })
+                                }
+                                _ => false,
+                            });
+                            if conflict_on_disk || conflict_in_tx {
                                 return Err(sparrowdb_common::Error::InvalidArgument(format!(
                                     "UNIQUE constraint violation: label \"{label}\" already has a node with {prop_name} = {:?}", val
                                 )));

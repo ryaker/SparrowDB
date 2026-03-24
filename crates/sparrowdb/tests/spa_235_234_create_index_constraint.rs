@@ -8,6 +8,8 @@
 //! 3. Constraint applies only to the constrained label — another label with the
 //!    same property value is unaffected.
 //! 4. Different property values on the same constrained label are each allowed.
+//! 5. Two nodes with the same constrained value in a single CREATE statement are
+//!    rejected (catches the pending-ops gap in the uniqueness check).
 
 use sparrowdb::GraphDb;
 use sparrowdb_execution::types::Value;
@@ -117,6 +119,33 @@ fn unique_constraint_is_label_scoped() {
     // A different label with the same property value must be allowed.
     db.execute("CREATE (:Admin {email: 'carol@example.com'})")
         .expect("same value on a different label must not violate the constraint");
+}
+
+// ── SPA-234 Test 5b: Duplicate in same CREATE statement is rejected ───────────
+//
+// Before the pending-ops fix, two nodes in a single `CREATE (a),(b)` statement
+// both passed the on-disk uniqueness check (neither was committed yet), so the
+// duplicate would be silently committed.
+
+#[test]
+fn unique_constraint_rejects_duplicate_within_same_statement() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    db.execute("CREATE CONSTRAINT ON (n:Item) ASSERT n.sku IS UNIQUE")
+        .unwrap();
+
+    // Both nodes share the same sku — should fail even though neither is on disk
+    // at the time the second node's uniqueness check runs.
+    let err = db
+        .execute("CREATE (:Item {sku: 'X1'}), (:Item {sku: 'X1'})")
+        .expect_err("duplicate in one CREATE statement must fail");
+
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("unique") || msg.contains("constraint") || msg.contains("violation"),
+        "error message should mention constraint violation, got: {msg}"
+    );
 }
 
 // ── SPA-234 Test 6: Different values on constrained label all pass ─────────────
