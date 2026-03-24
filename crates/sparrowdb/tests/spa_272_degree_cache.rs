@@ -125,12 +125,12 @@ fn top_k_by_degree_correct_order_and_count() {
     slots.sort_unstable();
     assert_eq!(slots, vec![0u64, 1, 2, 3, 4]);
 
-    // Verify: out_degree O(1) lookup for individual slots.
-    assert_eq!(engine.degree_cache.out_degree(0), 9);
-    assert_eq!(engine.degree_cache.out_degree(1), 8);
-    assert_eq!(engine.degree_cache.out_degree(9), 0);
-    assert_eq!(engine.degree_cache.out_degree(10), 0);
-    assert_eq!(engine.degree_cache.out_degree(19), 0);
+    // Verify: out_degree O(1) lookup for individual slots via the public API.
+    assert_eq!(engine.out_degree(0), 9);
+    assert_eq!(engine.out_degree(1), 8);
+    assert_eq!(engine.out_degree(9), 0);
+    assert_eq!(engine.out_degree(10), 0);
+    assert_eq!(engine.out_degree(19), 0);
 }
 
 // ── Test 2: DegreeCache includes delta-log edges (no checkpoint) ──────────────
@@ -166,31 +166,11 @@ fn degree_cache_counts_delta_log_edges() {
     let engine = build_engine(db_path);
     let lid = label_id(db_path, "Hub");
 
-    assert_eq!(
-        engine.degree_cache.out_degree(0),
-        3,
-        "Hub 0 should have degree 3"
-    );
-    assert_eq!(
-        engine.degree_cache.out_degree(1),
-        2,
-        "Hub 1 should have degree 2"
-    );
-    assert_eq!(
-        engine.degree_cache.out_degree(2),
-        1,
-        "Hub 2 should have degree 1"
-    );
-    assert_eq!(
-        engine.degree_cache.out_degree(3),
-        0,
-        "Hub 3 should have degree 0"
-    );
-    assert_eq!(
-        engine.degree_cache.out_degree(4),
-        0,
-        "Hub 4 should have degree 0"
-    );
+    assert_eq!(engine.out_degree(0), 3, "Hub 0 should have degree 3");
+    assert_eq!(engine.out_degree(1), 2, "Hub 1 should have degree 2");
+    assert_eq!(engine.out_degree(2), 1, "Hub 2 should have degree 1");
+    assert_eq!(engine.out_degree(3), 0, "Hub 3 should have degree 0");
+    assert_eq!(engine.out_degree(4), 0, "Hub 4 should have degree 0");
 
     let top3 = engine.top_k_by_degree(lid, 3).expect("top_k");
     assert_eq!(top3.len(), 3);

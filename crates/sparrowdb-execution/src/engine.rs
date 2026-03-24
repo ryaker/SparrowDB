@@ -521,7 +521,9 @@ impl Engine {
 
         self.ensure_degree_cache();
         let cache = self.degree_cache.borrow();
-        let cache = cache.as_ref().expect("degree_cache populated by ensure_degree_cache");
+        let cache = cache
+            .as_ref()
+            .expect("degree_cache populated by ensure_degree_cache");
 
         let mut pairs: Vec<(u64, u32)> = (0..hwm)
             .map(|slot| (slot, cache.out_degree(slot)))
