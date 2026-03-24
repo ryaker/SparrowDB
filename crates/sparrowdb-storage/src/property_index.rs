@@ -139,6 +139,22 @@ impl PropertyIndex {
         self.loaded.clear();
     }
 
+    /// Merge column data from `other` into `self` using union semantics.
+    ///
+    /// Only columns present in `other.loaded` but absent from `self.loaded` are
+    /// incorporated — already-cached columns are left unchanged.  This avoids
+    /// last-writer-wins races when multiple concurrent reads write back to the
+    /// shared cache simultaneously.
+    pub fn merge_from(&mut self, other: &PropertyIndex) {
+        for key in &other.loaded {
+            if self.loaded.insert(*key) {
+                if let Some(btree) = other.index.get(key) {
+                    self.index.insert(*key, btree.clone());
+                }
+            }
+        }
+    }
+
     /// Lazily load the index for a single `(label_id, col_id)` pair.
     ///
     /// Reads `nodes/{label_id}/col_{col_id}.bin` and the corresponding tombstone

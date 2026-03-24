@@ -396,12 +396,17 @@ impl Engine {
         self
     }
 
-    /// Write back the engine's lazily-populated property index into the shared
-    /// cache so that future read queries can skip I/O for columns we already
-    /// loaded.  Called from `GraphDb` read paths after `execute_statement`.
+    /// Merge the engine's lazily-populated property index into the shared cache
+    /// so that future read queries can skip I/O for columns we already loaded.
+    ///
+    /// Uses union/merge semantics: only columns not yet present in the shared
+    /// cache are added.  This prevents last-writer-wins races when multiple
+    /// concurrent read queries write back to the shared cache simultaneously.
+    ///
+    /// Called from `GraphDb` read paths after `execute_statement`.
     pub fn write_back_prop_index(&self, shared: &std::sync::RwLock<PropertyIndex>) {
         if let Ok(mut guard) = shared.write() {
-            *guard = self.prop_index.borrow().clone();
+            guard.merge_from(&self.prop_index.borrow());
         }
     }
 

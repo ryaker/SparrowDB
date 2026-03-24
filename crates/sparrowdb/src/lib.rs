@@ -375,9 +375,11 @@ impl GraphDb {
     /// Called after every write-transaction commit so the next read query
     /// re-populates from the updated column files on disk.
     fn invalidate_prop_index(&self) {
-        if let Ok(mut guard) = self.inner.prop_index.write() {
-            guard.clear();
-        }
+        self.inner
+            .prop_index
+            .write()
+            .expect("prop_index RwLock poisoned")
+            .clear();
     }
 
     /// Open a read-only snapshot transaction.
