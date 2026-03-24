@@ -425,9 +425,15 @@ impl GraphDb {
     /// Called after CHECKPOINT / OPTIMIZE since those compact the delta log
     /// into new CSR base files.  Regular writes do NOT need this because
     /// the delta log is read separately by the engine.
+    ///
+    /// Only replaces the cache when `open_csr_map` succeeds in loading the
+    /// catalog; a failed reload (e.g. transient I/O error) leaves the
+    /// existing in-memory map intact rather than replacing it with an empty
+    /// map that would cause subsequent queries to miss all checkpointed edges.
     fn invalidate_csr_map(&self) {
-        *self.inner.csr_map.write().expect("csr_map RwLock poisoned") =
-            open_csr_map(&self.inner.path);
+        if let Ok(fresh) = try_open_csr_map(&self.inner.path) {
+            *self.inner.csr_map.write().expect("csr_map RwLock poisoned") = fresh;
+        }
     }
 
     /// Clone the cached CSR map for use in a single query (SPA-189).
@@ -3213,6 +3219,34 @@ fn open_csr_map(path: &Path) -> HashMap<u32, CsrForward> {
         }
     }
     map
+}
+
+/// Like [`open_csr_map`] but surfaces the catalog-open error so callers can
+/// decide whether to replace an existing cache.  Used by
+/// [`GraphDb::invalidate_csr_map`] to avoid clobbering a valid in-memory map
+/// with an empty one when the catalog is transiently unreadable.
+fn try_open_csr_map(path: &Path) -> Result<HashMap<u32, CsrForward>> {
+    let catalog = Catalog::open(path)?;
+    let mut map = HashMap::new();
+
+    let mut rel_ids: Vec<u32> = catalog
+        .list_rel_table_ids()
+        .into_iter()
+        .map(|(id, _, _, _)| id as u32)
+        .collect();
+
+    if !rel_ids.contains(&0u32) {
+        rel_ids.push(0u32);
+    }
+
+    for rid in rel_ids {
+        if let Ok(store) = EdgeStore::open(path, RelTableId(rid)) {
+            if let Ok(csr) = store.open_fwd() {
+                map.insert(rid, csr);
+            }
+        }
+    }
+    Ok(map)
 }
 
 // ── Storage-size helpers (SPA-171) ────────────────────────────────────────────
