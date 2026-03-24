@@ -23,6 +23,25 @@ fn value_to_string(v: &Value) -> String {
     }
 }
 
+fn rows_to_person_names(result: sparrowdb::QueryResult) -> Vec<PersonName> {
+    result
+        .rows
+        .iter()
+        .filter_map(|row| {
+            if row.len() < 2 {
+                return None;
+            }
+            let first = value_to_string(&row[0]);
+            let last = value_to_string(&row[1]);
+            if first.is_empty() && last.is_empty() {
+                None
+            } else {
+                Some((first, last))
+            }
+        })
+        .collect()
+}
+
 // ── IC1 — Friends within 3 hops named X ──────────────────────────────────────
 
 /// **IC1** — Find all persons reachable within 1–3 KNOWS hops from any person
@@ -42,32 +61,11 @@ pub fn ic1_friends_named(db: &GraphDb, first_name: &str) -> sparrowdb::Result<Ve
         RETURN DISTINCT friend.firstName, friend.lastName \
         ORDER BY friend.lastName LIMIT 20";
 
-    let mut params: HashMap<String, Value> = HashMap::new();
-    params.insert(
-        "firstName".to_string(),
-        Value::String(first_name.to_string()),
-    );
+    let params = HashMap::from([("firstName".into(), Value::String(first_name.into()))]);
 
     let result = db.execute_with_params(cypher, params)?;
 
-    let rows = result
-        .rows
-        .iter()
-        .filter_map(|row| {
-            if row.len() < 2 {
-                return None;
-            }
-            let first = value_to_string(&row[0]);
-            let last = value_to_string(&row[1]);
-            if first.is_empty() && last.is_empty() {
-                None
-            } else {
-                Some((first, last))
-            }
-        })
-        .collect();
-
-    Ok(rows)
+    Ok(rows_to_person_names(result))
 }
 
 // ── IC2 — Recent messages by friends (simplified: returns friend names) ────────
@@ -82,29 +80,11 @@ pub fn ic2_recent_friends(db: &GraphDb, person_id: i64) -> sparrowdb::Result<Vec
         RETURN friend.firstName, friend.lastName \
         LIMIT 20";
 
-    let mut params: HashMap<String, Value> = HashMap::new();
-    params.insert("personId".to_string(), Value::Int64(person_id));
+    let params = HashMap::from([("personId".into(), Value::Int64(person_id))]);
 
     let result = db.execute_with_params(cypher, params)?;
 
-    let rows = result
-        .rows
-        .iter()
-        .filter_map(|row| {
-            if row.len() < 2 {
-                return None;
-            }
-            let first = value_to_string(&row[0]);
-            let last = value_to_string(&row[1]);
-            if first.is_empty() && last.is_empty() {
-                None
-            } else {
-                Some((first, last))
-            }
-        })
-        .collect();
-
-    Ok(rows)
+    Ok(rows_to_person_names(result))
 }
 
 // ── IC3–IC14 stubs ────────────────────────────────────────────────────────────
