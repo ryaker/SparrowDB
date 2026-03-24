@@ -84,8 +84,9 @@ enum Commands {
         /// Path to the database directory
         #[arg(long)]
         db: PathBuf,
-        /// Hex-encoded 32-byte encryption key (not yet implemented — see SPA-97).
-        /// Passing this flag will return an error until at-rest encryption lands.
+        /// Hex-encoded 32-byte encryption key (64 hex characters).
+        /// When provided the database is opened with XChaCha20-Poly1305
+        /// at-rest encryption via GraphDb::open_encrypted().
         #[arg(long)]
         key: Option<String>,
     },
@@ -452,22 +453,42 @@ struct ServeResponse {
     error: Option<String>,
 }
 
+/// Decode a 64-character hex string into a 32-byte encryption key.
+///
+/// Accepts both lower- and upper-case hex digits.  Returns an error when the
+/// string is not exactly 64 hex characters.
+fn parse_hex_key(hex: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    if hex.len() != 64 {
+        return Err(format!(
+            "--key must be a 64-character hex string (got {} chars)",
+            hex.len()
+        )
+        .into());
+    }
+    let mut key = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid hex digit '{}' in --key", chunk[0] as char))?;
+        let lo = (chunk[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid hex digit '{}' in --key", chunk[1] as char))?;
+        key[i] = (hi as u8) << 4 | lo as u8;
+    }
+    Ok(key)
+}
+
 fn cmd_serve(
     db_path: &std::path::Path,
     key: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if key.is_some() {
-        // Encryption is not yet wired through to the storage layer (SPA-97 /
-        // SPA-98).  Refuse to continue rather than silently opening the
-        // database unencrypted and giving the caller a false sense of security.
-        return Err(
-            "sparrowdb serve --key: at-rest encryption is not yet available. \
-             Remove --key to open the database without encryption, or wait for \
-             SPA-97 to land."
-                .into(),
-        );
-    }
-    let db = sparrowdb::GraphDb::open(db_path)?;
+    let db = match key {
+        Some(hex) => {
+            let raw_key = parse_hex_key(hex)?;
+            sparrowdb::GraphDb::open_encrypted(db_path, raw_key)?
+        }
+        None => sparrowdb::GraphDb::open(db_path)?,
+    };
 
     let stdin = io::stdin();
     let stdout = io::stdout();
