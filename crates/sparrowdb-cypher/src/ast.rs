@@ -64,6 +64,11 @@ pub struct RelPattern {
     /// Maximum hops for variable-length paths (None = unbounded, capped at 10 internally).
     /// Only meaningful when `min_hops` is `Some`.
     pub max_hops: Option<u32>,
+    /// Inline property predicates / values on the relationship (SPA-178).
+    ///
+    /// In a MATCH context these act as filters; in a CREATE context they set
+    /// the initial property values on the new edge.
+    pub props: Vec<PropEntry>,
 }
 
 /// A path pattern: a sequence of alternating nodes and relationships.
