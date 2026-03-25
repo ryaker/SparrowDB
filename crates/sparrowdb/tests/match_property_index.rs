@@ -144,11 +144,13 @@ fn match_create_edge_oi_performance() {
         .unwrap();
     assert_eq!(r.rows.len(), 1, "uid:1 should have exactly one EDGE");
 
-    // Performance assertion: 1 000 index-backed lookups over 10 000 nodes
-    // must complete well within 5 seconds.
+    // Performance assertion: release builds must be fast; debug builds get a
+    // generous ceiling just to catch catastrophic O(N²) regressions.
+    let limit_ms: u128 = if cfg!(debug_assertions) { 30_000 } else { 5_000 };
     assert!(
-        elapsed.as_millis() < 5_000,
-        "Performance regression: {N_EDGES} MATCH…CREATE cycles over {N_NODES} nodes took {:?} — expected < 5 000 ms. O(N) scan may have regressed.",
-        elapsed
+        elapsed.as_millis() < limit_ms,
+        "Performance regression: {N_EDGES} MATCH…CREATE cycles over {N_NODES} nodes took {:?} — expected < {}ms. O(N) scan may have regressed.",
+        elapsed,
+        limit_ms
     );
 }
