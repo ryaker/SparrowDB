@@ -5437,6 +5437,7 @@ impl Engine {
         all_label_ids: &[u32],
         neighbors_buf: &mut std::collections::HashSet<(u64, u32)>,
         use_reachability: bool,
+        result_limit: usize,
     ) -> Vec<(u64, u32)> {
         const SAFETY_CAP: u32 = 10;
         let max_hops = max_hops.min(SAFETY_CAP);
@@ -5700,9 +5701,25 @@ impl Engine {
         let mut neighbors_buf: std::collections::HashSet<(u64, u32)> =
             std::collections::HashSet::new();
 
+        // Compute effective result limit: when no ORDER BY and no SKIP are present,
+        // we can stop collecting rows once we reach LIMIT (early exit).
+        // With ORDER BY or SKIP we must collect all rows before sorting/skipping.
+        let has_order_by = !m.order_by.is_empty();
+        let has_skip = m.skip.is_some();
+        let row_limit: usize = if has_order_by || has_skip {
+            usize::MAX
+        } else {
+            m.limit.map(|l| l as usize).unwrap_or(usize::MAX)
+        };
+
         for src_slot in 0..hwm_src {
             // SPA-254: check per-query deadline at every slot boundary.
             self.check_deadline()?;
+
+            // Early exit: already have enough rows for the LIMIT.
+            if rows.len() >= row_limit {
+                break;
+            }
 
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
 
@@ -5732,6 +5749,8 @@ impl Engine {
             // Use reachability BFS when RETURN DISTINCT is present and no path variable
             // is bound (issue #165). Otherwise use enumerative DFS for full path semantics.
             let use_reachability = m.distinct && rel_pat.var.is_empty();
+            // Pass remaining row budget into the BFS/DFS so it can stop early.
+            let remaining = row_limit.saturating_sub(rows.len());
             let dst_nodes = self.execute_variable_hops(
                 src_slot,
                 src_label_id,
@@ -5742,6 +5761,7 @@ impl Engine {
                 &all_label_ids,
                 &mut neighbors_buf,
                 use_reachability,
+                remaining,
             );
 
             for (dst_slot, actual_label_id) in dst_nodes {
