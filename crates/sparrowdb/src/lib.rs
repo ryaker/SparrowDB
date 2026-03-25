@@ -2898,6 +2898,16 @@ impl WriteTx {
             }
         }
 
+        // Step 5b: Persist HWMs for all labels that received new nodes in Step 5.
+        //
+        // create_node_at_slot() only advances the in-memory HWM and marks the
+        // label as dirty (hwm_dirty).  We flush all dirty HWMs here — once per
+        // commit — instead of once per node, avoiding an fsync storm during bulk
+        // imports (SPA-217 regression fix).  Crash safety is preserved: the WAL
+        // record written in Step 4 is already durable; on crash-recovery, the
+        // WAL replayer re-applies all NodeCreate ops and re-advances the HWM.
+        self.store.flush_hwms()?;
+
         // Step 6: Flush property updates to disk.
         // Use `upsert_node_col` so that columns added by `set_property` (which
         // may not have been initialised during `create_node`) are created and

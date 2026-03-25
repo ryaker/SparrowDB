@@ -26,7 +26,7 @@
 //!
 //! Upper 32 bits are `label_id`, lower 32 bits are the within-label slot number.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -165,6 +165,9 @@ pub struct NodeStore {
     root: PathBuf,
     /// In-memory high-water marks per label.  Loaded lazily from disk.
     hwm: HashMap<u32, u64>,
+    /// Labels whose in-memory HWM has been advanced but not yet persisted to
+    /// `hwm.bin`.  Flushed atomically by [`flush_hwms`] at transaction commit.
+    hwm_dirty: HashSet<u32>,
 }
 
 impl NodeStore {
@@ -173,6 +176,7 @@ impl NodeStore {
         Ok(NodeStore {
             root: db_root.to_path_buf(),
             hwm: HashMap::new(),
+            hwm_dirty: HashSet::new(),
         })
     }
 
@@ -536,6 +540,27 @@ impl NodeStore {
         self.label_dir(label_id).join("hwm.bin.tmp")
     }
 
+    /// Persist all dirty in-memory HWMs to disk atomically.
+    ///
+    /// Called **once per transaction commit** rather than once per node creation,
+    /// so that bulk imports do not incur one fsync per node (SPA-217 regression fix).
+    ///
+    /// Each dirty label's HWM is written via the same tmp+fsync+rename strategy
+    /// used by [`save_hwm`], preserving the SPA-211 crash-safety guarantee.
+    /// After all writes succeed the dirty set is cleared.
+    pub fn flush_hwms(&mut self) -> Result<()> {
+        let dirty: Vec<u32> = self.hwm_dirty.iter().copied().collect();
+        for label_id in dirty {
+            let hwm = match self.hwm.get(&label_id) {
+                Some(&v) => v,
+                None => continue,
+            };
+            self.save_hwm(label_id, hwm)?;
+        }
+        self.hwm_dirty.clear();
+        Ok(())
+    }
+
     /// Append a `u64` value to a column file.
     fn append_col(&self, label_id: u32, col_id: u32, slot: u32, value: u64) -> Result<()> {
         use std::io::{Seek, SeekFrom, Write};
@@ -729,40 +754,27 @@ impl NodeStore {
             return Err(e);
         }
 
-        // Advance the on-disk HWM to at least slot + 1.
-        // Always write to disk; in-memory HWM may have been speculatively
-        // advanced by peek_next_slot but the disk HWM may be lower.
+        // Advance the in-memory HWM to at least slot + 1 and mark the label
+        // dirty so that flush_hwms() will persist it at commit boundary.
+        //
+        // We do NOT call save_hwm here.  The caller (WriteTx::commit) is
+        // responsible for calling flush_hwms() once after all PendingOp::NodeCreate
+        // entries have been applied.  This avoids one fsync per node during bulk
+        // imports (SPA-217 regression fix) while preserving crash-safety: the WAL
+        // record is already durable at this point, so recovery can reconstruct the
+        // HWM if we crash before flush_hwms() completes.
+        //
+        // NOTE: peek_next_slot() may have already advanced self.hwm to slot+1,
+        // so new_hwm > mem_hwm might be false.  We mark the label dirty
+        // unconditionally so that flush_hwms() always writes through to disk.
         let new_hwm = slot as u64 + 1;
-        let disk_hwm = self.load_hwm(label_id)?;
-        if new_hwm > disk_hwm {
-            if let Err(e) = self.save_hwm(label_id, new_hwm) {
-                // Column bytes were already written; roll them back to preserve
-                // the atomicity guarantee (SPA-181).
-                for (col_id, original_size) in &original_sizes {
-                    let path = self.col_path(label_id, *col_id);
-                    if path.exists() {
-                        if let Err(rollback_err) = fs::OpenOptions::new()
-                            .write(true)
-                            .open(&path)
-                            .and_then(|f| f.set_len(*original_size))
-                        {
-                            eprintln!(
-                                "CRITICAL: Failed to roll back column file {} to size {}: {}. Data may be corrupt.",
-                                path.display(),
-                                original_size,
-                                rollback_err
-                            );
-                        }
-                    }
-                }
-                return Err(e);
-            }
-        }
-        // Keep in-memory HWM at least as high as new_hwm.
         let mem_hwm = self.hwm.get(&label_id).copied().unwrap_or(0);
         if new_hwm > mem_hwm {
             self.hwm.insert(label_id, new_hwm);
         }
+        // Always mark dirty — flush_hwms() must write the post-commit HWM even
+        // if peek_next_slot already set mem HWM == new_hwm.
+        self.hwm_dirty.insert(label_id);
 
         Ok(NodeId((label_id as u64) << 32 | slot as u64))
     }
