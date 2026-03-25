@@ -245,7 +245,12 @@ impl NodeStore {
 
     /// Read string bytes from the overflow heap given an `TAG_BYTES_OVERFLOW`
     /// tagged `u64` produced by [`append_to_string_heap`].
+    ///
+    /// Uses `seek + read_exact` to load only the `len` bytes at `offset`,
+    /// avoiding a full file load regardless of `strings.bin` size (SPA-208).
     fn read_from_string_heap(&self, tagged: u64) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+
         let arr = tagged.to_le_bytes();
         debug_assert_eq!(arr[7], TAG_BYTES_OVERFLOW, "not an overflow pointer");
 
@@ -258,16 +263,20 @@ impl NodeStore {
         let len = arr[5] as usize | ((arr[6] as usize) << 8);
 
         let path = self.strings_bin_path();
-        let file_bytes = fs::read(&path).map_err(Error::Io)?;
-        let end = offset as usize + len;
-        if file_bytes.len() < end {
-            return Err(Error::Corruption(format!(
-                "string heap too short: need {} bytes, have {}",
-                end,
-                file_bytes.len()
-            )));
-        }
-        Ok(file_bytes[offset as usize..end].to_vec())
+        let mut file = fs::File::open(&path).map_err(Error::Io)?;
+        file.seek(SeekFrom::Start(offset)).map_err(|e| {
+            Error::Corruption(format!(
+                "string heap seek failed (offset={offset}): {e}"
+            ))
+        })?;
+        let mut buf = vec![0u8; len];
+        file.read_exact(&mut buf).map_err(|e| {
+            Error::Corruption(format!(
+                "string heap too short: need {} bytes at offset {offset}: {e}",
+                len
+            ))
+        })?;
+        Ok(buf)
     }
 
     // ── Value encode / decode with overflow support ───────────────────────────
