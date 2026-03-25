@@ -202,6 +202,8 @@ enum WalMutation {
         dst: NodeId,
         rel_type: String,
     },
+    /// A specific directed edge was deleted.
+    EdgeDelete { src: NodeId, dst: NodeId, rel_type: String },
 }
 
 // ── Pending structural operations (SPA-181 buffering) ────────────────────────
@@ -228,6 +230,12 @@ enum PendingOp {
     NodeDelete { node_id: NodeId },
     /// Create an edge: append to the edge delta log.
     EdgeCreate {
+        src: NodeId,
+        dst: NodeId,
+        rel_table_id: RelTableId,
+    },
+    /// Delete an edge: rewrite the delta log excluding this record.
+    EdgeDelete {
         src: NodeId,
         dst: NodeId,
         rel_table_id: RelTableId,
@@ -2181,6 +2189,22 @@ impl GraphDb {
         dot.push_str("}\n");
         Ok(dot)
     }
+
+    /// Convenience wrapper: remove the directed edge `src → dst` of `rel_type`.
+    ///
+    /// Opens a single-operation write transaction, calls
+    /// [`WriteTx::delete_edge`], and commits.  Suitable for callers that need
+    /// to remove a specific edge without managing a transaction explicitly.
+    ///
+    /// Returns [`Error::WriterBusy`] if another write transaction is already
+    /// active; returns [`Error::InvalidArgument`] if the rel type or edge is
+    /// not found.
+    pub fn delete_edge(&self, src: NodeId, dst: NodeId, rel_type: &str) -> Result<()> {
+        let mut tx = self.begin_write()?;
+        tx.delete_edge(src, dst, rel_type)?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 /// Convenience wrapper — equivalent to [`GraphDb::open`].
@@ -2667,6 +2691,78 @@ impl WriteTx {
         Ok(edge_id)
     }
 
+    /// Delete the directed edge `src → dst` with the given relationship type.
+    ///
+    /// Resolves the relationship type to a `RelTableId` via the catalog, then
+    /// buffers an `EdgeDelete` operation.  At commit time the edge is excised
+    /// from the on-disk delta log.
+    ///
+    /// Returns [`Error::InvalidArgument`] if the relationship type is not
+    /// registered in the catalog, or if no matching edge record exists in the
+    /// delta log for the resolved table.
+    ///
+    /// Unblocks `SparrowOntology::init(force=true)` which needs to remove all
+    /// existing edges before re-seeding the ontology graph.
+    ///
+    /// [`commit`]: WriteTx::commit
+    pub fn delete_edge(&mut self, src: NodeId, dst: NodeId, rel_type: &str) -> Result<()> {
+        let src_label_id = (src.0 >> 32) as u16;
+        let dst_label_id = (dst.0 >> 32) as u16;
+
+        // Resolve the rel type in the catalog.  We do not create a new entry —
+        // deleting a non-existent rel type is always an error.
+        // The catalog's RelTableId is u64; EdgeStore's is RelTableId(u32).
+        let catalog_rel_id = self
+            .catalog
+            .get_rel_table(src_label_id, dst_label_id, rel_type)?
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "relationship type '{}' not found in catalog for labels ({src_label_id}, {dst_label_id})",
+                    rel_type
+                ))
+            })?;
+        let rel_table_id = RelTableId(catalog_rel_id as u32);
+
+        // If the edge was created in this same transaction (not yet committed),
+        // cancel the create rather than scheduling a delete.
+        let buffered_pos = self.pending_ops.iter().position(|op| {
+            matches!(
+                op,
+                PendingOp::EdgeCreate {
+                    src: os,
+                    dst: od,
+                    rel_table_id: ort,
+                } if *os == src && *od == dst && *ort == rel_table_id
+            )
+        });
+
+        if let Some(pos) = buffered_pos {
+            // Remove the buffered create and its corresponding WAL mutation.
+            self.pending_ops.remove(pos);
+            // The WalMutation vec is parallel to pending_ops only for structural
+            // ops; find and remove the matching EdgeCreate entry.
+            if let Some(wpos) = self.wal_mutations.iter().position(|m| {
+                matches!(m, WalMutation::EdgeCreate { src: ms, dst: md, .. } if *ms == src && *md == dst)
+            }) {
+                self.wal_mutations.remove(wpos);
+            }
+            return Ok(());
+        }
+
+        // Edge is on disk — schedule the deletion for commit time.
+        self.pending_ops.push(PendingOp::EdgeDelete {
+            src,
+            dst,
+            rel_table_id,
+        });
+        self.wal_mutations.push(WalMutation::EdgeDelete {
+            src,
+            dst,
+            rel_type: rel_type.to_string(),
+        });
+        Ok(())
+    }
+
     // ── MVCC conflict detection (SPA-128) ────────────────────────────────────
 
     /// Check for write-write conflicts before committing.
@@ -2790,6 +2886,14 @@ impl WriteTx {
                 } => {
                     let mut es = EdgeStore::open(&self.inner.path, rel_table_id)?;
                     es.create_edge(src, rel_table_id, dst)?;
+                }
+                PendingOp::EdgeDelete {
+                    src,
+                    dst,
+                    rel_table_id,
+                } => {
+                    let mut es = EdgeStore::open(&self.inner.path, rel_table_id)?;
+                    es.delete_edge(src, dst)?;
                 }
             }
         }
@@ -2964,6 +3068,17 @@ fn write_mutation_wal(
                         dst: dst.0,
                         rel_type: rel_type.clone(),
                         props: vec![],
+                    },
+                )?;
+            }
+            WalMutation::EdgeDelete { src, dst, rel_type } => {
+                wal.append(
+                    WalRecordKind::EdgeDelete,
+                    txn,
+                    WalPayload::EdgeDelete {
+                        src: src.0,
+                        dst: dst.0,
+                        rel_type: rel_type.clone(),
                     },
                 )?;
             }

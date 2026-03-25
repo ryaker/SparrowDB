@@ -61,6 +61,8 @@ pub enum WalRecordKind {
     NodeDelete = 0x12,
     /// Create a new edge (Phase 7 mutation).
     EdgeCreate = 0x13,
+    /// Delete an existing edge (Phase 7 mutation).
+    EdgeDelete = 0x14,
 }
 
 impl WalRecordKind {
@@ -76,6 +78,7 @@ impl WalRecordKind {
             0x11 => Ok(Self::NodeUpdate),
             0x12 => Ok(Self::NodeDelete),
             0x13 => Ok(Self::EdgeCreate),
+            0x14 => Ok(Self::EdgeDelete),
             other => Err(Error::Corruption(format!(
                 "unknown WAL record kind: {other:#x}"
             ))),
@@ -138,6 +141,8 @@ pub enum WalPayload {
         rel_type: String,
         props: Vec<WalProp>,
     },
+    /// Phase 7 — a specific directed edge was deleted.
+    EdgeDelete { src: u64, dst: u64, rel_type: String },
 }
 
 // ── Payload encoding helpers ──────────────────────────────────────────────────
@@ -265,6 +270,13 @@ impl WalPayload {
                 buf
             }
             WalPayload::NodeDelete { node_id } => node_id.to_le_bytes().to_vec(),
+            WalPayload::EdgeDelete { src, dst, rel_type } => {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&src.to_le_bytes());
+                buf.extend_from_slice(&dst.to_le_bytes());
+                buf.extend_from_slice(&encode_str(rel_type));
+                buf
+            }
             WalPayload::EdgeCreate {
                 edge_id,
                 src,
@@ -317,7 +329,8 @@ impl WalPayload {
             WalRecordKind::NodeCreate
             | WalRecordKind::NodeUpdate
             | WalRecordKind::NodeDelete
-            | WalRecordKind::EdgeCreate => Self::decode_plaintext(kind, bytes),
+            | WalRecordKind::EdgeCreate
+            | WalRecordKind::EdgeDelete => Self::decode_plaintext(kind, bytes),
         }
     }
 
@@ -432,6 +445,16 @@ impl WalPayload {
                     rel_type,
                     props,
                 })
+            }
+            WalRecordKind::EdgeDelete => {
+                // src(8) + dst(8) + rel_type(variable)
+                if bytes.len() < 16 {
+                    return Err(Error::Corruption("EdgeDelete payload too short".into()));
+                }
+                let src = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let dst = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                let (rel_type, _) = decode_str(bytes, 16)?;
+                Ok(WalPayload::EdgeDelete { src, dst, rel_type })
             }
         }
     }

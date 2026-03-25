@@ -335,6 +335,53 @@ impl EdgeStore {
         Ok(())
     }
 
+    /// Remove the first delta-log record matching `(src, dst)` from this store.
+    ///
+    /// The delta log is rewritten in-place with the matching record excised.
+    /// Returns [`Error::InvalidArgument`] if no such record exists.
+    ///
+    /// This is an O(n) operation proportional to the current delta log size.
+    /// For bulk deletions, prefer a CHECKPOINT after all deletions are staged.
+    pub fn delete_edge(&mut self, src: NodeId, dst: NodeId) -> Result<()> {
+        let mut records = self.read_delta()?;
+
+        // Find the first record that matches (src, dst); rel_id is implicit from
+        // the store's own rel_table_id.
+        let pos = records
+            .iter()
+            .position(|r| r.src == src && r.dst == dst)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "edge {src:?} → {dst:?} not found in rel_table {:?}",
+                    self.rel_table_id
+                ))
+            })?;
+
+        records.remove(pos);
+
+        // Rewrite the entire delta log without the removed record.
+        // Write to a temp file then rename for crash-safety.
+        let tmp_path = self.rel_dir.join("delta.log.tmp");
+        {
+            use std::io::Write as IoWrite;
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .map_err(Error::Io)?;
+            for r in &records {
+                f.write_all(&r.encode()).map_err(Error::Io)?;
+            }
+            f.flush().map_err(Error::Io)?;
+        }
+        fs::rename(&tmp_path, self.delta_path()).map_err(Error::Io)?;
+
+        // Update the in-memory counter to reflect the new record count.
+        self.next_edge_id = records.len() as u64;
+        Ok(())
+    }
+
     /// Open the CSR forward file written by [`checkpoint`].
     pub fn open_fwd(&self) -> Result<CsrForward> {
         CsrForward::open(&self.fwd_path())
