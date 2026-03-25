@@ -3027,6 +3027,17 @@ impl WriteTx {
 
         // Step 5: Apply buffered structural operations to disk (SPA-181).
         // WAL is already durable at this point; a crash here is safe.
+        //
+        // SPA-212 (write-amplification fix): NodeCreate ops are collected into a
+        // single batch and written via `batch_write_node_creates`, which opens
+        // each (label_id, col_id) file only once regardless of how many nodes
+        // share that column.  This reduces file-open syscalls from O(nodes×cols)
+        // to O(labels×cols) per transaction commit.
+        let mut col_writes: Vec<(u32, u32, u32, u64, bool)> = Vec::new();
+        // All (label_id, slot) pairs for created nodes — needed for HWM
+        // advancement, even when a node has zero properties.
+        let mut node_slots: Vec<(u32, u32)> = Vec::new();
+
         for op in self.pending_ops.drain(..) {
             match op {
                 PendingOp::NodeCreate {
@@ -3034,7 +3045,14 @@ impl WriteTx {
                     slot,
                     props,
                 } => {
-                    self.store.create_node_at_slot(label_id, slot, &props)?;
+                    // Track this node's (label_id, slot) for HWM advancement.
+                    node_slots.push((label_id, slot));
+                    // Encode each property value and push (label_id, col_id,
+                    // slot, raw_u64, is_present) into the batch buffer.
+                    for (col_id, ref val) in props {
+                        let raw = self.store.encode_value(val)?;
+                        col_writes.push((label_id, col_id, slot, raw, true));
+                    }
                 }
                 PendingOp::NodeDelete { node_id } => {
                     self.store.tombstone_node(node_id)?;
@@ -3063,14 +3081,18 @@ impl WriteTx {
             }
         }
 
+        // Flush all NodeCreate column writes in one batched call.
+        // O(labels × cols) file opens instead of O(nodes × cols).
+        self.store.batch_write_node_creates(col_writes, &node_slots)?;
+
         // Step 5b: Persist HWMs for all labels that received new nodes in Step 5.
         //
-        // create_node_at_slot() only advances the in-memory HWM and marks the
-        // label as dirty (hwm_dirty).  We flush all dirty HWMs here — once per
-        // commit — instead of once per node, avoiding an fsync storm during bulk
-        // imports (SPA-217 regression fix).  Crash safety is preserved: the WAL
-        // record written in Step 4 is already durable; on crash-recovery, the
-        // WAL replayer re-applies all NodeCreate ops and re-advances the HWM.
+        // batch_write_node_creates() advances the in-memory HWM and marks
+        // labels dirty (hwm_dirty).  We flush all dirty HWMs here — once per
+        // commit — avoiding an fsync storm during bulk imports (SPA-217
+        // regression fix).  Crash safety is preserved: the WAL record written
+        // in Step 4 is already durable; on crash-recovery, the WAL replayer
+        // re-applies all NodeCreate ops and re-advances the HWM.
         self.store.flush_hwms()?;
 
         // Step 6: Flush property updates to disk.

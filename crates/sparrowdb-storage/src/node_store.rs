@@ -780,6 +780,227 @@ impl NodeStore {
         Ok(NodeId((label_id as u64) << 32 | slot as u64))
     }
 
+    /// Batch-write column data for multiple nodes created in a single transaction
+    /// commit (SPA-212 write-amplification fix).
+    ///
+    /// # Why this exists
+    ///
+    /// The naive path calls `create_node_at_slot` per node, which opens and
+    /// closes every column file once per node.  For a transaction that creates
+    /// `N` nodes each with `C` columns, that is `O(N × C)` file-open/close
+    /// syscalls.
+    ///
+    /// This method instead:
+    /// 1. Accepts pre-encoded `(label_id, col_id, slot, raw_value, is_present)`
+    ///    tuples from the caller (value encoding happens in `commit()` before
+    ///    the call).
+    /// 2. Sorts by `(label_id, col_id)` so all writes to the same column file
+    ///    are contiguous.
+    /// 3. Opens each `(label_id, col_id)` file exactly **once**, writes all
+    ///    slots for that column, then closes it — reducing file opens to
+    ///    `O(labels × cols)`.
+    /// 4. Updates each null-bitmap file once per `(label_id, col_id)` group.
+    ///
+    /// HWM advances are applied for every `(label_id, slot)` in `node_slots`,
+    /// exactly as `create_node_at_slot` would do them.  `node_slots` must
+    /// include **all** created nodes — including those with zero properties —
+    /// so that the HWM is advanced even for property-less nodes.
+    ///
+    /// # Rollback
+    ///
+    /// On I/O failure the method truncates every file that was opened back to
+    /// its pre-call size, matching the rollback contract of
+    /// `create_node_at_slot`.
+    pub fn batch_write_node_creates(
+        &mut self,
+        // (label_id, col_id, slot, raw_u64, is_present)
+        mut writes: Vec<(u32, u32, u32, u64, bool)>,
+        // All (label_id, slot) pairs for every created node, including those
+        // with zero properties.
+        node_slots: &[(u32, u32)],
+    ) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        if writes.is_empty() && node_slots.is_empty() {
+            return Ok(());
+        }
+
+        // Sort by (label_id, col_id, slot) so all writes to the same file are
+        // contiguous.
+        writes.sort_unstable_by_key(|&(lid, cid, slot, _, _)| (lid, cid, slot));
+
+        // Snapshot original sizes for rollback.  We only need one entry per
+        // (label_id, col_id) pair.
+        let mut original_sizes: Vec<(u32, u32, PathBuf, u64)> = Vec::new();
+        {
+            let mut prev_key: Option<(u32, u32)> = None;
+            for &(lid, cid, _, _, _) in &writes {
+                let key = (lid, cid);
+                if prev_key == Some(key) {
+                    continue;
+                }
+                prev_key = Some(key);
+                let path = self.col_path(lid, cid);
+                let original = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                original_sizes.push((lid, cid, path, original));
+            }
+        }
+        // Also snapshot null-bitmap files (one per col group).
+        let mut bitmap_originals: Vec<(u32, u32, PathBuf, u64)> = Vec::new();
+        {
+            let mut prev_key: Option<(u32, u32)> = None;
+            for &(lid, cid, _, _, is_present) in &writes {
+                if !is_present {
+                    continue;
+                }
+                let key = (lid, cid);
+                if prev_key == Some(key) {
+                    continue;
+                }
+                prev_key = Some(key);
+                let path = self.null_bitmap_path(lid, cid);
+                let original = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                bitmap_originals.push((lid, cid, path, original));
+            }
+        }
+
+        let write_result = (|| -> Result<()> {
+            let mut i = 0;
+            while i < writes.len() {
+                let (lid, cid, _, _, _) = writes[i];
+
+                // Find the end of this (label_id, col_id) group.
+                let group_start = i;
+                while i < writes.len() && writes[i].0 == lid && writes[i].1 == cid {
+                    i += 1;
+                }
+                let group = &writes[group_start..i];
+
+                // ── Column file ──────────────────────────────────────────────
+                let path = self.col_path(lid, cid);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(Error::Io)?;
+                }
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .map_err(Error::Io)?;
+
+                let mut current_len = file.seek(SeekFrom::End(0)).map_err(Error::Io)?;
+
+                for &(_, _, slot, raw_value, _) in group {
+                    let expected_offset = slot as u64 * 8;
+                    // Pad with zeros for any skipped slots.
+                    if current_len < expected_offset {
+                        file.seek(SeekFrom::Start(current_len)).map_err(Error::Io)?;
+                        const CHUNK: usize = 65536;
+                        let zeros = [0u8; CHUNK];
+                        let mut remaining = (expected_offset - current_len) as usize;
+                        while remaining > 0 {
+                            let n = remaining.min(CHUNK);
+                            file.write_all(&zeros[..n]).map_err(Error::Io)?;
+                            remaining -= n;
+                        }
+                        current_len = expected_offset;
+                    }
+                    // Seek to exact slot and write.
+                    file.seek(SeekFrom::Start(expected_offset))
+                        .map_err(Error::Io)?;
+                    file.write_all(&raw_value.to_le_bytes()).map_err(Error::Io)?;
+                    // Advance current_len to reflect what we wrote.
+                    let after = expected_offset + 8;
+                    if after > current_len {
+                        current_len = after;
+                    }
+                }
+
+                // ── Null bitmap (one read-modify-write per col group) ────────
+                let present_slots: Vec<u32> = group
+                    .iter()
+                    .filter(|&&(_, _, _, _, is_present)| is_present)
+                    .map(|&(_, _, slot, _, _)| slot)
+                    .collect();
+
+                if !present_slots.is_empty() {
+                    let bmap_path = self.null_bitmap_path(lid, cid);
+                    if let Some(parent) = bmap_path.parent() {
+                        fs::create_dir_all(parent).map_err(Error::Io)?;
+                    }
+                    let mut bits = if bmap_path.exists() {
+                        fs::read(&bmap_path).map_err(Error::Io)?
+                    } else {
+                        vec![]
+                    };
+                    for slot in present_slots {
+                        let byte_idx = (slot / 8) as usize;
+                        let bit_idx = slot % 8;
+                        if bits.len() <= byte_idx {
+                            bits.resize(byte_idx + 1, 0);
+                        }
+                        bits[byte_idx] |= 1 << bit_idx;
+                    }
+                    fs::write(&bmap_path, &bits).map_err(Error::Io)?;
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            // Roll back column files.
+            for (_, _, path, original_size) in &original_sizes {
+                if path.exists() {
+                    if let Err(rollback_err) = fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .and_then(|f| f.set_len(*original_size))
+                    {
+                        eprintln!(
+                            "CRITICAL: Failed to roll back column file {} to size {}: {}. Data may be corrupt.",
+                            path.display(),
+                            original_size,
+                            rollback_err
+                        );
+                    }
+                }
+            }
+            // Roll back null bitmap files.
+            for (_, _, path, original_size) in &bitmap_originals {
+                if path.exists() {
+                    if let Err(rollback_err) = fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .and_then(|f| f.set_len(*original_size))
+                    {
+                        eprintln!(
+                            "CRITICAL: Failed to roll back null bitmap file {} to size {}: {}. Data may be corrupt.",
+                            path.display(),
+                            original_size,
+                            rollback_err
+                        );
+                    }
+                }
+            }
+            return Err(e);
+        }
+
+        // Advance HWMs using the explicit node_slots list so that nodes with
+        // zero properties also advance the HWM, matching the contract of
+        // create_node_at_slot.
+        for &(lid, slot) in node_slots {
+            let new_hwm = slot as u64 + 1;
+            let mem_hwm = self.hwm.get(&lid).copied().unwrap_or(0);
+            if new_hwm > mem_hwm {
+                self.hwm.insert(lid, new_hwm);
+            }
+            self.hwm_dirty.insert(lid);
+        }
+
+        Ok(())
+    }
+
     /// Create a new node in `label_id` with the given properties.
     ///
     /// Returns the new [`NodeId`] packed as `(label_id << 32) | slot`.
