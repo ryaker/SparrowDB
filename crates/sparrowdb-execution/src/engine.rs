@@ -3846,6 +3846,20 @@ impl Engine {
                 Box::new(0..hwm)
             };
 
+        // SPA-198: LIMIT pushdown — compute an early-exit cap so we can break
+        // out of the scan loop once we have enough rows.  This is only safe
+        // when there is no aggregation, no ORDER BY, and no DISTINCT (all of
+        // which require the full result set before they can operate).
+        let scan_cap: usize = if !use_eval_path && !m.distinct && m.order_by.is_empty() {
+            match (m.skip, m.limit) {
+                (Some(s), Some(l)) => (s as usize).saturating_add(l as usize),
+                (None, Some(l)) => l as usize,
+                _ => usize::MAX,
+            }
+        } else {
+            usize::MAX
+        };
+
         for slot in slot_iter {
             // SPA-254: check per-query deadline at every slot boundary.
             self.check_deadline()?;
@@ -3954,6 +3968,10 @@ impl Engine {
                     &self.snapshot.store,
                 );
                 rows.push(row);
+                // SPA-198: early exit when we have enough rows for SKIP+LIMIT.
+                if rows.len() >= scan_cap {
+                    break;
+                }
             }
         }
 
