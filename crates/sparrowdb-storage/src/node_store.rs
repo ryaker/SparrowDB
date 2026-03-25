@@ -426,27 +426,114 @@ impl NodeStore {
     }
 
     /// Read the high-water mark for `label_id` from disk (or return 0).
+    ///
+    /// Recovery path (SPA-211): if `hwm.bin` is missing or corrupt but
+    /// `hwm.bin.tmp` exists (leftover from a previous crashed write), we
+    /// promote the tmp file to `hwm.bin` and use its value.
     fn load_hwm(&self, label_id: u32) -> Result<u64> {
         let path = self.hwm_path(label_id);
-        if !path.exists() {
-            return Ok(0);
+        let tmp_path = self.hwm_tmp_path(label_id);
+
+        // Try to read the canonical file first.
+        let try_read = |p: &std::path::Path| -> Option<u64> {
+            let bytes = fs::read(p).ok()?;
+            if bytes.len() < 8 {
+                return None;
+            }
+            Some(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+        };
+
+        if path.exists() {
+            match try_read(&path) {
+                Some(v) => return Ok(v),
+                None => {
+                    // hwm.bin exists but is corrupt — fall through to tmp recovery.
+                }
+            }
         }
-        let bytes = fs::read(&path).map_err(Error::Io)?;
-        if bytes.len() < 8 {
-            return Err(Error::Corruption(format!(
-                "hwm.bin for label {label_id} is truncated"
-            )));
+
+        // hwm.bin is absent or unreadable.  Check for a tmp leftover.
+        if tmp_path.exists() {
+            if let Some(v) = try_read(&tmp_path) {
+                // Promote: atomically rename tmp → canonical so the next open
+                // is clean even if we crash again immediately here.
+                let _ = fs::rename(&tmp_path, &path);
+                return Ok(v);
+            }
         }
-        Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+
+        // Last resort: infer the HWM from the sizes of the column files.
+        //
+        // Each `col_{n}.bin` is a flat array of 8-byte u64 LE values, one per
+        // slot.  The number of slots written equals `file_len / 8`.  If
+        // `hwm.bin` is corrupt we can reconstruct the HWM as the maximum slot
+        // count across all column files for this label.
+        {
+            let inferred = self.infer_hwm_from_cols(label_id);
+            if inferred > 0 {
+                // Persist the recovered HWM so the next open is clean.
+                let _ = self.save_hwm(label_id, inferred);
+                return Ok(inferred);
+            }
+        }
+
+        // No usable file at all — fresh label, HWM is 0.
+        Ok(0)
     }
 
-    /// Write the high-water mark for `label_id` to disk.
+    /// Infer the high-water mark for `label_id` from the sizes of the column
+    /// files on disk.  Returns 0 if no column files exist or none are readable.
+    ///
+    /// Each `col_{n}.bin` stores one u64 per slot, so `file_len / 8` gives the
+    /// slot count.  We return the maximum over all columns.
+    fn infer_hwm_from_cols(&self, label_id: u32) -> u64 {
+        let dir = self.label_dir(label_id);
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => return 0,
+        };
+        read_dir
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy().into_owned();
+                // Only consider col_{n}.bin files.
+                name_str.strip_prefix("col_")?.strip_suffix(".bin")?;
+                let meta = entry.metadata().ok()?;
+                Some(meta.len() / 8)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Write the high-water mark for `label_id` to disk atomically.
+    ///
+    /// Strategy (SPA-211): write to `hwm.bin.tmp`, fsync, then rename to
+    /// `hwm.bin`.  On POSIX, `rename(2)` is atomic, so a crash at any point
+    /// leaves either the old `hwm.bin` intact or the fully-written new one.
     fn save_hwm(&self, label_id: u32, hwm: u64) -> Result<()> {
+        use std::io::Write as _;
+
         let path = self.hwm_path(label_id);
+        let tmp_path = self.hwm_tmp_path(label_id);
+
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(Error::Io)?;
         }
-        fs::write(&path, hwm.to_le_bytes()).map_err(Error::Io)
+
+        // Write to the tmp file and fsync before renaming.
+        {
+            let mut file = fs::File::create(&tmp_path).map_err(Error::Io)?;
+            file.write_all(&hwm.to_le_bytes()).map_err(Error::Io)?;
+            file.sync_all().map_err(Error::Io)?;
+        }
+
+        // Atomic rename: on success the old hwm.bin is replaced in one syscall.
+        fs::rename(&tmp_path, &path).map_err(Error::Io)
+    }
+
+    fn hwm_tmp_path(&self, label_id: u32) -> PathBuf {
+        self.label_dir(label_id).join("hwm.bin.tmp")
     }
 
     /// Append a `u64` value to a column file.
