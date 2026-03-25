@@ -88,7 +88,8 @@ fn q7_exact_facebook_query_shape() {
     let (_dir, db) = make_db();
 
     for i in 0..5u32 {
-        db.execute(&format!("CREATE (n:User {{uid: {i}}})")).unwrap();
+        db.execute(&format!("CREATE (n:User {{uid: {i}}})"))
+            .unwrap();
     }
 
     // uid=0 has 4 friends, uid=1 has 2, uid=2 has 1
@@ -166,10 +167,7 @@ fn q7_count_with_where_falls_through_to_normal_path() {
         .unwrap();
 
     assert_eq!(result.rows.len(), 1);
-    assert_eq!(
-        result.rows[0][1],
-        sparrowdb_execution::Value::Int64(1),
-    );
+    assert_eq!(result.rows[0][1], sparrowdb_execution::Value::Int64(1),);
 }
 
 // ── Test 5: Column order preserved ──────────────────────────────────────────

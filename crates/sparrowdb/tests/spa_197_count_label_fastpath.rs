@@ -73,8 +73,7 @@ fn count_with_where_falls_through() {
 
     db.execute("CREATE (:User {name: 'Alice', age: 30})")
         .unwrap();
-    db.execute("CREATE (:User {name: 'Bob', age: 25})")
-        .unwrap();
+    db.execute("CREATE (:User {name: 'Bob', age: 25})").unwrap();
     db.execute("CREATE (:User {name: 'Carol', age: 35})")
         .unwrap();
 

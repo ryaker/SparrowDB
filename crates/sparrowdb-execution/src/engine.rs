@@ -3076,10 +3076,8 @@ impl Engine {
                         // COUNT(f) — arg must be the destination variable.
                         if let Some(Expr::Var(v)) = args.first() {
                             if v == dst_var {
-                                count_al = item
-                                    .alias
-                                    .clone()
-                                    .or_else(|| Some(format!("COUNT({})", v)));
+                                count_al =
+                                    item.alias.clone().or_else(|| Some(format!("COUNT({})", v)));
                             } else {
                                 return Ok(None);
                             }
