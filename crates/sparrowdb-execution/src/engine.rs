@@ -5533,6 +5533,7 @@ impl Engine {
         all_label_ids: &[u32],
         neighbors_buf: &mut std::collections::HashSet<(u64, u32)>,
         use_reachability: bool,
+        result_limit: usize,
     ) -> Vec<(u64, u32)> {
         const SAFETY_CAP: u32 = 10;
         let max_hops = max_hops.min(SAFETY_CAP);
@@ -5553,6 +5554,11 @@ impl Engine {
             // Global visited set: each node is enqueued at most once.
             // O(V + E) — correct when RETURN DISTINCT is present and no path
             // variable is bound, so per-path enumeration is not needed.
+            //
+            // Early-exit: when `result_limit` is set (LIMIT clause with no ORDER BY /
+            // SKIP), stop expanding the frontier once we have collected enough results.
+            // Safe because DISTINCT + LIMIT with no ORDER BY has no defined ordering
+            // — BFS order is as valid as any other.  (Issue #199.)
             let mut global_visited: std::collections::HashSet<(u64, u32)> =
                 std::collections::HashSet::new();
             global_visited.insert((src_slot, src_label_id));
@@ -5561,7 +5567,7 @@ impl Engine {
                 std::collections::VecDeque::new();
             frontier.push_back((src_slot, src_label_id, 0));
 
-            while let Some((cur_slot, cur_label, depth)) = frontier.pop_front() {
+            'bfs: while let Some((cur_slot, cur_label, depth)) = frontier.pop_front() {
                 if depth >= max_hops {
                     continue;
                 }
@@ -5578,6 +5584,11 @@ impl Engine {
                         let nb_depth = depth + 1;
                         if nb_depth >= min_hops {
                             results.push((nb_slot, nb_label));
+                            // Early-exit: stop the moment we have enough results.
+                            // Only safe when result_limit reflects a LIMIT with no ORDER BY.
+                            if results.len() >= result_limit {
+                                break 'bfs;
+                            }
                         }
                         frontier.push_back((nb_slot, nb_label, nb_depth));
                     }
@@ -5586,9 +5597,10 @@ impl Engine {
         } else {
             // ── Enumerative DFS (full path semantics) ─────────────────────────────────
             //
-            // Maximum number of result entries returned per source node.
+            // Hard cap: min of the caller's result_limit and PATH_RESULT_CAP.
             // Prevents unbounded memory growth on highly-connected graphs.
             const PATH_RESULT_CAP: usize = 100_000;
+            let effective_cap = result_limit.min(PATH_RESULT_CAP);
 
             // Each stack frame is `(node_slot, node_label_id, depth, neighbors)`.
             // The `neighbors` vec holds all outgoing neighbors of `node`; we consume
@@ -5641,12 +5653,14 @@ impl Engine {
                         // Emit if depth is within the result window.
                         if depth >= min_hops {
                             results.push((nb_slot, nb_label));
-                            if results.len() >= PATH_RESULT_CAP {
-                                eprintln!(
-                                    "sparrowdb: variable-length path result cap \
-                                     ({PATH_RESULT_CAP}) hit; truncating results.  \
-                                     Consider RETURN DISTINCT or a tighter *M..N bound."
-                                );
+                            if results.len() >= effective_cap {
+                                if effective_cap >= PATH_RESULT_CAP {
+                                    eprintln!(
+                                        "sparrowdb: variable-length path result cap \
+                                         ({PATH_RESULT_CAP}) hit; truncating results.  \
+                                         Consider RETURN DISTINCT or a tighter *M..N bound."
+                                    );
+                                }
                                 return results;
                             }
                         }
@@ -5796,9 +5810,25 @@ impl Engine {
         let mut neighbors_buf: std::collections::HashSet<(u64, u32)> =
             std::collections::HashSet::new();
 
+        // Compute effective result limit: when no ORDER BY and no SKIP are present,
+        // we can stop collecting rows once we reach LIMIT (early exit).
+        // With ORDER BY or SKIP we must collect all rows before sorting/skipping.
+        let has_order_by = !m.order_by.is_empty();
+        let has_skip = m.skip.is_some();
+        let row_limit: usize = if has_order_by || has_skip {
+            usize::MAX
+        } else {
+            m.limit.map(|l| l as usize).unwrap_or(usize::MAX)
+        };
+
         for src_slot in 0..hwm_src {
             // SPA-254: check per-query deadline at every slot boundary.
             self.check_deadline()?;
+
+            // Early exit: already have enough rows for the LIMIT.
+            if rows.len() >= row_limit {
+                break;
+            }
 
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
 
@@ -5828,6 +5858,8 @@ impl Engine {
             // Use reachability BFS when RETURN DISTINCT is present and no path variable
             // is bound (issue #165). Otherwise use enumerative DFS for full path semantics.
             let use_reachability = m.distinct && rel_pat.var.is_empty();
+            // Pass remaining row budget into the BFS/DFS so it can stop early.
+            let remaining = row_limit.saturating_sub(rows.len());
             let dst_nodes = self.execute_variable_hops(
                 src_slot,
                 src_label_id,
@@ -5838,6 +5870,7 @@ impl Engine {
                 &all_label_ids,
                 &mut neighbors_buf,
                 use_reachability,
+                remaining,
             );
 
             for (dst_slot, actual_label_id) in dst_nodes {
