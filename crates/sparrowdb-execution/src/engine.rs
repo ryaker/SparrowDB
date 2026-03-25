@@ -4456,6 +4456,54 @@ impl Engine {
                     .copied()
                     .chain(delta_neighbors.into_iter())
                     .collect();
+
+                // ── SPA-200: batch-read dst properties — O(cols) fs::read() calls
+                // instead of O(neighbors × cols). ─────────────────────────────────
+                // Compute the full column-id list needed for dst (same for every
+                // neighbor in this src → * traversal).
+                let all_needed_dst: Vec<u32> = if !col_ids_dst.is_empty()
+                    || !dst_node_pat.props.is_empty()
+                {
+                    let mut v = col_ids_dst.clone();
+                    for p in &dst_node_pat.props {
+                        let col_id = prop_name_to_col_id(&p.key);
+                        if !v.contains(&col_id) {
+                            v.push(col_id);
+                        }
+                    }
+                    v
+                } else {
+                    vec![]
+                };
+
+                // Deduplicate neighbor slots for the batch read (same set we
+                // visit in the inner loop; duplicates are skipped there anyway).
+                let unique_dst_slots: Vec<u32> = {
+                    let mut seen: HashSet<u64> = HashSet::new();
+                    all_neighbors
+                        .iter()
+                        .filter_map(|&s| if seen.insert(s) { Some(s as u32) } else { None })
+                        .collect()
+                };
+
+                // Batch-read: one fs::read() per column for all neighbors.
+                // dst_batch[i] = raw column values for unique_dst_slots[i].
+                let dst_batch: Vec<Vec<u64>> = if !all_needed_dst.is_empty() {
+                    self.snapshot.store.batch_read_node_props(
+                        effective_dst_label_id,
+                        &unique_dst_slots,
+                        &all_needed_dst,
+                    )?
+                } else {
+                    vec![]
+                };
+                // Build a slot → batch-row index map for O(1) lookup.
+                let dst_slot_to_idx: HashMap<u64, usize> = unique_dst_slots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &s)| (s as u64, i))
+                    .collect();
+
                 let mut seen_neighbors: HashSet<u64> = HashSet::new();
                 for &dst_slot in &all_neighbors {
                     if !seen_neighbors.insert(dst_slot) {
@@ -4467,18 +4515,20 @@ impl Engine {
                         seen_undirected.insert((src_slot, dst_slot));
                     }
                     let dst_node = NodeId(((effective_dst_label_id as u64) << 32) | dst_slot);
-                    let dst_props = if !col_ids_dst.is_empty() || !dst_node_pat.props.is_empty() {
-                        let all_needed: Vec<u32> = {
-                            let mut v = col_ids_dst.clone();
-                            for p in &dst_node_pat.props {
-                                let col_id = prop_name_to_col_id(&p.key);
-                                if !v.contains(&col_id) {
-                                    v.push(col_id);
-                                }
-                            }
-                            v
-                        };
-                        self.snapshot.store.get_node_raw(dst_node, &all_needed)?
+                    // Use the batch-prefetched result; fall back to per-node
+                    // read only when the slot was not in the batch (shouldn't
+                    // happen, but keeps the code correct under all conditions).
+                    let dst_props: Vec<(u32, u64)> = if !all_needed_dst.is_empty() {
+                        if let Some(&idx) = dst_slot_to_idx.get(&dst_slot) {
+                            all_needed_dst
+                                .iter()
+                                .copied()
+                                .zip(dst_batch[idx].iter().copied())
+                                .collect()
+                        } else {
+                            // Fallback: individual read (e.g. delta-only slot).
+                            self.snapshot.store.get_node_raw(dst_node, &all_needed_dst)?
+                        }
                     } else {
                         vec![]
                     };
@@ -4948,7 +4998,9 @@ impl Engine {
 
         let pat = &m.pattern[0];
         let src_node_pat = &pat.nodes[0];
-        // nodes[1] is the anonymous mid node
+        // nodes[1] is the mid node (may be named, e.g. `m` in Q8 mutual-friends)
+        let mid_node_pat = &pat.nodes[1];
+        // nodes[2] is the fof (friend-of-friend) / anchor-B in Q8
         let fof_node_pat = &pat.nodes[2];
 
         let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
@@ -4996,6 +5048,48 @@ impl Engine {
             ids
         };
 
+        // SPA-201: detect if the second relationship hop is Incoming FIRST,
+        // because col_ids_mid is only populated for the incoming case.
+        // For patterns like (a)-[:R]->(m)<-[:R]-(b), rels[1].dir == Incoming,
+        // meaning we need the PREDECESSORS of mid (nodes that have an edge TO mid)
+        // rather than the SUCCESSORS (forward neighbors of mid).
+        let second_hop_incoming = pat
+            .rels
+            .get(1)
+            .map(|r| r.dir == sparrowdb_cypher::ast::EdgeDir::Incoming)
+            .unwrap_or(false);
+
+        // SPA-201: collect col_ids for the mid node (nodes[1] = m in Q8).
+        // For the Incoming second-hop case the mid is the projected "common neighbor"
+        // (e.g. `RETURN m.uid`), so we must read its properties.
+        let mid_label = mid_node_pat.labels.first().cloned().unwrap_or_default();
+        let mid_label_id: u32 = if mid_label.is_empty() {
+            src_label_id // fall back to src label when mid has no label annotation
+        } else {
+            self.snapshot
+                .catalog
+                .get_label(&mid_label)
+                .ok()
+                .flatten()
+                .map(|id| id as u32)
+                .unwrap_or(src_label_id)
+        };
+        let col_ids_mid: Vec<u32> = if second_hop_incoming && !mid_node_pat.var.is_empty() {
+            let mut ids = collect_col_ids_for_var(&mid_node_pat.var, column_names, mid_label_id);
+            for p in &mid_node_pat.props {
+                let col_id = prop_name_to_col_id(&p.key);
+                if !ids.contains(&col_id) {
+                    ids.push(col_id);
+                }
+            }
+            if let Some(ref where_expr) = m.where_clause {
+                collect_col_ids_from_expr_for_var(where_expr, &mid_node_pat.var, &mut ids);
+            }
+            ids
+        } else {
+            vec![]
+        };
+
         // SPA-163 + SPA-185: build a slot-level adjacency map from all delta
         // logs so that edges written since the last checkpoint are visible for
         // 2-hop queries.  We aggregate across all rel types here because the
@@ -5040,6 +5134,56 @@ impl Engine {
             edges.dedup();
             CsrForward::build(max_nodes, &edges)
         };
+
+        // SPA-201: build a merged backward CSR when the second hop is Incoming.
+        // For (a)-[:R]->(m)<-[:R]-(b) we need predecessors(mid) to find b-nodes.
+        // We derive this from the already-loaded forward CSRs (no extra disk I/O)
+        // by building CsrBackward from the same forward edge list used for merged_csr.
+        // CsrBackward::build takes (src, dst) forward edges and stores them reversed.
+        let merged_bwd_csr: Option<CsrBackward> = if second_hop_incoming {
+            let max_nodes = self
+                .snapshot
+                .csrs
+                .values()
+                .map(|c| c.n_nodes())
+                .max()
+                .unwrap_or(0);
+            // Re-use the same sorted+deduped edge list already in merged_csr.
+            // We rebuild it here because CsrForward doesn't expose its edge list,
+            // but this construction is O(E) and the merged_csr build already did it.
+            let mut fwd_edges: Vec<(u64, u64)> = Vec::new();
+            for csr in self.snapshot.csrs.values() {
+                for src in 0..csr.n_nodes() {
+                    for &dst in csr.neighbors(src) {
+                        fwd_edges.push((src, dst));
+                    }
+                }
+            }
+            fwd_edges.sort_unstable();
+            fwd_edges.dedup();
+            if fwd_edges.is_empty() {
+                None
+            } else {
+                Some(CsrBackward::build(max_nodes, &fwd_edges))
+            }
+        } else {
+            None
+        };
+
+        // SPA-201: build a delta adjacency map for the backward (incoming) direction.
+        // Maps dst_slot → Vec<src_slot> for edges in the delta log (written since checkpoint).
+        let delta_adj_bwd: HashMap<u64, Vec<u64>> = if second_hop_incoming {
+            let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+            for r in self.read_delta_all() {
+                let r_dst_slot = r.dst.0 & 0xFFFF_FFFF;
+                let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                adj.entry(r_dst_slot).or_default().push(r_src_slot);
+            }
+            adj
+        } else {
+            HashMap::new()
+        };
+
         let join = AspJoin::new(&merged_csr);
         let mut rows = Vec::new();
 
@@ -5072,39 +5216,231 @@ impl Engine {
                 continue;
             }
 
-            // Use ASP-Join to get 2-hop fof from CSR.
-            let mut fof_slots = join.two_hop(src_slot)?;
+            if second_hop_incoming {
+                // SPA-201: Incoming second hop — pattern (a)-[:R]->(m)<-[:R]-(b).
+                //
+                // Semantics: find all mid-nodes M such that (a→M) AND (b→M) where
+                // b matches the fof_node_pat filter.  The result rows project M
+                // (the common neighbor / mutual friend), not B.
+                //
+                // Algorithm:
+                //   1. First-hop forward: candidate M slots = CSR neighbors of src + delta.
+                //   2. For each M: collect B slots = predecessors of M (bwd CSR + delta).
+                //   3. Read B props, apply fof_node_pat filter — if any B passes, M is valid.
+                //   4. For valid M: read mid props, apply mid prop filter, build result row.
 
-            // SPA-163: extend with delta-log 2-hop paths.
-            // First-hop delta neighbors of src_slot:
-            let first_hop_delta = delta_adj
-                .get(&src_slot)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            if !first_hop_delta.is_empty() {
-                let mut delta_fof: HashSet<u64> = HashSet::new();
-                for &mid_slot in first_hop_delta {
-                    // CSR second hop from mid (use merged multi-type CSR):
-                    for &fof in merged_csr.neighbors(mid_slot) {
-                        delta_fof.insert(fof);
-                    }
-                    // Delta second hop from mid:
-                    if let Some(mid_neighbors) = delta_adj.get(&mid_slot) {
-                        for &fof in mid_neighbors {
-                            delta_fof.insert(fof);
+                // Collect all candidate M slots from the forward first hop.
+                let mid_slots: Vec<u64> = {
+                    let mut csr_mids: Vec<u64> = merged_csr.neighbors(src_slot).to_vec();
+                    // Delta first hop from src.
+                    if let Some(delta_first) = delta_adj.get(&src_slot) {
+                        for &mid in delta_first {
+                            if !csr_mids.contains(&mid) {
+                                csr_mids.push(mid);
+                            }
                         }
                     }
+                    csr_mids
+                };
+
+                for mid_slot in mid_slots {
+                    // Read mid props for projection (and mid prop filter).
+                    let mid_node = NodeId(((mid_label_id as u64) << 32) | mid_slot);
+                    let mid_props = if !col_ids_mid.is_empty() {
+                        read_node_props(&self.snapshot.store, mid_node, &col_ids_mid)?
+                    } else {
+                        vec![]
+                    };
+
+                    // Apply mid inline prop filter (e.g. `m:User`).
+                    if !self.matches_prop_filter(&mid_props, &mid_node_pat.props) {
+                        continue;
+                    }
+
+                    // Collect B slots = predecessors of M (bwd CSR + delta bwd).
+                    let mut found_valid_fof = false;
+                    let csr_preds: &[u64] = merged_bwd_csr
+                        .as_ref()
+                        .map(|bwd| bwd.predecessors(mid_slot))
+                        .unwrap_or(&[]);
+                    let delta_preds_opt = delta_adj_bwd.get(&mid_slot);
+
+                    let all_b_slots: Vec<u64> = {
+                        let mut v: Vec<u64> = csr_preds.to_vec();
+                        if let Some(delta_preds) = delta_preds_opt {
+                            for &b in delta_preds {
+                                if !v.contains(&b) {
+                                    v.push(b);
+                                }
+                            }
+                        }
+                        v
+                    };
+
+                    for b_slot in &all_b_slots {
+                        let b_node = NodeId(((fof_label_id as u64) << 32) | *b_slot);
+                        let b_props =
+                            read_node_props(&self.snapshot.store, b_node, &col_ids_fof)?;
+
+                        // Apply fof (b) inline prop filter.
+                        if !self.matches_prop_filter(&b_props, &fof_node_pat.props) {
+                            continue;
+                        }
+
+                        // Apply WHERE clause for this (src=a, mid=m, fof=b) binding.
+                        if let Some(ref where_expr) = m.where_clause {
+                            let mut row_vals = build_row_vals(
+                                &src_props,
+                                &src_node_pat.var,
+                                &col_ids_src_where,
+                                &self.snapshot.store,
+                            );
+                            row_vals.extend(build_row_vals(
+                                &mid_props,
+                                &mid_node_pat.var,
+                                &col_ids_mid,
+                                &self.snapshot.store,
+                            ));
+                            row_vals.extend(build_row_vals(
+                                &b_props,
+                                &fof_node_pat.var,
+                                &col_ids_fof,
+                                &self.snapshot.store,
+                            ));
+                            // Label metadata.
+                            if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                                row_vals.insert(
+                                    format!("{}.__labels__", src_node_pat.var),
+                                    Value::List(vec![Value::String(src_label.clone())]),
+                                );
+                            }
+                            if !mid_node_pat.var.is_empty() && !mid_label.is_empty() {
+                                row_vals.insert(
+                                    format!("{}.__labels__", mid_node_pat.var),
+                                    Value::List(vec![Value::String(mid_label.clone())]),
+                                );
+                            }
+                            if !fof_node_pat.var.is_empty() && !fof_label.is_empty() {
+                                row_vals.insert(
+                                    format!("{}.__labels__", fof_node_pat.var),
+                                    Value::List(vec![Value::String(fof_label.clone())]),
+                                );
+                            }
+                            if !pat.rels[0].var.is_empty() {
+                                row_vals.insert(
+                                    format!("{}.__type__", pat.rels[0].var),
+                                    Value::String(pat.rels[0].rel_type.clone()),
+                                );
+                            }
+                            if !pat.rels[1].var.is_empty() {
+                                row_vals.insert(
+                                    format!("{}.__type__", pat.rels[1].var),
+                                    Value::String(pat.rels[1].rel_type.clone()),
+                                );
+                            }
+                            row_vals.extend(self.dollar_params());
+                            if !self.eval_where_graph(where_expr, &row_vals) {
+                                continue;
+                            }
+                        }
+
+                        // Project a row: src (a) + mid (m) + fof (b) columns.
+                        // We build the row using a 3-var aware helper here so that
+                        // `RETURN m.name`, `RETURN a.name`, and `RETURN b.name` all
+                        // resolve correctly.
+                        let row = project_three_var_row(
+                            &src_props,
+                            &mid_props,
+                            &b_props,
+                            column_names,
+                            &src_node_pat.var,
+                            &mid_node_pat.var,
+                            &self.snapshot.store,
+                        );
+                        rows.push(row);
+                        found_valid_fof = true;
+                        // Continue — multiple b nodes may match (emit one row per match).
+                    }
+                    let _ = found_valid_fof; // suppress unused warning
                 }
-                fof_slots.extend(delta_fof);
-                // Re-deduplicate the combined set.
-                let unique: HashSet<u64> = fof_slots.into_iter().collect();
-                fof_slots = unique.into_iter().collect();
-                fof_slots.sort_unstable();
+                // Skip the rest of the per-src-slot processing for the Incoming case.
+                continue;
             }
+
+            // ── Forward-forward path (both hops Outgoing) ─────────────────────
+            let mut fof_slots: Vec<u64> = {
+                // Use ASP-Join.
+                join.two_hop(src_slot)?
+            };
+
+            // SPA-163: extend with delta-log 2-hop paths (forward-forward only).
+            {
+                let first_hop_delta = delta_adj
+                    .get(&src_slot)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                if !first_hop_delta.is_empty() {
+                    let mut delta_fof: HashSet<u64> = HashSet::new();
+                    for &mid_slot in first_hop_delta {
+                        // CSR second hop from mid (use merged multi-type CSR):
+                        for &fof in merged_csr.neighbors(mid_slot) {
+                            delta_fof.insert(fof);
+                        }
+                        // Delta second hop from mid:
+                        if let Some(mid_neighbors) = delta_adj.get(&mid_slot) {
+                            for &fof in mid_neighbors {
+                                delta_fof.insert(fof);
+                            }
+                        }
+                    }
+                    fof_slots.extend(delta_fof);
+                    // Re-deduplicate the combined set.
+                    let unique: HashSet<u64> = fof_slots.into_iter().collect();
+                    fof_slots = unique.into_iter().collect();
+                    fof_slots.sort_unstable();
+                }
+            }
+
+            // ── SPA-200: batch-read fof properties — O(cols) fs::read() calls
+            // instead of O(fof_slots × cols). ────────────────────────────────
+            // `col_ids_fof` is constant for this src_slot iteration (determined
+            // by the query structure, not by the specific fof node).
+            let fof_slots_u32: Vec<u32> = fof_slots.iter().map(|&s| s as u32).collect();
+            let fof_batch: Vec<Vec<u64>> = if !col_ids_fof.is_empty() {
+                self.snapshot.store.batch_read_node_props(
+                    fof_label_id,
+                    &fof_slots_u32,
+                    &col_ids_fof,
+                )?
+            } else {
+                vec![]
+            };
+            // Build slot → batch-row index map for O(1) lookup in the inner loop.
+            let fof_slot_to_idx: HashMap<u64, usize> = fof_slots
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| (s, i))
+                .collect();
 
             for fof_slot in fof_slots {
                 let fof_node = NodeId(((fof_label_id as u64) << 32) | fof_slot);
-                let fof_props = read_node_props(&self.snapshot.store, fof_node, &col_ids_fof)?;
+                // Build fof_props in the same Vec<(col_id, u64)> format as
+                // read_node_props returns: filter out 0-sentinel (absent) values.
+                let fof_props: Vec<(u32, u64)> = if !col_ids_fof.is_empty() {
+                    if let Some(&idx) = fof_slot_to_idx.get(&fof_slot) {
+                        col_ids_fof
+                            .iter()
+                            .copied()
+                            .zip(fof_batch[idx].iter().copied())
+                            .filter(|&(_, v)| v != 0)
+                            .collect()
+                    } else {
+                        // Fallback: individual read (delta-only slot not in batch).
+                        read_node_props(&self.snapshot.store, fof_node, &col_ids_fof)?
+                    }
+                } else {
+                    vec![]
+                };
 
                 // Apply fof inline prop filter.
                 if !self.matches_prop_filter(&fof_props, &fof_node_pat.props) {
@@ -7652,6 +7988,44 @@ fn project_fof_row(
                 let col_id = prop_name_to_col_id(prop);
                 let props = if !src_var.is_empty() && var == src_var {
                     src_props
+                } else {
+                    fof_props
+                };
+                props
+                    .iter()
+                    .find(|(c, _)| *c == col_id)
+                    .map(|(_, v)| decode_raw_val(*v, store))
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            }
+        })
+        .collect()
+}
+
+/// SPA-201: Three-variable row projection for the incoming second-hop pattern
+/// `(a)-[:R]->(m)<-[:R]-(b) RETURN m.name`.
+///
+/// Resolves column references to src (a), mid (m), or fof (b) props based on
+/// variable name matching.  Any unrecognised variable falls back to fof_props.
+fn project_three_var_row(
+    src_props: &[(u32, u64)],
+    mid_props: &[(u32, u64)],
+    fof_props: &[(u32, u64)],
+    column_names: &[String],
+    src_var: &str,
+    mid_var: &str,
+    store: &NodeStore,
+) -> Vec<Value> {
+    column_names
+        .iter()
+        .map(|col_name| {
+            if let Some((var, prop)) = col_name.split_once('.') {
+                let col_id = prop_name_to_col_id(prop);
+                let props: &[(u32, u64)] = if !src_var.is_empty() && var == src_var {
+                    src_props
+                } else if !mid_var.is_empty() && var == mid_var {
+                    mid_props
                 } else {
                     fof_props
                 };
