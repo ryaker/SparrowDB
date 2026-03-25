@@ -279,6 +279,14 @@ impl GraphDb {
     /// edges to be wired correctly, and is **left in place** after import.
     /// Callers may remove it at the application layer if desired (e.g. with a
     /// future `REMOVE` Cypher clause once that is supported).
+    ///
+    /// ## Performance (SPA-223)
+    ///
+    /// Node creation and edge wiring each use [`execute_batch`](Self::execute_batch)
+    /// so that all mutations in each phase commit with a **single WAL fsync**
+    /// rather than one fsync per node/edge.  A 100-node import therefore
+    /// requires 2 fsyncs (one for the node batch, one for the edge batch)
+    /// instead of O(N) fsyncs.
     pub fn import(&self, dump: &GraphDump) -> Result<()> {
         // ── 1. Build a label lookup from the node list ────────────────────
         // Maps original node_id → label name (needed when wiring edges).
@@ -287,35 +295,47 @@ impl GraphDb {
             node_label.insert(n.node_id, n.label.clone());
         }
 
-        // ── 2. Create all nodes ───────────────────────────────────────────
-        for node in &dump.nodes {
-            let props_cypher = build_props_cypher(&node.properties, Some(node.node_id));
-            let label = cypher_escape_label(&node.label);
-            let query = format!("CREATE (n:{label} {{{props_cypher}}})");
-            self.execute(&query)?;
+        // ── 2. Create all nodes in a single batch (one WAL fsync) ─────────
+        // SPA-223: build all CREATE queries up front and submit them via
+        // execute_batch so the entire node set is committed with one fsync.
+        if !dump.nodes.is_empty() {
+            let node_queries: Vec<String> = dump
+                .nodes
+                .iter()
+                .map(|node| {
+                    let props_cypher = build_props_cypher(&node.properties, Some(node.node_id));
+                    let label = cypher_escape_label(&node.label);
+                    format!("CREATE (n:{label} {{{props_cypher}}})")
+                })
+                .collect();
+            let node_refs: Vec<&str> = node_queries.iter().map(String::as_str).collect();
+            self.execute_batch(&node_refs)?;
         }
 
-        // ── 3. Wire edges ─────────────────────────────────────────────────
+        // ── 3. Wire edges in a single batch (one WAL fsync) ───────────────
         // Look up source and destination nodes by the temporary `_sparrow_export_id`
         // property we stamped during node creation.
-        for edge in &dump.edges {
-            let src_label = match node_label.get(&edge.src_id) {
-                Some(l) => cypher_escape_label(l),
-                None => continue, // orphan edge — skip
-            };
-            let dst_label = match node_label.get(&edge.dst_id) {
-                Some(l) => cypher_escape_label(l),
-                None => continue,
-            };
-            let rel_type = cypher_escape_label(&edge.rel_type);
-            let src_sid = edge.src_id;
-            let dst_sid = edge.dst_id;
-            let query = format!(
-                "MATCH (a:{src_label} {{_sparrow_export_id: '{src_sid}'}}), \
-                 (b:{dst_label} {{_sparrow_export_id: '{dst_sid}'}}) \
-                 CREATE (a)-[:{rel_type}]->(b)"
-            );
-            self.execute(&query)?;
+        // SPA-223: collect all valid edge queries and submit them via
+        // execute_batch so the entire edge set commits with one fsync.
+        let edge_queries: Vec<String> = dump
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let src_label = cypher_escape_label(node_label.get(&edge.src_id)?);
+                let dst_label = cypher_escape_label(node_label.get(&edge.dst_id)?);
+                let rel_type = cypher_escape_label(&edge.rel_type);
+                let src_sid = edge.src_id;
+                let dst_sid = edge.dst_id;
+                Some(format!(
+                    "MATCH (a:{src_label} {{_sparrow_export_id: '{src_sid}'}}), \
+                     (b:{dst_label} {{_sparrow_export_id: '{dst_sid}'}}) \
+                     CREATE (a)-[:{rel_type}]->(b)"
+                ))
+            })
+            .collect();
+        if !edge_queries.is_empty() {
+            let edge_refs: Vec<&str> = edge_queries.iter().map(String::as_str).collect();
+            self.execute_batch(&edge_refs)?;
         }
 
         Ok(())
