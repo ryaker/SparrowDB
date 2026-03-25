@@ -190,6 +190,53 @@ impl NodeStore {
         self.label_dir(label_id).join(format!("col_{col_id}.bin"))
     }
 
+    /// Path to the null-bitmap sidecar for a column (SPA-207).
+    ///
+    /// Bit N = 1 means slot N has a real value (present/non-null).
+    /// Bit N = 0 means slot N was zero-padded (absent/null).
+    fn null_bitmap_path(&self, label_id: u32, col_id: u32) -> PathBuf {
+        self.label_dir(label_id)
+            .join(format!("col_{col_id}_null.bin"))
+    }
+
+    /// Mark slot `slot` as present (has a real value) in the null bitmap (SPA-207).
+    fn set_null_bit(&self, label_id: u32, col_id: u32, slot: u32) -> Result<()> {
+        let path = self.null_bitmap_path(label_id, col_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(Error::Io)?;
+        }
+        let byte_idx = (slot / 8) as usize;
+        let bit_idx = slot % 8;
+        let mut bits = if path.exists() {
+            fs::read(&path).map_err(Error::Io)?
+        } else {
+            vec![]
+        };
+        if bits.len() <= byte_idx {
+            bits.resize(byte_idx + 1, 0);
+        }
+        bits[byte_idx] |= 1 << bit_idx;
+        fs::write(&path, &bits).map_err(Error::Io)
+    }
+
+    /// Returns `true` if slot `slot` has a real value (present/non-null) (SPA-207).
+    ///
+    /// Backward-compatible: if no bitmap file exists (old data written before
+    /// the null-bitmap fix), every slot is treated as present.
+    fn get_null_bit(&self, label_id: u32, col_id: u32, slot: u32) -> Result<bool> {
+        let path = self.null_bitmap_path(label_id, col_id);
+        if !path.exists() {
+            // No bitmap file → backward-compatible: treat all slots as present.
+            return Ok(true);
+        }
+        let bits = fs::read(&path).map_err(Error::Io)?;
+        let byte_idx = (slot / 8) as usize;
+        if byte_idx >= bits.len() {
+            return Ok(false);
+        }
+        Ok((bits[byte_idx] >> (slot % 8)) & 1 == 1)
+    }
+
     /// Path to the overflow string heap (shared across all labels).
     fn strings_bin_path(&self) -> PathBuf {
         self.root.join("strings.bin")
@@ -568,6 +615,8 @@ impl NodeStore {
         let write_result = (|| {
             for &(col_id, ref val) in props {
                 self.append_col(label_id, col_id, slot, self.encode_value(val)?)?;
+                // Mark this slot as present in the null bitmap (SPA-207).
+                self.set_null_bit(label_id, col_id, slot)?;
             }
             Ok::<(), sparrowdb_common::Error>(())
         })();
@@ -698,8 +747,11 @@ impl NodeStore {
             // Write supplied columns with their actual values.
             for &(col_id, ref val) in props {
                 self.append_col(label_id, col_id, slot, self.encode_value(val)?)?;
+                // Mark this slot as present in the null bitmap (SPA-207).
+                self.set_null_bit(label_id, col_id, slot)?;
             }
             // Zero-pad existing columns that were NOT supplied for this node.
+            // Do NOT set null bitmap bits for these — they remain absent/null.
             for &col_id in &cols_to_zero_pad {
                 self.append_col(label_id, col_id, slot, 0u64)?;
             }
@@ -898,20 +950,18 @@ impl NodeStore {
     }
 
     /// Read a single column slot, returning `None` when the column was never
-    /// written for this node (file absent or slot out of bounds / zero-padded).
+    /// written for this node (file absent or slot out of bounds / not set).
     ///
     /// Unlike [`read_col_slot`], this function distinguishes between:
     /// - Column file does not exist → `None` (property never set on any node).
-    /// - Slot falls within the file but reads as 0 → the slot was zero-padded
-    ///   by `append_col` for a later node's write; treat as `None`.
-    /// - Slot has a non-zero value → `Some(value)`.
     /// - Slot is beyond the file end → `None` (property not set on this node).
+    /// - Null bitmap says slot is absent → `None` (slot was zero-padded for alignment).
+    /// - Null bitmap says slot is present → `Some(raw)` (real value, may be 0 for Int64(0)).
     ///
-    /// Value 0 is used as the "absent" sentinel: the storage encoding ensures
-    /// that any legitimately stored property (Int64, Bytes, Bool, Float) encodes
-    /// to a non-zero u64.  Specifically, `StoreValue::Int64(0)` stores as 0 and
-    /// would be misidentified as absent — callers that need to store integer 0
-    /// should be aware of this limitation.
+    /// The null-bitmap sidecar (`col_{id}_null.bin`) is used to distinguish
+    /// legitimately-stored 0 values (e.g. `Int64(0)`) from absent/zero-padded
+    /// slots (SPA-207).  Backward compat: if no bitmap file exists, all slots
+    /// within the file are treated as present.
     fn read_col_slot_nullable(&self, label_id: u32, col_id: u32, slot: u32) -> Result<Option<u64>> {
         let path = self.col_path(label_id, col_id);
         let bytes = match fs::read(&path) {
@@ -923,13 +973,14 @@ impl NodeStore {
         if bytes.len() < offset + 8 {
             return Ok(None);
         }
-        let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        // Zero means "never written" (absent). Non-zero means a real value.
-        if raw == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(raw))
+        // Use the null-bitmap sidecar to determine whether this slot has a real
+        // value.  This replaces the old raw==0 sentinel which incorrectly treated
+        // Int64(0) as absent (SPA-207).
+        if !self.get_null_bit(label_id, col_id, slot)? {
+            return Ok(None);
         }
+        let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        Ok(Some(raw))
     }
 
     /// Retrieve the typed property values for a node.
