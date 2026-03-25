@@ -958,6 +958,39 @@ impl NodeStore {
         }
         Ok(out)
     }
+
+    /// Batch-read multiple slots from multiple columns — one fs::read() per column.
+    /// All `slots` must belong to `label_id`.
+    /// Returns Vec indexed parallel to `slots`; inner Vec indexed parallel to `col_ids`.
+    /// Missing/out-of-range slots return 0 (null sentinel).
+    pub fn batch_read_node_props(
+        &self,
+        label_id: u32,
+        slots: &[u32],
+        col_ids: &[u32],
+    ) -> Result<Vec<Vec<u64>>> {
+        if slots.is_empty() {
+            return Ok(vec![]);
+        }
+        // Load each column once into memory
+        let col_data: Vec<Vec<u64>> = col_ids
+            .iter()
+            .map(|&col_id| self.read_col_all(label_id, col_id))
+            .collect::<Result<_>>()?;
+        // Index by slot for each requested node
+        Ok(slots
+            .iter()
+            .map(|&slot| {
+                col_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(ci, _)| {
+                        col_data[ci].get(slot as usize).copied().unwrap_or(0)
+                    })
+                    .collect()
+            })
+            .collect())
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────── ───────────────────────────────────────────────────────────────────
