@@ -2820,10 +2820,15 @@ impl WriteTx {
 
         // Convert HashMap<String, Value> props to (col_id, value_u64) pairs
         // using the canonical FNV-1a col_id derivation so read and write agree.
+        // SPA-229: use NodeStore::encode_value (not val.to_u64()) so that
+        // Value::Float is stored via f64::to_bits() in the heap rather than
+        // panicking with "cannot be inline-encoded".
         let encoded_props: Vec<(u32, u64)> = props
             .iter()
-            .map(|(name, val)| (col_id_of(name), val.to_u64()))
-            .collect();
+            .map(|(name, val)| -> Result<(u32, u64)> {
+                Ok((col_id_of(name), self.store.encode_value(val)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Human-readable entries for WAL schema introspection.
         let prop_entries: Vec<(String, Value)> = props.into_iter().collect();
