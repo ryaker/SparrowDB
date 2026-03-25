@@ -233,6 +233,92 @@ fn two_hop_returns_valid_names() {
     }
 }
 
+// ── test 5: sorted-slot reads — performance + correctness at scale ────────────
+
+/// SPA-200 real fix: sorted O(K) slot reads instead of O(N) full-column loads.
+///
+/// Creates 1 000 "Person" nodes each connected to exactly 50 "Friend" nodes
+/// (50 000 edges total, but we query from a single source so K=50, N=1000).
+/// The sorted-slot path should read only 50 entries per column instead of
+/// 1 000 — a 20× reduction. We verify correctness (row count + values) and
+/// that the query completes within a reasonable time bound.
+#[test]
+fn sorted_slot_reads_correct_and_fast() {
+    let (_dir, db) = make_db();
+
+    // Create 1 000 Friend destination nodes.
+    const N_FRIENDS: u32 = 1_000;
+    const SRC_IDX: u32 = 9999;
+    const K_NEIGHBORS: u32 = 50; // first 50 friends connected to src
+
+    for j in 1..=N_FRIENDS {
+        db.execute(&format!(
+            "CREATE (n:Friend {{name: 'friend_{j}', idx: {j}}})"
+        ))
+        .unwrap_or_else(|e| panic!("CREATE friend_{j} failed: {e}"));
+    }
+
+    // Create one source node.
+    db.execute(&format!(
+        "CREATE (n:Src {{name: 'source', idx: {SRC_IDX}}})"
+    ))
+    .unwrap();
+
+    // Connect source to the first K_NEIGHBORS friends.
+    for j in 1..=K_NEIGHBORS {
+        db.execute(&format!(
+            "MATCH (a:Src {{idx: {SRC_IDX}}}), (b:Friend {{idx: {j}}}) CREATE (a)-[:KNOWS]->(b)"
+        ))
+        .unwrap_or_else(|e| panic!("CREATE edge src->friend_{j} failed: {e}"));
+    }
+
+    let start = std::time::Instant::now();
+    let result = db
+        .execute("MATCH (a:Src)-[:KNOWS]->(b:Friend) RETURN b.name, b.idx")
+        .expect("sorted-slot hop query must succeed");
+    let elapsed = start.elapsed();
+
+    // Correctness: exactly K_NEIGHBORS rows.
+    assert_eq!(
+        result.rows.len(),
+        K_NEIGHBORS as usize,
+        "expected {K_NEIGHBORS} rows, got {}",
+        result.rows.len()
+    );
+
+    // Every returned name must match "friend_N" and idx must be 1..=K_NEIGHBORS.
+    for row in &result.rows {
+        match &row[0] {
+            Value::String(s) => {
+                assert!(
+                    s.starts_with("friend_"),
+                    "unexpected name: {s:?}"
+                );
+            }
+            other => panic!("expected String for name, got {other:?}"),
+        }
+        match &row[1] {
+            Value::Int64(n) => {
+                assert!(
+                    *n >= 1 && *n <= K_NEIGHBORS as i64,
+                    "idx {n} out of expected range 1..={K_NEIGHBORS}"
+                );
+            }
+            other => panic!("expected Int64 for idx, got {other:?}"),
+        }
+    }
+
+    // Performance gate: should complete in under 5 seconds in debug mode.
+    assert!(
+        elapsed.as_secs() < 5,
+        "sorted-slot hop query took {elapsed:?} — expected < 5s (performance regression?)"
+    );
+
+    eprintln!(
+        "sorted_slot_reads_correct_and_fast: K={K_NEIGHBORS}/N={N_FRIENDS} elapsed={elapsed:?}"
+    );
+}
+
 // ── test 4: batch-read does not mix properties across slots ──────────────────
 
 /// The integer `idx` property must match the node it was assigned to — verifies

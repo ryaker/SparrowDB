@@ -28,6 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use sparrowdb_common::{Error, NodeId, Result};
@@ -1118,10 +1119,82 @@ impl NodeStore {
         Ok(out)
     }
 
-    /// Batch-read multiple slots from multiple columns — one fs::read() per column.
+    /// Selective sorted-slot read — O(K) seeks instead of O(N) reads.
+    ///
+    /// For each column, opens the file once and reads only the `slots` needed,
+    /// in slot-ascending order (for sequential-ish I/O).  This is the hot path
+    /// for hop queries where K neighbor slots ≪ N total nodes.
+    ///
+    /// `slots` **must** be pre-sorted ascending by the caller.
+    /// Returns a `Vec` indexed parallel to `slots`; each inner `Vec` is indexed
+    /// parallel to `col_ids`.  Out-of-range or missing-file slots return 0.
+    ///
+    /// SPA-200: replaces full O(N) column loads with O(K) per-column seeks.
+    fn read_col_slots_sorted(
+        &self,
+        label_id: u32,
+        slots: &[u32],
+        col_ids: &[u32],
+    ) -> Result<Vec<Vec<u64>>> {
+        if slots.is_empty() || col_ids.is_empty() {
+            // Return a row of empty vecs parallel to slots
+            return Ok(slots.iter().map(|_| vec![0u64; col_ids.len()]).collect());
+        }
+
+        // result[slot_idx][col_idx]
+        let mut result: Vec<Vec<u64>> = slots.iter().map(|_| vec![0u64; col_ids.len()]).collect();
+
+        for (col_idx, &col_id) in col_ids.iter().enumerate() {
+            let path = self.col_path(label_id, col_id);
+            let mut file = match fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Column file doesn't exist — all slots stay 0
+                    continue;
+                }
+                Err(e) => return Err(Error::Io(e)),
+            };
+
+            let file_len = file
+                .seek(SeekFrom::End(0))
+                .map_err(Error::Io)?;
+            // Reset to start for sequential reads
+            file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
+
+            let mut buf = [0u8; 8];
+            let mut current_pos: u64 = 0;
+
+            for (slot_idx, &slot) in slots.iter().enumerate() {
+                let target_pos = slot as u64 * 8;
+                if target_pos + 8 > file_len {
+                    // Slot beyond end of file — leave as 0
+                    continue;
+                }
+                if target_pos != current_pos {
+                    file.seek(SeekFrom::Start(target_pos)).map_err(Error::Io)?;
+                    current_pos = target_pos;
+                }
+                file.read_exact(&mut buf).map_err(Error::Io)?;
+                current_pos += 8;
+                result[slot_idx][col_idx] = u64::from_le_bytes(buf);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Batch-read multiple slots from multiple columns.
+    ///
+    /// Chooses between two strategies based on the K/N ratio:
+    /// - **Sorted-slot reads** (SPA-200): when K ≪ N, seeks to each slot
+    ///   offset — O(K × C) I/O instead of O(N × C).  Slots are sorted
+    ///   ascending before the read so seeks are sequential.
+    /// - **Full-column load**: when K is close to N (>50% of column), reading
+    ///   the whole file is cheaper than many random seeks.
+    ///
     /// All `slots` must belong to `label_id`.
-    /// Returns Vec indexed parallel to `slots`; inner Vec indexed parallel to `col_ids`.
-    /// Missing/out-of-range slots return 0 (null sentinel).
+    /// Returns a `Vec` indexed parallel to `slots`; inner `Vec` indexed
+    /// parallel to `col_ids`.  Missing/out-of-range slots return 0.
     pub fn batch_read_node_props(
         &self,
         label_id: u32,
@@ -1131,24 +1204,47 @@ impl NodeStore {
         if slots.is_empty() {
             return Ok(vec![]);
         }
-        // Load each column once into memory
-        let col_data: Vec<Vec<u64>> = col_ids
-            .iter()
-            .map(|&col_id| self.read_col_all(label_id, col_id))
-            .collect::<Result<_>>()?;
-        // Index by slot for each requested node
-        Ok(slots
-            .iter()
-            .map(|&slot| {
-                col_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(ci, _)| {
-                        col_data[ci].get(slot as usize).copied().unwrap_or(0)
-                    })
-                    .collect()
-            })
-            .collect())
+
+        // Determine the column high-water mark (total node count for this label).
+        let hwm = self.hwm_for_label(label_id).unwrap_or(0) as usize;
+
+        // Use sorted-slot reads when K < 50% of N.  For K=100, N=4039 that is
+        // a ~40× reduction in bytes read per column.  The HWM=0 guard handles
+        // labels that have no nodes yet (shouldn't reach here, but be safe).
+        let use_sorted = hwm == 0 || slots.len() * 2 < hwm;
+
+        if use_sorted {
+            // Sort slots ascending for sequential I/O; keep a permutation index
+            // so we can return results in the original caller order.
+            let mut order: Vec<usize> = (0..slots.len()).collect();
+            order.sort_unstable_by_key(|&i| slots[i]);
+            let sorted_slots: Vec<u32> = order.iter().map(|&i| slots[i]).collect();
+
+            let sorted_result = self.read_col_slots_sorted(label_id, &sorted_slots, col_ids)?;
+
+            // Re-order back to the original slot order expected by the caller.
+            let mut result = vec![vec![0u64; col_ids.len()]; slots.len()];
+            for (sorted_idx, orig_idx) in order.into_iter().enumerate() {
+                result[orig_idx] = sorted_result[sorted_idx].clone();
+            }
+            Ok(result)
+        } else {
+            // Fall back to full column load when most slots are needed anyway.
+            let col_data: Vec<Vec<u64>> = col_ids
+                .iter()
+                .map(|&col_id| self.read_col_all(label_id, col_id))
+                .collect::<Result<_>>()?;
+            Ok(slots
+                .iter()
+                .map(|&slot| {
+                    col_ids
+                        .iter()
+                        .enumerate()
+                        .map(|(ci, _)| col_data[ci].get(slot as usize).copied().unwrap_or(0))
+                        .collect()
+                })
+                .collect())
+        }
     }
 }
 
