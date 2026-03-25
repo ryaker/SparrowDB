@@ -27,9 +27,8 @@ pub mod text_index;
 /// Edge delta log and CSR rebuild on checkpoint.
 pub mod edge_store;
 
-use std::io::{Read as IoRead, Seek, SeekFrom, Write as IoWrite};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use sparrowdb_common::{Error, PageId, Result};
 
@@ -100,7 +99,11 @@ pub fn crc32_zeroed_at(
 /// accidentally decoded as raw pages (sizes won't align).
 pub struct PageStore {
     /// The backing data file.
-    file: Mutex<std::fs::File>,
+    ///
+    /// `pread`/`pwrite` (`FileExt::read_exact_at` / `write_all_at`) are
+    /// used for all I/O so the file descriptor is never mutated (no seek
+    /// cursor movement).  This makes concurrent reads safe without a mutex.
+    file: std::fs::File,
     /// Logical page size in bytes (plaintext).
     page_size: usize,
     /// The encryption context — passthrough if no key was provided.
@@ -142,7 +145,7 @@ impl PageStore {
             .truncate(false)
             .open(path)?;
         Ok(PageStore {
-            file: Mutex::new(file),
+            file,
             page_size,
             enc,
             _path: path.to_path_buf(),
@@ -185,10 +188,7 @@ impl PageStore {
         };
 
         let mut on_disk_buf = vec![0u8; on_disk_size];
-        let mut file = self.file.lock().expect("page store lock poisoned");
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut on_disk_buf)?;
-        drop(file);
+        self.file.read_exact_at(&mut on_disk_buf, offset)?;
 
         if self.enc.is_encrypted() {
             let plaintext = self.enc.decrypt_page(id.0, &on_disk_buf)?;
@@ -223,16 +223,13 @@ impl PageStore {
         };
 
         let offset = self.page_offset(id);
-        let mut file = self.file.lock().expect("page store lock poisoned");
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(&on_disk_data)?;
+        self.file.write_all_at(&on_disk_data, offset)?;
         Ok(())
     }
 
     /// Flush and fsync the backing file to durable storage.
     pub fn fsync(&self) -> Result<()> {
-        let file = self.file.lock().expect("page store lock poisoned");
-        file.sync_all()?;
+        self.file.sync_all()?;
         Ok(())
     }
 }
