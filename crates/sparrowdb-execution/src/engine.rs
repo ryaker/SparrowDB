@@ -2736,6 +2736,12 @@ impl Engine {
             && m.pattern.len() == 1
             && m.pattern[0].rels.is_empty()
         {
+            // ── Q6 COUNT label fast-path (SPA-197) ──────────────────────
+            // MATCH (n:Label) RETURN COUNT(n) AS total  →  O(1) lookup
+            if let Some(result) = self.try_count_label_fastpath(m, &column_names)? {
+                return Ok(result);
+            }
+
             if let Some(result) = self.try_degree_sort_fastpath(m, &column_names)? {
                 return Ok(result);
             }
@@ -2757,6 +2763,92 @@ impl Engine {
             // Multi-pattern or complex query — fallback to sequential execution.
             self.execute_scan(m, &column_names)
         }
+    }
+
+    // ── Q6 COUNT label fast-path (SPA-197) ─────────────────────────────────────
+    //
+    // Detects `MATCH (n:Label) RETURN COUNT(n) AS alias` (or COUNT(*)) and
+    // answers it from the pre-populated `label_row_counts` HashMap in O(1)
+    // instead of scanning every node slot.
+    //
+    // Qualifying conditions:
+    //   1. Exactly one label on the node pattern.
+    //   2. No WHERE clause.
+    //   3. No inline prop filters on the node pattern.
+    //   4. RETURN has exactly one item: COUNT(*) or COUNT(var) where var
+    //      matches the node pattern variable.
+    //   5. No ORDER BY, SKIP, or LIMIT (single scalar result).
+    fn try_count_label_fastpath(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<Option<QueryResult>> {
+        let pat = &m.pattern[0];
+        let node = &pat.nodes[0];
+
+        // Condition 1: exactly one label.
+        let label = match node.labels.first() {
+            Some(l) => l.clone(),
+            None => return Ok(None),
+        };
+
+        // Condition 2: no WHERE clause.
+        if m.where_clause.is_some() {
+            return Ok(None);
+        }
+
+        // Condition 3: no inline prop filters.
+        if !node.props.is_empty() {
+            return Ok(None);
+        }
+
+        // Condition 4: exactly one RETURN item that is COUNT(*) or COUNT(var).
+        if m.return_clause.items.len() != 1 {
+            return Ok(None);
+        }
+        let item = &m.return_clause.items[0];
+        let is_count = match &item.expr {
+            Expr::CountStar => true,
+            Expr::FnCall { name, args } => {
+                name == "count"
+                    && args.len() == 1
+                    && matches!(&args[0], Expr::Var(v) if v == &node.var)
+            }
+            _ => false,
+        };
+        if !is_count {
+            return Ok(None);
+        }
+
+        // Condition 5: no ORDER BY / SKIP / LIMIT.
+        if !m.order_by.is_empty() || m.skip.is_some() || m.limit.is_some() {
+            return Ok(None);
+        }
+
+        // All conditions met — resolve label → count from the cached map.
+        let count = match self.snapshot.catalog.get_label(&label)? {
+            Some(id) => {
+                *self
+                    .snapshot
+                    .label_row_counts
+                    .get(&id)
+                    .unwrap_or(&0)
+            }
+            // Unknown label → 0 rows (matches SPA-245 execute_scan behavior).
+            None => {
+                return Ok(Some(QueryResult {
+                    columns: column_names.to_vec(),
+                    rows: vec![],
+                }));
+            }
+        };
+
+        tracing::debug!(label = %label, count = count, "Q6 COUNT label fastpath hit");
+
+        Ok(Some(QueryResult {
+            columns: column_names.to_vec(),
+            rows: vec![vec![Value::Int64(count as i64)]],
+        }))
     }
 
     // ── Q7 degree-cache fast-path (SPA-272 Cypher wiring) ─────────────────────
