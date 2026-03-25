@@ -1484,6 +1484,7 @@ impl Parser {
                     dir,
                     min_hops: None,
                     max_hops: None,
+                    props: vec![],
                 });
             }
             _ => String::new(),
@@ -1538,10 +1539,19 @@ impl Parser {
                 dir,
                 min_hops: None,
                 max_hops: None,
+                props: vec![],
             });
         } else {
             // No colon — rel type is unspecified (matches any relationship type).
             String::new()
+        };
+
+        // Parse optional inline property map: `[:R {key: val, ...}]`.
+        // Props come after the rel type and before any hop spec or closing `]`.
+        let rel_props: Vec<PropEntry> = if matches!(self.peek(), Token::LBrace) {
+            self.parse_prop_map()?
+        } else {
+            vec![]
         };
 
         // Parse optional variable-length hop spec after rel type:
@@ -1627,6 +1637,7 @@ impl Parser {
             dir,
             min_hops,
             max_hops,
+            props: rel_props,
         })
     }
 

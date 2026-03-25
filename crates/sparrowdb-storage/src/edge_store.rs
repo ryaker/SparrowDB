@@ -391,6 +391,95 @@ impl EdgeStore {
     pub fn open_bwd(&self) -> Result<CsrBackward> {
         CsrBackward::open(&self.bwd_path())
     }
+
+    // ── Edge property storage (SPA-178) ───────────────────────────────────────
+
+    fn edge_props_path(&self) -> PathBuf {
+        self.rel_dir.join("edge_props.bin")
+    }
+
+    /// Append a single property record for `edge_id`.
+    ///
+    /// Record format: `edge_id (u64 LE) + col_id (u32 LE) + value (u64 LE)` = 20 bytes.
+    ///
+    /// The file is append-only; multiple calls for the same `(edge_id, col_id)`
+    /// result in multiple records — the last written value wins on read-back.
+    pub fn set_edge_prop(&self, edge_id: u64, col_id: u32, value: u64) -> Result<()> {
+        let mut buf = [0u8; 20];
+        buf[0..8].copy_from_slice(&edge_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&col_id.to_le_bytes());
+        buf[12..20].copy_from_slice(&value.to_le_bytes());
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.edge_props_path())
+            .map_err(Error::Io)?;
+        file.write_all(&buf).map_err(Error::Io)?;
+        Ok(())
+    }
+
+    /// Read all properties for the given `edge_id`.
+    ///
+    /// Performs a linear scan of `edge_props.bin`.  Returns a `Vec<(col_id, value)>`
+    /// containing the last-written value for each `col_id` seen for this `edge_id`.
+    pub fn get_edge_props(&self, edge_id: u64) -> Result<Vec<(u32, u64)>> {
+        let path = self.edge_props_path();
+        if !path.exists() {
+            return Ok(vec![]);
+        }
+        let bytes = fs::read(&path).map_err(Error::Io)?;
+        if bytes.len() % 20 != 0 {
+            return Err(Error::Corruption(format!(
+                "edge_props.bin size {} is not a multiple of 20",
+                bytes.len()
+            )));
+        }
+        // Collect last-written value for each col_id (later writes win).
+        let mut result: Vec<(u32, u64)> = Vec::new();
+        for chunk in bytes.chunks_exact(20) {
+            let eid = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+            if eid != edge_id {
+                continue;
+            }
+            let col_id = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+            let value = u64::from_le_bytes(chunk[12..20].try_into().unwrap());
+            // Update or insert — last write wins.
+            if let Some(entry) = result.iter_mut().find(|(c, _)| *c == col_id) {
+                entry.1 = value;
+            } else {
+                result.push((col_id, value));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Read ALL edge properties from `edge_props.bin` and return them grouped
+    /// by `edge_id` as a `Vec<(edge_id, col_id, value)>`.
+    ///
+    /// Used by the query engine to load all edge props in one pass, then index
+    /// by `edge_id` for O(1) per-edge lookup during result projection.
+    pub fn read_all_edge_props(&self) -> Result<Vec<(u64, u32, u64)>> {
+        let path = self.edge_props_path();
+        if !path.exists() {
+            return Ok(vec![]);
+        }
+        let bytes = fs::read(&path).map_err(Error::Io)?;
+        if bytes.len() % 20 != 0 {
+            return Err(Error::Corruption(format!(
+                "edge_props.bin size {} is not a multiple of 20",
+                bytes.len()
+            )));
+        }
+        let mut result = Vec::with_capacity(bytes.len() / 20);
+        for chunk in bytes.chunks_exact(20) {
+            let edge_id = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+            let col_id = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+            let value = u64::from_le_bytes(chunk[12..20].try_into().unwrap());
+            result.push((edge_id, col_id, value));
+        }
+        Ok(result)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

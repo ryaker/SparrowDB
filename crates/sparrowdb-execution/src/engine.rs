@@ -4403,6 +4403,47 @@ impl Engine {
                 edge_store.and_then(|s| s.read_delta()).unwrap_or_default()
             };
 
+            // SPA-178: Build (src_slot, dst_slot) → edge_id map for delta edges.
+            // This lets us look up which edge a (src, dst) pair corresponds to
+            // when reading edge properties.
+            let delta_edge_id_map: std::collections::HashMap<(u64, u64), u64> =
+                delta_records_all
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, r)| {
+                        let s = r.src.0 & 0xFFFF_FFFF;
+                        let d = r.dst.0 & 0xFFFF_FFFF;
+                        ((s, d), idx as u64)
+                    })
+                    .collect();
+
+            // SPA-178: Pre-read all edge props for this rel table if any edge
+            // property access is needed (inline filter or projection).
+            let needs_edge_props = !rel_pat.props.is_empty()
+                || (!rel_pat.var.is_empty()
+                    && column_names.iter().any(|c| {
+                        c.split_once('.')
+                            .map_or(false, |(v, _)| v == rel_pat.var.as_str())
+                    }));
+            let all_edge_props_raw: Vec<(u64, u32, u64)> = if needs_edge_props {
+                EdgeStore::open(&self.snapshot.db_root, storage_rel_id)
+                    .and_then(|s| s.read_all_edge_props())
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+            // Group by edge_id: last-write-wins per col_id.
+            let mut edge_props_by_id: std::collections::HashMap<u64, Vec<(u32, u64)>> =
+                std::collections::HashMap::new();
+            for (edge_id, col_id, value) in &all_edge_props_raw {
+                let entry = edge_props_by_id.entry(*edge_id).or_default();
+                if let Some(existing) = entry.iter_mut().find(|(c, _)| *c == *col_id) {
+                    existing.1 = *value;
+                } else {
+                    entry.push((*col_id, *value));
+                }
+            }
+
             // Scan source nodes for this label.
             for src_slot in 0..hwm_src {
                 // SPA-254: check per-query deadline at every slot boundary.
@@ -4538,6 +4579,24 @@ impl Engine {
                         continue;
                     }
 
+                    // SPA-178: look up edge props for this (src_slot, dst_slot) pair.
+                    let current_edge_props: Vec<(u32, u64)> =
+                        if needs_edge_props {
+                            let eid = delta_edge_id_map.get(&(src_slot, dst_slot)).copied();
+                            eid.and_then(|id| edge_props_by_id.get(&id))
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            vec![]
+                        };
+
+                    // Apply inline edge prop filter from rel pattern: [r:TYPE {prop: val}].
+                    if !rel_pat.props.is_empty()
+                        && !self.matches_prop_filter(&current_edge_props, &rel_pat.props)
+                    {
+                        continue;
+                    }
+
                     // For undirected (Both), record (src_slot, dst_slot) so the
                     // backward pass skips already-emitted pairs.
                     if *dir == EdgeDir::Both {
@@ -4658,6 +4717,14 @@ impl Engine {
                             } else {
                                 None
                             };
+                        // SPA-178: build edge_props arg for project_hop_row.
+                        let rel_edge_props_arg = if !rel_pat.var.is_empty()
+                            && !current_edge_props.is_empty()
+                        {
+                            Some((rel_pat.var.as_str(), current_edge_props.as_slice()))
+                        } else {
+                            None
+                        };
                         let row = project_hop_row(
                             &src_props,
                             &dst_props,
@@ -4668,6 +4735,7 @@ impl Engine {
                             src_label_meta,
                             dst_label_meta,
                             &self.snapshot.store,
+                            rel_edge_props_arg,
                         );
                         rows.push(row);
                     }
@@ -4953,6 +5021,7 @@ impl Engine {
                                 src_label_meta,
                                 dst_label_meta,
                                 &self.snapshot.store,
+                                None, // edge props not available in backward pass
                             );
                             rows.push(row);
                         }
@@ -6313,6 +6382,7 @@ impl Engine {
                     src_label_meta,
                     dst_label_meta,
                     &self.snapshot.store,
+                    None, // edge props not available in OPTIONAL MATCH path
                 );
                 rows.push(row);
             }
@@ -7952,6 +8022,9 @@ fn project_hop_row(
     // Optional (dst_var, dst_label) for resolving `labels(dst_var)` columns.
     dst_label_meta: Option<(&str, &str)>,
     store: &NodeStore,
+    // Edge properties for the matched relationship variable (SPA-178).
+    // Keyed by rel_var name; the slice contains (col_id, raw_u64) pairs.
+    edge_props: Option<(&str, &[(u32, u64)])>,
 ) -> Vec<Value> {
     column_names
         .iter()
@@ -7988,6 +8061,16 @@ fn project_hop_row(
             }
             if let Some((v, prop)) = col_name.split_once('.') {
                 let col_id = prop_name_to_col_id(prop);
+                // Check if this is a relationship variable property access (SPA-178).
+                if let Some((evar, eprops)) = edge_props {
+                    if v == evar {
+                        return eprops
+                            .iter()
+                            .find(|(c, _)| *c == col_id)
+                            .map(|(_, val)| decode_raw_val(*val, store))
+                            .unwrap_or(Value::Null);
+                    }
+                }
                 let props = if v == src_var { src_props } else { dst_props };
                 props
                     .iter()

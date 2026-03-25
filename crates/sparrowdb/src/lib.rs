@@ -201,6 +201,8 @@ enum WalMutation {
         src: NodeId,
         dst: NodeId,
         rel_type: String,
+        /// Human-readable (name, value) pairs for WAL observability and schema introspection.
+        prop_entries: Vec<(String, Value)>,
     },
     /// A specific directed edge was deleted.
     EdgeDelete { src: NodeId, dst: NodeId, rel_type: String },
@@ -233,6 +235,8 @@ enum PendingOp {
         src: NodeId,
         dst: NodeId,
         rel_table_id: RelTableId,
+        /// Encoded (col_id, value_u64) pairs to persist in edge_props.bin.
+        props: Vec<(u32, u64)>,
     },
     /// Delete an edge: rewrite the delta log excluding this record.
     EdgeDelete {
@@ -991,7 +995,21 @@ impl GraphDb {
                     "CREATE edge references unresolved variable '{right_var}'"
                 ))
             })?;
-            tx.create_edge(src, dst, &rel_pat.rel_type, HashMap::new())?;
+            // Convert rel_pat.props (AST PropEntries) to HashMap<String, Value>.
+            let edge_props: HashMap<String, Value> = rel_pat
+                .props
+                .iter()
+                .map(|pe| {
+                    let val = match &pe.value {
+                        sparrowdb_cypher::ast::Expr::Literal(lit) => literal_to_value(lit),
+                        _ => return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                            "CREATE edge property '{}' must be a literal value", pe.key
+                        ))),
+                    };
+                    Ok((pe.key.clone(), val))
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+            tx.create_edge(src, dst, &rel_pat.rel_type, edge_props)?;
         }
 
         tx.commit()?;
@@ -1397,7 +1415,20 @@ impl GraphDb {
                         "CREATE references unbound variable: {right_var}"
                     ))
                 })?;
-                tx.create_edge(src, dst, &rel_pat.rel_type, HashMap::new())?;
+                let edge_props: HashMap<String, Value> = rel_pat
+                    .props
+                    .iter()
+                    .map(|pe| {
+                        let val = match &pe.value {
+                            sparrowdb_cypher::ast::Expr::Literal(lit) => literal_to_value(lit),
+                            _ => return Err(Error::InvalidArgument(format!(
+                                "CREATE edge property '{}' must be a literal value", pe.key
+                            ))),
+                        };
+                        Ok((pe.key.clone(), val))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                tx.create_edge(src, dst, &rel_pat.rel_type, edge_props)?;
             }
         }
 
@@ -1524,6 +1555,7 @@ impl GraphDb {
                                 src: ps,
                                 dst: pd,
                                 rel_table_id: prt,
+                                ..
                             } if *ps == src && *pd == dst && *prt == rel_table_id
                         )
                     });
@@ -1931,7 +1963,7 @@ impl GraphDb {
                                 matches!(
                                     op,
                                     PendingOp::EdgeCreate {
-                                        src: ps, dst: pd, rel_table_id: prt,
+                                        src: ps, dst: pd, rel_table_id: prt, ..
                                     } if *ps == src && *pd == dst && *prt == rtid
                                 )
                             });
@@ -2641,7 +2673,7 @@ impl WriteTx {
         src: NodeId,
         dst: NodeId,
         rel_type: &str,
-        _props: HashMap<String, Value>,
+        props: HashMap<String, Value>,
     ) -> Result<EdgeId> {
         // Derive label IDs from the packed node IDs (upper 32 bits).
         let src_label_id = (src.0 >> 32) as u16;
@@ -2676,17 +2708,29 @@ impl WriteTx {
             .count() as u64;
         let edge_id = EdgeId(base_edge_id.0 + buffered_count);
 
+        // Convert HashMap<String, Value> props to (col_id, value_u64) pairs
+        // using the canonical FNV-1a col_id derivation so read and write agree.
+        let encoded_props: Vec<(u32, u64)> = props
+            .iter()
+            .map(|(name, val)| (col_id_of(name), val.to_u64()))
+            .collect();
+
+        // Human-readable entries for WAL schema introspection.
+        let prop_entries: Vec<(String, Value)> = props.into_iter().collect();
+
         // Buffer the edge append — do NOT write to disk yet.
         self.pending_ops.push(PendingOp::EdgeCreate {
             src,
             dst,
             rel_table_id,
+            props: encoded_props,
         });
         self.wal_mutations.push(WalMutation::EdgeCreate {
             edge_id,
             src,
             dst,
             rel_type: rel_type.to_string(),
+            prop_entries,
         });
         Ok(edge_id)
     }
@@ -2732,6 +2776,7 @@ impl WriteTx {
                     src: os,
                     dst: od,
                     rel_table_id: ort,
+                    ..
                 } if *os == src && *od == dst && *ort == rel_table_id
             )
         });
@@ -2883,9 +2928,14 @@ impl WriteTx {
                     src,
                     dst,
                     rel_table_id,
+                    props,
                 } => {
                     let mut es = EdgeStore::open(&self.inner.path, rel_table_id)?;
-                    es.create_edge(src, rel_table_id, dst)?;
+                    let edge_id = es.create_edge(src, rel_table_id, dst)?;
+                    // Persist edge properties after writing the edge record.
+                    for (col_id, value) in &props {
+                        es.set_edge_prop(edge_id.0, *col_id, *value)?;
+                    }
                 }
                 PendingOp::EdgeDelete {
                     src,
@@ -3068,7 +3118,12 @@ fn write_mutation_wal(
                 src,
                 dst,
                 rel_type,
+                prop_entries,
             } => {
+                let wal_props: Vec<(String, Vec<u8>)> = prop_entries
+                    .iter()
+                    .map(|(name, val)| (name.clone(), value_to_wal_bytes(val)))
+                    .collect();
                 wal.append(
                     WalRecordKind::EdgeCreate,
                     txn,
@@ -3077,7 +3132,7 @@ fn write_mutation_wal(
                         src: src.0,
                         dst: dst.0,
                         rel_type: rel_type.clone(),
-                        props: vec![],
+                        props: wal_props,
                     },
                 )?;
             }
