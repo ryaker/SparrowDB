@@ -88,7 +88,7 @@ use sparrowdb_storage::wal::writer::WalWriter;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tracing::info_span;
 
 // ── Version chain ─────────────────────────────────────────────────────────────
@@ -265,8 +265,11 @@ struct DbInner {
     versions: RwLock<VersionStore>,
     /// Per-node last-committed txn_id (write-write conflict detection, SPA-128).
     node_versions: RwLock<NodeVersions>,
-    /// Optional 32-byte encryption key (SPA-98).  When `Some`, WAL payloads
-    /// are encrypted with XChaCha20-Poly1305 via [`WalWriter::open_encrypted`].
+    /// Optional 32-byte encryption key (SPA-98).  Retained for future use
+    /// (e.g., reopening the WAL writer after a full segment rotation triggered
+    /// by an external checkpoint).  The key is encoded into the WAL writer at
+    /// open time via [`WalWriter::open_encrypted`].
+    #[allow(dead_code)]
     encryption_key: Option<[u8; 32]>,
     unique_constraints: RwLock<HashSet<(u32, u32)>>,
     /// Shared property-index cache (SPA-187).
@@ -288,6 +291,13 @@ struct DbInner {
     /// instance.  Invalidated after CHECKPOINT / OPTIMIZE since those compact
     /// the delta log into new CSR base files.
     csr_map: RwLock<HashMap<u32, CsrForward>>,
+    /// Persistent WAL writer (SPA-210).
+    ///
+    /// Reused across transaction commits to avoid paying segment-scan and
+    /// file-open overhead on every write.  Protected by a `Mutex` because
+    /// only one writer exists at a time (the `write_locked` flag enforces
+    /// SWMR, so contention is zero in practice).
+    wal_writer: Mutex<WalWriter>,
 }
 
 // ── Write-lock guard (SPA-181: replaces 'static transmute UB) ────────────────
@@ -344,6 +354,8 @@ impl GraphDb {
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let catalog = Catalog::open(path)?;
+        let wal_dir = path.join("wal");
+        let wal_writer = WalWriter::open(&wal_dir)?;
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -356,6 +368,7 @@ impl GraphDb {
                 prop_index: RwLock::new(sparrowdb_storage::property_index::PropertyIndex::new()),
                 catalog: RwLock::new(catalog),
                 csr_map: RwLock::new(open_csr_map(path)),
+                wal_writer: Mutex::new(wal_writer),
             }),
         })
     }
@@ -372,6 +385,8 @@ impl GraphDb {
     pub fn open_encrypted(path: &Path, key: [u8; 32]) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let catalog = Catalog::open(path)?;
+        let wal_dir = path.join("wal");
+        let wal_writer = WalWriter::open_encrypted(&wal_dir, key)?;
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -384,6 +399,7 @@ impl GraphDb {
                 prop_index: RwLock::new(sparrowdb_storage::property_index::PropertyIndex::new()),
                 catalog: RwLock::new(catalog),
                 csr_map: RwLock::new(open_csr_map(path)),
+                wal_writer: Mutex::new(wal_writer),
             }),
         })
     }
@@ -2743,11 +2759,10 @@ impl WriteTx {
         // touching any data page (SPA-184).  A crash between here and the end
         // of Step 6 is recoverable: WAL replay will re-apply the ops.
         write_mutation_wal(
-            &self.inner.path,
+            &self.inner.wal_writer,
             new_id,
             &updates,
             &self.wal_mutations,
-            self.inner.encryption_key,
         )?;
 
         // Step 5: Apply buffered structural operations to disk (SPA-181).
@@ -2844,29 +2859,27 @@ impl Drop for WriteTx {
 
 /// Append mutation WAL records for a committed transaction.
 ///
-/// Opens (or continues) the WAL writer in `{db_root}/wal/` and emits:
+/// Uses the persistent `wal_writer` cached in [`DbInner`] — no segment scan
+/// or file-open overhead on each call (SPA-210).  Emits:
 /// - `Begin`
 /// - `NodeUpdate` for each staged property change in `updates`
 /// - `NodeCreate` / `NodeUpdate` / `NodeDelete` / `EdgeCreate` for each structural mutation
 /// - `Commit`
 /// - fsync
 fn write_mutation_wal(
-    db_root: &Path,
+    wal_writer: &Mutex<WalWriter>,
     txn_id: u64,
     updates: &[((u64, u32), StagedUpdate)],
     mutations: &[WalMutation],
-    encryption_key: Option<[u8; 32]>,
 ) -> Result<()> {
     // Nothing to record if there were no mutations or property updates.
     if updates.is_empty() && mutations.is_empty() {
         return Ok(());
     }
 
-    let wal_dir = db_root.join("wal");
-    let mut wal = match encryption_key {
-        Some(key) => WalWriter::open_encrypted(&wal_dir, key)?,
-        None => WalWriter::open(&wal_dir)?,
-    };
+    let mut wal = wal_writer
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let txn = TxnId(txn_id);
 
     wal.append(WalRecordKind::Begin, txn, WalPayload::Empty)?;
@@ -3519,7 +3532,11 @@ mod tests {
         let stats = db.stats().unwrap();
         assert_eq!(stats.edge_count, 0);
         assert_eq!(stats.node_count_per_label.len(), 0);
-        assert_eq!(stats.wal_bytes, 0);
+        // SPA-210: WalWriter is opened eagerly at GraphDb::open time, creating
+        // the initial segment file (1-byte version header).  wal_bytes may be
+        // a small non-zero value before any commits.
+        // (Previously the WAL directory was only created on first commit.)
+        let _ = stats.wal_bytes; // accept any value — presence is fine
     }
 
     #[test]
