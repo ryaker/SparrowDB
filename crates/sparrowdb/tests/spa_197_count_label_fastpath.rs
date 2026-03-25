@@ -60,8 +60,9 @@ fn count_label_fastpath_unknown_label() {
         .execute("MATCH (n:NonExistent) RETURN COUNT(n) AS total")
         .expect("COUNT on unknown label");
 
-    // SPA-245: unknown label → 0 rows (no aggregation row produced).
-    assert_eq!(result.rows.len(), 0);
+    // Standard Cypher: unknown label → single row with count 0.
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::Int64(0));
 }
 
 // ── COUNT with WHERE falls through to full scan ─────────────────────────────

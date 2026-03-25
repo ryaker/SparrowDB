@@ -2787,9 +2787,9 @@ impl Engine {
         let node = &pat.nodes[0];
 
         // Condition 1: exactly one label.
-        let label = match node.labels.first() {
-            Some(l) => l.clone(),
-            None => return Ok(None),
+        let label = match &node.labels[..] {
+            [l] => l.clone(),
+            _ => return Ok(None),
         };
 
         // Condition 2: no WHERE clause.
@@ -2827,20 +2827,8 @@ impl Engine {
 
         // All conditions met — resolve label → count from the cached map.
         let count = match self.snapshot.catalog.get_label(&label)? {
-            Some(id) => {
-                *self
-                    .snapshot
-                    .label_row_counts
-                    .get(&id)
-                    .unwrap_or(&0)
-            }
-            // Unknown label → 0 rows (matches SPA-245 execute_scan behavior).
-            None => {
-                return Ok(Some(QueryResult {
-                    columns: column_names.to_vec(),
-                    rows: vec![],
-                }));
-            }
+            Some(id) => *self.snapshot.label_row_counts.get(&id).unwrap_or(&0),
+            None => 0,
         };
 
         tracing::debug!(label = %label, count = count, "Q6 COUNT label fastpath hit");
@@ -2876,9 +2864,9 @@ impl Engine {
         let node = &pat.nodes[0];
 
         // Condition 1: exactly one label.
-        let label = match node.labels.first() {
-            Some(l) => l.clone(),
-            None => return Ok(None),
+        let label = match &node.labels[..] {
+            [l] => l.clone(),
+            _ => return Ok(None),
         };
 
         // Condition 2: no WHERE clause.
