@@ -58,6 +58,12 @@ pub enum Error {
     /// Returned by [`GraphDb::execute_with_timeout`] when the supplied
     /// [`std::time::Duration`] expires during scan or traversal.
     QueryTimeout,
+    /// A mutation or DDL statement was submitted to a read-only transaction.
+    ///
+    /// [`ReadTx::query`] only accepts read-only Cypher (`MATCH … RETURN`).
+    /// Use [`GraphDb::execute`] for `CREATE`, `MERGE`, `MATCH … SET`,
+    /// `MATCH … DELETE`, `CHECKPOINT`, and `OPTIMIZE`.
+    ReadOnly,
 }
 
 impl std::fmt::Display for Error {
@@ -88,6 +94,10 @@ impl std::fmt::Display for Error {
                 "node {node_id} has attached edges and cannot be deleted without removing them first"
             ),
             Error::QueryTimeout => write!(f, "query timeout: deadline exceeded"),
+            Error::ReadOnly => write!(
+                f,
+                "read-only transaction: mutation statements are not allowed in ReadTx::query"
+            ),
         }
     }
 }

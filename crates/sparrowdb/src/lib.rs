@@ -2303,6 +2303,101 @@ impl ReadTx {
     pub fn snapshot(&self) -> TxnId {
         TxnId(self.snapshot_txn_id)
     }
+
+    /// Execute a read-only Cypher query against the pinned snapshot.
+    ///
+    /// ## Snapshot isolation
+    ///
+    /// The query sees exactly the committed state at the moment
+    /// [`begin_read`](GraphDb::begin_read) was called.  Any writes committed
+    /// after that point — even fully committed ones — are invisible until a
+    /// new `ReadTx` is opened.
+    ///
+    /// ## Concurrency
+    ///
+    /// Multiple `ReadTx` handles may run `query` concurrently.  No write lock
+    /// is acquired; only the shared read-paths of the catalog, CSR, and
+    /// property-index caches are accessed.
+    ///
+    /// ## Mutation statements rejected
+    ///
+    /// Passing a mutation statement (`CREATE`, `MERGE`, `MATCH … SET`,
+    /// `MATCH … DELETE`, `CHECKPOINT`, `OPTIMIZE`, etc.) returns
+    /// [`Error::ReadOnly`].  Use [`GraphDb::execute`] for mutations.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use sparrowdb::GraphDb;
+    ///
+    /// let db = GraphDb::open(std::path::Path::new("/tmp/g.sparrow")).unwrap();
+    /// let tx = db.begin_read().unwrap();
+    /// let result = tx.query("MATCH (n:Person) RETURN n.name").unwrap();
+    /// println!("{} rows", result.rows.len());
+    /// ```
+    pub fn query(&self, cypher: &str) -> crate::Result<QueryResult> {
+        use sparrowdb_cypher::{bind, parse};
+
+        let stmt = parse(cypher)?;
+
+        // Take a snapshot of the catalog from the shared cache (no disk I/O if
+        // the catalog is already warm).
+        let catalog_snap = self.inner
+            .catalog
+            .read()
+            .expect("catalog RwLock poisoned")
+            .clone();
+
+        let bound = bind(stmt, &catalog_snap)?;
+
+        // Reject any statement that would mutate state — ReadTx is read-only.
+        if Engine::is_mutation(&bound.inner) {
+            return Err(crate::Error::ReadOnly);
+        }
+
+        // Also reject DDL / maintenance statements.
+        use sparrowdb_cypher::ast::Statement;
+        match &bound.inner {
+            Statement::Checkpoint | Statement::Optimize | Statement::CreateConstraint { .. } => {
+                return Err(crate::Error::ReadOnly);
+            }
+            _ => {}
+        }
+
+        let _span = info_span!("sparrowdb.readtx.query").entered();
+
+        let csrs = self.inner
+            .csr_map
+            .read()
+            .expect("csr_map RwLock poisoned")
+            .clone();
+
+        let mut engine = {
+            let _open_span = info_span!("sparrowdb.readtx.open_engine").entered();
+            Engine::new_with_cached_index(
+                NodeStore::open(&self.inner.path)?,
+                catalog_snap,
+                csrs,
+                &self.inner.path,
+                Some(&self.inner.prop_index),
+            )
+        };
+
+        let result = {
+            let _exec_span = info_span!("sparrowdb.readtx.execute").entered();
+            engine.execute_statement(bound.inner)?
+        };
+
+        // Write lazily-loaded columns back to the shared property-index cache
+        // so subsequent queries benefit from warm column data.
+        engine.write_back_prop_index(&self.inner.prop_index);
+
+        tracing::debug!(
+            rows = result.rows.len(),
+            snapshot_txn_id = self.snapshot_txn_id,
+            "readtx query complete"
+        );
+        Ok(result)
+    }
 }
 
 // ── WriteTx ───────────────────────────────────────────────────────────────────
