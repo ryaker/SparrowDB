@@ -1019,53 +1019,38 @@ impl Engine {
             None => return Ok(vec![]),
         };
 
-        let hwm = self.snapshot.store.hwm_for_label(label_id)?;
-
-        // Collect prop filter col_ids.
-        let filter_col_ids: Vec<u32> = node_pat
+        // Col_ids referenced by the WHERE clause (needed for WHERE evaluation
+        // even after the index narrows candidates by inline prop filter).
+        let mut where_col_ids: Vec<u32> = node_pat
             .props
             .iter()
             .map(|pe| prop_name_to_col_id(&pe.key))
             .collect();
-
-        // Col_ids referenced by the WHERE clause.
-        let mut all_col_ids: Vec<u32> = filter_col_ids;
         if let Some(ref where_expr) = mm.where_clause {
-            collect_col_ids_from_expr(where_expr, &mut all_col_ids);
+            collect_col_ids_from_expr(where_expr, &mut where_col_ids);
         }
 
         let var_name = node_pat.var.as_str();
+
+        // Use the property index for O(1) equality lookups on inline prop
+        // filters, falling back to full scan for overflow strings / params.
+        let candidates = self
+            .scan_nodes_for_label_with_index(label_id, &node_pat.props)?;
+
         let mut matching_ids = Vec::new();
-
-        for slot in 0..hwm {
-            let node_id = NodeId(((label_id as u64) << 32) | slot);
-
-            // SPA-216: skip tombstoned nodes so that already-deleted nodes are
-            // not re-deleted and are not matched by SET mutations either.
-            if self.is_node_tombstoned(node_id) {
-                continue;
-            }
-
-            let props = read_node_props(&self.snapshot.store, node_id, &all_col_ids)?;
-
-            if !matches_prop_filter_static(
-                &props,
-                &node_pat.props,
-                &self.dollar_params(),
-                &self.snapshot.store,
-            ) {
-                continue;
-            }
-
-            if let Some(ref where_expr) = mm.where_clause {
-                let mut row_vals =
-                    build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
-                row_vals.extend(self.dollar_params());
-                if !self.eval_where_graph(where_expr, &row_vals) {
-                    continue;
+        for node_id in candidates {
+            // Re-read props needed for WHERE clause evaluation.
+            if mm.where_clause.is_some() {
+                let props = read_node_props(&self.snapshot.store, node_id, &where_col_ids)?;
+                if let Some(ref where_expr) = mm.where_clause {
+                    let mut row_vals =
+                        build_row_vals(&props, var_name, &where_col_ids, &self.snapshot.store);
+                    row_vals.extend(self.dollar_params());
+                    if !self.eval_where_graph(where_expr, &row_vals) {
+                        continue;
+                    }
                 }
             }
-
             matching_ids.push(node_id);
         }
 
@@ -1129,6 +1114,91 @@ impl Engine {
 
     // ── Scan for MATCH…CREATE (called by GraphDb with a write transaction) ──────
 
+    /// Return all live `NodeId`s for `label_id` whose inline prop predicates
+    /// match, using the `PropertyIndex` for O(1) equality lookups when possible.
+    ///
+    /// ## Index path (O(log n) per unique value)
+    ///
+    /// When there is exactly one inline prop filter and the literal is directly
+    /// encodable (integers and strings ≤ 7 bytes), the method:
+    ///   1. Calls `build_for` lazily — reads the column file once and caches it.
+    ///   2. Does a single `BTreeMap::get` to obtain the matching slot list.
+    ///   3. Verifies tombstones on the (usually tiny) candidate set.
+    ///
+    /// ## Fallback (O(n) full scan)
+    ///
+    /// When the filter cannot use the index (overflow string, multiple props,
+    /// parameter expressions, or `build_for` I/O error) the method falls back
+    /// to iterating all `0..hwm` slots — the same behaviour as before this fix.
+    ///
+    /// ## Integration
+    ///
+    /// This replaces the inline `for slot in 0..hwm` blocks in
+    /// `scan_match_create`, `scan_match_create_rows`, and `scan_match_mutate`
+    /// so that the index is used consistently across all write-side MATCH paths.
+    fn scan_nodes_for_label_with_index(
+        &self,
+        label_id: u32,
+        node_props: &[sparrowdb_cypher::ast::PropEntry],
+    ) -> Result<Vec<NodeId>> {
+        let hwm = self.snapshot.store.hwm_for_label(label_id)?;
+
+        // Collect filter col_ids up-front (needed for the fallback path too).
+        let filter_col_ids: Vec<u32> = node_props
+            .iter()
+            .map(|p| prop_name_to_col_id(&p.key))
+            .collect();
+
+        // ── Lazy index build ────────────────────────────────────────────────
+        // Ensure the property index is loaded for every column referenced by
+        // inline prop filters.  `build_for` is idempotent (cache-hit no-op
+        // after the first call) and suppresses I/O errors internally.
+        for &col_id in &filter_col_ids {
+            let _ = self
+                .prop_index
+                .borrow_mut()
+                .build_for(&self.snapshot.store, label_id, col_id);
+        }
+
+        // ── Index lookup (single-equality filter, literal value) ────────────
+        let index_slots: Option<Vec<u32>> = {
+            let prop_index_ref = self.prop_index.borrow();
+            try_index_lookup_for_props(node_props, label_id, &prop_index_ref)
+        };
+
+        if let Some(candidate_slots) = index_slots {
+            // O(k) verification over a small candidate set (typically 1 slot).
+            let mut result = Vec::with_capacity(candidate_slots.len());
+            for slot in candidate_slots {
+                let node_id = NodeId(((label_id as u64) << 32) | slot as u64);
+                if self.is_node_tombstoned(node_id) {
+                    continue;
+                }
+                // For multi-prop filters the index only narrowed on one column;
+                // verify the remaining filters here.
+                if !self.node_matches_prop_filter(node_id, &filter_col_ids, node_props) {
+                    continue;
+                }
+                result.push(node_id);
+            }
+            return Ok(result);
+        }
+
+        // ── Fallback: full O(N) scan ────────────────────────────────────────
+        let mut result = Vec::new();
+        for slot in 0..hwm {
+            let node_id = NodeId(((label_id as u64) << 32) | slot);
+            if self.is_node_tombstoned(node_id) {
+                continue;
+            }
+            if !self.node_matches_prop_filter(node_id, &filter_col_ids, node_props) {
+                continue;
+            }
+            result.push(node_id);
+        }
+        Ok(result)
+    }
+
     /// Scan nodes matching the MATCH patterns in a `MatchCreateStatement` and
     /// return a map of variable name → Vec<NodeId> for each named node pattern.
     ///
@@ -1160,49 +1230,10 @@ impl Engine {
                     }
                 };
 
-                let hwm = self.snapshot.store.hwm_for_label(label_id)?;
-
-                // Collect col_ids needed for inline prop filtering.
-                let filter_col_ids: Vec<u32> = node_pat
-                    .props
-                    .iter()
-                    .map(|p| prop_name_to_col_id(&p.key))
-                    .collect();
-
-                let mut matching_ids: Vec<NodeId> = Vec::new();
-                for slot in 0..hwm {
-                    let node_id = NodeId(((label_id as u64) << 32) | slot);
-
-                    // Skip tombstoned nodes (col_0 == u64::MAX).
-                    // Treat a missing-file error as "not tombstoned".
-                    match self.snapshot.store.get_node_raw(node_id, &[0u32]) {
-                        Ok(col0) if col0.iter().any(|&(c, v)| c == 0 && v == u64::MAX) => {
-                            continue;
-                        }
-                        Ok(_) | Err(_) => {}
-                    }
-
-                    // Apply inline prop filter if any.
-                    if !node_pat.props.is_empty() {
-                        match self.snapshot.store.get_node_raw(node_id, &filter_col_ids) {
-                            Ok(props) => {
-                                if !matches_prop_filter_static(
-                                    &props,
-                                    &node_pat.props,
-                                    &self.dollar_params(),
-                                    &self.snapshot.store,
-                                ) {
-                                    continue;
-                                }
-                            }
-                            // If a filter column doesn't exist on disk, the node
-                            // cannot satisfy the filter.
-                            Err(_) => continue,
-                        }
-                    }
-
-                    matching_ids.push(node_id);
-                }
+                // Use the property index for O(1) equality lookups when possible,
+                // falling back to a full O(N) scan for overflow strings / params.
+                let matching_ids = self
+                    .scan_nodes_for_label_with_index(label_id, &node_pat.props)?;
 
                 var_candidates.insert(node_pat.var.clone(), matching_ids);
             }
@@ -1273,31 +1304,13 @@ impl Engine {
                         }
                     };
 
-                    let filter_col_ids: Vec<u32> = node_pat
-                        .props
-                        .iter()
-                        .map(|p| prop_name_to_col_id(&p.key))
-                        .collect();
-
+                    // Use the property index for O(1) equality lookups when possible,
+                    // falling back to a full O(N) scan for overflow strings / params.
                     let mut matching_ids: Vec<NodeId> = Vec::new();
                     for label_id in scan_label_ids {
-                        let hwm = self.snapshot.store.hwm_for_label(label_id)?;
-                        for slot in 0..hwm {
-                            let node_id = NodeId(((label_id as u64) << 32) | slot);
-
-                            if self.is_node_tombstoned(node_id) {
-                                continue;
-                            }
-                            if !self.node_matches_prop_filter(
-                                node_id,
-                                &filter_col_ids,
-                                &node_pat.props,
-                            ) {
-                                continue;
-                            }
-
-                            matching_ids.push(node_id);
-                        }
+                        let ids = self
+                            .scan_nodes_for_label_with_index(label_id, &node_pat.props)?;
+                        matching_ids.extend(ids);
                     }
 
                     if matching_ids.is_empty() {
