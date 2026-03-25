@@ -114,10 +114,28 @@ pub struct IndexKey {
 /// Use [`PropertyIndex::build_for`] to load a specific column on demand, or
 /// [`PropertyIndex::build`] for an upfront full build.  Then use
 /// [`PropertyIndex::lookup`] for O(log n) equality queries.
+///
+/// ## Clone cost (SPA-232 fix)
+///
+/// The inner B-tree for each `(label_id, col_id)` is wrapped in an `Arc` so
+/// that cloning a `PropertyIndex` is O(number of indexed columns) rather than
+/// O(total index entries).  This eliminates the per-query clone overhead when
+/// the shared property-index cache is warm (e.g. after Q1 point-lookups build
+/// a large uid index that Q4/Q5/Q8 multi-hop queries don't need).
+///
+/// Mutation methods (`build_for`, `insert`, `update`, `remove`) use
+/// `Arc::make_mut` to obtain exclusive access (copy-on-write semantics):
+/// only the first mutation of a shared Arc copies the BTreeMap; subsequent
+/// mutations on the same Engine's private copy are in-place.
 #[derive(Default, Clone)]
 pub struct PropertyIndex {
-    /// `index[(label_id, col_id)][raw_value] = [slot, ...]`
-    index: std::collections::HashMap<IndexKey, BTreeMap<u64, Vec<u32>>>,
+    /// `index[(label_id, col_id)] = Arc<BTreeMap<raw_value, [slot, ...]>>`
+    ///
+    /// The `Arc` wrapper makes `Clone` O(loaded.len()) instead of
+    /// O(Σ entries per column).  `Arc::make_mut` is used for mutations to
+    /// ensure copy-on-write isolation between the shared cache and per-Engine
+    /// copies.
+    index: std::collections::HashMap<IndexKey, std::sync::Arc<BTreeMap<u64, Vec<u32>>>>,
     /// Set of `(label_id, col_id)` pairs whose column file has already been
     /// loaded into `index`.  A pair is present here even when its column file
     /// contained no indexable values, so that `build_for` can skip repeated I/O.
@@ -215,7 +233,11 @@ impl PropertyIndex {
             }
         };
 
-        let btree = self.index.entry(key).or_default();
+        // Build a fresh BTreeMap for this column (always a new key at this
+        // point since we checked `self.loaded` above and returned early on
+        // cache hit).  Insert as `Arc::new` so later clones of this
+        // `PropertyIndex` share the data without copying.
+        let mut btree: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         for (slot, raw) in raw_vals.into_iter().enumerate() {
             let slot = slot as u32;
             if raw == ABSENT || tombstone_slots.contains(&slot) {
@@ -225,6 +247,7 @@ impl PropertyIndex {
             // so that integer ordering and equality checks are consistent.
             btree.entry(sort_key(raw)).or_default().push(slot);
         }
+        self.index.insert(key, std::sync::Arc::new(btree));
 
         Ok(())
     }
@@ -283,7 +306,7 @@ impl PropertyIndex {
                     }
                 };
 
-                let btree = idx.index.entry(key).or_default();
+                let mut btree: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
                 for (slot, raw) in raw_vals.into_iter().enumerate() {
                     let slot = slot as u32;
                     // Skip absent and tombstoned slots.
@@ -292,6 +315,8 @@ impl PropertyIndex {
                     }
                     btree.entry(sort_key(raw)).or_default().push(slot);
                 }
+                idx.index.insert(key, std::sync::Arc::new(btree));
+                idx.loaded.insert(key);
             }
         }
 
@@ -373,12 +398,15 @@ impl PropertyIndex {
             return;
         }
         let key = IndexKey { label_id, col_id };
-        self.index
-            .entry(key)
-            .or_default()
-            .entry(sort_key(raw_value))
-            .or_default()
-            .push(slot);
+        // `Arc::make_mut` gives us a `&mut BTreeMap` with copy-on-write
+        // semantics: if the Arc is shared (e.g. was cloned from the cache),
+        // the inner BTreeMap is cloned here; otherwise mutation is in-place.
+        let btree = std::sync::Arc::make_mut(
+            self.index
+                .entry(key)
+                .or_insert_with(|| std::sync::Arc::new(BTreeMap::new())),
+        );
+        btree.entry(sort_key(raw_value)).or_default().push(slot);
     }
 
     /// Update a slot from `old_raw` to `new_raw` after a SET operation.
@@ -387,7 +415,11 @@ impl PropertyIndex {
     /// A no-op for the absent sentinel.
     pub fn update(&mut self, label_id: u32, col_id: u32, slot: u32, old_raw: u64, new_raw: u64) {
         let key = IndexKey { label_id, col_id };
-        let btree = self.index.entry(key).or_default();
+        let btree = std::sync::Arc::make_mut(
+            self.index
+                .entry(key)
+                .or_insert_with(|| std::sync::Arc::new(BTreeMap::new())),
+        );
 
         // Remove slot from old bucket.
         if old_raw != ABSENT {
@@ -414,7 +446,8 @@ impl PropertyIndex {
         }
         let sk = sort_key(raw_value);
         let key = IndexKey { label_id, col_id };
-        if let Some(btree) = self.index.get_mut(&key) {
+        if let Some(arc_btree) = self.index.get_mut(&key) {
+            let btree = std::sync::Arc::make_mut(arc_btree);
             if let Some(slots) = btree.get_mut(&sk) {
                 slots.retain(|&s| s != slot);
                 if slots.is_empty() {
