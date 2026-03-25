@@ -31,9 +31,16 @@ use sparrowdb_common::{Error, Lsn, Result, TxnId};
 ///
 /// | Version | Checksum algorithm |
 /// |---------|--------------------|
-/// | 1       | CRC32 (IEEE 802.3) |
-/// | 2       | CRC32C (Castagnoli) — current |
+/// | 1       | CRC32 (IEEE 802.3) — retired |
+/// | 2       | CRC32C (Castagnoli) — current write format |
+/// | 21      | CRC32 (IEEE 802.3) — legacy 0.1.2 write format, read-only compat |
 pub const WAL_FORMAT_VERSION: u8 = 2;
+
+/// Legacy WAL format version byte written by SparrowDB 0.1.2.
+///
+/// Segments with this version byte use CRC32 (IEEE 802.3) checksums.
+/// The current code accepts them for reading (replay/scan) but never writes them.
+pub const WAL_FORMAT_VERSION_LEGACY: u8 = 21;
 
 // ── Record kind byte values ──────────────────────────────────────────────────
 
@@ -588,6 +595,83 @@ impl WalRecord {
             total_record_len,
         ))
     }
+
+    /// Decode a WAL record from the start of `bytes`, selecting the checksum
+    /// algorithm based on the segment's `wal_version` header byte.
+    ///
+    /// - `WAL_FORMAT_VERSION` (2) → CRC32C (Castagnoli) — current format.
+    /// - `WAL_FORMAT_VERSION_LEGACY` (21) → CRC32 (IEEE 802.3) — legacy 0.1.2 format.
+    ///
+    /// This is the read-path entry point used by replay and schema-scan when
+    /// opening databases that may have been written by an older SparrowDB release.
+    /// The write path always uses [`WalRecord::encode`] which emits CRC32C.
+    pub fn decode_with_version(bytes: &[u8], wal_version: u8) -> Result<(Self, usize)> {
+        if bytes.len() < HEADER_LEN {
+            return Err(Error::Corruption(format!(
+                "WAL record too short: {} bytes (need at least {})",
+                bytes.len(),
+                HEADER_LEN
+            )));
+        }
+
+        // length field
+        let length_val = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+
+        if length_val < 21 {
+            return Err(Error::Corruption(format!(
+                "WAL record length field too small: {length_val} (minimum 21)"
+            )));
+        }
+
+        let total_record_len = 4 + length_val;
+
+        if bytes.len() < total_record_len {
+            return Err(Error::Corruption(format!(
+                "WAL record truncated: have {} bytes, need {}",
+                bytes.len(),
+                total_record_len
+            )));
+        }
+
+        // kind
+        let kind = WalRecordKind::from_byte(bytes[4])?;
+
+        // lsn
+        let lsn = u64::from_le_bytes(bytes[5..13].try_into().unwrap());
+
+        // txn_id
+        let txn_id = u64::from_le_bytes(bytes[13..21].try_into().unwrap());
+
+        // payload bytes = everything between txn_id end and crc
+        let payload_end = total_record_len - CRC_LEN;
+        let payload_bytes = &bytes[21..payload_end];
+
+        // crc
+        let stored_crc =
+            u32::from_le_bytes(bytes[payload_end..payload_end + 4].try_into().unwrap());
+
+        // Select checksum algorithm based on segment version.
+        // CRC covers [kind + lsn + txn_id + payload] = bytes[4..payload_end].
+        let computed_crc = match wal_version {
+            WAL_FORMAT_VERSION_LEGACY => compute_crc32_ieee(&bytes[4..payload_end]),
+            _ => compute_crc32c(&bytes[4..payload_end]),
+        };
+        if computed_crc != stored_crc {
+            return Err(Error::ChecksumMismatch);
+        }
+
+        let payload = WalPayload::decode(kind, payload_bytes)?;
+
+        Ok((
+            WalRecord {
+                lsn: Lsn(lsn),
+                txn_id: TxnId(txn_id),
+                kind,
+                payload,
+            },
+            total_record_len,
+        ))
+    }
 }
 
 // ── CRC32C helper ────────────────────────────────────────────────────────────
@@ -598,6 +682,15 @@ impl WalRecord {
 /// available via the `crc32c` crate.
 pub(crate) fn compute_crc32c(data: &[u8]) -> u32 {
     crc32c::crc32c(data)
+}
+
+/// Compute CRC32 (IEEE 802.3) checksum over `data`.
+///
+/// Used only for backward-compatible reads of legacy WAL segments
+/// written by SparrowDB 0.1.2 (version byte = [`WAL_FORMAT_VERSION_LEGACY`]).
+/// Never used in the write path.
+pub(crate) fn compute_crc32_ieee(data: &[u8]) -> u32 {
+    crc32fast::hash(data)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

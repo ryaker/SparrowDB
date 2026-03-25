@@ -25,7 +25,9 @@ use std::{
 
 use sparrowdb_common::{Error, Lsn, Result};
 
-use super::codec::{WalPayload, WalRecord, WalRecordKind, WAL_FORMAT_VERSION};
+use super::codec::{
+    WalPayload, WalRecord, WalRecordKind, WAL_FORMAT_VERSION, WAL_FORMAT_VERSION_LEGACY,
+};
 use super::writer::segment_path;
 use crate::encryption::EncryptionContext;
 
@@ -106,11 +108,14 @@ impl WalReplayer {
             }
 
             // Validate the 1-byte version header.
+            // Accept both the current format (WAL_FORMAT_VERSION = 2, CRC32C) and
+            // the legacy format written by SparrowDB 0.1.2 (WAL_FORMAT_VERSION_LEGACY = 21, CRC32).
             let version = data[0];
-            if version != WAL_FORMAT_VERSION {
+            if version != WAL_FORMAT_VERSION && version != WAL_FORMAT_VERSION_LEGACY {
                 return Err(Error::Corruption(format!(
-                    "WAL segment {seg_no} version mismatch: found {version}, expected {WAL_FORMAT_VERSION}. \
-                     This segment was written with an incompatible WAL format."
+                    "WAL segment {seg_no} has unrecognised version byte {version}. \
+                     Supported versions: {WAL_FORMAT_VERSION} (current), \
+                     {WAL_FORMAT_VERSION_LEGACY} (legacy 0.1.2)."
                 )));
             }
 
@@ -121,7 +126,7 @@ impl WalReplayer {
                 if data[offset..].iter().all(|&b| b == 0) {
                     break;
                 }
-                match WalRecord::decode(&data[offset..]) {
+                match WalRecord::decode_with_version(&data[offset..], version) {
                     Ok((rec, consumed)) => {
                         all_records.insert(rec.lsn.0, rec);
                         offset += consumed;
@@ -272,11 +277,13 @@ impl WalReplayer {
                 continue;
             }
             // Validate the 1-byte version header.
+            // Accept both current (2, CRC32C) and legacy 0.1.2 (21, CRC32) formats.
             let version = data[0];
-            if version != WAL_FORMAT_VERSION {
+            if version != WAL_FORMAT_VERSION && version != WAL_FORMAT_VERSION_LEGACY {
                 return Err(Error::Corruption(format!(
-                    "WAL segment {seg_no} version mismatch: found {version}, expected {WAL_FORMAT_VERSION}. \
-                     This segment was written with an incompatible WAL format."
+                    "WAL segment {seg_no} has unrecognised version byte {version}. \
+                     Supported versions: {WAL_FORMAT_VERSION} (current), \
+                     {WAL_FORMAT_VERSION_LEGACY} (legacy 0.1.2)."
                 )));
             }
             // Records start at byte 1 (after the version header byte).
@@ -285,7 +292,7 @@ impl WalReplayer {
                 if data[offset..].iter().all(|&b| b == 0) {
                     break;
                 }
-                match WalRecord::decode(&data[offset..]) {
+                match WalRecord::decode_with_version(&data[offset..], version) {
                     Ok((rec, consumed)) => {
                         all_records.insert(rec.lsn.0, rec);
                         offset += consumed;

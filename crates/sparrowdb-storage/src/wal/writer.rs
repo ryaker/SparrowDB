@@ -29,7 +29,9 @@ use std::{
 
 use sparrowdb_common::{Lsn, Result, TxnId};
 
-use super::codec::{WalPayload, WalRecord, WalRecordKind, WAL_FORMAT_VERSION};
+use super::codec::{
+    WalPayload, WalRecord, WalRecordKind, WAL_FORMAT_VERSION, WAL_FORMAT_VERSION_LEGACY,
+};
 use crate::encryption::EncryptionContext;
 
 /// 64 MiB per segment.
@@ -154,11 +156,14 @@ impl WalWriter {
         }
 
         // Validate the version header byte.
+        // Accept both the current format (WAL_FORMAT_VERSION = 2, CRC32C) and
+        // the legacy format written by SparrowDB 0.1.2 (WAL_FORMAT_VERSION_LEGACY = 21, CRC32).
         let version = data[0];
-        if version != WAL_FORMAT_VERSION {
+        if version != WAL_FORMAT_VERSION && version != WAL_FORMAT_VERSION_LEGACY {
             return Err(sparrowdb_common::Error::Corruption(format!(
-                "WAL segment version mismatch: found version {version}, expected {WAL_FORMAT_VERSION}. \
-                 This database was written with an incompatible WAL format (CRC32 vs CRC32C). \
+                "WAL segment has unrecognised version byte {version}. \
+                 Supported versions: {WAL_FORMAT_VERSION} (current CRC32C), \
+                 {WAL_FORMAT_VERSION_LEGACY} (legacy 0.1.2 CRC32). \
                  The database cannot be opened."
             )));
         }
@@ -168,7 +173,7 @@ impl WalWriter {
         let mut offset = 1usize;
         let mut max_lsn = 0u64;
         while offset < data.len() {
-            match WalRecord::decode(&data[offset..]) {
+            match WalRecord::decode_with_version(&data[offset..], version) {
                 Ok((rec, consumed)) => {
                     if rec.lsn.0 > max_lsn {
                         max_lsn = rec.lsn.0;
