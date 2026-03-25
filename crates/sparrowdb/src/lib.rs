@@ -35,6 +35,10 @@ use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::{col_id_of, TxnId};
 use sparrowdb_execution::Engine;
 
+// ── Export / import module ────────────────────────────────────────────────────
+pub mod export;
+pub use export::{EdgeDump, GraphDump, NodeDump};
+
 // ── Public re-exports ─────────────────────────────────────────────────────────
 //
 // Re-export the types that consumers of the top-level `sparrowdb` crate need
