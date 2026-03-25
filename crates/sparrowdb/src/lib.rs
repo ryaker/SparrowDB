@@ -1362,12 +1362,19 @@ impl GraphDb {
         let mut tx = self.begin_write()?;
 
         // Build an Engine for the read-scan phase.
+        //
+        // Use `new_with_cached_index` so that the lazy property index built
+        // during this engine's scan is seeded from (and written back to) the
+        // shared per-GraphDb cache.  MATCH…CREATE only creates edges — it never
+        // changes node property columns — so the cached column data remains
+        // valid across calls and does not need to be invalidated.
         let csrs = self.cached_csr_map();
-        let engine = Engine::new(
+        let engine = Engine::new_with_cached_index(
             NodeStore::open(&self.inner.path)?,
             self.catalog_snapshot(),
             csrs,
             &self.inner.path,
+            Some(&self.inner.prop_index),
         );
 
         // SPA-208: reject reserved __SO_ rel-type prefix on edges in the CREATE clause.
@@ -1396,6 +1403,12 @@ impl GraphDb {
         // multiple nodes of the same label existed (SPA-183).
 
         let matched_rows = engine.scan_match_create_rows(mc)?;
+
+        // Write any newly-loaded index columns back to the shared cache so
+        // subsequent MATCH…CREATE calls can reuse them without re-reading disk.
+        // Node property columns are NOT changed by this operation (only edges
+        // are created), so the cache remains valid.
+        engine.write_back_prop_index(&self.inner.prop_index);
 
         if matched_rows.is_empty() {
             return Ok(QueryResult::empty(vec![]));
@@ -1433,7 +1446,9 @@ impl GraphDb {
         }
 
         tx.commit()?;
-        self.invalidate_prop_index();
+        // Note: do NOT call invalidate_prop_index() here — MATCH…CREATE only
+        // creates edges, not node properties, so the cached column data remains
+        // valid.  Only invalidate the catalog in case a new rel-type was registered.
         self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
