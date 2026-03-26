@@ -15,6 +15,65 @@ use crate::ast::{
 };
 use crate::lexer::{tokenize, Token};
 
+/// Map a keyword `Token` variant to its canonical string representation.
+///
+/// Returns `None` for non-keyword tokens (e.g. `Ident`, `Integer`, punctuation).
+fn token_keyword_name(tok: &Token) -> Option<&'static str> {
+    match tok {
+        Token::Match => Some("MATCH"),
+        Token::Create => Some("CREATE"),
+        Token::Return => Some("RETURN"),
+        Token::Where => Some("WHERE"),
+        Token::Not => Some("NOT"),
+        Token::And => Some("AND"),
+        Token::Or => Some("OR"),
+        Token::Order => Some("ORDER"),
+        Token::By => Some("BY"),
+        Token::Asc => Some("ASC"),
+        Token::Desc => Some("DESC"),
+        Token::Limit => Some("LIMIT"),
+        Token::Skip => Some("SKIP"),
+        Token::Distinct => Some("DISTINCT"),
+        Token::Optional => Some("OPTIONAL"),
+        Token::Union => Some("UNION"),
+        Token::Unwind => Some("UNWIND"),
+        Token::Delete => Some("DELETE"),
+        Token::Detach => Some("DETACH"),
+        Token::Set => Some("SET"),
+        Token::Merge => Some("MERGE"),
+        Token::Checkpoint => Some("CHECKPOINT"),
+        Token::Optimize => Some("OPTIMIZE"),
+        Token::Contains => Some("CONTAINS"),
+        Token::StartsWith => Some("STARTS"),
+        Token::EndsWith => Some("ENDS"),
+        Token::Count => Some("COUNT"),
+        Token::Null => Some("NULL"),
+        Token::True => Some("TRUE"),
+        Token::False => Some("FALSE"),
+        Token::As => Some("AS"),
+        Token::With => Some("WITH"),
+        Token::Exists => Some("EXISTS"),
+        Token::In => Some("IN"),
+        Token::Any => Some("ANY"),
+        Token::All => Some("ALL"),
+        Token::NoneKw => Some("NONE"),
+        Token::Single => Some("SINGLE"),
+        Token::Is => Some("IS"),
+        Token::Call => Some("CALL"),
+        Token::Yield => Some("YIELD"),
+        Token::Case => Some("CASE"),
+        Token::When => Some("WHEN"),
+        Token::Then => Some("THEN"),
+        Token::Else => Some("ELSE"),
+        Token::End => Some("END"),
+        Token::Index => Some("INDEX"),
+        Token::On => Some("ON"),
+        Token::Constraint => Some("CONSTRAINT"),
+        Token::Assert => Some("ASSERT"),
+        _ => None,
+    }
+}
+
 /// Parse a Cypher statement string.  Returns `Err` for any unsupported or
 /// malformed input; never panics.
 pub fn parse(input: &str) -> Result<Statement> {
@@ -99,6 +158,26 @@ impl Parser {
                 "expected identifier, got {:?}",
                 other
             ))),
+        }
+    }
+
+    /// Accept the next token as an identifier for a label or relationship type.
+    ///
+    /// In standard Cypher, backtick-escaped identifiers allow reserved words to
+    /// be used as labels or relationship types.  After lexing, backtick-quoted
+    /// words are already `Token::Ident`, but *unquoted* reserved words (e.g.
+    /// `CONTAINS`, `ORDER`) are lexed as keyword tokens.  This helper accepts
+    /// both `Token::Ident` and any keyword token and returns the string form,
+    /// so that `:CONTAINS` and `` :`CONTAINS` `` both work.
+    fn expect_label_or_type(&mut self) -> Result<String> {
+        let tok = self.advance().clone();
+        match tok {
+            Token::Ident(s) => Ok(s),
+            ref kw => token_keyword_name(kw)
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!("expected label/type name, got {:?}", tok))
+                }),
         }
     }
 
@@ -1052,15 +1131,7 @@ impl Parser {
             ));
         }
         self.advance(); // consume ':'
-        let label = match self.advance().clone() {
-            Token::Ident(s) => s,
-            other => {
-                return Err(Error::InvalidArgument(format!(
-                    "expected label name after ':', got {:?}",
-                    other
-                )))
-            }
-        };
+        let label = self.expect_label_or_type()?;
 
         // Property map (optional but typical for MERGE).
         let props = if matches!(self.peek(), Token::LBrace) {
@@ -1180,7 +1251,7 @@ impl Parser {
     fn parse_create_index(&mut self) -> Result<Statement> {
         self.expect_tok(&Token::On)?;
         self.expect_tok(&Token::Colon)?;
-        let label = self.expect_ident()?;
+        let label = self.expect_label_or_type()?;
         self.expect_tok(&Token::LParen)?;
         let property = self.expect_ident()?;
         self.expect_tok(&Token::RParen)?;
@@ -1191,7 +1262,7 @@ impl Parser {
         self.expect_tok(&Token::LParen)?;
         let _var = self.expect_ident()?;
         self.expect_tok(&Token::Colon)?;
-        let label = self.expect_ident()?;
+        let label = self.expect_label_or_type()?;
         self.expect_tok(&Token::RParen)?;
         match self.advance().clone() {
             Token::Assert => {}
@@ -1380,15 +1451,7 @@ impl Parser {
         let mut labels = Vec::new();
         while matches!(self.peek(), Token::Colon) {
             self.advance();
-            let label = match self.advance().clone() {
-                Token::Ident(s) => s,
-                other => {
-                    return Err(Error::InvalidArgument(format!(
-                        "expected label name, got {:?}",
-                        other
-                    )))
-                }
-            };
+            let label = self.expect_label_or_type()?;
             labels.push(label);
         }
 
@@ -1493,15 +1556,7 @@ impl Parser {
         // Parse optional colon + rel type, or detect illegal bare star.
         let rel_type = if matches!(self.peek(), Token::Colon) {
             self.advance(); // consume ':'
-            match self.advance().clone() {
-                Token::Ident(s) => s,
-                other => {
-                    return Err(Error::InvalidArgument(format!(
-                        "expected relationship type, got {:?}",
-                        other
-                    )))
-                }
-            }
+            self.expect_label_or_type()?
         } else if matches!(self.peek(), Token::Star) {
             return Err(Error::InvalidArgument(
                 "variable-length paths require a relationship type: use [:R*] not [*]".into(),

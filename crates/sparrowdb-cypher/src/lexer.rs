@@ -292,6 +292,28 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     Token::Integer(v)
                 }
             }
+            '`' => {
+                // Backtick-escaped identifier: `ORDER`, `CONTAINS`, etc.
+                // Always produces Token::Ident, bypassing keyword matching.
+                i += 1; // consume opening backtick
+                let start = i;
+                while i < n && chars[i] != '`' {
+                    i += 1;
+                }
+                if i >= n {
+                    return Err(Error::InvalidArgument(
+                        "unterminated backtick-quoted identifier".into(),
+                    ));
+                }
+                let ident: String = chars[start..i].iter().collect();
+                i += 1; // consume closing backtick
+                if ident.is_empty() {
+                    return Err(Error::InvalidArgument(
+                        "empty backtick-quoted identifier".into(),
+                    ));
+                }
+                Token::Ident(ident)
+            }
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
                 while i < n && (chars[i].is_alphanumeric() || chars[i] == '_') {
