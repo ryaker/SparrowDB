@@ -5,6 +5,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
+
+/// Per-rel-table edge property cache: `rel_table_id → { (src_slot, dst_slot) → [(col_id, raw_value)] }`.
+type EdgePropsCache = Arc<RwLock<HashMap<u32, HashMap<(u64, u64), Vec<(u32, u64)>>>>>;
 
 use tracing::info_span;
 
@@ -175,8 +179,7 @@ pub struct ReadSnapshot {
     /// `Sync` and can safely be shared across parallel BFS threads.
     rel_degree_stats: std::sync::OnceLock<HashMap<u32, DegreeStats>>,
     /// Shared edge-property cache (SPA-261).
-    edge_props_cache:
-        std::sync::Arc<std::sync::RwLock<HashMap<u32, HashMap<(u64, u64), Vec<(u32, u64)>>>>>,
+    edge_props_cache: EdgePropsCache,
 }
 
 impl ReadSnapshot {
@@ -345,9 +348,7 @@ impl Engine {
         db_root: &Path,
         cached_index: Option<&std::sync::RwLock<PropertyIndex>>,
         cached_row_counts: Option<HashMap<LabelId, usize>>,
-        shared_edge_props_cache: Option<
-            std::sync::Arc<std::sync::RwLock<HashMap<u32, HashMap<(u64, u64), Vec<(u32, u64)>>>>>,
-        >,
+        shared_edge_props_cache: Option<EdgePropsCache>,
     ) -> Self {
         // SPA-249 (lazy fix): property index is built on demand per
         // (label_id, col_id) pair via PropertyIndex::build_for, called from
