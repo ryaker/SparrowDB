@@ -150,40 +150,32 @@ impl Engine {
                 edge_store.and_then(|s| s.read_delta()).unwrap_or_default()
             };
 
-            // SPA-178: Build (src_slot, dst_slot) → edge_id map for delta edges.
-            // This lets us look up which edge a (src, dst) pair corresponds to
-            // when reading edge properties.
-            let delta_edge_id_map: std::collections::HashMap<(u64, u64), u64> =
-                delta_records_all
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, r)| {
-                        let s = r.src.0 & 0xFFFF_FFFF;
-                        let d = r.dst.0 & 0xFFFF_FFFF;
-                        ((s, d), idx as u64)
-                    })
-                    .collect();
-
-            // SPA-178: Pre-read all edge props for this rel table if any edge
+            // SPA-240: Pre-read all edge props for this rel table if any edge
             // property access is needed (inline filter or projection).
+            //
+            // edge_props.bin is now keyed by (src_slot, dst_slot) rather than by
+            // the transient delta-log edge_id.  This makes lookups correct for
+            // both pre- and post-checkpoint databases; previously the lookup via
+            // delta_edge_id_map always returned None after CHECKPOINT because the
+            // delta log is truncated on checkpoint.
             let needs_edge_props = !rel_pat.props.is_empty()
                 || (!rel_pat.var.is_empty()
                     && column_names.iter().any(|c| {
                         c.split_once('.')
                             .map_or(false, |(v, _)| v == rel_pat.var.as_str())
                     }));
-            let all_edge_props_raw: Vec<(u64, u32, u64)> = if needs_edge_props {
+            let all_edge_props_raw: Vec<(u64, u64, u32, u64)> = if needs_edge_props {
                 EdgeStore::open(&self.snapshot.db_root, storage_rel_id)
                     .and_then(|s| s.read_all_edge_props())
                     .unwrap_or_default()
             } else {
                 vec![]
             };
-            // Group by edge_id: last-write-wins per col_id.
-            let mut edge_props_by_id: std::collections::HashMap<u64, Vec<(u32, u64)>> =
+            // Group by (src_slot, dst_slot): last-write-wins per col_id.
+            let mut edge_props_by_slots: std::collections::HashMap<(u64, u64), Vec<(u32, u64)>> =
                 std::collections::HashMap::new();
-            for (edge_id, col_id, value) in &all_edge_props_raw {
-                let entry = edge_props_by_id.entry(*edge_id).or_default();
+            for (src_s, dst_s, col_id, value) in &all_edge_props_raw {
+                let entry = edge_props_by_slots.entry((*src_s, *dst_s)).or_default();
                 if let Some(existing) = entry.iter_mut().find(|(c, _)| *c == *col_id) {
                     existing.1 = *value;
                 } else {
@@ -326,11 +318,13 @@ impl Engine {
                         continue;
                     }
 
-                    // SPA-178: look up edge props for this (src_slot, dst_slot) pair.
+                    // SPA-240: look up edge props for this (src_slot, dst_slot) pair.
+                    // Works for both delta-only and checkpointed edges because
+                    // edge_props.bin is now keyed by (src_slot, dst_slot).
                     let current_edge_props: Vec<(u32, u64)> =
                         if needs_edge_props {
-                            let eid = delta_edge_id_map.get(&(src_slot, dst_slot)).copied();
-                            eid.and_then(|id| edge_props_by_id.get(&id))
+                            edge_props_by_slots
+                                .get(&(src_slot, dst_slot))
                                 .cloned()
                                 .unwrap_or_default()
                         } else {

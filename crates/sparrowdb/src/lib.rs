@@ -3064,10 +3064,15 @@ impl WriteTx {
                     props,
                 } => {
                     let mut es = EdgeStore::open(&self.inner.path, rel_table_id)?;
-                    let edge_id = es.create_edge(src, rel_table_id, dst)?;
-                    // Persist edge properties after writing the edge record.
-                    for (col_id, value) in &props {
-                        es.set_edge_prop(edge_id.0, *col_id, *value)?;
+                    es.create_edge(src, rel_table_id, dst)?;
+                    // Persist edge properties keyed by (src_slot, dst_slot) so
+                    // that reads work correctly after CHECKPOINT (SPA-240).
+                    if !props.is_empty() {
+                        let src_slot = src.0 & 0xFFFF_FFFF;
+                        let dst_slot = dst.0 & 0xFFFF_FFFF;
+                        for (col_id, value) in &props {
+                            es.set_edge_prop(src_slot, dst_slot, *col_id, *value)?;
+                        }
                     }
                 }
                 PendingOp::EdgeDelete {
