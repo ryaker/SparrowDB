@@ -289,18 +289,12 @@ fn test_edge_prop_float_where_filter() {
     let (_dir, db) = make_db();
 
     // Create a movie with ratings (integer-valued, but stored as Int64)
-    db.execute(
-        "CREATE (m:Movie {title:\"Matrix\"})-[:RATED {rating:5}]->(u1:User {id:1})",
-    )
-    .expect("create u1 rated 5");
-    db.execute(
-        "CREATE (m:Movie {title:\"Matrix\"})-[:RATED {rating:4}]->(u2:User {id:2})",
-    )
-    .expect("create u2 rated 4");
-    db.execute(
-        "CREATE (m:Movie {title:\"Matrix\"})-[:RATED {rating:3}]->(u3:User {id:3})",
-    )
-    .expect("create u3 rated 3");
+    db.execute("CREATE (m:Movie {title:\"Matrix\"})-[:RATED {rating:5}]->(u1:User {id:1})")
+        .expect("create u1 rated 5");
+    db.execute("CREATE (m:Movie {title:\"Matrix\"})-[:RATED {rating:4}]->(u2:User {id:2})")
+        .expect("create u2 rated 4");
+    db.execute("CREATE (m:Movie {title:\"Matrix\"})-[:RATED {rating:3}]->(u3:User {id:3})")
+        .expect("create u3 rated 3");
 
     // Query with float WHERE literal >= 4.0
     // Should return 2 rows (u1 with rating 5, u2 with rating 4)
