@@ -1584,6 +1584,13 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::String(x), Value::String(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Float64(x), Value::Float64(y)) => x == y,
+        // SPA-264: Bool↔Int64 coercion — booleans are stored as Int64(0/1)
+        // because the storage layer has no Bool type tag.  When a WHERE clause
+        // compares a stored Int64 against a boolean literal (or vice versa),
+        // coerce so that true == 1 and false == 0.
+        (Value::Bool(b), Value::Int64(n)) | (Value::Int64(n), Value::Bool(b)) => {
+            *n == if *b { 1 } else { 0 }
+        }
         // Mixed: stored raw-int vs string literal — kept for backwards
         // compatibility; should not be triggered after SPA-169 since string
         // props are now decoded to Value::String by decode_raw_val.
@@ -1778,8 +1785,9 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             let lv = eval_expr(left, vals);
             let rv = eval_expr(right, vals);
             match op {
-                BinOpKind::Eq => Value::Bool(lv == rv),
-                BinOpKind::Neq => Value::Bool(lv != rv),
+                // SPA-264: use values_equal for cross-type Bool↔Int64 coercion.
+                BinOpKind::Eq => Value::Bool(values_equal(&lv, &rv)),
+                BinOpKind::Neq => Value::Bool(!values_equal(&lv, &rv)),
                 BinOpKind::Lt => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => Value::Bool(a < b),
                     (Value::Float64(a), Value::Float64(b)) => Value::Bool(a < b),
