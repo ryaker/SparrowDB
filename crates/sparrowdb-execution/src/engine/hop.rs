@@ -182,24 +182,15 @@ impl Engine {
                     });
                     in_return || in_where
                 });
-            let all_edge_props_raw: Vec<(u64, u64, u32, u64)> = if needs_edge_props {
-                EdgeStore::open(&self.snapshot.db_root, storage_rel_id)
-                    .and_then(|s| s.read_all_edge_props())
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            };
-            // Group by (src_slot, dst_slot): last-write-wins per col_id.
-            let mut edge_props_by_slots: std::collections::HashMap<(u64, u64), Vec<(u32, u64)>> =
-                std::collections::HashMap::new();
-            for (src_s, dst_s, col_id, value) in &all_edge_props_raw {
-                let entry = edge_props_by_slots.entry((*src_s, *dst_s)).or_default();
-                if let Some(existing) = entry.iter_mut().find(|(c, _)| *c == *col_id) {
-                    existing.1 = *value;
+            // SPA-261: use cached edge-props map from ReadSnapshot instead of
+            // re-reading edge_props.bin on every query.  On first access per
+            // rel table the file is read once and the grouped HashMap is cached.
+            let edge_props_by_slots: std::collections::HashMap<(u64, u64), Vec<(u32, u64)>> =
+                if needs_edge_props {
+                    self.snapshot.edge_props_for_rel(storage_rel_id.0)
                 } else {
-                    entry.push((*col_id, *value));
-                }
-            }
+                    std::collections::HashMap::new()
+                };
 
             // Scan source nodes for this label.
             for src_slot in 0..hwm_src {

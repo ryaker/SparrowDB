@@ -63,6 +63,9 @@ pub use sparrowdb_common::Error;
 /// Convenience alias: `std::result::Result<T, sparrowdb::Error>`.
 pub use sparrowdb_common::Result;
 
+/// Per-rel-table edge property cache (SPA-261).
+type EdgePropsCache = Arc<RwLock<HashMap<u32, HashMap<(u64, u64), Vec<(u32, u64)>>>>>;
+
 // ── DbStats ───────────────────────────────────────────────────────────────────
 
 /// Storage-size snapshot returned by [`GraphDb::stats`] (SPA-171).
@@ -325,6 +328,8 @@ struct DbInner {
     /// only one writer exists at a time (the `write_locked` flag enforces
     /// SWMR, so contention is zero in practice).
     wal_writer: Mutex<WalWriter>,
+    /// Shared edge-property cache (SPA-261).
+    edge_props_cache: EdgePropsCache,
 }
 
 // ── Write-lock guard (SPA-181: replaces 'static transmute UB) ────────────────
@@ -398,6 +403,7 @@ impl GraphDb {
                 csr_map: RwLock::new(open_csr_map(path)),
                 label_row_counts,
                 wal_writer: Mutex::new(wal_writer),
+                edge_props_cache: Arc::new(RwLock::new(HashMap::new())),
             }),
         })
     }
@@ -431,6 +437,7 @@ impl GraphDb {
                 csr_map: RwLock::new(open_csr_map(path)),
                 label_row_counts,
                 wal_writer: Mutex::new(wal_writer),
+                edge_props_cache: Arc::new(RwLock::new(HashMap::new())),
             }),
         })
     }
@@ -484,6 +491,7 @@ impl GraphDb {
             &self.inner.path,
             Some(&self.inner.prop_index),
             Some(self.cached_label_row_counts()),
+            Some(Arc::clone(&self.inner.edge_props_cache)),
         )
     }
 
@@ -515,6 +523,15 @@ impl GraphDb {
     /// catalog; a failed reload (e.g. transient I/O error) leaves the
     /// existing in-memory map intact rather than replacing it with an empty
     /// map that would cause subsequent queries to miss all checkpointed edges.
+    /// Clear the entire edge-props cache (SPA-261).
+    fn invalidate_edge_props_cache(&self) {
+        self.inner
+            .edge_props_cache
+            .write()
+            .expect("edge_props_cache poisoned")
+            .clear();
+    }
+
     fn invalidate_csr_map(&self) {
         if let Ok(fresh) = try_open_csr_map(&self.inner.path) {
             *self.inner.csr_map.write().expect("csr_map RwLock poisoned") = fresh;
@@ -590,6 +607,7 @@ impl GraphDb {
         let engine = MaintenanceEngine::new(&self.inner.path);
         engine.checkpoint(&rel_table_ids, n_nodes)?;
         self.invalidate_csr_map();
+        self.invalidate_edge_props_cache();
         Ok(())
     }
 
@@ -610,6 +628,7 @@ impl GraphDb {
         let engine = MaintenanceEngine::new(&self.inner.path);
         engine.optimize(&rel_table_ids, n_nodes)?;
         self.invalidate_csr_map();
+        self.invalidate_edge_props_cache();
         Ok(())
     }
 
@@ -2485,6 +2504,7 @@ impl ReadTx {
                 &self.inner.path,
                 Some(&self.inner.prop_index),
                 Some(row_counts),
+                Some(Arc::clone(&self.inner.edge_props_cache)),
             )
         };
 
@@ -3264,6 +3284,12 @@ impl WriteTx {
                         for (col_id, value) in &props {
                             es.set_edge_prop(src_slot, dst_slot, *col_id, *value)?;
                         }
+                        // SPA-261: invalidate cached edge props for this rel table.
+                        self.inner
+                            .edge_props_cache
+                            .write()
+                            .expect("edge_props_cache poisoned")
+                            .remove(&rel_table_id.0);
                     }
                 }
                 PendingOp::EdgeDelete {
