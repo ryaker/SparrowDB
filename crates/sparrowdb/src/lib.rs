@@ -63,6 +63,9 @@ pub use sparrowdb_common::Error;
 /// Convenience alias: `std::result::Result<T, sparrowdb::Error>`.
 pub use sparrowdb_common::Result;
 
+/// Per-rel-table edge property cache (SPA-261).
+type EdgePropsCache = Arc<RwLock<HashMap<u32, HashMap<(u64, u64), Vec<(u32, u64)>>>>>;
+
 // ── DbStats ───────────────────────────────────────────────────────────────────
 
 /// Storage-size snapshot returned by [`GraphDb::stats`] (SPA-171).
@@ -326,7 +329,7 @@ struct DbInner {
     /// SWMR, so contention is zero in practice).
     wal_writer: Mutex<WalWriter>,
     /// Shared edge-property cache (SPA-261).
-    edge_props_cache: Arc<RwLock<HashMap<u32, HashMap<(u64, u64), Vec<(u32, u64)>>>>>,
+    edge_props_cache: EdgePropsCache,
 }
 
 // ── Write-lock guard (SPA-181: replaces 'static transmute UB) ────────────────
