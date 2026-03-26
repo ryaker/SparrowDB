@@ -61,7 +61,11 @@ fn test_edge_prop_filter_match() {
         .execute("MATCH (a:Person)-[r:KNOWS {since:2020}]->(b:Person) RETURN b.name")
         .expect("match");
 
-    assert_eq!(result.rows.len(), 1, "should match one edge with since=2020");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "should match one edge with since=2020"
+    );
     assert_eq!(
         result.rows[0],
         vec![Value::String("Bob".to_string())],
@@ -85,11 +89,7 @@ fn test_edge_prop_filter_no_match() {
         .execute("MATCH (a:Person)-[r:KNOWS {since:1999}]->(b:Person) RETURN b.name")
         .expect("match");
 
-    assert_eq!(
-        result.rows.len(),
-        0,
-        "no edge with since=1999 should exist"
-    );
+    assert_eq!(result.rows.len(), 0, "no edge with since=1999 should exist");
 }
 
 /// Test 4: multiple edge properties.
@@ -144,9 +144,13 @@ fn test_edge_prop_int_survives_checkpoint() {
 }
 
 /// Test 6 (SPA-240): float edge property is readable after CHECKPOINT.
+// 3.14 is test data (not PI); allow the approx_constant lint.
+#[allow(clippy::approx_constant)]
 #[test]
 fn test_edge_prop_float_survives_checkpoint() {
     let (_dir, db) = make_db();
+
+    const RATING: f64 = 3.14;
 
     db.execute("CREATE (a:P {n:1})-[:K {rating:3.14}]->(b:P {n:2})")
         .expect("create");
@@ -159,8 +163,8 @@ fn test_edge_prop_float_survives_checkpoint() {
     assert_eq!(result.rows.len(), 1, "expected one edge after checkpoint");
     match &result.rows[0][0] {
         Value::Float64(v) => assert!(
-            (*v - 3.14_f64).abs() < 1e-9,
-            "r.rating must be ~3.14 after checkpoint, got {v}"
+            (*v - RATING).abs() < 1e-9,
+            "r.rating must be ~{RATING} after checkpoint, got {v}"
         ),
         other => panic!("expected Float64, got {other:?}"),
     }
@@ -197,14 +201,10 @@ fn test_edge_prop_string_survives_checkpoint() {
 fn test_edge_prop_where_filter_match() {
     let (_dir, db) = make_db();
 
-    db.execute(
-        "CREATE (a:User {name:\"Alice\"})-[:KNOWS {since:2020}]->(b:User {name:\"Bob\"})",
-    )
-    .expect("create");
-    db.execute(
-        "CREATE (c:User {name:\"Carol\"})-[:KNOWS {since:2018}]->(d:User {name:\"Dave\"})",
-    )
-    .expect("create");
+    db.execute("CREATE (a:User {name:\"Alice\"})-[:KNOWS {since:2020}]->(b:User {name:\"Bob\"})")
+        .expect("create");
+    db.execute("CREATE (c:User {name:\"Carol\"})-[:KNOWS {since:2018}]->(d:User {name:\"Dave\"})")
+        .expect("create");
 
     // Only edges with since > 2019 should be returned.
     let result = db
@@ -228,10 +228,8 @@ fn test_edge_prop_where_filter_match() {
 fn test_no_edge_var_no_read() {
     let (_dir, db) = make_db();
 
-    db.execute(
-        "CREATE (a:User {name:\"Alice\"})-[:KNOWS {since:2020}]->(b:User {name:\"Bob\"})",
-    )
-    .expect("create");
+    db.execute("CREATE (a:User {name:\"Alice\"})-[:KNOWS {since:2020}]->(b:User {name:\"Bob\"})")
+        .expect("create");
 
     // No [r] variable, no inline edge props — edge_props.bin must not be read.
     let result = db

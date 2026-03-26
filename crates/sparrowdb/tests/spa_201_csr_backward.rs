@@ -44,14 +44,10 @@ fn mutual_friends_basic() {
     db.execute("CREATE (:User {name: 'M'})").expect("CREATE M");
     db.execute("CREATE (:User {name: 'B'})").expect("CREATE B");
 
-    db.execute(
-        "MATCH (a:User {name:'A'}), (m:User {name:'M'}) CREATE (a)-[:FRIENDS]->(m)",
-    )
-    .expect("edge A->M");
-    db.execute(
-        "MATCH (b:User {name:'B'}), (m:User {name:'M'}) CREATE (b)-[:FRIENDS]->(m)",
-    )
-    .expect("edge B->M");
+    db.execute("MATCH (a:User {name:'A'}), (m:User {name:'M'}) CREATE (a)-[:FRIENDS]->(m)")
+        .expect("edge A->M");
+    db.execute("MATCH (b:User {name:'B'}), (m:User {name:'M'}) CREATE (b)-[:FRIENDS]->(m)")
+        .expect("edge B->M");
 
     let result = db
         .execute(
@@ -85,17 +81,15 @@ fn mutual_friends_no_common() {
 
     db.execute("CREATE (:User {name: 'A'})").expect("CREATE A");
     db.execute("CREATE (:User {name: 'B'})").expect("CREATE B");
-    db.execute("CREATE (:User {name: 'M1'})").expect("CREATE M1");
-    db.execute("CREATE (:User {name: 'M2'})").expect("CREATE M2");
+    db.execute("CREATE (:User {name: 'M1'})")
+        .expect("CREATE M1");
+    db.execute("CREATE (:User {name: 'M2'})")
+        .expect("CREATE M2");
 
-    db.execute(
-        "MATCH (a:User {name:'A'}), (m:User {name:'M1'}) CREATE (a)-[:FRIENDS]->(m)",
-    )
-    .expect("edge A->M1");
-    db.execute(
-        "MATCH (b:User {name:'B'}), (m:User {name:'M2'}) CREATE (b)-[:FRIENDS]->(m)",
-    )
-    .expect("edge B->M2");
+    db.execute("MATCH (a:User {name:'A'}), (m:User {name:'M1'}) CREATE (a)-[:FRIENDS]->(m)")
+        .expect("edge A->M1");
+    db.execute("MATCH (b:User {name:'B'}), (m:User {name:'M2'}) CREATE (b)-[:FRIENDS]->(m)")
+        .expect("edge B->M2");
 
     let result = db
         .execute(
@@ -125,9 +119,12 @@ fn mutual_friends_multiple() {
 
     db.execute("CREATE (:User {name: 'A'})").expect("CREATE A");
     db.execute("CREATE (:User {name: 'B'})").expect("CREATE B");
-    db.execute("CREATE (:User {name: 'M1'})").expect("CREATE M1");
-    db.execute("CREATE (:User {name: 'M2'})").expect("CREATE M2");
-    db.execute("CREATE (:User {name: 'M3'})").expect("CREATE M3");
+    db.execute("CREATE (:User {name: 'M1'})")
+        .expect("CREATE M1");
+    db.execute("CREATE (:User {name: 'M2'})")
+        .expect("CREATE M2");
+    db.execute("CREATE (:User {name: 'M3'})")
+        .expect("CREATE M3");
 
     for m in ["M1", "M2", "M3"] {
         db.execute(&format!(
@@ -173,22 +170,14 @@ fn mutual_friends_directed_vs_undirected() {
     db.execute("CREATE (:User {name: 'B'})").expect("CREATE B");
 
     // Bidirectional edges: A<->M and B<->M
-    db.execute(
-        "MATCH (a:User {name:'A'}), (m:User {name:'M'}) CREATE (a)-[:FRIENDS]->(m)",
-    )
-    .expect("A->M");
-    db.execute(
-        "MATCH (m:User {name:'M'}), (a:User {name:'A'}) CREATE (m)-[:FRIENDS]->(a)",
-    )
-    .expect("M->A");
-    db.execute(
-        "MATCH (b:User {name:'B'}), (m:User {name:'M'}) CREATE (b)-[:FRIENDS]->(m)",
-    )
-    .expect("B->M");
-    db.execute(
-        "MATCH (m:User {name:'M'}), (b:User {name:'B'}) CREATE (m)-[:FRIENDS]->(b)",
-    )
-    .expect("M->B");
+    db.execute("MATCH (a:User {name:'A'}), (m:User {name:'M'}) CREATE (a)-[:FRIENDS]->(m)")
+        .expect("A->M");
+    db.execute("MATCH (m:User {name:'M'}), (a:User {name:'A'}) CREATE (m)-[:FRIENDS]->(a)")
+        .expect("M->A");
+    db.execute("MATCH (b:User {name:'B'}), (m:User {name:'M'}) CREATE (b)-[:FRIENDS]->(m)")
+        .expect("B->M");
+    db.execute("MATCH (m:User {name:'M'}), (b:User {name:'B'}) CREATE (m)-[:FRIENDS]->(b)")
+        .expect("M->B");
 
     // Query: (a)-[:FRIENDS]->(m)<-[:FRIENDS]-(b) — second hop is Incoming
     // This looks for nodes that A points TO and that B also points TO.
@@ -223,10 +212,8 @@ fn mutual_friends_empty_anchor() {
     db.execute("CREATE (:User {name: 'M'})").expect("CREATE M");
 
     // Only B -> M; A has no outgoing edges.
-    db.execute(
-        "MATCH (b:User {name:'B'}), (m:User {name:'M'}) CREATE (b)-[:FRIENDS]->(m)",
-    )
-    .expect("edge B->M");
+    db.execute("MATCH (b:User {name:'B'}), (m:User {name:'M'}) CREATE (b)-[:FRIENDS]->(m)")
+        .expect("edge B->M");
 
     let result = db
         .execute(

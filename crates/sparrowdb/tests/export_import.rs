@@ -54,15 +54,30 @@ fn export_json_produces_valid_structure() {
         env!("CARGO_PKG_VERSION"),
         "version must match current crate version"
     );
-    assert!(dump.exported_at > 0, "exported_at must be a non-zero timestamp");
-    assert_eq!(dump.nodes.len(), 3, "must export 3 nodes; got: {:?}", dump.nodes.len());
-    assert_eq!(dump.edges.len(), 2, "must export 2 edges; got: {:?}", dump.edges.len());
+    assert!(
+        dump.exported_at > 0,
+        "exported_at must be a non-zero timestamp"
+    );
+    assert_eq!(
+        dump.nodes.len(),
+        3,
+        "must export 3 nodes; got: {:?}",
+        dump.nodes.len()
+    );
+    assert_eq!(
+        dump.edges.len(),
+        2,
+        "must export 2 edges; got: {:?}",
+        dump.edges.len()
+    );
 
     // Check node properties are present.
     let alice = dump
         .nodes
         .iter()
-        .find(|n| n.label == "Person" && n.properties.get("name") == Some(&serde_json::json!("Alice")))
+        .find(|n| {
+            n.label == "Person" && n.properties.get("name") == Some(&serde_json::json!("Alice"))
+        })
         .expect("Alice node must be in dump");
     assert_eq!(
         alice.properties.get("age"),
@@ -191,14 +206,17 @@ fn round_trip_export_import() {
 fn empty_db_round_trip() {
     let (_dir, db) = make_db();
 
-    let json = db.export_json().expect("export_json on empty DB must succeed");
-    let dump: GraphDump =
-        serde_json::from_str(&json).expect("empty dump must deserialise");
+    let json = db
+        .export_json()
+        .expect("export_json on empty DB must succeed");
+    let dump: GraphDump = serde_json::from_str(&json).expect("empty dump must deserialise");
 
     assert_eq!(dump.nodes.len(), 0, "empty DB must have 0 nodes");
     assert_eq!(dump.edges.len(), 0, "empty DB must have 0 edges");
 
     // Import into a fresh DB — must succeed without errors.
     let (_dst_dir, dst_db) = make_db();
-    dst_db.import_json(&json).expect("import of empty dump must succeed");
+    dst_db
+        .import_json(&json)
+        .expect("import of empty dump must succeed");
 }

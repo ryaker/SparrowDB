@@ -33,7 +33,11 @@ fn limit_returns_exact_count() {
         .execute("MATCH (n:User) RETURN n.uid LIMIT 10")
         .expect("LIMIT 10 must succeed");
 
-    assert_eq!(result.rows.len(), 10, "LIMIT 10 should return exactly 10 rows");
+    assert_eq!(
+        result.rows.len(),
+        10,
+        "LIMIT 10 should return exactly 10 rows"
+    );
 }
 
 // ── LIMIT with WHERE clause ─────────────────────────────────────────────────
@@ -48,7 +52,11 @@ fn limit_with_where_returns_exact_count() {
         .execute("MATCH (n:User) WHERE n.age > 30 RETURN n.uid, n.city LIMIT 5")
         .expect("WHERE + LIMIT must succeed");
 
-    assert_eq!(result.rows.len(), 5, "WHERE + LIMIT 5 should return exactly 5 rows");
+    assert_eq!(
+        result.rows.len(),
+        5,
+        "WHERE + LIMIT 5 should return exactly 5 rows"
+    );
 }
 
 // ── LIMIT larger than result set returns all matching rows ──────────────────
@@ -63,7 +71,11 @@ fn limit_larger_than_result_set() {
         .execute("MATCH (n:User) WHERE n.age > 95 RETURN n.uid LIMIT 50")
         .expect("LIMIT > result size must succeed");
 
-    assert_eq!(result.rows.len(), 5, "LIMIT 50 with 5 matches should return 5 rows");
+    assert_eq!(
+        result.rows.len(),
+        5,
+        "LIMIT 50 with 5 matches should return 5 rows"
+    );
 }
 
 // ── No LIMIT still returns all matching rows ────────────────────────────────
@@ -77,7 +89,11 @@ fn no_limit_returns_all_rows() {
         .execute("MATCH (n:User) WHERE n.age > 90 RETURN n.uid")
         .expect("no LIMIT must succeed");
 
-    assert_eq!(result.rows.len(), 10, "no LIMIT should return all 10 matching rows");
+    assert_eq!(
+        result.rows.len(),
+        10,
+        "no LIMIT should return all 10 matching rows"
+    );
 }
 
 // ── SKIP + LIMIT combination ────────────────────────────────────────────────
@@ -93,7 +109,11 @@ fn skip_and_limit_combination() {
         .execute("MATCH (n:User) RETURN n.uid SKIP 5 LIMIT 3")
         .expect("SKIP + LIMIT must succeed");
 
-    assert_eq!(result.rows.len(), 3, "SKIP 5 LIMIT 3 should return exactly 3 rows");
+    assert_eq!(
+        result.rows.len(),
+        3,
+        "SKIP 5 LIMIT 3 should return exactly 3 rows"
+    );
 }
 
 // ── LIMIT with ORDER BY must not use pushdown (correctness) ─────────────────
@@ -133,7 +153,11 @@ fn limit_with_distinct_returns_correct_count() {
         .expect("DISTINCT + LIMIT must succeed");
 
     // Only 2 distinct cities exist, LIMIT 5 should return 2.
-    assert_eq!(result.rows.len(), 2, "DISTINCT should yield 2 unique cities");
+    assert_eq!(
+        result.rows.len(),
+        2,
+        "DISTINCT should yield 2 unique cities"
+    );
 }
 
 // ── LIMIT 0 returns no rows ────────────────────────────────────────────────
