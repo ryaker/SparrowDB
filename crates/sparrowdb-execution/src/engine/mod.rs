@@ -404,9 +404,23 @@ impl Engine {
     /// concurrent read queries write back to the shared cache simultaneously.
     ///
     /// Called from `GraphDb` read paths after `execute_statement`.
+    /// Write lazily-loaded index columns back to the shared per-`GraphDb` cache.
+    ///
+    /// Only merges data back when the shared cache's `generation` matches the
+    /// generation this engine's index was cloned from (SPA-242).  If a write
+    /// transaction committed and cleared the shared cache while this engine was
+    /// executing, the shared cache's generation will have advanced, indicating
+    /// that this engine's index data is derived from a stale on-disk snapshot.
+    /// In that case the write-back is skipped entirely so the next engine that
+    /// runs will rebuild the index from the freshly committed column files.
     pub fn write_back_prop_index(&self, shared: &std::sync::RwLock<PropertyIndex>) {
         if let Ok(mut guard) = shared.write() {
-            guard.merge_from(&self.prop_index.borrow());
+            let engine_index = self.prop_index.borrow();
+            if guard.generation == engine_index.generation {
+                guard.merge_from(&engine_index);
+            }
+            // If generations differ a write committed since this engine was
+            // created — its index is stale and must not pollute the shared cache.
         }
     }
 
