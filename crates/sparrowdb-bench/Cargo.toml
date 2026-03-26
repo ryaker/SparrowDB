@@ -28,3 +28,8 @@ csv = { workspace = true }
 tempfile = { workspace = true }
 sparrowdb = { workspace = true }
 sparrowdb-execution = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "ldbc_snb"
+harness = false
