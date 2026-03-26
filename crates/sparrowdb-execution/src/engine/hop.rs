@@ -1068,6 +1068,11 @@ impl Engine {
         };
 
         let mut rows = Vec::new();
+        // SPA-263: detect aggregates early so we can build proper HashMap rows
+        // instead of projecting through project_three_var_row (which returns Null
+        // for aggregate columns like COUNT(*)).
+        let use_agg = has_aggregate_in_return(&m.return_clause.items);
+        let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
 
         // Scan source nodes.
         for src_slot in 0..hwm_src {
@@ -1225,20 +1230,53 @@ impl Engine {
                             }
                         }
 
-                        // Project a row: src (a) + mid (m) + fof (b) columns.
-                        // We build the row using a 3-var aware helper here so that
-                        // `RETURN m.name`, `RETURN a.name`, and `RETURN b.name` all
-                        // resolve correctly.
-                        let row = project_three_var_row(
-                            &src_props,
-                            &mid_props,
-                            &b_props,
-                            column_names,
-                            &src_node_pat.var,
-                            &mid_node_pat.var,
-                            &self.snapshot.store,
-                        );
-                        rows.push(row);
+                        // SPA-263: when aggregates are present, build a HashMap
+                        // row with node refs (needed for COUNT(var), etc.) instead
+                        // of projecting through project_three_var_row which returns
+                        // Null for non-property columns.
+                        if use_agg {
+                            let mut row_vals = build_row_vals(
+                                &src_props,
+                                &src_node_pat.var,
+                                &col_ids_src_where,
+                                &self.snapshot.store,
+                            );
+                            row_vals.extend(build_row_vals(
+                                &mid_props,
+                                &mid_node_pat.var,
+                                &col_ids_mid,
+                                &self.snapshot.store,
+                            ));
+                            row_vals.extend(build_row_vals(
+                                &b_props,
+                                &fof_node_pat.var,
+                                &col_ids_fof,
+                                &self.snapshot.store,
+                            ));
+                            // Bind node refs so COUNT(var) resolves as non-null.
+                            if !src_node_pat.var.is_empty() {
+                                row_vals.insert(src_node_pat.var.clone(), Value::NodeRef(src_node));
+                            }
+                            if !mid_node_pat.var.is_empty() {
+                                row_vals.insert(mid_node_pat.var.clone(), Value::NodeRef(mid_node));
+                            }
+                            if !fof_node_pat.var.is_empty() {
+                                row_vals.insert(fof_node_pat.var.clone(), Value::NodeRef(b_node));
+                            }
+                            raw_rows.push(row_vals);
+                        } else {
+                            // Project a row: src (a) + mid (m) + fof (b) columns.
+                            let row = project_three_var_row(
+                                &src_props,
+                                &mid_props,
+                                &b_props,
+                                column_names,
+                                &src_node_pat.var,
+                                &mid_node_pat.var,
+                                &self.snapshot.store,
+                            );
+                            rows.push(row);
+                        }
                         found_valid_fof = true;
                         // Continue — multiple b nodes may match (emit one row per match).
                     }
@@ -1407,35 +1445,58 @@ impl Engine {
                         }
                     }
 
-                    // SPA-241: use three-var projection so mid variable columns
-                    // are resolved from mid_props rather than defaulting to fof_props.
-                    let row = project_three_var_row(
-                        &src_props,
-                        &mid_props,
-                        &fof_props,
-                        column_names,
-                        &src_node_pat.var,
-                        &mid_node_pat.var,
-                        &self.snapshot.store,
-                    );
-                    rows.push(row);
+                    // SPA-263: when aggregates are present, build a HashMap
+                    // row with node refs instead of projecting.
+                    if use_agg {
+                        let mut row_vals = build_row_vals(
+                            &src_props,
+                            &src_node_pat.var,
+                            &col_ids_src_where,
+                            &self.snapshot.store,
+                        );
+                        row_vals.extend(build_row_vals(
+                            &mid_props,
+                            &mid_node_pat.var,
+                            &col_ids_mid,
+                            &self.snapshot.store,
+                        ));
+                        row_vals.extend(build_row_vals(
+                            &fof_props,
+                            &fof_node_pat.var,
+                            &col_ids_fof,
+                            &self.snapshot.store,
+                        ));
+                        // Bind node refs so COUNT(var) resolves as non-null.
+                        if !src_node_pat.var.is_empty() {
+                            row_vals.insert(src_node_pat.var.clone(), Value::NodeRef(src_node));
+                        }
+                        if !mid_node_pat.var.is_empty() {
+                            row_vals.insert(mid_node_pat.var.clone(), Value::NodeRef(mid_node));
+                        }
+                        if !fof_node_pat.var.is_empty() {
+                            row_vals.insert(fof_node_pat.var.clone(), Value::NodeRef(fof_node));
+                        }
+                        raw_rows.push(row_vals);
+                    } else {
+                        // SPA-241: use three-var projection so mid variable columns
+                        // are resolved from mid_props rather than defaulting to fof_props.
+                        let row = project_three_var_row(
+                            &src_props,
+                            &mid_props,
+                            &fof_props,
+                            column_names,
+                            &src_node_pat.var,
+                            &mid_node_pat.var,
+                            &self.snapshot.store,
+                        );
+                        rows.push(row);
+                    }
                 }
             }
         }
 
-        // SPA-263: apply aggregation (COUNT, SUM, etc.) if RETURN has aggregates.
-        let use_agg = has_aggregate_in_return(&m.return_clause.items);
+        // SPA-263: apply aggregation using pre-built raw_rows (with node refs).
         if use_agg {
-            let raw_rows: Vec<HashMap<String, Value>> = rows
-                .iter()
-                .map(|row| {
-                    column_names
-                        .iter()
-                        .zip(row.iter())
-                        .map(|(col, val)| (col.clone(), val.clone()))
-                        .collect()
-                })
-                .collect();
             rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
         } else {
             // DISTINCT
