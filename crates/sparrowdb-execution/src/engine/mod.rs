@@ -287,12 +287,29 @@ impl Engine {
     /// cache.  When `cached_index` is `Some`, the index is cloned out of the
     /// `RwLock` at construction time so the engine can use `RefCell` internally
     /// without holding the lock.
+    ///
+    /// When `cached_row_counts` is `Some`, the pre-built label row-count map is
+    /// used directly instead of re-reading each label's HWM from disk.  This
+    /// eliminates O(n_labels) syscalls on every read query (SPA-190).
     pub fn new_with_cached_index(
         store: NodeStore,
         catalog: Catalog,
         csrs: HashMap<u32, CsrForward>,
         db_root: &Path,
         cached_index: Option<&std::sync::RwLock<PropertyIndex>>,
+    ) -> Self {
+        Self::new_with_all_caches(store, catalog, csrs, db_root, cached_index, None)
+    }
+
+    /// Like [`Engine::new_with_cached_index`] but also accepts a pre-built
+    /// `label_row_counts` map to avoid the per-query HWM disk reads (SPA-190).
+    pub fn new_with_all_caches(
+        store: NodeStore,
+        catalog: Catalog,
+        csrs: HashMap<u32, CsrForward>,
+        db_root: &Path,
+        cached_index: Option<&std::sync::RwLock<PropertyIndex>>,
+        cached_row_counts: Option<HashMap<LabelId, usize>>,
     ) -> Self {
         // SPA-249 (lazy fix): property index is built on demand per
         // (label_id, col_id) pair via PropertyIndex::build_for, called from
@@ -311,26 +328,25 @@ impl Engine {
         // degree information (point lookups, full scans, hop traversals) pay
         // zero cost at engine-open time: no CSR iteration, no delta-log I/O.
         //
-        // SPA-Q1-perf: build label_row_counts ONCE at Engine::new() by reading
-        // each label's high-water-mark from the NodeStore HWM file (an O(1)
-        // in-memory map lookup after the first call per label).  Previously this
-        // map was left empty and only populated via the write path, so every
-        // read query started with an empty map, forcing the planner to fall back
-        // to per-scan HWM reads on every execution.  Now the snapshot carries a
-        // pre-populated map; the write path continues to increment it on creation.
-        let label_row_counts: HashMap<LabelId, usize> = catalog
-            .list_labels()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(lid, _name)| {
-                let hwm = store.hwm_for_label(lid as u32).unwrap_or(0);
-                if hwm > 0 {
-                    Some((lid, hwm as usize))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // SPA-Q1-perf / SPA-190: use pre-built row counts when provided by the
+        // caller (GraphDb passes cached values to skip per-label HWM disk reads).
+        // Fall back to building from disk when no cache is available (Engine::new
+        // or first call after a write invalidation).
+        let label_row_counts: HashMap<LabelId, usize> = cached_row_counts.unwrap_or_else(|| {
+            catalog
+                .list_labels()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(lid, _name)| {
+                    let hwm = store.hwm_for_label(lid as u32).unwrap_or(0);
+                    if hwm > 0 {
+                        Some((lid, hwm as usize))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        });
 
         // SPA-273 (lazy): rel_degree_stats is now computed on first access via
         // ReadSnapshot::rel_degree_stats().  Simple traversal queries (Q3/Q4)
