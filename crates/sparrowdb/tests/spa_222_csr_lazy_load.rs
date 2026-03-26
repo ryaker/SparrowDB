@@ -17,28 +17,33 @@ fn spa222_mmap_open_and_traverse() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path()).unwrap();
 
-    // Create 50K Person nodes.
+    // Create 50K Person nodes in a single batch transaction.
     let n = 50_000u64;
-    for i in 0..n {
-        db.execute(&format!("CREATE (:Person {{id: {}}})", i))
-            .unwrap();
-    }
+    let node_queries: Vec<String> = (0..n)
+        .map(|i| format!("CREATE (:Person {{id: {}}})", i))
+        .collect();
+    let node_query_refs: Vec<&str> = node_queries.iter().map(String::as_str).collect();
+    db.execute_batch(&node_query_refs).unwrap();
 
-    // Create edges: each node connects to next and skip-7.
-    for i in 0..n {
-        let next = (i + 1) % n;
-        let skip = (i + 7) % n;
-        db.execute(&format!(
-            "MATCH (a:Person {{id: {}}}), (b:Person {{id: {}}}) CREATE (a)-[:KNOWS]->(b)",
-            i, next
-        ))
-        .unwrap();
-        db.execute(&format!(
-            "MATCH (a:Person {{id: {}}}), (b:Person {{id: {}}}) CREATE (a)-[:KNOWS]->(b)",
-            i, skip
-        ))
-        .unwrap();
-    }
+    // Create edges in a single batch: each node connects to next and skip-7.
+    let edge_queries: Vec<String> = (0..n)
+        .flat_map(|i| {
+            let next = (i + 1) % n;
+            let skip = (i + 7) % n;
+            [
+                format!(
+                    "MATCH (a:Person {{id: {}}}), (b:Person {{id: {}}}) CREATE (a)-[:KNOWS]->(b)",
+                    i, next
+                ),
+                format!(
+                    "MATCH (a:Person {{id: {}}}), (b:Person {{id: {}}}) CREATE (a)-[:KNOWS]->(b)",
+                    i, skip
+                ),
+            ]
+        })
+        .collect();
+    let edge_query_refs: Vec<&str> = edge_queries.iter().map(String::as_str).collect();
+    db.execute_batch(&edge_query_refs).unwrap();
 
     // Checkpoint to flush edges into CSR files.
     db.checkpoint().unwrap();
