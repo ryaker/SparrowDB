@@ -144,9 +144,13 @@ fn test_edge_prop_int_survives_checkpoint() {
 }
 
 /// Test 6 (SPA-240): float edge property is readable after CHECKPOINT.
+// 3.14 is test data (not PI); allow the approx_constant lint.
+#[allow(clippy::approx_constant)]
 #[test]
 fn test_edge_prop_float_survives_checkpoint() {
     let (_dir, db) = make_db();
+
+    const RATING: f64 = 3.14;
 
     db.execute("CREATE (a:P {n:1})-[:K {rating:3.14}]->(b:P {n:2})")
         .expect("create");
@@ -159,8 +163,8 @@ fn test_edge_prop_float_survives_checkpoint() {
     assert_eq!(result.rows.len(), 1, "expected one edge after checkpoint");
     match &result.rows[0][0] {
         Value::Float64(v) => assert!(
-            (*v - 3.14_f64).abs() < 1e-9,
-            "r.rating must be ~3.14 after checkpoint, got {v}"
+            (*v - RATING).abs() < 1e-9,
+            "r.rating must be ~{RATING} after checkpoint, got {v}"
         ),
         other => panic!("expected Float64, got {other:?}"),
     }
