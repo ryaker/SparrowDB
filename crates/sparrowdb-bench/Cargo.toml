@@ -23,13 +23,19 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 csv = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 sparrowdb = { workspace = true }
 sparrowdb-execution = { workspace = true }
 criterion = { workspace = true }
+rand = { workspace = true }
 
 [[bench]]
 name = "ldbc_snb"
+harness = false
+
+[[bench]]
+name = "mlm_benchmark"
 harness = false
