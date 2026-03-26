@@ -1,6 +1,6 @@
 {
   "name": "sparrowdb",
-  "version": "0.1.0",
+  "version": "0.1.8",
   "description": "Native Node.js/TypeScript bindings for SparrowDB — embedded graph database with Cypher query support",
   "main": "index.js",
   "types": "index.d.ts",
@@ -22,10 +22,10 @@
   },
   "keywords": ["graph", "database", "cypher", "native", "napi"],
   "optionalDependencies": {
-    "@sparrowdb/linux-x64-gnu": "0.1.0",
-    "@sparrowdb/linux-arm64-gnu": "0.1.0",
-    "@sparrowdb/darwin-x64": "0.1.0",
-    "@sparrowdb/darwin-arm64": "0.1.0",
-    "@sparrowdb/win32-x64-msvc": "0.1.0"
+    "@sparrowdb/linux-x64-gnu": "0.1.8",
+    "@sparrowdb/linux-arm64-gnu": "0.1.8",
+    "@sparrowdb/darwin-x64": "0.1.8",
+    "@sparrowdb/darwin-arm64": "0.1.8",
+    "@sparrowdb/win32-x64-msvc": "0.1.8"
   }
 }
