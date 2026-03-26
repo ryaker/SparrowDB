@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sparrowdb"
-version = "0.1.0"
+version = "0.1.8"
 description = "Python bindings for SparrowDB embedded graph database"
 requires-python = ">=3.9"
 license = { text = "MIT OR Apache-2.0" }

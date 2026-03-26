@@ -1,0 +1,295 @@
+name: Release — Publish Language Bindings
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Extract version from tag ─────────────────────────────────────────────
+  meta:
+    name: Extract release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Extract version from tag
+        id: ver
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release version: $TAG"
+
+  # ── Publish npm package ──────────────────────────────────────────────────
+  publish-npm:
+    name: Publish npm (Node.js bindings)
+    needs: meta
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact-name: linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact-name: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build sparrowdb-node
+        run: cargo build --release -p sparrowdb-node --target ${{ matrix.target }}
+
+      - name: Locate native artifact
+        id: artifact
+        run: |
+          ARTIFACT=$(ls target/${{ matrix.target }}/release/libsparrowdb_node.so \
+                        target/${{ matrix.target }}/release/libsparrowdb_node.dylib \
+                        target/${{ matrix.target }}/release/sparrowdb_node.dll \
+                        2>/dev/null | head -1)
+          if [ -z "$ARTIFACT" ]; then
+            echo "ERROR: could not find compiled sparrowdb-node artifact" >&2
+            ls target/${{ matrix.target }}/release/ >&2
+            exit 1
+          fi
+          echo "path=$ARTIFACT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sparrowdb-node-${{ matrix.artifact-name }}
+          path: ${{ steps.artifact.outputs.path }}
+
+  npm-publish:
+    name: Publish to npm
+    needs: [meta, publish-npm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download all native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Assemble npm package
+        run: |
+          # Copy native binaries into npm package directory
+          cp artifacts/sparrowdb-node-linux-x64/libsparrowdb_node.so \
+             npm/sparrowdb/sparrowdb.linux-x64-gnu.node 2>/dev/null || true
+          cp artifacts/sparrowdb-node-darwin-arm64/libsparrowdb_node.dylib \
+             npm/sparrowdb/sparrowdb.darwin-arm64.node 2>/dev/null || true
+
+          # Also create a generic fallback name
+          if [ -f npm/sparrowdb/sparrowdb.linux-x64-gnu.node ]; then
+            cp npm/sparrowdb/sparrowdb.linux-x64-gnu.node npm/sparrowdb/sparrowdb.node
+          fi
+
+      - name: Sync version to package.json
+        run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+          cd npm/sparrowdb
+          node -e "
+            const pkg = require('./package.json');
+            pkg.version = '$VERSION';
+            // Update optional dependency versions too
+            if (pkg.optionalDependencies) {
+              for (const dep of Object.keys(pkg.optionalDependencies)) {
+                pkg.optionalDependencies[dep] = '$VERSION';
+              }
+            }
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          echo "package.json version set to $VERSION"
+          cat package.json
+
+      - name: Publish to npm
+        run: |
+          cd npm/sparrowdb
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ── Publish Python wheel to PyPI ─────────────────────────────────────────
+  publish-pypi:
+    name: Publish PyPI (Python bindings)
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check if Python bindings are implemented
+        id: py_check
+        run: |
+          if grep -r '#\[pymodule\]' crates/sparrowdb-python/src/ 2>/dev/null; then
+            echo "implemented=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "implemented=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::sparrowdb-python not yet implemented — skipping PyPI publish"
+          fi
+
+      - name: Install maturin
+        if: steps.py_check.outputs.implemented == 'true'
+        run: pip install maturin twine
+
+      - name: Sync version to pyproject.toml
+        if: steps.py_check.outputs.implemented == 'true'
+        run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+          cd crates/sparrowdb-python
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+          echo "pyproject.toml version set to $VERSION"
+          grep '^version' pyproject.toml
+
+      - name: Build wheel
+        if: steps.py_check.outputs.implemented == 'true'
+        run: |
+          cd crates/sparrowdb-python
+          maturin build --release --strip
+
+      - name: Publish to PyPI
+        if: steps.py_check.outputs.implemented == 'true'
+        run: twine upload target/wheels/*.whl
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+
+  # ── Publish Ruby gem to RubyGems ─────────────────────────────────────────
+  publish-rubygems:
+    name: Publish RubyGems (Ruby bindings)
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Ruby 3.3
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      - name: Check if Ruby bindings compile
+        id: rb_check
+        run: |
+          if cargo check -p sparrowdb-ruby 2>/dev/null; then
+            echo "compiles=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "compiles=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::sparrowdb-ruby does not compile — skipping RubyGems publish"
+          fi
+
+      - name: Build native extension
+        if: steps.rb_check.outputs.compiles == 'true'
+        run: |
+          cargo build --release -p sparrowdb-ruby
+          ARTIFACT=$(ls target/release/libsparrowdb_ruby.so \
+                        target/release/libsparrowdb_ruby.dylib \
+                        2>/dev/null | head -1)
+          if [ -z "$ARTIFACT" ]; then
+            echo "::warning::Could not find compiled sparrowdb-ruby artifact — skipping"
+            echo "compiles=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p crates/sparrowdb-ruby/lib
+          cp "$ARTIFACT" crates/sparrowdb-ruby/lib/sparrowdb_ruby.so
+
+      - name: Create gemspec
+        if: steps.rb_check.outputs.compiles == 'true'
+        run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+          cat > crates/sparrowdb-ruby/sparrowdb.gemspec <<GEMSPEC
+          Gem::Specification.new do |s|
+            s.name        = 'sparrowdb'
+            s.version     = '$VERSION'
+            s.summary     = 'Ruby bindings for SparrowDB embedded graph database'
+            s.description = 'Native Ruby bindings for SparrowDB, an embedded graph database with Cypher query support.'
+            s.authors     = ['Rich Yaker']
+            s.license     = 'MIT'
+            s.homepage    = 'https://github.com/ryaker/SparrowDB'
+            s.files       = ['lib/sparrowdb.rb', 'lib/sparrowdb_ruby.so']
+            s.require_paths = ['lib']
+            s.required_ruby_version = '>= 3.1'
+          end
+          GEMSPEC
+
+      - name: Build and publish gem
+        if: steps.rb_check.outputs.compiles == 'true'
+        run: |
+          cd crates/sparrowdb-ruby
+          gem build sparrowdb.gemspec
+          gem push sparrowdb-*.gem
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_TOKEN }}
+
+  # ── Create GitHub Release ────────────────────────────────────────────────
+  github-release:
+    name: Create GitHub Release
+    needs: [meta, npm-publish, publish-pypi, publish-rubygems]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gather publish results
+        id: results
+        run: |
+          echo "## Release v${{ needs.meta.outputs.version }}" > release-notes.md
+          echo "" >> release-notes.md
+          echo "### Published packages" >> release-notes.md
+          echo "- **npm**: \`sparrowdb@${{ needs.meta.outputs.version }}\`" >> release-notes.md
+          echo "- **PyPI**: \`sparrowdb==${{ needs.meta.outputs.version }}\`" >> release-notes.md
+          echo "- **RubyGems**: \`sparrowdb ${{ needs.meta.outputs.version }}\`" >> release-notes.md
+          echo "" >> release-notes.md
+          echo "### Install" >> release-notes.md
+          echo '```bash' >> release-notes.md
+          echo "npm install sparrowdb@${{ needs.meta.outputs.version }}" >> release-notes.md
+          echo "pip install sparrowdb==${{ needs.meta.outputs.version }}" >> release-notes.md
+          echo 'gem install sparrowdb -v ${{ needs.meta.outputs.version }}' >> release-notes.md
+          echo '```' >> release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: v${{ needs.meta.outputs.version }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ contains(needs.meta.outputs.version, '-') }}
