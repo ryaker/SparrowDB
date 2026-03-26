@@ -34,14 +34,32 @@ fn main() {
             continue;
         }
 
+        // Detect notifications before full parse: JSON-RPC notifications have no "id".
+        // We still parse fully so we can identify the method for proper dispatch.
         let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
             Ok(req) => handle_request(req),
-            Err(e) => JsonRpcResponse {
-                jsonrpc: "2.0".into(),
-                id: None,
-                result: None,
-                error: Some(json!({"code": -32700, "message": e.to_string()})),
-            },
+            Err(e) => {
+                // Parse error — only respond if the raw JSON had a non-null "id" field,
+                // otherwise it looks like a notification and MCP SDK rejects null-id errors.
+                let id = serde_json::from_str::<Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("id").cloned())
+                    .filter(|v| !v.is_null());
+                if id.is_none() {
+                    continue; // Malformed notification or request with null id, discard silently.
+                }
+                Some(JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id,
+                    result: None,
+                    error: Some(json!({"code": -32700, "message": e.to_string()})),
+                })
+            }
+        };
+
+        let response = match response {
+            Some(r) => r,
+            None => continue, // Notification — no response.
         };
 
         let resp_str = match serde_json::to_string(&response) {
@@ -57,16 +75,24 @@ fn main() {
     }
 }
 
-fn handle_request(req: JsonRpcRequest) -> JsonRpcResponse {
+/// Returns `None` for notifications (no response required by MCP spec).
+fn handle_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
+    // MCP spec: messages without an "id" are notifications — must receive no response.
+    // Keying off id absence (not method prefix) handles all notifications correctly,
+    // including future notification methods beyond "notifications/*".
+    if req.id.is_none() {
+        return None;
+    }
+
     if req.jsonrpc != "2.0" {
-        return JsonRpcResponse {
+        return Some(JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id: req.id,
             result: None,
             error: Some(
                 json!({"code": -32600, "message": "Invalid Request: jsonrpc must be \"2.0\""}),
             ),
-        };
+        });
     }
 
     let result = match req.method.as_str() {
@@ -107,6 +133,33 @@ fn handle_request(req: JsonRpcRequest) -> JsonRpcResponse {
                             }
                         },
                         "required": ["db_path", "class_name"]
+                    }
+                },
+                {
+                    "name": "merge_node_by_property",
+                    "description": "Find-or-create a node by a unique property (upsert). If a node with label and match_key=match_value exists, update it with the given properties; otherwise create a new node. Returns whether the node was created or found. (SPA-247)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "db_path": {"type": "string"},
+                            "label": {
+                                "type": "string",
+                                "description": "Node label (e.g. \"Person\")"
+                            },
+                            "match_key": {
+                                "type": "string",
+                                "description": "Property name used for matching (e.g. \"id\")"
+                            },
+                            "match_value": {
+                                "description": "Property value to match on (string, number, or boolean)"
+                            },
+                            "properties": {
+                                "type": "object",
+                                "description": "Properties to set/update on the node. Scalar values only.",
+                                "additionalProperties": true
+                            }
+                        },
+                        "required": ["db_path", "label", "match_key", "match_value"]
                     }
                 },
                 {
@@ -159,11 +212,11 @@ fn handle_request(req: JsonRpcRequest) -> JsonRpcResponse {
                 }
             ]
         })),
-        "tools/call" => handle_tool_call(req.params),
-        _ => Err(json!({"code": -32601, "message": "Method not found"})),
+        "tools/call" => Ok(handle_tool_call(req.params)),
+        _ => Err(json!({"code": -32601, "message": format!("Method not found: {}", req.method)})),
     };
 
-    match result {
+    Some(match result {
         Ok(r) => JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id: req.id,
@@ -176,178 +229,52 @@ fn handle_request(req: JsonRpcRequest) -> JsonRpcResponse {
             result: None,
             error: Some(e),
         },
+    })
+}
+
+/// All tool calls return a successful JSON-RPC result.
+/// Errors are expressed as `isError: true` in the content, per MCP spec.
+/// (MCP SDK clients reject `{ error }` responses from tool calls.)
+fn handle_tool_call(params: Option<Value>) -> Value {
+    match handle_tool_call_inner(params) {
+        Ok(v) => v,
+        Err(msg) => json!({
+            "content": [{"type": "text", "text": msg}],
+            "isError": true
+        }),
     }
 }
 
-/// Escape a string for safe Cypher single-quoted literal interpolation.
-fn escape_cypher_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
-/// Build a Cypher CREATE query from a class name and a JSON properties object.
-///
-/// Returns Err with a descriptive message when class_name is empty or a
-/// property value is null, an array, or a nested object.
-fn build_create_query(class_name: &str, props: &Value) -> Result<String, String> {
-    if class_name.is_empty() {
-        return Err("create_entity: class_name must not be empty".into());
-    }
-
-    let mut prop_parts: Vec<String> = Vec::new();
-
-    if let Some(obj) = props.as_object() {
-        for (key, val) in obj {
-            if key.is_empty() {
-                return Err("create_entity: property key must not be empty".into());
-            }
-            let cypher_val = match val {
-                Value::String(s) => format!("'{}'", escape_cypher_string(s)),
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                Value::Null => {
-                    return Err(format!(
-                        "create_entity: property '{}' is null; use a concrete value",
-                        key
-                    ))
-                }
-                Value::Array(_) => {
-                    return Err(format!(
-                        "create_entity: property '{}' is an array; only scalar values are supported",
-                        key
-                    ))
-                }
-                Value::Object(_) => {
-                    return Err(format!(
-                        "create_entity: property '{}' is a nested object; only scalar values are supported",
-                        key
-                    ))
-                }
-            };
-            prop_parts.push(format!("{}: {}", key, cypher_val));
-        }
-    }
-
-    let props_clause = if prop_parts.is_empty() {
-        String::new()
-    } else {
-        format!(" {{{}}}", prop_parts.join(", "))
-    };
-
-    Ok(format!("CREATE (n:{}{})", class_name, props_clause))
-}
-
-/// Build a Cypher MATCH … SET query for the add_property tool.
-///
-/// Returns Err with a descriptive message when any argument is invalid
-/// (empty label, empty property names, unsupported value type).
-fn build_add_property_query(
-    label: &str,
-    match_prop: &str,
-    match_val: &str,
-    set_prop: &str,
-    set_val: &Value,
-) -> Result<String, String> {
-    if label.is_empty() {
-        return Err("add_property: label must not be empty".into());
-    }
-    if match_prop.is_empty() {
-        return Err("add_property: match_prop must not be empty".into());
-    }
-    if set_prop.is_empty() {
-        return Err("add_property: set_prop must not be empty".into());
-    }
-
-    let cypher_set_val = match set_val {
-        Value::String(s) => format!("'{}'", escape_cypher_string(s)),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Null => {
-            return Err("add_property: set_val is null; use a concrete scalar value".into())
-        }
-        Value::Array(_) => {
-            return Err(
-                "add_property: set_val is an array; only scalar values are supported".into(),
-            )
-        }
-        Value::Object(_) => {
-            return Err(
-                "add_property: set_val is a nested object; only scalar values are supported".into(),
-            )
-        }
-    };
-
-    Ok(format!(
-        "MATCH (n:{label} {{{match_prop}: '{match_val_escaped}'}}) SET n.{set_prop} = {cypher_set_val}",
-        label = label,
-        match_prop = match_prop,
-        match_val_escaped = escape_cypher_string(match_val),
-        set_prop = set_prop,
-        cypher_set_val = cypher_set_val,
-    ))
-}
-
-/// Build a Cypher MATCH count query to check how many nodes match.
-fn build_count_query(label: &str, match_prop: &str, match_val: &str) -> String {
-    format!(
-        "MATCH (n:{label} {{{match_prop}: '{match_val_escaped}'}}) RETURN count(n) AS cnt",
-        label = label,
-        match_prop = match_prop,
-        match_val_escaped = escape_cypher_string(match_val),
-    )
-}
-
-fn handle_tool_call(params: Option<Value>) -> Result<Value, Value> {
-    let params = params.ok_or_else(|| json!({"code": -32602, "message": "Missing params"}))?;
-    let tool_name = params["name"]
-        .as_str()
-        .ok_or_else(|| json!({"code": -32602, "message": "Missing tool name"}))?;
+fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
+    let params = params.ok_or("Missing params")?;
+    let tool_name = params["name"].as_str().ok_or("Missing tool name")?;
     let args = &params["arguments"];
 
     match tool_name {
         "add_property" => {
-            let db_path = args["db_path"]
-                .as_str()
-                .ok_or_else(|| json!({"code": -32602, "message": "Missing db_path"}))?;
-            let label = args["label"]
-                .as_str()
-                .ok_or_else(|| json!({"code": -32602, "message": "Missing label"}))?;
-            let match_prop = args["match_prop"]
-                .as_str()
-                .ok_or_else(|| json!({"code": -32602, "message": "Missing match_prop"}))?;
-            let match_val = args["match_val"]
-                .as_str()
-                .ok_or_else(|| json!({"code": -32602, "message": "Missing match_val"}))?;
-            let set_prop = args["set_prop"]
-                .as_str()
-                .ok_or_else(|| json!({"code": -32602, "message": "Missing set_prop"}))?;
+            let db_path = args["db_path"].as_str().ok_or("Missing db_path")?;
+            let label = args["label"].as_str().ok_or("Missing label")?;
+            let match_prop = args["match_prop"].as_str().ok_or("Missing match_prop")?;
+            let match_val = args["match_val"].as_str().ok_or("Missing match_val")?;
+            let set_prop = args["set_prop"].as_str().ok_or("Missing set_prop")?;
             let set_val = &args["set_val"];
 
-            // Validate and build the SET query.
             let set_query =
-                build_add_property_query(label, match_prop, match_val, set_prop, set_val)
-                    .map_err(|msg| json!({"code": -32602, "message": msg}))?;
+                build_add_property_query(label, match_prop, match_val, set_prop, set_val)?;
 
             let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path)).map_err(|e| {
-                json!({
-                    "code": -32000,
-                    "message": format!(
-                        "add_property: failed to open database at '{}': {}",
-                        db_path, e
-                    )
-                })
+                format!(
+                    "add_property: failed to open database at '{}': {}",
+                    db_path, e
+                )
             })?;
 
-            // Count how many nodes match before applying SET, so we can report
-            // zero-match without the caller having to inspect empty rows.
             let count_query = build_count_query(label, match_prop, match_val);
             let count_result = db.execute(&count_query).map_err(|e| {
-                json!({
-                    "code": -32000,
-                    "message": format!(
-                        "add_property: count query failed for label '{}': {}",
-                        label, e
-                    )
-                })
+                format!(
+                    "add_property: count query failed for label '{}': {}",
+                    label, e
+                )
             })?;
 
             let matched: i64 = count_result
@@ -373,16 +300,8 @@ fn handle_tool_call(params: Option<Value>) -> Result<Value, Value> {
                 }));
             }
 
-            // Apply the SET.
-            db.execute(&set_query).map_err(|e| {
-                json!({
-                    "code": -32000,
-                    "message": format!(
-                        "add_property: SET failed for label '{}': {}",
-                        label, e
-                    )
-                })
-            })?;
+            db.execute(&set_query)
+                .map_err(|e| format!("add_property: SET failed for label '{}': {}", label, e))?;
 
             Ok(json!({
                 "content": [{
@@ -396,49 +315,31 @@ fn handle_tool_call(params: Option<Value>) -> Result<Value, Value> {
             }))
         }
         "checkpoint" => {
-            let db_path = args["db_path"]
-                .as_str()
-                .ok_or_else(|| json!({"code": -32602, "message": "Missing db_path"}))?;
+            let db_path = args["db_path"].as_str().ok_or("Missing db_path")?;
             let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path))
-                .map_err(|e| json!({"code": -32000, "message": e.to_string()}))?;
-            db.checkpoint()
-                .map_err(|e| json!({"code": -32000, "message": e.to_string()}))?;
+                .map_err(|e| e.to_string())?;
+            db.checkpoint().map_err(|e| e.to_string())?;
             Ok(json!({"content": [{"type": "text", "text": "Checkpoint complete"}]}))
         }
         "create_entity" => {
-            let db_path = args["db_path"]
-                .as_str()
-                .ok_or_else(|| json!({"code": -32602, "message": "Missing db_path"}))?;
-            let class_name = args["class_name"]
-                .as_str()
-                .ok_or_else(|| json!({"code": -32602, "message": "Missing class_name"}))?;
+            let db_path = args["db_path"].as_str().ok_or("Missing db_path")?;
+            let class_name = args["class_name"].as_str().ok_or("Missing class_name")?;
             let props = &args["properties"];
 
-            // Build the Cypher CREATE statement, surfacing argument errors as
-            // -32602 (invalid params) not -32000 (generic execution error).
-            // SPA-243 root cause: the tool was absent; callers received the
-            // generic "Unknown tool: create_entity" error.
-            let query = build_create_query(class_name, props)
-                .map_err(|msg| json!({"code": -32602, "message": msg}))?;
+            let query = build_create_query(class_name, props)?;
 
             let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path)).map_err(|e| {
-                json!({
-                    "code": -32000,
-                    "message": format!(
-                        "create_entity: failed to open database at '{}': {}",
-                        db_path, e
-                    )
-                })
+                format!(
+                    "create_entity: failed to open database at '{}': {}",
+                    db_path, e
+                )
             })?;
 
             db.execute(&query).map_err(|e| {
-                json!({
-                    "code": -32000,
-                    "message": format!(
-                        "create_entity: write failed for class '{}': {}",
-                        class_name, e
-                    )
-                })
+                format!(
+                    "create_entity: write failed for class '{}': {}",
+                    class_name, e
+                )
             })?;
 
             Ok(json!({
@@ -449,30 +350,20 @@ fn handle_tool_call(params: Option<Value>) -> Result<Value, Value> {
             }))
         }
         "execute_cypher" => {
-            let db_path = args["db_path"]
-                .as_str()
-                .ok_or_else(|| json!({"code": -32602, "message": "Missing db_path"}))?;
-            let query = args["query"]
-                .as_str()
-                .ok_or_else(|| json!({"code": -32602, "message": "Missing query"}))?;
+            let db_path = args["db_path"].as_str().ok_or("Missing db_path")?;
+            let query = args["query"].as_str().ok_or("Missing query")?;
             let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path))
-                .map_err(|e| json!({"code": -32000, "message": e.to_string()}))?;
-            match db.execute(query) {
-                Ok(result) => Ok(json!({
-                    "content": [{"type": "text", "text": format!("{result:?}")}]
-                })),
-                Err(e) => Err(json!({"code": -32000, "message": e.to_string()})),
-            }
+                .map_err(|e| e.to_string())?;
+            let result = db.execute(query).map_err(|e| e.to_string())?;
+            Ok(json!({
+                "content": [{"type": "text", "text": format!("{result:?}")}]
+            }))
         }
         "info" => {
-            let db_path = args["db_path"]
-                .as_str()
-                .ok_or_else(|| json!({"code": -32602, "message": "Missing db_path"}))?;
+            let db_path = args["db_path"].as_str().ok_or("Missing db_path")?;
             let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path))
-                .map_err(|e| json!({"code": -32000, "message": e.to_string()}))?;
-            let rx = db
-                .begin_read()
-                .map_err(|e| json!({"code": -32000, "message": e.to_string()}))?;
+                .map_err(|e| e.to_string())?;
+            let rx = db.begin_read().map_err(|e| e.to_string())?;
             let txn_id = rx.snapshot_txn_id;
             let meta = json!({
                 "db_path": db_path,
@@ -483,6 +374,256 @@ fn handle_tool_call(params: Option<Value>) -> Result<Value, Value> {
             });
             Ok(json!({"content": [{"type": "text", "text": meta.to_string()}]}))
         }
-        _ => Err(json!({"code": -32602, "message": format!("Unknown tool: {tool_name}")})),
+        "merge_node_by_property" => {
+            let db_path = args["db_path"].as_str().ok_or("Missing db_path")?;
+            let label = args["label"].as_str().ok_or("Missing label")?;
+            let match_key = args["match_key"].as_str().ok_or("Missing match_key")?;
+            let match_value = &args["match_value"];
+            let properties = &args["properties"];
+
+            validate_cypher_identifier(label, "merge_node_by_property: label")?;
+            validate_cypher_identifier(match_key, "merge_node_by_property: match_key")?;
+
+            let cypher_match_val = json_scalar_to_cypher(match_value).ok_or_else(|| {
+                format!(
+                    "merge_node_by_property: match_value must be a scalar, got {:?}",
+                    match_value
+                )
+            })?;
+
+            let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path)).map_err(|e| {
+                format!(
+                    "merge_node_by_property: failed to open database at '{}': {}",
+                    db_path, e
+                )
+            })?;
+
+            // Build additional SET clause from properties (excluding the match key).
+            let mut set_parts: Vec<String> = Vec::new();
+            if let Some(obj) = properties.as_object() {
+                for (k, v) in obj {
+                    if k == match_key {
+                        continue; // match key already in MERGE clause
+                    }
+                    validate_cypher_identifier(k, "merge_node_by_property: property key")?;
+                    let cypher_v = json_scalar_to_cypher(v).ok_or_else(|| {
+                        format!("merge_node_by_property: property '{}' must be a scalar", k)
+                    })?;
+                    set_parts.push(format!("n.{} = {}", k, cypher_v));
+                }
+            }
+
+            let set_clause = if set_parts.is_empty() {
+                String::new()
+            } else {
+                format!(" SET {}", set_parts.join(", "))
+            };
+
+            // Check whether the node already exists before MERGE so we can accurately
+            // report whether it was created or matched.
+            let count_query =
+                format!("MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) RETURN count(n)",);
+            let count_result = db
+                .execute(&count_query)
+                .map_err(|e| format!("merge_node_by_property: pre-merge count failed: {}", e))?;
+            let pre_existing = count_result
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| match v {
+                    sparrowdb_execution::types::Value::Int64(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0);
+
+            // Use MERGE (find-or-create) semantics.
+            let query = format!(
+                "MERGE (n:{label} {{{match_key}: {cypher_match_val}}}){set_clause} RETURN n",
+            );
+
+            let result = db
+                .execute(&query)
+                .map_err(|e| format!("merge_node_by_property: MERGE failed: {}", e))?;
+
+            let created = pre_existing == 0;
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "merge_node_by_property: node with {}={} on label '{}' {} ({} row(s) returned).",
+                        match_key, match_value, label,
+                        if created { "created" } else { "found (existing)" },
+                        result.rows.len()
+                    )
+                }],
+                "rows": result.rows.len(),
+                "created": created
+            }))
+        }
+        _ => Err(format!("Unknown tool: {tool_name}")),
+    }
+}
+
+/// Validate a Cypher identifier (label or property key).
+/// Accepts only `[A-Za-z_][A-Za-z0-9_]*` — no spaces, backticks, or special chars.
+/// Returns `Err` with a descriptive message when the identifier is unsafe.
+fn validate_cypher_identifier(ident: &str, context: &str) -> Result<(), String> {
+    if ident.is_empty() {
+        return Err(format!("{context}: identifier must not be empty"));
+    }
+    let mut chars = ident.chars();
+    let first_ok = chars
+        .next()
+        .map(|c| c.is_ascii_alphabetic() || c == '_')
+        .unwrap_or(false);
+    if !first_ok || chars.any(|c| !c.is_ascii_alphanumeric() && c != '_') {
+        return Err(format!(
+            "{context}: identifier '{ident}' contains unsafe characters; \
+             only [A-Za-z_][A-Za-z0-9_]* is allowed"
+        ));
+    }
+    Ok(())
+}
+
+/// Escape a string for safe Cypher single-quoted literal interpolation.
+fn escape_cypher_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// Convert a JSON scalar to a Cypher literal string. Returns None for
+/// non-scalar values (null, array, object).
+fn json_scalar_to_cypher(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(format!("'{}'", escape_cypher_string(s))),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Build a Cypher CREATE query from a class name and a JSON properties object.
+fn build_create_query(class_name: &str, props: &Value) -> Result<String, String> {
+    validate_cypher_identifier(class_name, "create_entity: class_name")?;
+
+    let mut prop_parts: Vec<String> = Vec::new();
+
+    if let Some(obj) = props.as_object() {
+        for (key, val) in obj {
+            validate_cypher_identifier(key, "create_entity: property key")?;
+            let cypher_val = json_scalar_to_cypher(val).ok_or_else(|| match val {
+                Value::Null => format!("create_entity: property '{}' is null; use a concrete value", key),
+                Value::Array(_) => format!("create_entity: property '{}' is an array; only scalar values are supported", key),
+                Value::Object(_) => format!("create_entity: property '{}' is a nested object; only scalar values are supported", key),
+                _ => format!("create_entity: unsupported value for property '{}'", key),
+            })?;
+            prop_parts.push(format!("{}: {}", key, cypher_val));
+        }
+    }
+
+    let props_clause = if prop_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {{{}}}", prop_parts.join(", "))
+    };
+
+    Ok(format!("CREATE (n:{}{})", class_name, props_clause))
+}
+
+/// Build a Cypher MATCH … SET query for the add_property tool.
+fn build_add_property_query(
+    label: &str,
+    match_prop: &str,
+    match_val: &str,
+    set_prop: &str,
+    set_val: &Value,
+) -> Result<String, String> {
+    validate_cypher_identifier(label, "add_property: label")?;
+    validate_cypher_identifier(match_prop, "add_property: match_prop")?;
+    validate_cypher_identifier(set_prop, "add_property: set_prop")?;
+
+    let cypher_set_val = json_scalar_to_cypher(set_val).ok_or_else(|| match set_val {
+        Value::Null => "add_property: set_val is null; use a concrete scalar value".to_string(),
+        Value::Array(_) => {
+            "add_property: set_val is an array; only scalar values are supported".to_string()
+        }
+        Value::Object(_) => {
+            "add_property: set_val is a nested object; only scalar values are supported".to_string()
+        }
+        _ => "add_property: unsupported set_val type".to_string(),
+    })?;
+
+    Ok(format!(
+        "MATCH (n:{label} {{{match_prop}: '{match_val_escaped}'}}) SET n.{set_prop} = {cypher_set_val}",
+        label = label,
+        match_prop = match_prop,
+        match_val_escaped = escape_cypher_string(match_val),
+        set_prop = set_prop,
+        cypher_set_val = cypher_set_val,
+    ))
+}
+
+/// Build a Cypher MATCH count query to check how many nodes match.
+/// Callers must have already validated `label` and `match_prop` as safe identifiers.
+fn build_count_query(label: &str, match_prop: &str, match_val: &str) -> String {
+    format!(
+        "MATCH (n:{label} {{{match_prop}: '{match_val_escaped}'}}) RETURN count(n) AS cnt",
+        label = label,
+        match_prop = match_prop,
+        match_val_escaped = escape_cypher_string(match_val),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_notifications_return_none() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: None,
+            method: "notifications/initialized".into(),
+            params: None,
+        };
+        assert!(handle_request(req).is_none());
+    }
+
+    #[test]
+    fn test_notifications_generic_return_none() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: None,
+            method: "notifications/something_else".into(),
+            params: None,
+        };
+        assert!(handle_request(req).is_none());
+    }
+
+    #[test]
+    fn test_tool_error_is_is_error_not_rpc_error() {
+        let result = handle_tool_call(None);
+        assert!(result["isError"].as_bool().unwrap_or(false));
+        assert!(result["content"].is_array());
+    }
+
+    #[test]
+    fn test_build_create_query_basic() {
+        let props = serde_json::json!({"name": "Alice", "age": 30});
+        let q = build_create_query("Person", &props).unwrap();
+        assert!(q.starts_with("CREATE (n:Person {"));
+        assert!(q.contains("name: 'Alice'"));
+        assert!(q.contains("age: 30"));
+    }
+
+    #[test]
+    fn test_json_scalar_to_cypher() {
+        assert_eq!(
+            json_scalar_to_cypher(&json!("hello")),
+            Some("'hello'".into())
+        );
+        assert_eq!(json_scalar_to_cypher(&json!(42)), Some("42".into()));
+        assert_eq!(json_scalar_to_cypher(&json!(true)), Some("true".into()));
+        assert!(json_scalar_to_cypher(&json!(null)).is_none());
+        assert!(json_scalar_to_cypher(&json!([])).is_none());
     }
 }
