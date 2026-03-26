@@ -65,7 +65,7 @@ impl CsrData {
             return &[];
         }
         let ptr = mmap[byte_start..].as_ptr();
-        debug_assert!(ptr as usize % std::mem::align_of::<u64>() == 0);
+        debug_assert!((ptr as usize).is_multiple_of(std::mem::align_of::<u64>()));
         unsafe { std::slice::from_raw_parts(ptr as *const u64, count) }
     }
 
