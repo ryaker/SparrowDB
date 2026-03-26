@@ -832,8 +832,6 @@ impl Engine {
         m: &MatchStatement,
         column_names: &[String],
     ) -> Result<QueryResult> {
-        use crate::join::AspJoin;
-
         let pat = &m.pattern[0];
         let src_node_pat = &pat.nodes[0];
         // nodes[1] is the mid node (may be named, e.g. `m` in Q8 mutual-friends)
@@ -937,67 +935,117 @@ impl Engine {
         // 2-hop queries.  We aggregate across all rel types here because the
         // 2-hop executor does not currently filter on rel_type.
         // Map: src_slot → Vec<dst_slot> (only records whose src label matches).
-        let delta_adj: HashMap<u64, Vec<u64>> = {
-            let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
-            for r in self.read_delta_all() {
-                let r_src_label = (r.src.0 >> 32) as u32;
-                let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                if r_src_label == src_label_id {
-                    adj.entry(r_src_slot)
-                        .or_default()
-                        .push(r.dst.0 & 0xFFFF_FFFF);
+        // SPA-263: per-hop CSRs and delta adjacency maps.
+        let rel1 = &pat.rels[0];
+        let rel2 = &pat.rels[1];
+        let all_rel_tables_2hop = self.snapshot.catalog.list_rel_tables_with_ids();
+        let hop1_rel_ids: Vec<u64> = all_rel_tables_2hop
+            .iter()
+            .filter(|(_, sid, did, rt)| {
+                let type_ok = rel1.rel_type.is_empty() || rt == &rel1.rel_type;
+                let src_ok = *sid as u32 == src_label_id;
+                let dst_ok = *did as u32 == mid_label_id;
+                type_ok && src_ok && dst_ok
+            })
+            .map(|(id, _, _, _)| *id)
+            .collect();
+        let hop2_rel_ids: Vec<u64> = all_rel_tables_2hop
+            .iter()
+            .filter(|(_, sid, did, rt)| {
+                let type_ok = rel2.rel_type.is_empty() || rt == &rel2.rel_type;
+                let src_ok = *sid as u32 == mid_label_id;
+                let dst_ok = *did as u32 == fof_label_id;
+                type_ok && src_ok && dst_ok
+            })
+            .map(|(id, _, _, _)| *id)
+            .collect();
+        let hop1_csr = {
+            let mut max_n: u64 = 0;
+            let mut edges: Vec<(u64, u64)> = Vec::new();
+            for &rid in &hop1_rel_ids {
+                if let Some(csr) = self.snapshot.csrs.get(&(rid as u32)) {
+                    if csr.n_nodes() > max_n {
+                        max_n = csr.n_nodes();
+                    }
+                    for s in 0..csr.n_nodes() {
+                        for &d in csr.neighbors(s) {
+                            edges.push((s, d));
+                        }
+                    }
                 }
             }
-            adj
+            edges.sort_unstable();
+            edges.dedup();
+            CsrForward::build(max_n, &edges)
         };
+        let hop2_csr = {
+            let mut max_n: u64 = 0;
+            let mut edges: Vec<(u64, u64)> = Vec::new();
+            for &rid in &hop2_rel_ids {
+                if let Some(csr) = self.snapshot.csrs.get(&(rid as u32)) {
+                    if csr.n_nodes() > max_n {
+                        max_n = csr.n_nodes();
+                    }
+                    for s in 0..csr.n_nodes() {
+                        for &d in csr.neighbors(s) {
+                            edges.push((s, d));
+                        }
+                    }
+                }
+            }
+            edges.sort_unstable();
+            edges.dedup();
+            CsrForward::build(max_n, &edges)
+        };
+        let mut delta_adj_hop1: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut delta_adj_hop2: HashMap<u64, Vec<u64>> = HashMap::new();
+        for &rid in &hop1_rel_ids {
+            for r in self.read_delta_for(rid as u32) {
+                let ss = r.src.0 & 0xFFFF_FFFF;
+                let ds = r.dst.0 & 0xFFFF_FFFF;
+                let e = delta_adj_hop1.entry(ss).or_default();
+                if !e.contains(&ds) {
+                    e.push(ds);
+                }
+            }
+        }
+        for &rid in &hop2_rel_ids {
+            for r in self.read_delta_for(rid as u32) {
+                let ss = r.src.0 & 0xFFFF_FFFF;
+                let ds = r.dst.0 & 0xFFFF_FFFF;
+                let e = delta_adj_hop2.entry(ss).or_default();
+                if !e.contains(&ds) {
+                    e.push(ds);
+                }
+            }
+        }
 
         // SPA-185: build a merged CSR that union-combines edges from all
         // per-type CSRs so the 2-hop traversal sees paths through any rel type.
         // AspJoin requires a single &CsrForward; we construct a combined one
         // rather than using an arbitrary first entry.
-        let merged_csr = {
-            let max_nodes = self
-                .snapshot
-                .csrs
-                .values()
-                .map(|c| c.n_nodes())
-                .max()
-                .unwrap_or(0);
-            let mut edges: Vec<(u64, u64)> = Vec::new();
-            for csr in self.snapshot.csrs.values() {
-                for src in 0..csr.n_nodes() {
-                    for &dst in csr.neighbors(src) {
-                        edges.push((src, dst));
-                    }
-                }
-            }
-            // CsrForward::build requires a sorted edge list.
-            edges.sort_unstable();
-            edges.dedup();
-            CsrForward::build(max_nodes, &edges)
-        };
+        // (merged_csr removed by SPA-263)
 
         // SPA-201: build a merged backward CSR when the second hop is Incoming.
         // For (a)-[:R]->(m)<-[:R]-(b) we need predecessors(mid) to find b-nodes.
         // We derive this from the already-loaded forward CSRs (no extra disk I/O)
-        // by building CsrBackward from the same forward edge list used for merged_csr.
+        // by building CsrBackward from the same .
         // CsrBackward::build takes (src, dst) forward edges and stores them reversed.
         let merged_bwd_csr: Option<CsrBackward> = if second_hop_incoming {
-            let max_nodes = self
-                .snapshot
-                .csrs
-                .values()
-                .map(|c| c.n_nodes())
-                .max()
-                .unwrap_or(0);
-            // Re-use the same sorted+deduped edge list already in merged_csr.
-            // We rebuild it here because CsrForward doesn't expose its edge list,
-            // but this construction is O(E) and the merged_csr build already did it.
+            let mut max_nodes: u64 = 0;
+            //
+            //
+            //
             let mut fwd_edges: Vec<(u64, u64)> = Vec::new();
-            for csr in self.snapshot.csrs.values() {
-                for src in 0..csr.n_nodes() {
-                    for &dst in csr.neighbors(src) {
-                        fwd_edges.push((src, dst));
+            for &rid in &hop2_rel_ids {
+                if let Some(csr) = self.snapshot.csrs.get(&(rid as u32)) {
+                    if csr.n_nodes() > max_nodes {
+                        max_nodes = csr.n_nodes();
+                    }
+                    for src in 0..csr.n_nodes() {
+                        for &dst in csr.neighbors(src) {
+                            fwd_edges.push((src, dst));
+                        }
                     }
                 }
             }
@@ -1016,17 +1064,18 @@ impl Engine {
         // Maps dst_slot → Vec<src_slot> for edges in the delta log (written since checkpoint).
         let delta_adj_bwd: HashMap<u64, Vec<u64>> = if second_hop_incoming {
             let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
-            for r in self.read_delta_all() {
-                let r_dst_slot = r.dst.0 & 0xFFFF_FFFF;
-                let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                adj.entry(r_dst_slot).or_default().push(r_src_slot);
+            for &rid in &hop2_rel_ids {
+                for r in self.read_delta_for(rid as u32) {
+                    let ds = r.dst.0 & 0xFFFF_FFFF;
+                    let ss = r.src.0 & 0xFFFF_FFFF;
+                    adj.entry(ds).or_default().push(ss);
+                }
             }
             adj
         } else {
             HashMap::new()
         };
 
-        let join = AspJoin::new(&merged_csr);
         let mut rows = Vec::new();
 
         // Scan source nodes.
@@ -1073,9 +1122,9 @@ impl Engine {
 
                 // Collect all candidate M slots from the forward first hop.
                 let mid_slots: Vec<u64> = {
-                    let mut csr_mids: Vec<u64> = merged_csr.neighbors(src_slot).to_vec();
+                    let mut csr_mids: Vec<u64> = hop1_csr.neighbors(src_slot).to_vec();
                     // Delta first hop from src.
-                    if let Some(delta_first) = delta_adj.get(&src_slot) {
+                    if let Some(delta_first) = delta_adj_hop1.get(&src_slot) {
                         for &mid in delta_first {
                             if !csr_mids.contains(&mid) {
                                 csr_mids.push(mid);
@@ -1212,51 +1261,30 @@ impl Engine {
             // SPA-241: use factorized join to preserve mid_slot→fof_slots mapping.
             // The previous flat two_hop() call discarded which mid node connected
             // src to each fof, making it impossible to read or return mid properties.
-            let mut mid_fof_pairs: Vec<(u64, Vec<u64>)> = {
-                let chunk = join.two_hop_factorized(src_slot)?;
-                chunk
-                    .groups
-                    .into_iter()
-                    .map(|g| (g.mid_slot, g.fof_slots))
-                    .collect()
-            };
-
-            // SPA-163 + SPA-241: extend with delta-log 2-hop paths, preserving
-            // the mid→fof structure so we can read mid node properties.
+            let mut mid_fof_pairs: Vec<(u64, Vec<u64>)> = Vec::new();
             {
-                let first_hop_delta = delta_adj
-                    .get(&src_slot)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                if !first_hop_delta.is_empty() {
-                    for &mid_slot in first_hop_delta {
-                        let mut fof_for_mid: HashSet<u64> = HashSet::new();
-                        // CSR second hop from mid:
-                        for &fof in merged_csr.neighbors(mid_slot) {
-                            fof_for_mid.insert(fof);
+                let mut mid_slots: Vec<u64> = hop1_csr.neighbors(src_slot).to_vec();
+                if let Some(df) = delta_adj_hop1.get(&src_slot) {
+                    for &m in df {
+                        if !mid_slots.contains(&m) {
+                            mid_slots.push(m);
                         }
-                        // Delta second hop from mid:
-                        if let Some(mid_neighbors) = delta_adj.get(&mid_slot) {
-                            for &fof in mid_neighbors {
-                                fof_for_mid.insert(fof);
-                            }
+                    }
+                }
+                for mid_slot in mid_slots {
+                    let mut fof_set: HashSet<u64> = HashSet::new();
+                    for &f in hop2_csr.neighbors(mid_slot) {
+                        fof_set.insert(f);
+                    }
+                    if let Some(d2) = delta_adj_hop2.get(&mid_slot) {
+                        for &f in d2 {
+                            fof_set.insert(f);
                         }
-                        if !fof_for_mid.is_empty() {
-                            // Merge into existing group for this mid_slot or add new.
-                            if let Some(existing) =
-                                mid_fof_pairs.iter_mut().find(|(ms, _)| *ms == mid_slot)
-                            {
-                                for fof in fof_for_mid {
-                                    if !existing.1.contains(&fof) {
-                                        existing.1.push(fof);
-                                    }
-                                }
-                            } else {
-                                let mut fof_vec: Vec<u64> = fof_for_mid.into_iter().collect();
-                                fof_vec.sort_unstable();
-                                mid_fof_pairs.push((mid_slot, fof_vec));
-                            }
-                        }
+                    }
+                    if !fof_set.is_empty() {
+                        let mut fv: Vec<u64> = fof_set.into_iter().collect();
+                        fv.sort_unstable();
+                        mid_fof_pairs.push((mid_slot, fv));
                     }
                 }
             }
@@ -1404,23 +1432,39 @@ impl Engine {
             }
         }
 
-        // DISTINCT
-        if m.distinct {
-            deduplicate_rows(&mut rows);
-        }
+        // SPA-263: apply aggregation (COUNT, SUM, etc.) if RETURN has aggregates.
+        let use_agg = has_aggregate_in_return(&m.return_clause.items);
+        if use_agg {
+            let raw_rows: Vec<HashMap<String, Value>> = rows
+                .iter()
+                .map(|row| {
+                    column_names
+                        .iter()
+                        .zip(row.iter())
+                        .map(|(col, val)| (col.clone(), val.clone()))
+                        .collect()
+                })
+                .collect();
+            rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
+        } else {
+            // DISTINCT
+            if m.distinct {
+                deduplicate_rows(&mut rows);
+            }
 
-        // ORDER BY
-        apply_order_by(&mut rows, m, column_names);
+            // ORDER BY
+            apply_order_by(&mut rows, m, column_names);
 
-        // SKIP
-        if let Some(skip) = m.skip {
-            let skip = (skip as usize).min(rows.len());
-            rows.drain(0..skip);
-        }
+            // SKIP
+            if let Some(skip) = m.skip {
+                let skip = (skip as usize).min(rows.len());
+                rows.drain(0..skip);
+            }
 
-        // LIMIT
-        if let Some(lim) = m.limit {
-            rows.truncate(lim as usize);
+            // LIMIT
+            if let Some(lim) = m.limit {
+                rows.truncate(lim as usize);
+            }
         }
 
         tracing::debug!(rows = rows.len(), "two-hop traversal complete");
