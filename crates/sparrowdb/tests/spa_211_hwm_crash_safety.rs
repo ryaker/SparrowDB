@@ -129,7 +129,8 @@ fn corrupted_hwm_bin_no_panic_no_collision() {
 
     // Session 3: open the full GraphDb — must not panic.
     {
-        let db = GraphDb::open(&db_path).expect("GraphDb::open after hwm corruption must not panic");
+        let db =
+            GraphDb::open(&db_path).expect("GraphDb::open after hwm corruption must not panic");
 
         // Insert another node. If the HWM was reset to 0, this would normally
         // collide with slot 0 which was already persisted.  The SPA-211 fix
@@ -162,11 +163,13 @@ fn hwm_recovered_from_tmp_leftover() {
     {
         let db = GraphDb::open(&db_path).expect("open session 1");
         let mut tx = db.begin_write().expect("begin_write");
-        tx.create_node(0, &[(0u32, Value::Int64(1))]).expect("node 0");
+        tx.create_node(0, &[(0u32, Value::Int64(1))])
+            .expect("node 0");
         tx.commit().expect("commit 1");
 
         let mut tx2 = db.begin_write().expect("begin_write 2");
-        tx2.create_node(0, &[(0u32, Value::Int64(2))]).expect("node 1");
+        tx2.create_node(0, &[(0u32, Value::Int64(2))])
+            .expect("node 1");
         tx2.commit().expect("commit 2");
     }
 

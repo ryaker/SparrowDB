@@ -35,25 +35,21 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 /// (dst indices 0..9 for src 0, 10..19 for src 1, etc.).
 /// No src ever shares a destination with another src, so no inter-src
 /// deduplication occurs and the total edge count is exactly N_SRC * 10.
-const N_SRC: u32 = 5;    // 5 source nodes
-const N_DST: u32 = 50;   // 50 destination nodes (10 per source, non-overlapping)
+const N_SRC: u32 = 5; // 5 source nodes
+const N_DST: u32 = 50; // 50 destination nodes (10 per source, non-overlapping)
 
 fn build_graph(db: &sparrowdb::GraphDb) {
     // Create destination nodes (the "b" side).
     // Use 1-based idx to avoid the 0-sentinel issue (0 == absent in storage).
     for j in 1..=N_DST {
-        db.execute(&format!(
-            "CREATE (n:Dst {{name: 'dst_{j}', idx: {j}}})"
-        ))
-        .unwrap_or_else(|e| panic!("CREATE dst_{j} failed: {e}"));
+        db.execute(&format!("CREATE (n:Dst {{name: 'dst_{j}', idx: {j}}})"))
+            .unwrap_or_else(|e| panic!("CREATE dst_{j} failed: {e}"));
     }
 
     // Create source nodes and connect each to its 10 private destinations.
     for i in 1..=N_SRC {
-        db.execute(&format!(
-            "CREATE (n:Node {{name: 'node_{i}', idx: {i}}})"
-        ))
-        .unwrap_or_else(|e| panic!("CREATE node_{i} failed: {e}"));
+        db.execute(&format!("CREATE (n:Node {{name: 'node_{i}', idx: {i}}})"))
+            .unwrap_or_else(|e| panic!("CREATE node_{i} failed: {e}"));
 
         for k in 0u32..10 {
             let j = (i - 1) * 10 + k + 1; // unique dst idx 1..50, non-overlapping per src
@@ -90,10 +86,7 @@ fn one_hop_returns_all_neighbour_names() {
     for row in &result.rows {
         match &row[0] {
             Value::String(s) => {
-                assert!(
-                    s.starts_with("dst_"),
-                    "unexpected name value: {s:?}"
-                );
+                assert!(s.starts_with("dst_"), "unexpected name value: {s:?}");
             }
             other => panic!("expected String, got {other:?}"),
         }
@@ -112,14 +105,10 @@ fn one_hop_src_and_dst_properties_are_correct() {
     db.execute("CREATE (n:P {name: 'alpha', idx: 1})").unwrap();
     db.execute("CREATE (n:P {name: 'beta',  idx: 2})").unwrap();
     db.execute("CREATE (n:P {name: 'gamma', idx: 3})").unwrap();
-    db.execute(
-        "MATCH (a:P {idx: 1}), (b:P {idx: 2}) CREATE (a)-[:LINK]->(b)",
-    )
-    .unwrap();
-    db.execute(
-        "MATCH (a:P {idx: 2}), (b:P {idx: 3}) CREATE (a)-[:LINK]->(b)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:P {idx: 1}), (b:P {idx: 2}) CREATE (a)-[:LINK]->(b)")
+        .unwrap();
+    db.execute("MATCH (a:P {idx: 2}), (b:P {idx: 3}) CREATE (a)-[:LINK]->(b)")
+        .unwrap();
 
     let result = db
         .execute("MATCH (a:P)-[:LINK]->(b:P) RETURN a.name, b.name")
@@ -173,14 +162,13 @@ fn two_hop_returns_valid_names() {
     let (_dir, db) = make_db();
 
     // Source node.
-    db.execute("CREATE (n:Person {name: 'src', idx: 100})").unwrap();
+    db.execute("CREATE (n:Person {name: 'src', idx: 100})")
+        .unwrap();
 
     for m in 1u32..=5 {
         // Mid node.
-        db.execute(&format!(
-            "CREATE (n:Person {{name: 'mid_{m}', idx: {m}}})"
-        ))
-        .unwrap();
+        db.execute(&format!("CREATE (n:Person {{name: 'mid_{m}', idx: {m}}})"))
+            .unwrap();
         // src -> mid
         db.execute(&format!(
             "MATCH (a:Person {{idx: 100}}), (b:Person {{idx: {m}}}) CREATE (a)-[:KNOWS]->(b)"
@@ -290,10 +278,7 @@ fn sorted_slot_reads_correct_and_fast() {
     for row in &result.rows {
         match &row[0] {
             Value::String(s) => {
-                assert!(
-                    s.starts_with("friend_"),
-                    "unexpected name: {s:?}"
-                );
+                assert!(s.starts_with("friend_"), "unexpected name: {s:?}");
             }
             other => panic!("expected String for name, got {other:?}"),
         }
@@ -331,14 +316,10 @@ fn one_hop_idx_values_are_not_shifted() {
     db.execute("CREATE (n:Q {name: 'x0', idx: 10})").unwrap();
     db.execute("CREATE (n:Q {name: 'x1', idx: 20})").unwrap();
     db.execute("CREATE (n:Q {name: 'x2', idx: 30})").unwrap();
-    db.execute(
-        "MATCH (a:Q {idx: 10}), (b:Q {idx: 20}) CREATE (a)-[:HOP]->(b)",
-    )
-    .unwrap();
-    db.execute(
-        "MATCH (a:Q {idx: 10}), (b:Q {idx: 30}) CREATE (a)-[:HOP]->(b)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:Q {idx: 10}), (b:Q {idx: 20}) CREATE (a)-[:HOP]->(b)")
+        .unwrap();
+    db.execute("MATCH (a:Q {idx: 10}), (b:Q {idx: 30}) CREATE (a)-[:HOP]->(b)")
+        .unwrap();
 
     let result = db
         .execute("MATCH (a:Q)-[:HOP]->(b:Q) RETURN b.name, b.idx")

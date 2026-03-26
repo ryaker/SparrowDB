@@ -50,8 +50,7 @@ impl Engine {
 
         // Use the property index for O(1) equality lookups on inline prop
         // filters, falling back to full scan for overflow strings / params.
-        let candidates = self
-            .scan_nodes_for_label_with_index(label_id, &node_pat.props)?;
+        let candidates = self.scan_nodes_for_label_with_index(label_id, &node_pat.props)?;
 
         let mut matching_ids = Vec::new();
         for node_id in candidates {
@@ -248,8 +247,8 @@ impl Engine {
 
                 // Use the property index for O(1) equality lookups when possible,
                 // falling back to a full O(N) scan for overflow strings / params.
-                let matching_ids = self
-                    .scan_nodes_for_label_with_index(label_id, &node_pat.props)?;
+                let matching_ids =
+                    self.scan_nodes_for_label_with_index(label_id, &node_pat.props)?;
 
                 var_candidates.insert(node_pat.var.clone(), matching_ids);
             }
@@ -324,8 +323,8 @@ impl Engine {
                     // falling back to a full O(N) scan for overflow strings / params.
                     let mut matching_ids: Vec<NodeId> = Vec::new();
                     for label_id in scan_label_ids {
-                        let ids = self
-                            .scan_nodes_for_label_with_index(label_id, &node_pat.props)?;
+                        let ids =
+                            self.scan_nodes_for_label_with_index(label_id, &node_pat.props)?;
                         matching_ids.extend(ids);
                     }
 
@@ -712,7 +711,11 @@ impl Engine {
         Ok(QueryResult::empty(vec![]))
     }
 
-    pub(crate) fn execute_create_index(&mut self, label: &str, property: &str) -> Result<QueryResult> {
+    pub(crate) fn execute_create_index(
+        &mut self,
+        label: &str,
+        property: &str,
+    ) -> Result<QueryResult> {
         let label_id: u32 = match self.snapshot.catalog.get_label(label)? {
             Some(id) => id as u32,
             None => return Ok(QueryResult::empty(vec![])),
@@ -731,7 +734,11 @@ impl Engine {
     /// the backing prop-index for that pair (needed to check existence cheaply).
     /// If the label does not yet exist in the catalog it is auto-created so that
     /// later `CREATE` statements can register against the constraint.
-    pub(crate) fn execute_create_constraint(&mut self, label: &str, property: &str) -> Result<QueryResult> {
+    pub(crate) fn execute_create_constraint(
+        &mut self,
+        label: &str,
+        property: &str,
+    ) -> Result<QueryResult> {
         let label_id: u32 = match self.snapshot.catalog.get_label(label)? {
             Some(id) => id as u32,
             None => self.snapshot.catalog.create_label(label)? as u32,

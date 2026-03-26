@@ -10,8 +10,11 @@
 //! This file validates two things:
 //!   1. **Correctness**: MATCH by uid returns exactly the right node.
 //!   2. **Performance**: 1 000 MATCH-then-CREATE cycles over 10 000 nodes
-//!      complete in < 5 000 ms on any reasonable machine (the O(N) version
-//!      would take ~55 s on the benchmark hardware).
+//!      complete within an OS-specific threshold (the O(N) version would take
+//!      ~55 s on the benchmark hardware):
+//!        - Linux release: < 5 000 ms  (fsync ~1 ms each)
+//!        - macOS release: < 30 000 ms (WAL fsync ~13 ms each adds ~13 s total)
+//!        - Debug builds:  < 60 000 ms (catches catastrophic O(N²) regressions)
 
 use sparrowdb::open;
 use std::time::Instant;
@@ -31,9 +34,11 @@ fn match_by_uid_returns_correct_node() {
     let (_dir, mut db) = make_db();
 
     // Insert three User nodes with distinct uid values.
-    db.execute("CREATE (:User {uid: 10, name: 'Alice'})").unwrap();
+    db.execute("CREATE (:User {uid: 10, name: 'Alice'})")
+        .unwrap();
     db.execute("CREATE (:User {uid: 20, name: 'Bob'})").unwrap();
-    db.execute("CREATE (:User {uid: 30, name: 'Carol'})").unwrap();
+    db.execute("CREATE (:User {uid: 30, name: 'Carol'})")
+        .unwrap();
 
     // MATCH each by uid and verify the name property.
     let r = db
@@ -73,10 +78,8 @@ fn match_create_edge_connects_correct_nodes() {
     db.execute("CREATE (:User {uid: 3})").unwrap();
 
     // Connect uid:1 → uid:2
-    db.execute(
-        "MATCH (a:User {uid: 1}), (b:User {uid: 2}) CREATE (a)-[:FOLLOWS]->(b)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:User {uid: 1}), (b:User {uid: 2}) CREATE (a)-[:FOLLOWS]->(b)")
+        .unwrap();
 
     // Verify the edge exists: uid:1 should have one outgoing FOLLOWS edge.
     let r = db

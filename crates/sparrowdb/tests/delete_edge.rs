@@ -18,10 +18,7 @@ fn make_db() -> (tempfile::TempDir, GraphDb) {
 
 /// Helpers: count how many rows a Cypher MATCH returns.
 fn count_matches(db: &GraphDb, cypher: &str) -> usize {
-    db.execute(cypher)
-        .expect("execute")
-        .rows
-        .len()
+    db.execute(cypher).expect("execute").rows.len()
 }
 
 // ── WriteTx::delete_edge ──────────────────────────────────────────────────────
@@ -101,7 +98,8 @@ fn graphdb_delete_edge_wrapper() {
     );
 
     // Use the convenience wrapper.
-    db.delete_edge(a, b, "LINKED").expect("GraphDb::delete_edge");
+    db.delete_edge(a, b, "LINKED")
+        .expect("GraphDb::delete_edge");
 
     assert_eq!(
         count_matches(&db, "MATCH (x)-[:LINKED]->(y) RETURN x, y"),

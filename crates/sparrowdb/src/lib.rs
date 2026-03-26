@@ -205,7 +205,11 @@ enum WalMutation {
         prop_entries: Vec<(String, Value)>,
     },
     /// A specific directed edge was deleted.
-    EdgeDelete { src: NodeId, dst: NodeId, rel_type: String },
+    EdgeDelete {
+        src: NodeId,
+        dst: NodeId,
+        rel_type: String,
+    },
 }
 
 // ── Pending structural operations (SPA-181 buffering) ────────────────────────
@@ -1002,9 +1006,12 @@ impl GraphDb {
                 .map(|pe| {
                     let val = match &pe.value {
                         sparrowdb_cypher::ast::Expr::Literal(lit) => literal_to_value(lit),
-                        _ => return Err(sparrowdb_common::Error::InvalidArgument(format!(
-                            "CREATE edge property '{}' must be a literal value", pe.key
-                        ))),
+                        _ => {
+                            return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                                "CREATE edge property '{}' must be a literal value",
+                                pe.key
+                            )))
+                        }
                     };
                     Ok((pe.key.clone(), val))
                 })
@@ -1434,9 +1441,12 @@ impl GraphDb {
                     .map(|pe| {
                         let val = match &pe.value {
                             sparrowdb_cypher::ast::Expr::Literal(lit) => literal_to_value(lit),
-                            _ => return Err(Error::InvalidArgument(format!(
-                                "CREATE edge property '{}' must be a literal value", pe.key
-                            ))),
+                            _ => {
+                                return Err(Error::InvalidArgument(format!(
+                                    "CREATE edge property '{}' must be a literal value",
+                                    pe.key
+                                )))
+                            }
                         };
                         Ok((pe.key.clone(), val))
                     })
@@ -2341,7 +2351,8 @@ impl ReadTx {
 
         // Take a snapshot of the catalog from the shared cache (no disk I/O if
         // the catalog is already warm).
-        let catalog_snap = self.inner
+        let catalog_snap = self
+            .inner
             .catalog
             .read()
             .expect("catalog RwLock poisoned")
@@ -2365,7 +2376,8 @@ impl ReadTx {
 
         let _span = info_span!("sparrowdb.readtx.query").entered();
 
-        let csrs = self.inner
+        let csrs = self
+            .inner
             .csr_map
             .read()
             .expect("csr_map RwLock poisoned")
@@ -3088,7 +3100,8 @@ impl WriteTx {
 
         // Flush all NodeCreate column writes in one batched call.
         // O(labels × cols) file opens instead of O(nodes × cols).
-        self.store.batch_write_node_creates(col_writes, &node_slots)?;
+        self.store
+            .batch_write_node_creates(col_writes, &node_slots)?;
 
         // Step 5b: Persist HWMs for all labels that received new nodes in Step 5.
         //
@@ -3187,9 +3200,7 @@ fn write_mutation_wal(
         return Ok(());
     }
 
-    let mut wal = wal_writer
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut wal = wal_writer.lock().unwrap_or_else(|e| e.into_inner());
     let txn = TxnId(txn_id);
 
     wal.append(WalRecordKind::Begin, txn, WalPayload::Empty)?;
