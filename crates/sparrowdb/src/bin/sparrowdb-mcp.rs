@@ -246,9 +246,7 @@ fn handle_tool_call(params: Option<Value>) -> Value {
 
 fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
     let params = params.ok_or("Missing params")?;
-    let tool_name = params["name"]
-        .as_str()
-        .ok_or("Missing tool name")?;
+    let tool_name = params["name"].as_str().ok_or("Missing tool name")?;
     let args = &params["arguments"];
 
     match tool_name {
@@ -264,12 +262,18 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 build_add_property_query(label, match_prop, match_val, set_prop, set_val)?;
 
             let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path)).map_err(|e| {
-                format!("add_property: failed to open database at '{}': {}", db_path, e)
+                format!(
+                    "add_property: failed to open database at '{}': {}",
+                    db_path, e
+                )
             })?;
 
             let count_query = build_count_query(label, match_prop, match_val);
             let count_result = db.execute(&count_query).map_err(|e| {
-                format!("add_property: count query failed for label '{}': {}", label, e)
+                format!(
+                    "add_property: count query failed for label '{}': {}",
+                    label, e
+                )
             })?;
 
             let matched: i64 = count_result
@@ -295,9 +299,8 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 }));
             }
 
-            db.execute(&set_query).map_err(|e| {
-                format!("add_property: SET failed for label '{}': {}", label, e)
-            })?;
+            db.execute(&set_query)
+                .map_err(|e| format!("add_property: SET failed for label '{}': {}", label, e))?;
 
             Ok(json!({
                 "content": [{
@@ -325,11 +328,17 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
             let query = build_create_query(class_name, props)?;
 
             let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path)).map_err(|e| {
-                format!("create_entity: failed to open database at '{}': {}", db_path, e)
+                format!(
+                    "create_entity: failed to open database at '{}': {}",
+                    db_path, e
+                )
             })?;
 
             db.execute(&query).map_err(|e| {
-                format!("create_entity: write failed for class '{}': {}", class_name, e)
+                format!(
+                    "create_entity: write failed for class '{}': {}",
+                    class_name, e
+                )
             })?;
 
             Ok(json!({
@@ -371,11 +380,18 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
             let match_value = &args["match_value"];
             let properties = &args["properties"];
 
-            let cypher_match_val = json_scalar_to_cypher(match_value)
-                .ok_or_else(|| format!("merge_node_by_property: match_value must be a scalar, got {:?}", match_value))?;
+            let cypher_match_val = json_scalar_to_cypher(match_value).ok_or_else(|| {
+                format!(
+                    "merge_node_by_property: match_value must be a scalar, got {:?}",
+                    match_value
+                )
+            })?;
 
             let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path)).map_err(|e| {
-                format!("merge_node_by_property: failed to open database at '{}': {}", db_path, e)
+                format!(
+                    "merge_node_by_property: failed to open database at '{}': {}",
+                    db_path, e
+                )
             })?;
 
             // Build additional SET clause from properties (excluding the match key).
@@ -403,9 +419,9 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 "MERGE (n:{label} {{{match_key}: {cypher_match_val}}}){set_clause} RETURN n",
             );
 
-            let result = db.execute(&query).map_err(|e| {
-                format!("merge_node_by_property: MERGE failed: {}", e)
-            })?;
+            let result = db
+                .execute(&query)
+                .map_err(|e| format!("merge_node_by_property: MERGE failed: {}", e))?;
 
             let created = result.rows.is_empty(); // MERGE returns the node; empty = unexpected
             Ok(json!({
@@ -492,8 +508,12 @@ fn build_add_property_query(
 
     let cypher_set_val = json_scalar_to_cypher(set_val).ok_or_else(|| match set_val {
         Value::Null => "add_property: set_val is null; use a concrete scalar value".to_string(),
-        Value::Array(_) => "add_property: set_val is an array; only scalar values are supported".to_string(),
-        Value::Object(_) => "add_property: set_val is a nested object; only scalar values are supported".to_string(),
+        Value::Array(_) => {
+            "add_property: set_val is an array; only scalar values are supported".to_string()
+        }
+        Value::Object(_) => {
+            "add_property: set_val is a nested object; only scalar values are supported".to_string()
+        }
         _ => "add_property: unsupported set_val type".to_string(),
     })?;
 
@@ -561,7 +581,10 @@ mod tests {
 
     #[test]
     fn test_json_scalar_to_cypher() {
-        assert_eq!(json_scalar_to_cypher(&json!("hello")), Some("'hello'".into()));
+        assert_eq!(
+            json_scalar_to_cypher(&json!("hello")),
+            Some("'hello'".into())
+        );
         assert_eq!(json_scalar_to_cypher(&json!(42)), Some("42".into()));
         assert_eq!(json_scalar_to_cypher(&json!(true)), Some("true".into()));
         assert!(json_scalar_to_cypher(&json!(null)).is_none());
