@@ -117,9 +117,9 @@ fn wal_writer_reused_across_commits() {
 /// transactions and confirm they land in a subsequent segment.
 #[test]
 fn wal_survives_rotation() {
+    use sparrowdb_common::TxnId;
     use sparrowdb_storage::wal::codec::{WalPayload, WalRecord, WalRecordKind};
     use sparrowdb_storage::wal::writer::{WalWriter, SEGMENT_SIZE};
-    use sparrowdb_common::TxnId;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let wal_dir = dir.path().join("wal");
@@ -272,7 +272,10 @@ fn concurrent_reads_during_write() {
     let vals_before = read_before
         .get_node(node_id, &[0u32])
         .expect("get_node before");
-    let val_before = vals_before.iter().find(|(c, _)| *c == 0).map(|(_, v)| v.clone());
+    let val_before = vals_before
+        .iter()
+        .find(|(c, _)| *c == 0)
+        .map(|(_, v)| v.clone());
     assert_eq!(
         val_before,
         Some(Value::Int64(100)),
@@ -284,7 +287,10 @@ fn concurrent_reads_during_write() {
     let vals_after = read_after
         .get_node(node_id, &[0u32])
         .expect("get_node after");
-    let val_after = vals_after.iter().find(|(c, _)| *c == 0).map(|(_, v)| v.clone());
+    let val_after = vals_after
+        .iter()
+        .find(|(c, _)| *c == 0)
+        .map(|(_, v)| v.clone());
     assert_eq!(
         val_after,
         Some(Value::Int64(200)),

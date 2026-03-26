@@ -199,11 +199,9 @@ impl GraphDb {
             std::collections::HashSet::new();
 
         for (catalog_id, src_label_id, dst_label_id, rel_type) in &rel_tables {
-            let storage_rel_id =
-                sparrowdb_storage::edge_store::RelTableId(*catalog_id as u32);
+            let storage_rel_id = sparrowdb_storage::edge_store::RelTableId(*catalog_id as u32);
 
-            if let Ok(store) =
-                sparrowdb_storage::edge_store::EdgeStore::open(path, storage_rel_id)
+            if let Ok(store) = sparrowdb_storage::edge_store::EdgeStore::open(path, storage_rel_id)
             {
                 // Delta log — stores full NodeId pairs (label_id << 32 | slot).
                 if let Ok(records) = store.read_delta() {
@@ -382,10 +380,7 @@ fn execution_value_to_json(val: &sparrowdb_execution::types::Value) -> serde_jso
 ///
 /// Always injects `_sparrow_export_id` set to the original node_id so that
 /// edges can be wired during import.
-fn build_props_cypher(
-    props: &HashMap<String, serde_json::Value>,
-    sid: Option<u64>,
-) -> String {
+fn build_props_cypher(props: &HashMap<String, serde_json::Value>, sid: Option<u64>) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(id) = sid {
@@ -437,11 +432,7 @@ fn cypher_escape_label(name: &str) -> String {
 
 /// Escape a property key identifier.
 fn cypher_escape_identifier(name: &str) -> String {
-    if name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_')
-        && !name.is_empty()
-    {
+    if name.chars().all(|c| c.is_alphanumeric() || c == '_') && !name.is_empty() {
         name.to_owned()
     } else {
         format!("`{}`", name.replace('`', "``"))

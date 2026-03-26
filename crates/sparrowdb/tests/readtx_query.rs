@@ -196,9 +196,15 @@ fn readtx_query_concurrent_readers() {
     let tx2 = db.begin_read().expect("tx2");
     let tx3 = db.begin_read().expect("tx3");
 
-    let r1 = tx1.query("MATCH (n:Person) RETURN n.age").expect("tx1 query");
-    let r2 = tx2.query("MATCH (n:Person) RETURN n.age").expect("tx2 query");
-    let r3 = tx3.query("MATCH (n:Person) RETURN n.age").expect("tx3 query");
+    let r1 = tx1
+        .query("MATCH (n:Person) RETURN n.age")
+        .expect("tx1 query");
+    let r2 = tx2
+        .query("MATCH (n:Person) RETURN n.age")
+        .expect("tx2 query");
+    let r3 = tx3
+        .query("MATCH (n:Person) RETURN n.age")
+        .expect("tx3 query");
 
     assert_eq!(r1.rows.len(), 1);
     assert_eq!(r2.rows.len(), 1);
@@ -215,8 +221,12 @@ fn readtx_query_reusable() {
 
     let tx = db.begin_read().expect("begin_read");
     // Query the same ReadTx twice — should not error or panic.
-    let r1 = tx.query("MATCH (n:Person) RETURN n.name").expect("first query");
-    let r2 = tx.query("MATCH (n:Person) RETURN n.age").expect("second query");
+    let r1 = tx
+        .query("MATCH (n:Person) RETURN n.name")
+        .expect("first query");
+    let r2 = tx
+        .query("MATCH (n:Person) RETURN n.age")
+        .expect("second query");
     assert_eq!(r1.rows.len(), 1);
     assert_eq!(r2.rows.len(), 1);
 }

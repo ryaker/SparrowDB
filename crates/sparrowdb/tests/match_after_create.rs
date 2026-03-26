@@ -41,13 +41,15 @@ fn match_finds_all_nodes_after_wal_only_creates() {
 
     // Phase 1: 1 000 nodes → checkpoint so they are in column files on disk.
     for uid in 1i64..=1000 {
-        db.execute(&format!("CREATE (:User {{uid: {uid}}})")).unwrap();
+        db.execute(&format!("CREATE (:User {{uid: {uid}}})"))
+            .unwrap();
     }
     db.execute("CHECKPOINT").unwrap();
 
     // Phase 2: 1 000 more nodes — WAL only (no checkpoint).
     for uid in 1001i64..=2000 {
-        db.execute(&format!("CREATE (:User {{uid: {uid}}})")).unwrap();
+        db.execute(&format!("CREATE (:User {{uid: {uid}}})"))
+            .unwrap();
     }
 
     // Phase 3: every uid must be found.
@@ -87,7 +89,11 @@ fn match_finds_node_after_second_create() {
     // missed if a concurrent (or previous) read wrote back a stale index.
     let r10b = db.execute("MATCH (n:User {uid: 10}) RETURN n.uid").unwrap();
     let r20 = db.execute("MATCH (n:User {uid: 20}) RETURN n.uid").unwrap();
-    assert_eq!(r10b.rows.len(), 1, "uid=10 must still be found after uid=20 CREATE");
+    assert_eq!(
+        r10b.rows.len(),
+        1,
+        "uid=10 must still be found after uid=20 CREATE"
+    );
     assert_eq!(r20.rows.len(), 1, "uid=20 must be found after its CREATE");
 }
 
@@ -100,7 +106,8 @@ fn match_create_edges_finds_all_nodes() {
     let (_dir, db) = make_db();
 
     for uid in 1i64..=100 {
-        db.execute(&format!("CREATE (:User {{uid: {uid}}})")).unwrap();
+        db.execute(&format!("CREATE (:User {{uid: {uid}}})"))
+            .unwrap();
     }
 
     for src_uid in 1i64..=99 {

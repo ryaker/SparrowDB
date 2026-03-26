@@ -659,7 +659,6 @@ impl Engine {
         }
     }
 
-
     pub fn is_mutation(stmt: &Statement) -> bool {
         match stmt {
             Statement::Merge(_)
@@ -676,14 +675,13 @@ impl Engine {
 }
 
 // ── Submodules (split from the original monolithic engine.rs) ─────────────────
-mod procedure;
-mod mutation;
 mod aggregate;
-mod scan;
-mod hop;
-mod path;
 mod expr;
-
+mod hop;
+mod mutation;
+mod path;
+mod procedure;
+mod scan;
 
 // ── Free-standing prop-filter helper (usable without &self) ───────────────────
 

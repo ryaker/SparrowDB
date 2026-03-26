@@ -197,7 +197,11 @@ impl Engine {
     }
 
     /// Resolve a NodeId from `vals` for a variable name.
-    pub(crate) fn resolve_node_id_from_var(&self, var: &str, vals: &HashMap<String, Value>) -> Option<NodeId> {
+    pub(crate) fn resolve_node_id_from_var(
+        &self,
+        var: &str,
+        vals: &HashMap<String, Value>,
+    ) -> Option<NodeId> {
         let id_key = format!("{var}.__node_id__");
         if let Some(Value::NodeRef(nid)) = vals.get(&id_key) {
             return Some(*nid);
