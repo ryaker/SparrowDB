@@ -187,6 +187,65 @@ fn test_edge_prop_string_survives_checkpoint() {
     );
 }
 
+/// Test 9: edge property WHERE clause filter — match case (perf guard regression).
+///
+/// Verifies that `WHERE r.since > 2019` correctly filters edges when the
+/// edge variable `r` is referenced only in the WHERE clause (not in RETURN).
+/// This also exercises the perf guard: needs_edge_props must be true when
+/// the edge var appears in WHERE, ensuring edge_props.bin is read.
+#[test]
+fn test_edge_prop_where_filter_match() {
+    let (_dir, db) = make_db();
+
+    db.execute(
+        "CREATE (a:User {name:\"Alice\"})-[:KNOWS {since:2020}]->(b:User {name:\"Bob\"})",
+    )
+    .expect("create");
+    db.execute(
+        "CREATE (c:User {name:\"Carol\"})-[:KNOWS {since:2018}]->(d:User {name:\"Dave\"})",
+    )
+    .expect("create");
+
+    // Only edges with since > 2019 should be returned.
+    let result = db
+        .execute("MATCH (a:User)-[r:KNOWS]->(b:User) WHERE r.since > 2019 RETURN b.name")
+        .expect("match with WHERE edge prop");
+
+    assert_eq!(result.rows.len(), 1, "only one KNOWS edge has since > 2019");
+    assert_eq!(
+        result.rows[0],
+        vec![Value::String("Bob".to_string())],
+        "destination should be Bob (since=2020 > 2019)"
+    );
+}
+
+/// Test 10: no edge variable — edge_props.bin read must be skipped (perf guard).
+///
+/// Verifies that `MATCH (a:User)-[:KNOWS]->(b:User) RETURN b.name` completes
+/// correctly without reading edge properties when the rel pattern has no
+/// variable and no inline prop filter.  This is the regression case from #243.
+#[test]
+fn test_no_edge_var_no_read() {
+    let (_dir, db) = make_db();
+
+    db.execute(
+        "CREATE (a:User {name:\"Alice\"})-[:KNOWS {since:2020}]->(b:User {name:\"Bob\"})",
+    )
+    .expect("create");
+
+    // No [r] variable, no inline edge props — edge_props.bin must not be read.
+    let result = db
+        .execute("MATCH (a:User)-[:KNOWS]->(b:User) RETURN b.name")
+        .expect("match without edge var");
+
+    assert_eq!(result.rows.len(), 1, "should return one row");
+    assert_eq!(
+        result.rows[0],
+        vec![Value::String("Bob".to_string())],
+        "destination should be Bob"
+    );
+}
+
 /// Test 8 (SPA-240): edge prop inline filter works after CHECKPOINT.
 ///
 /// MATCH (a)-[r:K {score:42}]->(b) must return the edge; MATCH with

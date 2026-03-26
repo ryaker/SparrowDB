@@ -151,19 +151,33 @@ impl Engine {
             };
 
             // SPA-240: Pre-read all edge props for this rel table if any edge
-            // property access is needed (inline filter or projection).
+            // property access is needed (inline filter, projection, or WHERE).
             //
             // edge_props.bin is now keyed by (src_slot, dst_slot) rather than by
             // the transient delta-log edge_id.  This makes lookups correct for
             // both pre- and post-checkpoint databases; previously the lookup via
             // delta_edge_id_map always returned None after CHECKPOINT because the
             // delta log is truncated on checkpoint.
+            //
+            // Guard: skip the read entirely when the query has no inline edge
+            // property filter AND the relationship variable (if any) is not
+            // referenced by a property access in either RETURN or WHERE.  This
+            // avoids opening edge_props.bin for every hop query (SPA-243 perf).
             let needs_edge_props = !rel_pat.props.is_empty()
-                || (!rel_pat.var.is_empty()
-                    && column_names.iter().any(|c| {
+                || (!rel_pat.var.is_empty() && {
+                    // Check RETURN columns for rel_var.* references.
+                    let in_return = column_names.iter().any(|c| {
                         c.split_once('.')
                             .map_or(false, |(v, _)| v == rel_pat.var.as_str())
-                    }));
+                    });
+                    // Check WHERE clause for rel_var.* property access.
+                    let in_where = m.where_clause.as_ref().map_or(false, |wexpr| {
+                        let mut tmp: Vec<u32> = Vec::new();
+                        collect_col_ids_from_expr_for_var(wexpr, rel_pat.var.as_str(), &mut tmp);
+                        !tmp.is_empty()
+                    });
+                    in_return || in_where
+                });
             let all_edge_props_raw: Vec<(u64, u64, u32, u64)> = if needs_edge_props {
                 EdgeStore::open(&self.snapshot.db_root, storage_rel_id)
                     .and_then(|s| s.read_all_edge_props())
@@ -364,6 +378,13 @@ impl Engine {
                                 format!("{}.__type__", rel_pat.var),
                                 Value::String(effective_rel_type.to_string()),
                             );
+                        }
+                        // Inject edge properties so r.prop references in WHERE resolve.
+                        if !rel_pat.var.is_empty() && !current_edge_props.is_empty() {
+                            for &(col_id, raw) in &current_edge_props {
+                                let key = format!("{}.col_{}", rel_pat.var, col_id);
+                                row_vals.insert(key, decode_raw_val(raw, &self.snapshot.store));
+                            }
                         }
                         // Inject node label metadata so labels(n) works in WHERE.
                         if !src_node_pat.var.is_empty() && !effective_src_label.is_empty() {
