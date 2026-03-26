@@ -172,10 +172,10 @@ impl Engine {
                     // Check RETURN columns for rel_var.* references.
                     let in_return = column_names.iter().any(|c| {
                         c.split_once('.')
-                            .map_or(false, |(v, _)| v == rel_pat.var.as_str())
+                            .is_some_and(|(v, _)| v == rel_pat.var.as_str())
                     });
                     // Check WHERE clause for rel_var.* property access.
-                    let in_where = m.where_clause.as_ref().map_or(false, |wexpr| {
+                    let in_where = m.where_clause.as_ref().is_some_and(|wexpr| {
                         let mut tmp: Vec<u32> = Vec::new();
                         collect_col_ids_from_expr_for_var(wexpr, rel_pat.var.as_str(), &mut tmp);
                         !tmp.is_empty()
