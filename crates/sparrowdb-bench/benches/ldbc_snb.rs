@@ -1,7 +1,7 @@
 //! Criterion benchmarks for LDBC SNB queries on a synthetic mini dataset.
 //!
 //! The benchmark generates a small in-memory LDBC-style graph (the `mini`
-//! fixture data) and times IC1 and IC2 query execution.
+//! fixture data) and times IC query execution.
 //!
 //! Run with:
 //! ```text
@@ -40,7 +40,6 @@ fn bench_ic1(c: &mut Criterion) {
     c.bench_function("ldbc_ic1_friends_named_Bob", |b| {
         b.iter(|| {
             let result = ic_queries::ic1_friends_named(&db, "Bob");
-            // Force the result to be evaluated, not optimized away.
             std::hint::black_box(result)
         });
     });
@@ -71,5 +70,50 @@ fn bench_ic2(c: &mut Criterion) {
     });
 }
 
-criterion_group!(ldbc_snb, bench_ic1, bench_ic2);
+fn bench_ic3(c: &mut Criterion) {
+    let (_dir, db) = load_mini_db();
+
+    c.bench_function("ldbc_ic3_friends_in_uk", |b| {
+        b.iter(|| {
+            let result =
+                ic_queries::ic3_friends_in_countries(&db, 1, "United Kingdom", "Germany", 30);
+            std::hint::black_box(result)
+        });
+    });
+}
+
+fn bench_ic4(c: &mut Criterion) {
+    let (_dir, db) = load_mini_db();
+
+    c.bench_function("ldbc_ic4_top_tags_person_1", |b| {
+        b.iter(|| {
+            let result = ic_queries::ic4_top_tags(&db, 1, "2010-01-01", 365);
+            std::hint::black_box(result)
+        });
+    });
+}
+
+fn bench_ic5(c: &mut Criterion) {
+    let (_dir, db) = load_mini_db();
+
+    c.bench_function("ldbc_ic5_forums_person_1", |b| {
+        b.iter(|| {
+            let result = ic_queries::ic5_forums_with_friends(&db, 1, "2010-01-01");
+            std::hint::black_box(result)
+        });
+    });
+}
+
+fn bench_ic6(c: &mut Criterion) {
+    let (_dir, db) = load_mini_db();
+
+    c.bench_function("ldbc_ic6_tag_co_occurrence_person_1", |b| {
+        b.iter(|| {
+            let result = ic_queries::ic6_tag_co_occurrence(&db, 1, "Databases");
+            std::hint::black_box(result)
+        });
+    });
+}
+
+criterion_group!(ldbc_snb, bench_ic1, bench_ic2, bench_ic3, bench_ic4, bench_ic5, bench_ic6);
 criterion_main!(ldbc_snb);
