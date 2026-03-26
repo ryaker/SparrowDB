@@ -1632,10 +1632,10 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
                     (Value::Int64(a), Value::Int64(b)) => a < b,
                     (Value::Float64(a), Value::Float64(b)) => a < b,
                     (Value::Int64(a), Value::Float64(b)) => {
-                        cmp_i64_f64(*a, *b).map_or(false, |o| o.is_lt())
+                        cmp_i64_f64(*a, *b).is_some_and(|o| o.is_lt())
                     }
                     (Value::Float64(a), Value::Int64(b)) => {
-                        cmp_i64_f64(*b, *a).map_or(false, |o| o.is_gt())
+                        cmp_i64_f64(*b, *a).is_some_and(|o| o.is_gt())
                     }
                     _ => false,
                 },
@@ -1643,10 +1643,10 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
                     (Value::Int64(a), Value::Int64(b)) => a <= b,
                     (Value::Float64(a), Value::Float64(b)) => a <= b,
                     (Value::Int64(a), Value::Float64(b)) => {
-                        cmp_i64_f64(*a, *b).map_or(false, |o| o.is_le())
+                        cmp_i64_f64(*a, *b).is_some_and(|o| o.is_le())
                     }
                     (Value::Float64(a), Value::Int64(b)) => {
-                        cmp_i64_f64(*b, *a).map_or(false, |o| o.is_ge())
+                        cmp_i64_f64(*b, *a).is_some_and(|o| o.is_ge())
                     }
                     _ => false,
                 },
@@ -1654,10 +1654,10 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
                     (Value::Int64(a), Value::Int64(b)) => a > b,
                     (Value::Float64(a), Value::Float64(b)) => a > b,
                     (Value::Int64(a), Value::Float64(b)) => {
-                        cmp_i64_f64(*a, *b).map_or(false, |o| o.is_gt())
+                        cmp_i64_f64(*a, *b).is_some_and(|o| o.is_gt())
                     }
                     (Value::Float64(a), Value::Int64(b)) => {
-                        cmp_i64_f64(*b, *a).map_or(false, |o| o.is_lt())
+                        cmp_i64_f64(*b, *a).is_some_and(|o| o.is_lt())
                     }
                     _ => false,
                 },
@@ -1665,10 +1665,10 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
                     (Value::Int64(a), Value::Int64(b)) => a >= b,
                     (Value::Float64(a), Value::Float64(b)) => a >= b,
                     (Value::Int64(a), Value::Float64(b)) => {
-                        cmp_i64_f64(*a, *b).map_or(false, |o| o.is_ge())
+                        cmp_i64_f64(*a, *b).is_some_and(|o| o.is_ge())
                     }
                     (Value::Float64(a), Value::Int64(b)) => {
-                        cmp_i64_f64(*b, *a).map_or(false, |o| o.is_le())
+                        cmp_i64_f64(*b, *a).is_some_and(|o| o.is_le())
                     }
                     _ => false,
                 },
