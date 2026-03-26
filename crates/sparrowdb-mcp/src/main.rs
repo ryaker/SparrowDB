@@ -80,9 +80,7 @@ fn handle_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
     // MCP spec: messages without an "id" are notifications — must receive no response.
     // Keying off id absence (not method prefix) handles all notifications correctly,
     // including future notification methods beyond "notifications/*".
-    if req.id.is_none() {
-        return None;
-    }
+    req.id.as_ref()?;
 
     if req.jsonrpc != "2.0" {
         return Some(JsonRpcResponse {
