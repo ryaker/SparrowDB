@@ -3340,9 +3340,30 @@ impl WriteTx {
 
         // Step 11: Refresh the shared catalog cache so subsequent reads see
         // any labels / rel types created in this transaction (SPA-188).
+        // Also rebuild the label-row-count cache (SPA-190) from the freshly
+        // opened catalog to avoid a second I/O trip.
         if let Ok(fresh) = Catalog::open(&self.inner.path) {
+            let new_counts = build_label_row_counts_from_disk(&fresh, &self.inner.path);
             *self.inner.catalog.write().expect("catalog RwLock poisoned") = fresh;
+            *self
+                .inner
+                .label_row_counts
+                .write()
+                .expect("label_row_counts RwLock poisoned") = new_counts;
         }
+
+        // Step 12: Invalidate the shared property-index cache (SPA-259).
+        //
+        // GraphDb-level execute functions (execute_create_standalone, etc.)
+        // call invalidate_prop_index() again after this — the extra clear
+        // is harmless (just bumps the generation counter).  The critical
+        // case is when a caller uses WriteTx directly without going through
+        // a GraphDb::execute path, which previously left the cache stale.
+        self.inner
+            .prop_index
+            .write()
+            .expect("prop_index RwLock poisoned")
+            .clear();
 
         self.committed = true;
         Ok(TxnId(new_id))
