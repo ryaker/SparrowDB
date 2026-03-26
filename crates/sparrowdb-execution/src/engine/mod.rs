@@ -1991,12 +1991,17 @@ fn project_hop_row(
         .collect()
 }
 
-/// Project a single 2-hop result row.
+/// Project a single 2-hop result row (src + fof only, no mid).
 ///
 /// For each return column of the form `var.prop`, looks up the property value
 /// from `src_props` when `var == src_var`, and from `fof_props` otherwise.
 /// This ensures that `RETURN a.name, c.name` correctly reads the source and
 /// destination node properties independently (SPA-252).
+///
+/// NOTE: SPA-241 replaced calls to this function in the forward-forward two-hop
+/// path with `project_three_var_row`, which also handles the mid variable.
+/// Retained for potential future use in simplified single-level projections.
+#[allow(dead_code)]
 fn project_fof_row(
     src_props: &[(u32, u64)],
     fof_props: &[(u32, u64)],

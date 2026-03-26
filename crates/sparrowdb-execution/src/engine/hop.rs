@@ -848,7 +848,7 @@ impl Engine {
 
         // Collect col_ids for src: columns referenced in RETURN (for projection)
         // plus columns referenced in WHERE for the src variable.
-        // SPA-252: projection columns must be included so that project_fof_row
+        // SPA-252: projection columns must be included so that project_three_var_row
         // can resolve src-variable columns (e.g. `RETURN a.name` when src_var = "a").
         let col_ids_src_where: Vec<u32> = {
             let mut ids = collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
@@ -884,7 +884,11 @@ impl Engine {
                 .map(|id| id as u32)
                 .unwrap_or(src_label_id)
         };
-        let col_ids_mid: Vec<u32> = if second_hop_incoming && !mid_node_pat.var.is_empty() {
+        // SPA-241: collect col_ids for the mid node for BOTH forward-forward
+        // and incoming patterns.  Previously this was only populated for the
+        // incoming case, leaving mid node properties unresolvable in the
+        // forward-forward path (a)-[:R]->(m)-[:R]->(b).
+        let col_ids_mid: Vec<u32> = if !mid_node_pat.var.is_empty() {
             let mut ids = collect_col_ids_for_var(&mid_node_pat.var, column_names, mid_label_id);
             for p in &mid_node_pat.props {
                 let col_id = prop_name_to_col_id(&p.key);
@@ -1178,139 +1182,194 @@ impl Engine {
             }
 
             // ── Forward-forward path (both hops Outgoing) ─────────────────────
-            let mut fof_slots: Vec<u64> = {
-                // Use ASP-Join.
-                join.two_hop(src_slot)?
+            // SPA-241: use factorized join to preserve mid_slot→fof_slots mapping.
+            // The previous flat two_hop() call discarded which mid node connected
+            // src to each fof, making it impossible to read or return mid properties.
+            let mut mid_fof_pairs: Vec<(u64, Vec<u64>)> = {
+                let chunk = join.two_hop_factorized(src_slot)?;
+                chunk.groups.into_iter().map(|g| (g.mid_slot, g.fof_slots)).collect()
             };
 
-            // SPA-163: extend with delta-log 2-hop paths (forward-forward only).
+            // SPA-163 + SPA-241: extend with delta-log 2-hop paths, preserving
+            // the mid→fof structure so we can read mid node properties.
             {
                 let first_hop_delta = delta_adj
                     .get(&src_slot)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
                 if !first_hop_delta.is_empty() {
-                    let mut delta_fof: HashSet<u64> = HashSet::new();
                     for &mid_slot in first_hop_delta {
-                        // CSR second hop from mid (use merged multi-type CSR):
+                        let mut fof_for_mid: HashSet<u64> = HashSet::new();
+                        // CSR second hop from mid:
                         for &fof in merged_csr.neighbors(mid_slot) {
-                            delta_fof.insert(fof);
+                            fof_for_mid.insert(fof);
                         }
                         // Delta second hop from mid:
                         if let Some(mid_neighbors) = delta_adj.get(&mid_slot) {
                             for &fof in mid_neighbors {
-                                delta_fof.insert(fof);
+                                fof_for_mid.insert(fof);
+                            }
+                        }
+                        if !fof_for_mid.is_empty() {
+                            // Merge into existing group for this mid_slot or add new.
+                            if let Some(existing) =
+                                mid_fof_pairs.iter_mut().find(|(ms, _)| *ms == mid_slot)
+                            {
+                                for fof in fof_for_mid {
+                                    if !existing.1.contains(&fof) {
+                                        existing.1.push(fof);
+                                    }
+                                }
+                            } else {
+                                let mut fof_vec: Vec<u64> = fof_for_mid.into_iter().collect();
+                                fof_vec.sort_unstable();
+                                mid_fof_pairs.push((mid_slot, fof_vec));
                             }
                         }
                     }
-                    fof_slots.extend(delta_fof);
-                    // Re-deduplicate the combined set.
-                    let unique: HashSet<u64> = fof_slots.into_iter().collect();
-                    fof_slots = unique.into_iter().collect();
-                    fof_slots.sort_unstable();
                 }
             }
 
-            // ── SPA-200: batch-read fof properties — O(cols) fs::read() calls
-            // instead of O(fof_slots × cols). ────────────────────────────────
-            // `col_ids_fof` is constant for this src_slot iteration (determined
-            // by the query structure, not by the specific fof node).
-            let fof_slots_u32: Vec<u32> = fof_slots.iter().map(|&s| s as u32).collect();
+            // Collect all unique fof slots for batch property reads (SPA-200).
+            let all_fof_slots: Vec<u32> = {
+                let mut seen: HashSet<u64> = HashSet::new();
+                let mut v: Vec<u32> = Vec::new();
+                for (_, fof_slots) in &mid_fof_pairs {
+                    for &fof in fof_slots {
+                        if seen.insert(fof) {
+                            v.push(fof as u32);
+                        }
+                    }
+                }
+                v.sort_unstable();
+                v
+            };
+
+            // Batch-read fof properties once per src_slot.
             let fof_batch: Vec<Vec<u64>> = if !col_ids_fof.is_empty() {
                 self.snapshot.store.batch_read_node_props(
                     fof_label_id,
-                    &fof_slots_u32,
+                    &all_fof_slots,
                     &col_ids_fof,
                 )?
             } else {
                 vec![]
             };
-            // Build slot → batch-row index map for O(1) lookup in the inner loop.
-            let fof_slot_to_idx: HashMap<u64, usize> = fof_slots
+            let fof_slot_to_idx: HashMap<u64, usize> = all_fof_slots
                 .iter()
                 .enumerate()
-                .map(|(i, &s)| (s, i))
+                .map(|(i, &s)| (s as u64, i))
                 .collect();
 
-            for fof_slot in fof_slots {
-                let fof_node = NodeId(((fof_label_id as u64) << 32) | fof_slot);
-                // Build fof_props in the same Vec<(col_id, u64)> format as
-                // read_node_props returns: filter out 0-sentinel (absent) values.
-                let fof_props: Vec<(u32, u64)> = if !col_ids_fof.is_empty() {
-                    if let Some(&idx) = fof_slot_to_idx.get(&fof_slot) {
-                        col_ids_fof
-                            .iter()
-                            .copied()
-                            .zip(fof_batch[idx].iter().copied())
-                            .filter(|&(_, v)| v != 0)
-                            .collect()
-                    } else {
-                        // Fallback: individual read (delta-only slot not in batch).
-                        read_node_props(&self.snapshot.store, fof_node, &col_ids_fof)?
-                    }
+            for (mid_slot, fof_slots) in mid_fof_pairs {
+                // SPA-241: read mid node properties for forward-forward path.
+                let mid_node = NodeId(((mid_label_id as u64) << 32) | mid_slot);
+                let mid_props: Vec<(u32, u64)> = if !col_ids_mid.is_empty() {
+                    read_node_props(&self.snapshot.store, mid_node, &col_ids_mid)?
                 } else {
                     vec![]
                 };
 
-                // Apply fof inline prop filter.
-                if !self.matches_prop_filter(&fof_props, &fof_node_pat.props) {
+                // Apply mid inline prop filter.
+                if !self.matches_prop_filter(&mid_props, &mid_node_pat.props) {
                     continue;
                 }
 
-                // Apply WHERE clause predicate.
-                if let Some(ref where_expr) = m.where_clause {
-                    let mut row_vals = build_row_vals(
-                        &src_props,
-                        &src_node_pat.var,
-                        &col_ids_src_where,
-                        &self.snapshot.store,
-                    );
-                    row_vals.extend(build_row_vals(
-                        &fof_props,
-                        &fof_node_pat.var,
-                        &col_ids_fof,
-                        &self.snapshot.store,
-                    ));
-                    // Inject label metadata so labels(n) works in WHERE.
-                    if !src_node_pat.var.is_empty() && !src_label.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__labels__", src_node_pat.var),
-                            Value::List(vec![Value::String(src_label.clone())]),
-                        );
-                    }
-                    if !fof_node_pat.var.is_empty() && !fof_label.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__labels__", fof_node_pat.var),
-                            Value::List(vec![Value::String(fof_label.clone())]),
-                        );
-                    }
-                    // Inject relationship type metadata so type(r) works in WHERE.
-                    if !pat.rels[0].var.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__type__", pat.rels[0].var),
-                            Value::String(pat.rels[0].rel_type.clone()),
-                        );
-                    }
-                    if !pat.rels[1].var.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__type__", pat.rels[1].var),
-                            Value::String(pat.rels[1].rel_type.clone()),
-                        );
-                    }
-                    row_vals.extend(self.dollar_params());
-                    if !self.eval_where_graph(where_expr, &row_vals) {
+                for fof_slot in fof_slots {
+                    let fof_node = NodeId(((fof_label_id as u64) << 32) | fof_slot);
+                    // Build fof_props from batch or fallback individual read.
+                    let fof_props: Vec<(u32, u64)> = if !col_ids_fof.is_empty() {
+                        if let Some(&idx) = fof_slot_to_idx.get(&fof_slot) {
+                            col_ids_fof
+                                .iter()
+                                .copied()
+                                .zip(fof_batch[idx].iter().copied())
+                                .filter(|&(_, v)| v != 0)
+                                .collect()
+                        } else {
+                            // Fallback: individual read (delta-only slot not in batch).
+                            read_node_props(&self.snapshot.store, fof_node, &col_ids_fof)?
+                        }
+                    } else {
+                        vec![]
+                    };
+
+                    // Apply fof inline prop filter.
+                    if !self.matches_prop_filter(&fof_props, &fof_node_pat.props) {
                         continue;
                     }
-                }
 
-                let row = project_fof_row(
-                    &src_props,
-                    &fof_props,
-                    column_names,
-                    &src_node_pat.var,
-                    &self.snapshot.store,
-                );
-                rows.push(row);
+                    // Apply WHERE clause predicate.
+                    if let Some(ref where_expr) = m.where_clause {
+                        let mut row_vals = build_row_vals(
+                            &src_props,
+                            &src_node_pat.var,
+                            &col_ids_src_where,
+                            &self.snapshot.store,
+                        );
+                        row_vals.extend(build_row_vals(
+                            &mid_props,
+                            &mid_node_pat.var,
+                            &col_ids_mid,
+                            &self.snapshot.store,
+                        ));
+                        row_vals.extend(build_row_vals(
+                            &fof_props,
+                            &fof_node_pat.var,
+                            &col_ids_fof,
+                            &self.snapshot.store,
+                        ));
+                        // Inject label metadata so labels(n) works in WHERE.
+                        if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__labels__", src_node_pat.var),
+                                Value::List(vec![Value::String(src_label.clone())]),
+                            );
+                        }
+                        if !mid_node_pat.var.is_empty() && !mid_label.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__labels__", mid_node_pat.var),
+                                Value::List(vec![Value::String(mid_label.clone())]),
+                            );
+                        }
+                        if !fof_node_pat.var.is_empty() && !fof_label.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__labels__", fof_node_pat.var),
+                                Value::List(vec![Value::String(fof_label.clone())]),
+                            );
+                        }
+                        // Inject relationship type metadata so type(r) works in WHERE.
+                        if !pat.rels[0].var.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__type__", pat.rels[0].var),
+                                Value::String(pat.rels[0].rel_type.clone()),
+                            );
+                        }
+                        if !pat.rels[1].var.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__type__", pat.rels[1].var),
+                                Value::String(pat.rels[1].rel_type.clone()),
+                            );
+                        }
+                        row_vals.extend(self.dollar_params());
+                        if !self.eval_where_graph(where_expr, &row_vals) {
+                            continue;
+                        }
+                    }
+
+                    // SPA-241: use three-var projection so mid variable columns
+                    // are resolved from mid_props rather than defaulting to fof_props.
+                    let row = project_three_var_row(
+                        &src_props,
+                        &mid_props,
+                        &fof_props,
+                        column_names,
+                        &src_node_pat.var,
+                        &mid_node_pat.var,
+                        &self.snapshot.store,
+                    );
+                    rows.push(row);
+                }
             }
         }
 
