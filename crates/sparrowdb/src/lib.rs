@@ -31,7 +31,7 @@
 //! db.optimize().unwrap();
 //! ```
 
-use sparrowdb_catalog::catalog::Catalog;
+use sparrowdb_catalog::catalog::{Catalog, LabelId};
 use sparrowdb_common::{col_id_of, TxnId};
 use sparrowdb_execution::Engine;
 
@@ -311,6 +311,13 @@ struct DbInner {
     /// instance.  Invalidated after CHECKPOINT / OPTIMIZE since those compact
     /// the delta log into new CSR base files.
     csr_map: RwLock<HashMap<u32, CsrForward>>,
+    /// Cached label row counts (SPA-190).
+    ///
+    /// Maps `LabelId → node count` (high-water mark).  Built once at open
+    /// time and refreshed after any write that creates or deletes nodes.
+    /// Passed to `Engine::new_with_all_caches` to avoid per-label HWM disk
+    /// reads on every read query.
+    label_row_counts: RwLock<HashMap<LabelId, usize>>,
     /// Persistent WAL writer (SPA-210).
     ///
     /// Reused across transaction commits to avoid paying segment-scan and
@@ -376,6 +383,7 @@ impl GraphDb {
         let catalog = Catalog::open(path)?;
         let wal_dir = path.join("wal");
         let wal_writer = WalWriter::open(&wal_dir)?;
+        let label_row_counts = RwLock::new(build_label_row_counts_from_disk(&catalog, path));
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -388,6 +396,7 @@ impl GraphDb {
                 prop_index: RwLock::new(sparrowdb_storage::property_index::PropertyIndex::new()),
                 catalog: RwLock::new(catalog),
                 csr_map: RwLock::new(open_csr_map(path)),
+                label_row_counts,
                 wal_writer: Mutex::new(wal_writer),
             }),
         })
@@ -407,6 +416,7 @@ impl GraphDb {
         let catalog = Catalog::open(path)?;
         let wal_dir = path.join("wal");
         let wal_writer = WalWriter::open_encrypted(&wal_dir, key)?;
+        let label_row_counts = RwLock::new(build_label_row_counts_from_disk(&catalog, path));
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -419,6 +429,7 @@ impl GraphDb {
                 prop_index: RwLock::new(sparrowdb_storage::property_index::PropertyIndex::new()),
                 catalog: RwLock::new(catalog),
                 csr_map: RwLock::new(open_csr_map(path)),
+                label_row_counts,
                 wal_writer: Mutex::new(wal_writer),
             }),
         })
@@ -436,15 +447,53 @@ impl GraphDb {
             .clear();
     }
 
-    /// Refresh the shared catalog cache from disk (SPA-188).
+    /// Refresh the shared catalog cache from disk (SPA-188) and simultaneously
+    /// rebuild the cached label row counts (SPA-190).
     ///
-    /// Called after DDL operations (label/rel-type creation, constraints) so
-    /// the next read query sees the updated schema without re-parsing the TLV
-    /// file itself.
+    /// Called after DDL operations and any write commit so the next read query
+    /// sees the updated schema and fresh node counts without extra disk reads.
     fn invalidate_catalog(&self) {
         if let Ok(fresh) = Catalog::open(&self.inner.path) {
+            // Rebuild row counts while we have the fresh catalog in hand —
+            // no extra I/O to open it again.
+            let new_counts = build_label_row_counts_from_disk(&fresh, &self.inner.path);
             *self.inner.catalog.write().expect("catalog RwLock poisoned") = fresh;
+            *self
+                .inner
+                .label_row_counts
+                .write()
+                .expect("label_row_counts RwLock poisoned") = new_counts;
         }
+    }
+
+    /// Build a read-optimised `Engine` using all available shared caches
+    /// (PropertyIndex, CSR map, label row counts) — SPA-190.
+    ///
+    /// All read query paths should use this instead of calling
+    /// `Engine::new_with_cached_index` directly.
+    fn build_read_engine(
+        &self,
+        store: NodeStore,
+        catalog: Catalog,
+        csrs: HashMap<u32, CsrForward>,
+    ) -> Engine {
+        Engine::new_with_all_caches(
+            store,
+            catalog,
+            csrs,
+            &self.inner.path,
+            Some(&self.inner.prop_index),
+            Some(self.cached_label_row_counts()),
+        )
+    }
+
+    /// Return a clone of the cached label row counts (SPA-190).
+    fn cached_label_row_counts(&self) -> HashMap<LabelId, usize> {
+        self.inner
+            .label_row_counts
+            .read()
+            .expect("label_row_counts RwLock poisoned")
+            .clone()
     }
 
     /// Clone the cached catalog for use in a single query (SPA-188).
@@ -684,13 +733,7 @@ impl GraphDb {
             let mut engine = {
                 let _open_span = info_span!("sparrowdb.open_engine").entered();
                 let csrs = self.cached_csr_map();
-                Engine::new_with_cached_index(
-                    NodeStore::open(&self.inner.path)?,
-                    catalog_snap,
-                    csrs,
-                    &self.inner.path,
-                    Some(&self.inner.prop_index),
-                )
+                self.build_read_engine(NodeStore::open(&self.inner.path)?, catalog_snap, csrs)
             };
 
             let result = {
@@ -781,14 +824,8 @@ impl GraphDb {
         let mut engine = {
             let _open_span = info_span!("sparrowdb.open_engine").entered();
             let csrs = self.cached_csr_map();
-            Engine::new_with_cached_index(
-                NodeStore::open(&self.inner.path)?,
-                catalog_snap,
-                csrs,
-                &self.inner.path,
-                Some(&self.inner.prop_index),
-            )
-            .with_deadline(deadline)
+            self.build_read_engine(NodeStore::open(&self.inner.path)?, catalog_snap, csrs)
+                .with_deadline(deadline)
         };
 
         let result = {
@@ -1080,14 +1117,8 @@ impl GraphDb {
         let mut engine = {
             let _open_span = info_span!("sparrowdb.open_engine").entered();
             let csrs = self.cached_csr_map();
-            Engine::new_with_cached_index(
-                NodeStore::open(&self.inner.path)?,
-                catalog_snap,
-                csrs,
-                &self.inner.path,
-                Some(&self.inner.prop_index),
-            )
-            .with_params(params)
+            self.build_read_engine(NodeStore::open(&self.inner.path)?, catalog_snap, csrs)
+                .with_params(params)
         };
 
         let result = {
@@ -1370,18 +1401,15 @@ impl GraphDb {
 
         // Build an Engine for the read-scan phase.
         //
-        // Use `new_with_cached_index` so that the lazy property index built
-        // during this engine's scan is seeded from (and written back to) the
-        // shared per-GraphDb cache.  MATCH…CREATE only creates edges — it never
-        // changes node property columns — so the cached column data remains
-        // valid across calls and does not need to be invalidated.
+        // Use build_read_engine so that the lazy property index and cached
+        // label row counts are reused.  MATCH…CREATE only creates edges — it
+        // never changes node property columns — so the cached data remains
+        // valid across calls.
         let csrs = self.cached_csr_map();
-        let engine = Engine::new_with_cached_index(
+        let engine = self.build_read_engine(
             NodeStore::open(&self.inner.path)?,
             self.catalog_snapshot(),
             csrs,
-            &self.inner.path,
-            Some(&self.inner.prop_index),
         );
 
         // SPA-208: reject reserved __SO_ rel-type prefix on edges in the CREATE clause.
@@ -2408,12 +2436,19 @@ impl ReadTx {
 
         let mut engine = {
             let _open_span = info_span!("sparrowdb.readtx.open_engine").entered();
-            Engine::new_with_cached_index(
+            let row_counts = self
+                .inner
+                .label_row_counts
+                .read()
+                .expect("label_row_counts RwLock poisoned")
+                .clone();
+            Engine::new_with_all_caches(
                 NodeStore::open(&self.inner.path)?,
                 catalog_snap,
                 csrs,
                 &self.inner.path,
                 Some(&self.inner.prop_index),
+                Some(row_counts),
             )
         };
 
@@ -3649,6 +3684,28 @@ fn collect_maintenance_params(
 ///
 /// SPA-185: replaces the old `open_csr_forward` that only opened `RelTableId(0)`.
 /// The catalog is used to discover all registered rel types.
+/// Build a `LabelId → node count` map by reading each label's HWM from disk
+/// (SPA-190).  Called at `GraphDb::open()` and after node-mutating writes.
+fn build_label_row_counts_from_disk(catalog: &Catalog, db_root: &Path) -> HashMap<LabelId, usize> {
+    let store = match NodeStore::open(db_root) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    catalog
+        .list_labels()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(lid, _name)| {
+            let hwm = store.hwm_for_label(lid as u32).unwrap_or(0);
+            if hwm > 0 {
+                Some((lid, hwm as usize))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn open_csr_map(path: &Path) -> HashMap<u32, CsrForward> {
     let catalog = match Catalog::open(path) {
         Ok(c) => c,
