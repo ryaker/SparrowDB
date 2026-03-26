@@ -157,8 +157,8 @@ fn collect_segments(wal_dir: &Path) -> Result<Vec<u64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::codec::{WalPayload, WalRecordKind};
     use super::*;
+    use crate::wal::codec::{WalPayload, WalRecordKind};
     use sparrowdb_common::{Lsn, TxnId};
     use tempfile::TempDir;
 
