@@ -194,7 +194,7 @@ cargo install sparrowdb --bin sparrowdb
 ### MCP Server (Claude Desktop integration)
 
 ```bash
-cargo install sparrowdb --bin sparrowdb-mcp
+cargo install sparrowdb --bin sparrowdb-mcp --locked
 ```
 
 ---

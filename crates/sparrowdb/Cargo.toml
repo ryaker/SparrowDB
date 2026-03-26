@@ -29,6 +29,10 @@ serde_json = { workspace = true }
 criterion  = { workspace = true }
 
 [[bin]]
+name = "sparrowdb-mcp"
+path = "src/bin/sparrowdb-mcp.rs"
+
+[[bin]]
 name = "gen-encrypted-fixture"
 path = "src/bin/gen-encrypted-fixture.rs"
 
