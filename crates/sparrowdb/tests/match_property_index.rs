@@ -146,7 +146,20 @@ fn match_create_edge_oi_performance() {
 
     // Performance assertion: release builds must be fast; debug builds get a
     // generous ceiling just to catch catastrophic O(N²) regressions.
-    let limit_ms: u128 = if cfg!(debug_assertions) { 30_000 } else { 5_000 };
+    //
+    // macOS note: each WriteTx commit includes a WAL fsync (~13 ms on macOS
+    // SSDs due to stricter flush guarantees).  With 1 000 edge-create commits
+    // the fsync overhead alone totals ~13 s, regardless of how fast the index
+    // lookup is.  The O(N) scan baseline on macOS is ~55 s+, so 30 s is
+    // comfortably between "indexed O(log N) + fsync" and "O(N) scan".
+    // On Linux CI, fsync takes ~1 ms, so the 5 s limit remains appropriate.
+    let limit_ms: u128 = if cfg!(debug_assertions) {
+        60_000
+    } else if cfg!(target_os = "macos") {
+        30_000
+    } else {
+        5_000
+    };
     assert!(
         elapsed.as_millis() < limit_ms,
         "Performance regression: {N_EDGES} MATCH…CREATE cycles over {N_NODES} nodes took {:?} — expected < {}ms. O(N) scan may have regressed.",
