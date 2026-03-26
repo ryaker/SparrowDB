@@ -39,18 +39,18 @@ fn main() {
         let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
             Ok(req) => handle_request(req),
             Err(e) => {
-                // Parse error — only respond if the raw JSON had an "id" field,
+                // Parse error — only respond if the raw JSON had a non-null "id" field,
                 // otherwise it looks like a notification and MCP SDK rejects null-id errors.
-                let has_id = serde_json::from_str::<Value>(&line)
+                let id = serde_json::from_str::<Value>(&line)
                     .ok()
                     .and_then(|v| v.get("id").cloned())
-                    .is_some();
-                if !has_id {
-                    continue; // Malformed notification, discard silently.
+                    .filter(|v| !v.is_null());
+                if id.is_none() {
+                    continue; // Malformed notification or request with null id, discard silently.
                 }
                 Some(JsonRpcResponse {
                     jsonrpc: "2.0".into(),
-                    id: None,
+                    id,
                     result: None,
                     error: Some(json!({"code": -32700, "message": e.to_string()})),
                 })
@@ -77,9 +77,10 @@ fn main() {
 
 /// Returns `None` for notifications (no response required by MCP spec).
 fn handle_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
-    // MCP notifications (method starts with "notifications/") must not be responded to.
-    // The MCP SDK sends e.g. "notifications/initialized" after the initialize handshake.
-    if req.method.starts_with("notifications/") {
+    // MCP spec: messages without an "id" are notifications — must receive no response.
+    // Keying off id absence (not method prefix) handles all notifications correctly,
+    // including future notification methods beyond "notifications/*".
+    if req.id.is_none() {
         return None;
     }
 
@@ -380,6 +381,9 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
             let match_value = &args["match_value"];
             let properties = &args["properties"];
 
+            validate_cypher_identifier(label, "merge_node_by_property: label")?;
+            validate_cypher_identifier(match_key, "merge_node_by_property: match_key")?;
+
             let cypher_match_val = json_scalar_to_cypher(match_value).ok_or_else(|| {
                 format!(
                     "merge_node_by_property: match_value must be a scalar, got {:?}",
@@ -401,6 +405,7 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                     if k == match_key {
                         continue; // match key already in MERGE clause
                     }
+                    validate_cypher_identifier(k, "merge_node_by_property: property key")?;
                     let cypher_v = json_scalar_to_cypher(v).ok_or_else(|| {
                         format!("merge_node_by_property: property '{}' must be a scalar", k)
                     })?;
@@ -414,6 +419,23 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 format!(" SET {}", set_parts.join(", "))
             };
 
+            // Check whether the node already exists before MERGE so we can accurately
+            // report whether it was created or matched.
+            let count_query =
+                format!("MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) RETURN count(n)",);
+            let count_result = db
+                .execute(&count_query)
+                .map_err(|e| format!("merge_node_by_property: pre-merge count failed: {}", e))?;
+            let pre_existing = count_result
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| match v {
+                    sparrowdb_execution::types::Value::Int64(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0);
+
             // Use MERGE (find-or-create) semantics.
             let query = format!(
                 "MERGE (n:{label} {{{match_key}: {cypher_match_val}}}){set_clause} RETURN n",
@@ -423,13 +445,15 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 .execute(&query)
                 .map_err(|e| format!("merge_node_by_property: MERGE failed: {}", e))?;
 
-            let created = result.rows.is_empty(); // MERGE returns the node; empty = unexpected
+            let created = pre_existing == 0;
             Ok(json!({
                 "content": [{
                     "type": "text",
                     "text": format!(
-                        "merge_node_by_property: node with {}={} on label '{}' processed ({} row(s) returned).",
-                        match_key, match_value, label, result.rows.len()
+                        "merge_node_by_property: node with {}={} on label '{}' {} ({} row(s) returned).",
+                        match_key, match_value, label,
+                        if created { "created" } else { "found (existing)" },
+                        result.rows.len()
                     )
                 }],
                 "rows": result.rows.len(),
@@ -438,6 +462,27 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
         }
         _ => Err(format!("Unknown tool: {tool_name}")),
     }
+}
+
+/// Validate a Cypher identifier (label or property key).
+/// Accepts only `[A-Za-z_][A-Za-z0-9_]*` — no spaces, backticks, or special chars.
+/// Returns `Err` with a descriptive message when the identifier is unsafe.
+fn validate_cypher_identifier(ident: &str, context: &str) -> Result<(), String> {
+    if ident.is_empty() {
+        return Err(format!("{context}: identifier must not be empty"));
+    }
+    let mut chars = ident.chars();
+    let first_ok = chars
+        .next()
+        .map(|c| c.is_ascii_alphabetic() || c == '_')
+        .unwrap_or(false);
+    if !first_ok || chars.any(|c| !c.is_ascii_alphanumeric() && c != '_') {
+        return Err(format!(
+            "{context}: identifier '{ident}' contains unsafe characters; \
+             only [A-Za-z_][A-Za-z0-9_]* is allowed"
+        ));
+    }
+    Ok(())
 }
 
 /// Escape a string for safe Cypher single-quoted literal interpolation.
@@ -458,17 +503,13 @@ fn json_scalar_to_cypher(v: &Value) -> Option<String> {
 
 /// Build a Cypher CREATE query from a class name and a JSON properties object.
 fn build_create_query(class_name: &str, props: &Value) -> Result<String, String> {
-    if class_name.is_empty() {
-        return Err("create_entity: class_name must not be empty".into());
-    }
+    validate_cypher_identifier(class_name, "create_entity: class_name")?;
 
     let mut prop_parts: Vec<String> = Vec::new();
 
     if let Some(obj) = props.as_object() {
         for (key, val) in obj {
-            if key.is_empty() {
-                return Err("create_entity: property key must not be empty".into());
-            }
+            validate_cypher_identifier(key, "create_entity: property key")?;
             let cypher_val = json_scalar_to_cypher(val).ok_or_else(|| match val {
                 Value::Null => format!("create_entity: property '{}' is null; use a concrete value", key),
                 Value::Array(_) => format!("create_entity: property '{}' is an array; only scalar values are supported", key),
@@ -496,15 +537,9 @@ fn build_add_property_query(
     set_prop: &str,
     set_val: &Value,
 ) -> Result<String, String> {
-    if label.is_empty() {
-        return Err("add_property: label must not be empty".into());
-    }
-    if match_prop.is_empty() {
-        return Err("add_property: match_prop must not be empty".into());
-    }
-    if set_prop.is_empty() {
-        return Err("add_property: set_prop must not be empty".into());
-    }
+    validate_cypher_identifier(label, "add_property: label")?;
+    validate_cypher_identifier(match_prop, "add_property: match_prop")?;
+    validate_cypher_identifier(set_prop, "add_property: set_prop")?;
 
     let cypher_set_val = json_scalar_to_cypher(set_val).ok_or_else(|| match set_val {
         Value::Null => "add_property: set_val is null; use a concrete scalar value".to_string(),
@@ -528,6 +563,7 @@ fn build_add_property_query(
 }
 
 /// Build a Cypher MATCH count query to check how many nodes match.
+/// Callers must have already validated `label` and `match_prop` as safe identifiers.
 fn build_count_query(label: &str, match_prop: &str, match_val: &str) -> String {
     format!(
         "MATCH (n:{label} {{{match_prop}: '{match_val_escaped}'}}) RETURN count(n) AS cnt",
