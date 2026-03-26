@@ -10,11 +10,8 @@
 //! This file validates two things:
 //!   1. **Correctness**: MATCH by uid returns exactly the right node.
 //!   2. **Performance**: 1 000 MATCH-then-CREATE cycles over 10 000 nodes
-//!      complete within an OS-specific threshold (the O(N) version would take
-//!      ~55 s on the benchmark hardware):
-//!        - Linux release: < 5 000 ms  (fsync ~1 ms each)
-//!        - macOS release: < 30 000 ms (WAL fsync ~13 ms each adds ~13 s total)
-//!        - Debug builds:  < 60 000 ms (catches catastrophic O(N²) regressions)
+//!      complete in < 5 000 ms on any reasonable machine (the O(N) version
+//!      would take ~55 s on the benchmark hardware).
 
 use sparrowdb::open;
 use std::time::Instant;
@@ -149,16 +146,7 @@ fn match_create_edge_oi_performance() {
 
     // Performance assertion: release builds must be fast; debug builds get a
     // generous ceiling just to catch catastrophic O(N²) regressions.
-    //
-    // macOS note: each WriteTx commit includes a WAL fsync (~13 ms on macOS
-    // SSDs due to stricter flush guarantees).  With 1 000 edge-create commits
-    // the fsync overhead alone totals ~13 s, regardless of how fast the index
-    // lookup is.  The O(N) scan baseline on macOS is ~55 s+, so 30 s is
-    // comfortably between "indexed O(log N) + fsync" and "O(N) scan".
-    // On Linux CI, fsync takes ~1 ms, so the 5 s limit remains appropriate.
     let limit_ms: u128 = if cfg!(debug_assertions) {
-        60_000
-    } else if cfg!(target_os = "macos") {
         30_000
     } else {
         5_000

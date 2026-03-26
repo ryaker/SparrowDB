@@ -2247,6 +2247,29 @@ impl GraphDb {
         Ok(dot)
     }
 
+    /// SPA-247: Convenience wrapper for upsert — find an existing node with
+    /// `(label, match_key=match_value)` and update its properties, or create a
+    /// new one if none exists.
+    ///
+    /// Opens a single-operation write transaction, calls
+    /// [`WriteTx::merge_node_by_property`], and commits.
+    ///
+    /// Returns `(NodeId, created)`.
+    pub fn merge_node_by_property(
+        &self,
+        label: &str,
+        match_key: &str,
+        match_value: &Value,
+        properties: HashMap<String, Value>,
+    ) -> Result<(NodeId, bool)> {
+        let mut tx = self.begin_write()?;
+        let result = tx.merge_node_by_property(label, match_key, match_value, properties)?;
+        tx.commit()?;
+        self.invalidate_prop_index();
+        self.invalidate_catalog();
+        Ok(result)
+    }
+
     /// Convenience wrapper: remove the directed edge `src → dst` of `rel_type`.
     ///
     /// Opens a single-operation write transaction, calls
@@ -2712,6 +2735,91 @@ impl WriteTx {
             prop_names: disk_prop_names,
         });
         Ok(node_id)
+    }
+
+    /// SPA-247: Upsert a node — find an existing node with `(label, match_key=match_value)`
+    /// and update its properties, or create a new one if none exists.
+    ///
+    /// Returns `(NodeId, created)` where `created` is `true` when a new node
+    /// was inserted and `false` when an existing node was found and updated.
+    ///
+    /// The lookup scans both pending (in-transaction) nodes and committed
+    /// on-disk nodes for a slot whose label matches and whose `match_key`
+    /// column equals `match_value`.  On a hit the remaining `properties` are
+    /// applied via [`set_property`]; on a miss a new node is created via
+    /// [`merge_node`] with `match_key=match_value` merged into `properties`.
+    pub fn merge_node_by_property(
+        &mut self,
+        label: &str,
+        match_key: &str,
+        match_value: &Value,
+        properties: HashMap<String, Value>,
+    ) -> Result<(NodeId, bool)> {
+        let label_id: u32 = match self.catalog.get_label(label)? {
+            Some(id) => id as u32,
+            None => {
+                // Label doesn't exist yet — no node can match. Create it.
+                let mut full_props = properties;
+                full_props.insert(match_key.to_string(), match_value.clone());
+                let node_id = self.merge_node(label, full_props)?;
+                return Ok((node_id, true));
+            }
+        };
+
+        let match_col_id = fnv1a_col_id(match_key);
+        let match_col_ids = vec![match_col_id];
+
+        // Step 1: Check pending (in-transaction) nodes.
+        for op in &self.pending_ops {
+            if let PendingOp::NodeCreate {
+                label_id: op_label_id,
+                slot: op_slot,
+                props: op_props,
+            } = op
+            {
+                if *op_label_id == label_id {
+                    let matches = op_props
+                        .iter()
+                        .find(|&&(c, _)| c == match_col_id)
+                        .map(|(_, v)| v == match_value)
+                        .unwrap_or(false);
+                    if matches {
+                        let node_id = NodeId((label_id as u64) << 32 | *op_slot as u64);
+                        // Update remaining properties on the existing node.
+                        for (k, v) in &properties {
+                            self.set_property(node_id, k, v.clone())?;
+                        }
+                        return Ok((node_id, false));
+                    }
+                }
+            }
+        }
+
+        // Step 2: Scan on-disk committed nodes.
+        let disk_hwm = self.store.disk_hwm_for_label(label_id)?;
+        for slot in 0..disk_hwm {
+            let candidate = NodeId((label_id as u64) << 32 | slot);
+            if let Ok(stored) = self.store.get_node_raw(candidate, &match_col_ids) {
+                let matches = stored
+                    .iter()
+                    .find(|&&(c, _)| c == match_col_id)
+                    .map(|&(_, raw)| self.store.decode_raw_value(raw) == *match_value)
+                    .unwrap_or(false);
+                if matches {
+                    // Update remaining properties on the existing node.
+                    for (k, v) in &properties {
+                        self.set_property(candidate, k, v.clone())?;
+                    }
+                    return Ok((candidate, false));
+                }
+            }
+        }
+
+        // Step 3: Not found — create new node with match_key included.
+        let mut full_props = properties;
+        full_props.insert(match_key.to_string(), match_value.clone());
+        let node_id = self.merge_node(label, full_props)?;
+        Ok((node_id, true))
     }
 
     /// SPA-124: Update a named property on a node.
