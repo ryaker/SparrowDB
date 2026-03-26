@@ -39,7 +39,8 @@ fn string_roundtrip_basic() {
 fn string_zero_value_not_confused() {
     let (_dir, db) = make_db();
     // This is the first string written, so it will land at offset 0 in strings.bin.
-    db.execute("CREATE (n:First {val: 'OffsetZeroTest'})").unwrap();
+    db.execute("CREATE (n:First {val: 'OffsetZeroTest'})")
+        .unwrap();
     let result = db
         .execute("MATCH (n:First) RETURN n.val")
         .expect("MATCH RETURN");
@@ -121,26 +122,22 @@ fn empty_string_roundtrip() {
 
     // Empty strings are inline (0 bytes < 7-byte limit), so pair with a real
     // overflow string before and after to exercise heap adjacency.
-    db.execute("CREATE (n:Before {val: 'before-boundary'})").unwrap();
+    db.execute("CREATE (n:Before {val: 'before-boundary'})")
+        .unwrap();
     db.execute("CREATE (n:Empty  {val: ''})").unwrap();
-    db.execute("CREATE (n:After  {val: 'after-boundary-ok'})").unwrap();
+    db.execute("CREATE (n:After  {val: 'after-boundary-ok'})")
+        .unwrap();
 
-    let before = db
-        .execute("MATCH (n:Before) RETURN n.val")
-        .expect("before");
+    let before = db.execute("MATCH (n:Before) RETURN n.val").expect("before");
     assert_eq!(before.rows[0][0], Value::String("before-boundary".into()));
 
-    let empty = db
-        .execute("MATCH (n:Empty) RETURN n.val")
-        .expect("empty");
+    let empty = db.execute("MATCH (n:Empty) RETURN n.val").expect("empty");
     assert_eq!(
         empty.rows[0][0],
         Value::String(String::new()),
         "Empty string must round-trip as empty (SPA-208)"
     );
 
-    let after = db
-        .execute("MATCH (n:After) RETURN n.val")
-        .expect("after");
+    let after = db.execute("MATCH (n:After) RETURN n.val").expect("after");
     assert_eq!(after.rows[0][0], Value::String("after-boundary-ok".into()));
 }

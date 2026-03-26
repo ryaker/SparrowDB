@@ -317,9 +317,7 @@ impl NodeStore {
         let path = self.strings_bin_path();
         let mut file = fs::File::open(&path).map_err(Error::Io)?;
         file.seek(SeekFrom::Start(offset)).map_err(|e| {
-            Error::Corruption(format!(
-                "string heap seek failed (offset={offset}): {e}"
-            ))
+            Error::Corruption(format!("string heap seek failed (offset={offset}): {e}"))
         })?;
         let mut buf = vec![0u8; len];
         file.read_exact(&mut buf).map_err(|e| {
@@ -909,7 +907,8 @@ impl NodeStore {
                     // Seek to exact slot and write.
                     file.seek(SeekFrom::Start(expected_offset))
                         .map_err(Error::Io)?;
-                    file.write_all(&raw_value.to_le_bytes()).map_err(Error::Io)?;
+                    file.write_all(&raw_value.to_le_bytes())
+                        .map_err(Error::Io)?;
                     // Advance current_len to reflect what we wrote.
                     let after = expected_offset + 8;
                     if after > current_len {
@@ -1376,9 +1375,7 @@ impl NodeStore {
                 Err(e) => return Err(Error::Io(e)),
             };
 
-            let file_len = file
-                .seek(SeekFrom::End(0))
-                .map_err(Error::Io)?;
+            let file_len = file.seek(SeekFrom::End(0)).map_err(Error::Io)?;
             // Reset to start for sequential reads
             file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
 

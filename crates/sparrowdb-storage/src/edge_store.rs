@@ -412,7 +412,13 @@ impl EdgeStore {
     /// (delta-log position) means that properties survive `CHECKPOINT`, which
     /// truncates the delta log and resets all edge IDs to zero.  A lookup by
     /// node slots works correctly for both delta and CSR edges.
-    pub fn set_edge_prop(&self, src_slot: u64, dst_slot: u64, col_id: u32, value: u64) -> Result<()> {
+    pub fn set_edge_prop(
+        &self,
+        src_slot: u64,
+        dst_slot: u64,
+        col_id: u32,
+        value: u64,
+    ) -> Result<()> {
         let mut buf = [0u8; 28];
         buf[0..8].copy_from_slice(&src_slot.to_le_bytes());
         buf[8..16].copy_from_slice(&dst_slot.to_le_bytes());

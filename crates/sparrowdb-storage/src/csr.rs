@@ -31,6 +31,10 @@ use sparrowdb_common::{Error, Result};
 // ── Shared backing store ────────────────────────────────────────────────────
 
 /// Backing data for CSR arrays — either heap-owned or memory-mapped.
+///
+/// `Clone` on the `Mapped` variant bumps the `Arc` reference count; no data
+/// is copied.  `Clone` on `Owned` deep-copies the vectors.
+#[derive(Clone)]
 enum CsrData {
     Owned {
         offsets: Vec<u64>,
@@ -47,30 +51,6 @@ enum CsrData {
         /// Number of u64 entries in the neighbors array.
         neighbors_count: usize,
     },
-}
-
-impl Clone for CsrData {
-    fn clone(&self) -> Self {
-        match self {
-            CsrData::Owned { offsets, neighbors } => CsrData::Owned {
-                offsets: offsets.clone(),
-                neighbors: neighbors.clone(),
-            },
-            CsrData::Mapped {
-                mmap,
-                offsets_byte_start,
-                offsets_count,
-                neighbors_byte_start,
-                neighbors_count,
-            } => CsrData::Mapped {
-                mmap: Arc::clone(mmap),
-                offsets_byte_start: *offsets_byte_start,
-                offsets_count: *offsets_count,
-                neighbors_byte_start: *neighbors_byte_start,
-                neighbors_count: *neighbors_count,
-            },
-        }
-    }
 }
 
 impl CsrData {
@@ -134,9 +114,11 @@ impl CsrData {
 
         // Read n_edges from the sentinel offset[n_nodes].
         let sentinel_start = offsets_byte_start + n_nodes as usize * 8;
-        let n_edges =
-            u64::from_le_bytes(bytes[sentinel_start..sentinel_start + 8].try_into().unwrap())
-                as usize;
+        let n_edges = u64::from_le_bytes(
+            bytes[sentinel_start..sentinel_start + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
         let neighbors_byte_start = offsets_byte_end;
         let neighbors_byte_end = neighbors_byte_start + n_edges * 8;
@@ -208,8 +190,15 @@ impl CsrForward {
     }
 
     /// Open an existing CSR forward file from disk via memory-map (SPA-222).
+    ///
+    /// # Safety
+    /// `Mmap::map` is safe here because the file handle lives for the duration
+    /// of the call; the resulting `Mmap` owns its mapping and extends the
+    /// lifetime independently of `file`.  No other code aliases the raw pointer
+    /// before the `Mmap` is fully constructed.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).map_err(Error::Io)?;
+        // SAFETY: see doc comment above.
         let mmap = unsafe { Mmap::map(&file) }.map_err(Error::Io)?;
         let (n_nodes, data) = CsrData::from_mmap(mmap)?;
         Ok(CsrForward { n_nodes, data })
@@ -280,8 +269,15 @@ impl CsrBackward {
     }
 
     /// Open an existing CSR backward file from disk via memory-map (SPA-222).
+    ///
+    /// # Safety
+    /// `Mmap::map` is safe here because the file handle lives for the duration
+    /// of the call; the resulting `Mmap` owns its mapping and extends the
+    /// lifetime independently of `file`.  No other code aliases the raw pointer
+    /// before the `Mmap` is fully constructed.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).map_err(Error::Io)?;
+        // SAFETY: see doc comment above.
         let mmap = unsafe { Mmap::map(&file) }.map_err(Error::Io)?;
         let (n_nodes, data) = CsrData::from_mmap(mmap)?;
         Ok(CsrBackward { n_nodes, data })
@@ -648,9 +644,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.fwd.csr");
 
-        CsrForward::build(N_NODES, TEST_EDGES)
-            .write(&path)
-            .unwrap();
+        CsrForward::build(N_NODES, TEST_EDGES).write(&path).unwrap();
         let mapped = CsrForward::open(&path).unwrap();
 
         // Clone should work and produce identical results.

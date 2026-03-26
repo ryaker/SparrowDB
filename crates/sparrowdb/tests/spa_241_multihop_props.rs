@@ -29,18 +29,15 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 
 /// Build: (alice:Node {name:"alice",age:30}) -[:E]-> (mid:Node {name:"mid",age:25}) -[:E]-> (bob:Node {name:"bob",age:20})
 fn setup_simple_chain(db: &sparrowdb::GraphDb) {
-    db.execute("CREATE (:Node {name: 'alice', age: 30})").unwrap();
+    db.execute("CREATE (:Node {name: 'alice', age: 30})")
+        .unwrap();
     db.execute("CREATE (:Node {name: 'mid', age: 25})").unwrap();
     db.execute("CREATE (:Node {name: 'bob', age: 20})").unwrap();
 
-    db.execute(
-        "MATCH (a:Node {name: 'alice'}), (m:Node {name: 'mid'}) CREATE (a)-[:E]->(m)",
-    )
-    .unwrap();
-    db.execute(
-        "MATCH (m:Node {name: 'mid'}), (b:Node {name: 'bob'}) CREATE (m)-[:E]->(b)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:Node {name: 'alice'}), (m:Node {name: 'mid'}) CREATE (a)-[:E]->(m)")
+        .unwrap();
+    db.execute("MATCH (m:Node {name: 'mid'}), (b:Node {name: 'bob'}) CREATE (m)-[:E]->(b)")
+        .unwrap();
 }
 
 /// Core regression: m.name must be "mid", not "alice" or "bob".
@@ -50,12 +47,15 @@ fn two_hop_intermediate_name_is_correct() {
     setup_simple_chain(&db);
 
     let result = db
-        .execute(
-            "MATCH (a:Node)-[:E]->(m:Node)-[:E]->(b:Node) RETURN a.name, m.name, b.name",
-        )
+        .execute("MATCH (a:Node)-[:E]->(m:Node)-[:E]->(b:Node) RETURN a.name, m.name, b.name")
         .expect("two-hop query");
 
-    assert_eq!(result.rows.len(), 1, "expected exactly 1 result row, got {:?}", result.rows);
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected exactly 1 result row, got {:?}",
+        result.rows
+    );
     let row = &result.rows[0];
     assert_eq!(
         row[0],
@@ -84,12 +84,15 @@ fn two_hop_intermediate_age_is_correct() {
     setup_simple_chain(&db);
 
     let result = db
-        .execute(
-            "MATCH (a:Node)-[:E]->(m:Node)-[:E]->(b:Node) RETURN m.age",
-        )
+        .execute("MATCH (a:Node)-[:E]->(m:Node)-[:E]->(b:Node) RETURN m.age")
         .expect("two-hop age query");
 
-    assert_eq!(result.rows.len(), 1, "expected exactly 1 row, got {:?}", result.rows);
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected exactly 1 row, got {:?}",
+        result.rows
+    );
     // age is stored as integer — accept either Int or Float representation.
     let age_val = &result.rows[0][0];
     let age_num = match age_val {
@@ -125,7 +128,8 @@ fn two_hop_multi_intermediate_correct_bindings() {
         ))
         .unwrap();
     }
-    db.execute("CREATE (:Hop {name: 'dst', kind: 'dst'})").unwrap();
+    db.execute("CREATE (:Hop {name: 'dst', kind: 'dst'})")
+        .unwrap();
 
     // src1 -> mid1, mid2, mid3; src2 -> mid4, mid5, mid6; src3 -> mid7, mid8, mid9
     for src_i in 1..=3usize {
@@ -172,7 +176,9 @@ fn two_hop_multi_intermediate_correct_bindings() {
         assert!(
             m_name.starts_with("mid"),
             "row {}: m.name should start with 'mid' but got '{}' (full row: {:?})",
-            i, m_name, row
+            i,
+            m_name,
+            row
         );
 
         let s_name = match &row[0] {
@@ -182,14 +188,19 @@ fn two_hop_multi_intermediate_correct_bindings() {
         assert!(
             s_name.starts_with("src"),
             "row {}: s.name should start with 'src' but got '{}'",
-            i, s_name
+            i,
+            s_name
         );
 
         let d_name = match &row[2] {
             Value::String(s) => s.clone(),
             other => panic!("row {}: d.name is not a string: {:?}", i, other),
         };
-        assert_eq!(d_name, "dst", "row {}: d.name should be 'dst' but got '{}'", i, d_name);
+        assert_eq!(
+            d_name, "dst",
+            "row {}: d.name should be 'dst' but got '{}'",
+            i, d_name
+        );
     }
 
     // Verify each mid1..mid9 appears exactly once.
@@ -203,7 +214,10 @@ fn two_hop_multi_intermediate_correct_bindings() {
         .collect();
     mid_names.sort();
     let expected: Vec<String> = (1..=9).map(|i| format!("mid{}", i)).collect();
-    assert_eq!(mid_names, expected, "each mid node should appear exactly once");
+    assert_eq!(
+        mid_names, expected,
+        "each mid node should appear exactly once"
+    );
 }
 
 /// Verify b.uid != a.uid in the pattern from the issue report (Enron-style).
@@ -218,14 +232,10 @@ fn two_hop_uid_no_aliasing() {
     db.execute("CREATE (:Person {uid: 3, name: 'C'})").unwrap();
 
     // A -[EMAILED]-> B -[EMAILED]-> C
-    db.execute(
-        "MATCH (a:Person {uid: 1}), (b:Person {uid: 2}) CREATE (a)-[:EMAILED]->(b)",
-    )
-    .unwrap();
-    db.execute(
-        "MATCH (b:Person {uid: 2}), (c:Person {uid: 3}) CREATE (b)-[:EMAILED]->(c)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:Person {uid: 1}), (b:Person {uid: 2}) CREATE (a)-[:EMAILED]->(b)")
+        .unwrap();
+    db.execute("MATCH (b:Person {uid: 2}), (c:Person {uid: 3}) CREATE (b)-[:EMAILED]->(c)")
+        .unwrap();
 
     let result = db
         .execute(
@@ -234,7 +244,12 @@ fn two_hop_uid_no_aliasing() {
         )
         .expect("uid two-hop");
 
-    assert_eq!(result.rows.len(), 1, "expected 1 row, got {:?}", result.rows);
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected 1 row, got {:?}",
+        result.rows
+    );
     let row = &result.rows[0];
 
     // Extract uids as numbers.
@@ -251,8 +266,15 @@ fn two_hop_uid_no_aliasing() {
     let c_uid = uid(&row[2]);
 
     assert_eq!(a_uid, 1, "a.uid should be 1, got {}", a_uid);
-    assert_eq!(b_uid, 2, "b.uid should be 2, got {} (was it aliased to a.uid={}?)", b_uid, a_uid);
+    assert_eq!(
+        b_uid, 2,
+        "b.uid should be 2, got {} (was it aliased to a.uid={}?)",
+        b_uid, a_uid
+    );
     assert_eq!(c_uid, 3, "c.uid should be 3, got {}", c_uid);
-    assert_ne!(b_uid, a_uid, "b.uid must NOT equal a.uid (property aliasing bug)");
+    assert_ne!(
+        b_uid, a_uid,
+        "b.uid must NOT equal a.uid (property aliasing bug)"
+    );
     assert_ne!(b_uid, c_uid, "b.uid must NOT equal c.uid");
 }

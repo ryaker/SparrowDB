@@ -22,9 +22,7 @@ fn edge_float_prop_roundtrip() {
     .unwrap();
 
     let r = db
-        .execute(
-            "MATCH (a:Knowledge)-[r:RELATED_TO]->(b:Knowledge) RETURN r.strength",
-        )
+        .execute("MATCH (a:Knowledge)-[r:RELATED_TO]->(b:Knowledge) RETURN r.strength")
         .unwrap();
 
     assert_eq!(r.rows.len(), 1, "expected one edge row");
@@ -54,9 +52,7 @@ fn edge_multiple_float_props() {
     .unwrap();
 
     let r = db
-        .execute(
-            "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN r.weight, r.score",
-        )
+        .execute("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN r.weight, r.score")
         .unwrap();
 
     assert_eq!(r.rows.len(), 1, "expected one row");
@@ -113,9 +109,7 @@ fn edge_mixed_int_and_float_props() {
     .unwrap();
 
     let r = db
-        .execute(
-            "MATCH (u:User)-[r:FOLLOWS]->(v:User) RETURN r.since, r.strength",
-        )
+        .execute("MATCH (u:User)-[r:FOLLOWS]->(v:User) RETURN r.since, r.strength")
         .unwrap();
 
     assert_eq!(r.rows.len(), 1);

@@ -149,7 +149,11 @@ pub enum WalPayload {
         props: Vec<WalProp>,
     },
     /// Phase 7 — a specific directed edge was deleted.
-    EdgeDelete { src: u64, dst: u64, rel_type: String },
+    EdgeDelete {
+        src: u64,
+        dst: u64,
+        rel_type: String,
+    },
 }
 
 // ── Payload encoding helpers ──────────────────────────────────────────────────

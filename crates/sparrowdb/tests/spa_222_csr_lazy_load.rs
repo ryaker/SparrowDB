@@ -69,7 +69,6 @@ fn spa222_mmap_open_and_traverse() {
         })
         .collect();
 
-    // Node 0 should connect to node 1 (next) and node 7 (skip-7).
-    assert!(ids.contains(&1), "expected neighbor 1, got {:?}", ids);
-    assert!(ids.contains(&7), "expected neighbor 7, got {:?}", ids);
+    // Node 0 connects to exactly node 1 (next) and node 7 (skip-7) — no more, no less.
+    assert_eq!(ids, vec![1i64, 7], "expected exactly [1, 7], got {:?}", ids);
 }

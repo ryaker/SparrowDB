@@ -1142,7 +1142,10 @@ impl Engine {
     ///
     /// Left-outer-join semantics: if the scan finds zero rows (label missing or
     /// no nodes), return exactly one row with NULL for every RETURN column.
-    pub(crate) fn execute_optional_match(&self, om: &OptionalMatchStatement) -> Result<QueryResult> {
+    pub(crate) fn execute_optional_match(
+        &self,
+        om: &OptionalMatchStatement,
+    ) -> Result<QueryResult> {
         use sparrowdb_common::Error;
 
         // Re-use execute_match by constructing a temporary MatchStatement.
@@ -1597,7 +1600,11 @@ impl Engine {
         })
     }
 
-    pub(crate) fn execute_scan(&self, m: &MatchStatement, column_names: &[String]) -> Result<QueryResult> {
+    pub(crate) fn execute_scan(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<QueryResult> {
         let pat = &m.pattern[0];
         let node = &pat.nodes[0];
 
@@ -2190,5 +2197,4 @@ impl Engine {
             rows,
         })
     }
-
 }

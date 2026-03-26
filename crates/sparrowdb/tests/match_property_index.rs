@@ -31,9 +31,11 @@ fn match_by_uid_returns_correct_node() {
     let (_dir, mut db) = make_db();
 
     // Insert three User nodes with distinct uid values.
-    db.execute("CREATE (:User {uid: 10, name: 'Alice'})").unwrap();
+    db.execute("CREATE (:User {uid: 10, name: 'Alice'})")
+        .unwrap();
     db.execute("CREATE (:User {uid: 20, name: 'Bob'})").unwrap();
-    db.execute("CREATE (:User {uid: 30, name: 'Carol'})").unwrap();
+    db.execute("CREATE (:User {uid: 30, name: 'Carol'})")
+        .unwrap();
 
     // MATCH each by uid and verify the name property.
     let r = db
@@ -73,10 +75,8 @@ fn match_create_edge_connects_correct_nodes() {
     db.execute("CREATE (:User {uid: 3})").unwrap();
 
     // Connect uid:1 → uid:2
-    db.execute(
-        "MATCH (a:User {uid: 1}), (b:User {uid: 2}) CREATE (a)-[:FOLLOWS]->(b)",
-    )
-    .unwrap();
+    db.execute("MATCH (a:User {uid: 1}), (b:User {uid: 2}) CREATE (a)-[:FOLLOWS]->(b)")
+        .unwrap();
 
     // Verify the edge exists: uid:1 should have one outgoing FOLLOWS edge.
     let r = db
@@ -146,7 +146,11 @@ fn match_create_edge_oi_performance() {
 
     // Performance assertion: release builds must be fast; debug builds get a
     // generous ceiling just to catch catastrophic O(N²) regressions.
-    let limit_ms: u128 = if cfg!(debug_assertions) { 30_000 } else { 5_000 };
+    let limit_ms: u128 = if cfg!(debug_assertions) {
+        30_000
+    } else {
+        5_000
+    };
     assert!(
         elapsed.as_millis() < limit_ms,
         "Performance regression: {N_EDGES} MATCH…CREATE cycles over {N_NODES} nodes took {:?} — expected < {}ms. O(N) scan may have regressed.",

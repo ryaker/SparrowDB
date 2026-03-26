@@ -4,7 +4,11 @@ use super::*;
 impl Engine {
     // ── 1-hop traversal: (a)-[:R]->(f) ───────────────────────────────────────
 
-    pub(crate) fn execute_one_hop(&self, m: &MatchStatement, column_names: &[String]) -> Result<QueryResult> {
+    pub(crate) fn execute_one_hop(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<QueryResult> {
         // ── Q7 COUNT-agg degree-cache fast-path (SPA-272) ─────────────────────
         // Try to short-circuit `MATCH (n)-[:R]->(f) RETURN n.prop, COUNT(f) AS
         // alias ORDER BY alias DESC LIMIT k` via DegreeCache before falling
@@ -255,20 +259,19 @@ impl Engine {
                 // instead of O(neighbors × cols). ─────────────────────────────────
                 // Compute the full column-id list needed for dst (same for every
                 // neighbor in this src → * traversal).
-                let all_needed_dst: Vec<u32> = if !col_ids_dst.is_empty()
-                    || !dst_node_pat.props.is_empty()
-                {
-                    let mut v = col_ids_dst.clone();
-                    for p in &dst_node_pat.props {
-                        let col_id = prop_name_to_col_id(&p.key);
-                        if !v.contains(&col_id) {
-                            v.push(col_id);
+                let all_needed_dst: Vec<u32> =
+                    if !col_ids_dst.is_empty() || !dst_node_pat.props.is_empty() {
+                        let mut v = col_ids_dst.clone();
+                        for p in &dst_node_pat.props {
+                            let col_id = prop_name_to_col_id(&p.key);
+                            if !v.contains(&col_id) {
+                                v.push(col_id);
+                            }
                         }
-                    }
-                    v
-                } else {
-                    vec![]
-                };
+                        v
+                    } else {
+                        vec![]
+                    };
 
                 // Deduplicate neighbor slots for the batch read (same set we
                 // visit in the inner loop; duplicates are skipped there anyway).
@@ -321,7 +324,9 @@ impl Engine {
                                 .collect()
                         } else {
                             // Fallback: individual read (e.g. delta-only slot).
-                            self.snapshot.store.get_node_raw(dst_node, &all_needed_dst)?
+                            self.snapshot
+                                .store
+                                .get_node_raw(dst_node, &all_needed_dst)?
                         }
                     } else {
                         vec![]
@@ -335,15 +340,14 @@ impl Engine {
                     // SPA-240: look up edge props for this (src_slot, dst_slot) pair.
                     // Works for both delta-only and checkpointed edges because
                     // edge_props.bin is now keyed by (src_slot, dst_slot).
-                    let current_edge_props: Vec<(u32, u64)> =
-                        if needs_edge_props {
-                            edge_props_by_slots
-                                .get(&(src_slot, dst_slot))
-                                .cloned()
-                                .unwrap_or_default()
-                        } else {
-                            vec![]
-                        };
+                    let current_edge_props: Vec<(u32, u64)> = if needs_edge_props {
+                        edge_props_by_slots
+                            .get(&(src_slot, dst_slot))
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
 
                     // Apply inline edge prop filter from rel pattern: [r:TYPE {prop: val}].
                     if !rel_pat.props.is_empty()
@@ -480,13 +484,12 @@ impl Engine {
                                 None
                             };
                         // SPA-178: build edge_props arg for project_hop_row.
-                        let rel_edge_props_arg = if !rel_pat.var.is_empty()
-                            && !current_edge_props.is_empty()
-                        {
-                            Some((rel_pat.var.as_str(), current_edge_props.as_slice()))
-                        } else {
-                            None
-                        };
+                        let rel_edge_props_arg =
+                            if !rel_pat.var.is_empty() && !current_edge_props.is_empty() {
+                                Some((rel_pat.var.as_str(), current_edge_props.as_slice()))
+                            } else {
+                                None
+                            };
                         let row = project_hop_row(
                             &src_props,
                             &dst_props,
@@ -824,7 +827,11 @@ impl Engine {
 
     // ── 2-hop traversal: (a)-[:R]->()-[:R]->(fof) ────────────────────────────
 
-    pub(crate) fn execute_two_hop(&self, m: &MatchStatement, column_names: &[String]) -> Result<QueryResult> {
+    pub(crate) fn execute_two_hop(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<QueryResult> {
         use crate::join::AspJoin;
 
         let pat = &m.pattern[0];
@@ -1114,8 +1121,7 @@ impl Engine {
 
                     for b_slot in &all_b_slots {
                         let b_node = NodeId(((fof_label_id as u64) << 32) | *b_slot);
-                        let b_props =
-                            read_node_props(&self.snapshot.store, b_node, &col_ids_fof)?;
+                        let b_props = read_node_props(&self.snapshot.store, b_node, &col_ids_fof)?;
 
                         // Apply fof (b) inline prop filter.
                         if !self.matches_prop_filter(&b_props, &fof_node_pat.props) {
@@ -1208,7 +1214,11 @@ impl Engine {
             // src to each fof, making it impossible to read or return mid properties.
             let mut mid_fof_pairs: Vec<(u64, Vec<u64>)> = {
                 let chunk = join.two_hop_factorized(src_slot)?;
-                chunk.groups.into_iter().map(|g| (g.mid_slot, g.fof_slots)).collect()
+                chunk
+                    .groups
+                    .into_iter()
+                    .map(|g| (g.mid_slot, g.fof_slots))
+                    .collect()
             };
 
             // SPA-163 + SPA-241: extend with delta-log 2-hop paths, preserving
@@ -1434,7 +1444,11 @@ impl Engine {
     ///
     /// This replaces the previous fallthrough to `execute_scan` which only
     /// scanned the first node and ignored all relationship hops.
-    pub(crate) fn execute_n_hop(&self, m: &MatchStatement, column_names: &[String]) -> Result<QueryResult> {
+    pub(crate) fn execute_n_hop(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<QueryResult> {
         let pat = &m.pattern[0];
         let n_nodes = pat.nodes.len();
         let n_rels = pat.rels.len();
@@ -1656,5 +1670,4 @@ impl Engine {
             rows,
         })
     }
-
 }
