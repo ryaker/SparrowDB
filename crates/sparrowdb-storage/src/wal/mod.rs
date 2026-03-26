@@ -15,9 +15,11 @@
 ///
 /// Segments: `wal/segment-{:020}.wal`, 64 MiB each.
 pub mod codec;
+pub mod migrate;
 pub mod replay;
 pub mod writer;
 
 pub use codec::{WalPayload, WalRecord, WalRecordKind};
+pub use migrate::{migrate_wal, MigrationResult};
 pub use replay::{WalReplayer, WalSchema};
 pub use writer::WalWriter;

@@ -2375,6 +2375,34 @@ pub fn open(path: &Path) -> Result<GraphDb> {
     GraphDb::open(path)
 }
 
+/// Migrate WAL segments from legacy v21 (CRC32 IEEE) to v2 (CRC32C Castagnoli).
+///
+/// Call this on a database path **before** opening it with [`GraphDb::open`].
+/// The database must not be open by any other process.
+///
+/// This is safe to run on a database that is already at v2 — those segments are
+/// simply skipped.  The migration is idempotent.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::path::Path;
+/// let result = sparrowdb::migrate_wal(Path::new("/path/to/my.sparrow")).unwrap();
+/// println!("Converted {} segments", result.segments_converted);
+/// ```
+pub fn migrate_wal(db_path: &Path) -> Result<sparrowdb_storage::wal::migrate::MigrationResult> {
+    let wal_dir = db_path.join("wal");
+    if !wal_dir.exists() {
+        return Ok(sparrowdb_storage::wal::migrate::MigrationResult {
+            segments_inspected: 0,
+            segments_converted: 0,
+            segments_skipped: 0,
+            records_converted: 0,
+        });
+    }
+    sparrowdb_storage::wal::migrate::migrate_wal(&wal_dir)
+}
+
 // ── Legacy alias ──────────────────────────────────────────────────────────────
 
 /// Legacy alias kept for backward compatibility with Phase 0 tests.
