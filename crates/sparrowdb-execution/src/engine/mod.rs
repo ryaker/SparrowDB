@@ -1596,18 +1596,30 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
                 }
                 BinOpKind::Lt => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => a < b,
+                    (Value::Float64(a), Value::Float64(b)) => a < b,
+                    (Value::Int64(a), Value::Float64(b)) => (*a as f64) < *b,
+                    (Value::Float64(a), Value::Int64(b)) => *a < (*b as f64),
                     _ => false,
                 },
                 BinOpKind::Le => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => a <= b,
+                    (Value::Float64(a), Value::Float64(b)) => a <= b,
+                    (Value::Int64(a), Value::Float64(b)) => (*a as f64) <= *b,
+                    (Value::Float64(a), Value::Int64(b)) => *a <= (*b as f64),
                     _ => false,
                 },
                 BinOpKind::Gt => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => a > b,
+                    (Value::Float64(a), Value::Float64(b)) => a > b,
+                    (Value::Int64(a), Value::Float64(b)) => (*a as f64) > *b,
+                    (Value::Float64(a), Value::Int64(b)) => *a > (*b as f64),
                     _ => false,
                 },
                 BinOpKind::Ge => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => a >= b,
+                    (Value::Float64(a), Value::Float64(b)) => a >= b,
+                    (Value::Int64(a), Value::Float64(b)) => (*a as f64) >= *b,
+                    (Value::Float64(a), Value::Int64(b)) => *a >= (*b as f64),
                     _ => false,
                 },
                 _ => false,
@@ -1728,21 +1740,29 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
                 BinOpKind::Lt => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => Value::Bool(a < b),
                     (Value::Float64(a), Value::Float64(b)) => Value::Bool(a < b),
+                    (Value::Int64(a), Value::Float64(b)) => Value::Bool((*a as f64) < *b),
+                    (Value::Float64(a), Value::Int64(b)) => Value::Bool(*a < (*b as f64)),
                     _ => Value::Null,
                 },
                 BinOpKind::Le => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => Value::Bool(a <= b),
                     (Value::Float64(a), Value::Float64(b)) => Value::Bool(a <= b),
+                    (Value::Int64(a), Value::Float64(b)) => Value::Bool((*a as f64) <= *b),
+                    (Value::Float64(a), Value::Int64(b)) => Value::Bool(*a <= (*b as f64)),
                     _ => Value::Null,
                 },
                 BinOpKind::Gt => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => Value::Bool(a > b),
                     (Value::Float64(a), Value::Float64(b)) => Value::Bool(a > b),
+                    (Value::Int64(a), Value::Float64(b)) => Value::Bool((*a as f64) > *b),
+                    (Value::Float64(a), Value::Int64(b)) => Value::Bool(*a > (*b as f64)),
                     _ => Value::Null,
                 },
                 BinOpKind::Ge => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => Value::Bool(a >= b),
                     (Value::Float64(a), Value::Float64(b)) => Value::Bool(a >= b),
+                    (Value::Int64(a), Value::Float64(b)) => Value::Bool((*a as f64) >= *b),
+                    (Value::Float64(a), Value::Int64(b)) => Value::Bool(*a >= (*b as f64)),
                     _ => Value::Null,
                 },
                 BinOpKind::Contains => match (&lv, &rv) {

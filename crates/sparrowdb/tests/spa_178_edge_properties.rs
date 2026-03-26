@@ -276,3 +276,53 @@ fn test_edge_prop_filter_survives_checkpoint() {
         "filter score=99 must not match after checkpoint"
     );
 }
+
+/// Test 11: (SPA-248) Edge property WHERE filter with cross-type numeric comparison.
+///
+/// Create edges with integer-stored ratings (e.g., {rating: 4}), then query
+/// with float WHERE literals (e.g., WHERE r.rating >= 4.0).
+///
+/// Previously, Int64(4) >= Float64(4.0) would return false due to lack of
+/// cross-type numeric promotion, causing WHERE predicates to return 0 rows.
+#[test]
+fn test_edge_prop_float_where_filter() {
+    let (_dir, db) = make_db();
+
+    // Create a movie with ratings (integer-valued, but stored as Int64)
+    db.execute(
+        "CREATE (m:Movie {title:\"Matrix\"})-[:RATED {rating:5}]->(u1:User {id:1})",
+    )
+    .expect("create u1 rated 5");
+    db.execute(
+        "CREATE (m:Movie {title:\"Matrix\"})-[:RATED {rating:4}]->(u2:User {id:2})",
+    )
+    .expect("create u2 rated 4");
+    db.execute(
+        "CREATE (m:Movie {title:\"Matrix\"})-[:RATED {rating:3}]->(u3:User {id:3})",
+    )
+    .expect("create u3 rated 3");
+
+    // Query with float WHERE literal >= 4.0
+    // Should return 2 rows (u1 with rating 5, u2 with rating 4)
+    let result = db
+        .execute("MATCH (m:Movie {title:\"Matrix\"})-[r:RATED]->(u:User) WHERE r.rating >= 4.0 RETURN u.id")
+        .expect("query with float WHERE");
+
+    assert_eq!(
+        result.rows.len(),
+        2,
+        "WHERE r.rating >= 4.0 should match ratings 5 and 4 (cross-type Int64 vs Float64)"
+    );
+
+    // Query with float WHERE literal < 4.0
+    // Should return 1 row (u3 with rating 3)
+    let result_lt = db
+        .execute("MATCH (m:Movie {title:\"Matrix\"})-[r:RATED]->(u:User) WHERE r.rating < 4.0 RETURN u.id")
+        .expect("query with float WHERE <");
+
+    assert_eq!(
+        result_lt.rows.len(),
+        1,
+        "WHERE r.rating < 4.0 should match rating 3 (cross-type Int64 vs Float64)"
+    );
+}
