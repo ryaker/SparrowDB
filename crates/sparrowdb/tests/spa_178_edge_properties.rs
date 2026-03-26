@@ -307,6 +307,16 @@ fn test_edge_prop_float_where_filter() {
         2,
         "WHERE r.rating >= 4.0 should match ratings 5 and 4 (cross-type Int64 vs Float64)"
     );
+    let mut ids_ge: Vec<i64> = result
+        .rows
+        .iter()
+        .filter_map(|r| match r.first() {
+            Some(Value::Int64(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    ids_ge.sort_unstable();
+    assert_eq!(ids_ge, vec![1, 2], ">= 4.0 should return users 1 and 2");
 
     // Query with float WHERE literal < 4.0
     // Should return 1 row (u3 with rating 3)
@@ -319,4 +329,13 @@ fn test_edge_prop_float_where_filter() {
         1,
         "WHERE r.rating < 4.0 should match rating 3 (cross-type Int64 vs Float64)"
     );
+    let ids_lt: Vec<i64> = result_lt
+        .rows
+        .iter()
+        .filter_map(|r| match r.first() {
+            Some(Value::Int64(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids_lt, vec![3], "< 4.0 should return only user 3");
 }

@@ -1579,6 +1579,17 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Compare an i64 and an f64 numerically, returning `None` when the i64 cannot
+/// be represented exactly as f64 (i.e. `|i| > 2^53`).  Callers that receive
+/// `None` should treat the values as incomparable.
+fn cmp_i64_f64(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+    const MAX_EXACT: i64 = 1_i64 << 53;
+    if i.unsigned_abs() > MAX_EXACT as u64 {
+        return None; // precision loss: cannot compare faithfully
+    }
+    (i as f64).partial_cmp(&f)
+}
+
 fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
     match expr {
         Expr::BinOp { left, op, right } => {
@@ -1597,29 +1608,45 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
                 BinOpKind::Lt => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => a < b,
                     (Value::Float64(a), Value::Float64(b)) => a < b,
-                    (Value::Int64(a), Value::Float64(b)) => (*a as f64) < *b,
-                    (Value::Float64(a), Value::Int64(b)) => *a < (*b as f64),
+                    (Value::Int64(a), Value::Float64(b)) => {
+                        cmp_i64_f64(*a, *b).map_or(false, |o| o.is_lt())
+                    }
+                    (Value::Float64(a), Value::Int64(b)) => {
+                        cmp_i64_f64(*b, *a).map_or(false, |o| o.is_gt())
+                    }
                     _ => false,
                 },
                 BinOpKind::Le => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => a <= b,
                     (Value::Float64(a), Value::Float64(b)) => a <= b,
-                    (Value::Int64(a), Value::Float64(b)) => (*a as f64) <= *b,
-                    (Value::Float64(a), Value::Int64(b)) => *a <= (*b as f64),
+                    (Value::Int64(a), Value::Float64(b)) => {
+                        cmp_i64_f64(*a, *b).map_or(false, |o| o.is_le())
+                    }
+                    (Value::Float64(a), Value::Int64(b)) => {
+                        cmp_i64_f64(*b, *a).map_or(false, |o| o.is_ge())
+                    }
                     _ => false,
                 },
                 BinOpKind::Gt => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => a > b,
                     (Value::Float64(a), Value::Float64(b)) => a > b,
-                    (Value::Int64(a), Value::Float64(b)) => (*a as f64) > *b,
-                    (Value::Float64(a), Value::Int64(b)) => *a > (*b as f64),
+                    (Value::Int64(a), Value::Float64(b)) => {
+                        cmp_i64_f64(*a, *b).map_or(false, |o| o.is_gt())
+                    }
+                    (Value::Float64(a), Value::Int64(b)) => {
+                        cmp_i64_f64(*b, *a).map_or(false, |o| o.is_lt())
+                    }
                     _ => false,
                 },
                 BinOpKind::Ge => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => a >= b,
                     (Value::Float64(a), Value::Float64(b)) => a >= b,
-                    (Value::Int64(a), Value::Float64(b)) => (*a as f64) >= *b,
-                    (Value::Float64(a), Value::Int64(b)) => *a >= (*b as f64),
+                    (Value::Int64(a), Value::Float64(b)) => {
+                        cmp_i64_f64(*a, *b).map_or(false, |o| o.is_ge())
+                    }
+                    (Value::Float64(a), Value::Int64(b)) => {
+                        cmp_i64_f64(*b, *a).map_or(false, |o| o.is_le())
+                    }
                     _ => false,
                 },
                 _ => false,
@@ -1740,29 +1767,45 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
                 BinOpKind::Lt => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => Value::Bool(a < b),
                     (Value::Float64(a), Value::Float64(b)) => Value::Bool(a < b),
-                    (Value::Int64(a), Value::Float64(b)) => Value::Bool((*a as f64) < *b),
-                    (Value::Float64(a), Value::Int64(b)) => Value::Bool(*a < (*b as f64)),
+                    (Value::Int64(a), Value::Float64(b)) => {
+                        cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_lt()))
+                    }
+                    (Value::Float64(a), Value::Int64(b)) => {
+                        cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_gt()))
+                    }
                     _ => Value::Null,
                 },
                 BinOpKind::Le => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => Value::Bool(a <= b),
                     (Value::Float64(a), Value::Float64(b)) => Value::Bool(a <= b),
-                    (Value::Int64(a), Value::Float64(b)) => Value::Bool((*a as f64) <= *b),
-                    (Value::Float64(a), Value::Int64(b)) => Value::Bool(*a <= (*b as f64)),
+                    (Value::Int64(a), Value::Float64(b)) => {
+                        cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_le()))
+                    }
+                    (Value::Float64(a), Value::Int64(b)) => {
+                        cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_ge()))
+                    }
                     _ => Value::Null,
                 },
                 BinOpKind::Gt => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => Value::Bool(a > b),
                     (Value::Float64(a), Value::Float64(b)) => Value::Bool(a > b),
-                    (Value::Int64(a), Value::Float64(b)) => Value::Bool((*a as f64) > *b),
-                    (Value::Float64(a), Value::Int64(b)) => Value::Bool(*a > (*b as f64)),
+                    (Value::Int64(a), Value::Float64(b)) => {
+                        cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_gt()))
+                    }
+                    (Value::Float64(a), Value::Int64(b)) => {
+                        cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_lt()))
+                    }
                     _ => Value::Null,
                 },
                 BinOpKind::Ge => match (&lv, &rv) {
                     (Value::Int64(a), Value::Int64(b)) => Value::Bool(a >= b),
                     (Value::Float64(a), Value::Float64(b)) => Value::Bool(a >= b),
-                    (Value::Int64(a), Value::Float64(b)) => Value::Bool((*a as f64) >= *b),
-                    (Value::Float64(a), Value::Int64(b)) => Value::Bool(*a >= (*b as f64)),
+                    (Value::Int64(a), Value::Float64(b)) => {
+                        cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_ge()))
+                    }
+                    (Value::Float64(a), Value::Int64(b)) => {
+                        cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_le()))
+                    }
                     _ => Value::Null,
                 },
                 BinOpKind::Contains => match (&lv, &rv) {
