@@ -179,3 +179,81 @@ fn delete_edge_unknown_rel_type_errors() {
 
     drop(dir);
 }
+
+// ── Cypher MATCH...DELETE r ───────────────────────────────────────────────────
+
+/// `MATCH (a:P)-[r:KNOWS]->(b:P) DELETE r` removes the edge.
+#[test]
+fn cypher_match_delete_rel_removes_edge() {
+    let (_dir, db) = make_db();
+
+    db.execute("CREATE (a:Person {name:\"Alice\"})-[:KNOWS]->(b:Person {name:\"Bob\"})")
+        .expect("create");
+
+    assert_eq!(
+        count_matches(&db, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b"),
+        1,
+        "edge should exist before Cypher DELETE"
+    );
+
+    db.execute("MATCH (a:Person)-[r:KNOWS]->(b:Person) DELETE r")
+        .expect("delete");
+
+    assert_eq!(
+        count_matches(&db, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b"),
+        0,
+        "edge must be gone after Cypher DELETE r"
+    );
+}
+
+/// `MATCH (a)-[r:REL]->(b) DELETE r` with inline prop filter on src node.
+#[test]
+fn cypher_match_delete_rel_with_src_prop_filter() {
+    let (_dir, db) = make_db();
+
+    db.execute("CREATE (a:Item {id:1})-[:LINKED]->(b:Item {id:2})")
+        .expect("create 1->2");
+    db.execute("CREATE (a:Item {id:3})-[:LINKED]->(b:Item {id:4})")
+        .expect("create 3->4");
+
+    assert_eq!(
+        count_matches(&db, "MATCH (:Item)-[:LINKED]->(:Item) RETURN 1"),
+        2,
+        "two edges before delete"
+    );
+
+    // Only delete the edge starting from Item {id:1}.
+    db.execute("MATCH (a:Item {id:1})-[r:LINKED]->(b:Item) DELETE r")
+        .expect("delete with src filter");
+
+    assert_eq!(
+        count_matches(&db, "MATCH (:Item)-[:LINKED]->(:Item) RETURN 1"),
+        1,
+        "only one edge should remain after targeted delete"
+    );
+}
+
+/// Cypher edge delete survives CHECKPOINT.
+#[test]
+fn cypher_match_delete_rel_after_checkpoint() {
+    let (_dir, db) = make_db();
+
+    db.execute("CREATE (a:N {x:1})-[:E]->(b:N {x:2})")
+        .expect("create");
+    db.checkpoint().expect("checkpoint");
+
+    assert_eq!(
+        count_matches(&db, "MATCH (:N)-[:E]->(:N) RETURN 1"),
+        1,
+        "edge visible after checkpoint"
+    );
+
+    db.execute("MATCH (a:N)-[r:E]->(b:N) DELETE r")
+        .expect("delete after checkpoint");
+
+    assert_eq!(
+        count_matches(&db, "MATCH (:N)-[:E]->(:N) RETURN 1"),
+        0,
+        "edge gone after Cypher DELETE r post-checkpoint"
+    );
+}

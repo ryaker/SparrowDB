@@ -1273,6 +1273,20 @@ impl GraphDb {
             csrs,
             &self.inner.path,
         );
+
+        // SPA-219: `MATCH (a)-[r:REL]->(b) DELETE r` — edge delete path.
+        if is_edge_delete_mutation(mm) {
+            let edges = engine.scan_match_mutate_edges(mm)?;
+            for (src, dst, rel_type) in edges {
+                tx.delete_edge(src, dst, &rel_type)?;
+            }
+            tx.commit()?;
+            self.invalidate_csr_map();
+            self.invalidate_prop_index();
+            self.invalidate_catalog();
+            return Ok(QueryResult::empty(vec![]));
+        }
+
         let matching_ids = engine.scan_match_mutate(mm)?;
         if matching_ids.is_empty() {
             return Ok(QueryResult::empty(vec![]));
@@ -1320,6 +1334,19 @@ impl GraphDb {
             csrs,
             &self.inner.path,
         );
+
+        // SPA-219: `MATCH (a)-[r:REL]->(b) DELETE r` — edge delete path.
+        if is_edge_delete_mutation(mm) {
+            let edges = engine.scan_match_mutate_edges(mm)?;
+            for (src, dst, rel_type) in edges {
+                tx.delete_edge(src, dst, &rel_type)?;
+            }
+            tx.commit()?;
+            self.invalidate_csr_map();
+            self.invalidate_prop_index();
+            self.invalidate_catalog();
+            return Ok(QueryResult::empty(vec![]));
+        }
 
         // Collect matching node ids via the engine's scan (lock already held).
         let matching_ids = engine.scan_match_mutate(mm)?;
@@ -1878,15 +1905,23 @@ impl GraphDb {
                     csrs,
                     &self.inner.path,
                 );
-                let matching_ids = engine.scan_match_mutate(mm)?;
-                for node_id in matching_ids {
-                    match &mm.mutation {
-                        sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
-                            let sv = expr_to_value(value);
-                            tx.set_property(node_id, prop, sv)?;
-                        }
-                        sparrowdb_cypher::ast::Mutation::Delete { .. } => {
-                            tx.delete_node(node_id)?;
+                // SPA-219: edge delete path.
+                if is_edge_delete_mutation(mm) {
+                    let edges = engine.scan_match_mutate_edges(mm)?;
+                    for (src, dst, rel_type) in edges {
+                        tx.delete_edge(src, dst, &rel_type)?;
+                    }
+                } else {
+                    let matching_ids = engine.scan_match_mutate(mm)?;
+                    for node_id in matching_ids {
+                        match &mm.mutation {
+                            sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
+                                let sv = expr_to_value(value);
+                                tx.set_property(node_id, prop, sv)?;
+                            }
+                            sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                                tx.delete_node(node_id)?;
+                            }
                         }
                     }
                 }
@@ -2283,6 +2318,7 @@ impl GraphDb {
         let mut tx = self.begin_write()?;
         tx.delete_edge(src, dst, rel_type)?;
         tx.commit()?;
+        self.invalidate_csr_map();
         Ok(())
     }
 }
@@ -3472,6 +3508,20 @@ fn literal_to_value(lit: &sparrowdb_cypher::ast::Literal) -> Value {
 
 /// Convert a Cypher [`Expr`] to a storage [`Value`].
 ///
+/// Returns `true` when the `DELETE` clause variable in a `MatchMutateStatement`
+/// refers to a relationship pattern variable rather than a node variable.
+///
+/// Used to route `MATCH (a)-[r:REL]->(b) DELETE r` to the edge-delete path
+/// instead of the node-delete path.
+fn is_edge_delete_mutation(mm: &sparrowdb_cypher::ast::MatchMutateStatement) -> bool {
+    let sparrowdb_cypher::ast::Mutation::Delete { var } = &mm.mutation else {
+        return false;
+    };
+    mm.match_patterns
+        .iter()
+        .any(|p| p.rels.iter().any(|r| !r.var.is_empty() && &r.var == var))
+}
+
 /// Only literal expressions are supported for SET values at this stage.
 fn expr_to_value(expr: &sparrowdb_cypher::ast::Expr) -> Value {
     use sparrowdb_cypher::ast::Expr;
