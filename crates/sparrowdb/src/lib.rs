@@ -2784,8 +2784,7 @@ impl WriteTx {
                         .map(|(_, v)| v == match_value)
                         .unwrap_or(false);
                     if matches {
-                        let node_id =
-                            NodeId((label_id as u64) << 32 | *op_slot as u64);
+                        let node_id = NodeId((label_id as u64) << 32 | *op_slot as u64);
                         // Update remaining properties on the existing node.
                         for (k, v) in &properties {
                             self.set_property(node_id, k, v.clone())?;
