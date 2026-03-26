@@ -27,6 +27,7 @@ tracing             = { workspace = true }
 tempfile   = { workspace = true }
 serde_json = { workspace = true }
 criterion  = { workspace = true }
+crc32fast  = { workspace = true }
 
 [[bin]]
 name = "sparrowdb-mcp"
