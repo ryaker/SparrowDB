@@ -78,6 +78,154 @@ impl Engine {
         &mm.mutation
     }
 
+    /// Scan edges matching a MATCH pattern with exactly one hop and return
+    /// `(src, dst, rel_type)` tuples for edge deletion.
+    ///
+    /// Supports `MATCH (a:Label)-[r:REL]->(b:Label) DELETE r` with optional
+    /// inline property filters on source and destination node patterns.
+    ///
+    /// Includes both checkpointed (CSR) and uncheckpointed (delta) edges.
+    pub fn scan_match_mutate_edges(
+        &self,
+        mm: &MatchMutateStatement,
+    ) -> Result<Vec<(NodeId, NodeId, String)>> {
+        if mm.match_patterns.len() != 1 {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "MATCH...DELETE edge: only single-path patterns are supported".into(),
+            ));
+        }
+        let pat = &mm.match_patterns[0];
+        if pat.rels.len() != 1 || pat.nodes.len() != 2 {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "MATCH...DELETE edge: pattern must have exactly one relationship hop".into(),
+            ));
+        }
+
+        let src_node_pat = &pat.nodes[0];
+        let dst_node_pat = &pat.nodes[1];
+        let rel_pat = &pat.rels[0];
+
+        let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
+        let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
+
+        // Resolve optional label-id constraints.
+        let src_label_id_opt: Option<u32> = if src_label.is_empty() {
+            None
+        } else {
+            match self.snapshot.catalog.get_label(&src_label)? {
+                Some(id) => Some(id as u32),
+                None => return Ok(vec![]), // unknown label → no matches
+            }
+        };
+        let dst_label_id_opt: Option<u32> = if dst_label.is_empty() {
+            None
+        } else {
+            match self.snapshot.catalog.get_label(&dst_label)? {
+                Some(id) => Some(id as u32),
+                None => return Ok(vec![]), // unknown label → no matches
+            }
+        };
+
+        // Filter registered rel tables by rel type and src/dst label.
+        let rel_tables: Vec<(u64, u32, u32, String)> = self
+            .snapshot
+            .catalog
+            .list_rel_tables_with_ids()
+            .into_iter()
+            .filter(|(_, sid, did, rt)| {
+                let type_ok = rel_pat.rel_type.is_empty() || rt == &rel_pat.rel_type;
+                let src_ok = src_label_id_opt.map(|id| id == *sid as u32).unwrap_or(true);
+                let dst_ok = dst_label_id_opt.map(|id| id == *did as u32).unwrap_or(true);
+                type_ok && src_ok && dst_ok
+            })
+            .map(|(cid, sid, did, rt)| (cid, sid as u32, did as u32, rt))
+            .collect();
+
+        // Pre-compute col_ids for inline prop filters (avoid re-computing per slot).
+        let src_filter_col_ids: Vec<u32> = src_node_pat
+            .props
+            .iter()
+            .map(|p| prop_name_to_col_id(&p.key))
+            .collect();
+        let dst_filter_col_ids: Vec<u32> = dst_node_pat
+            .props
+            .iter()
+            .map(|p| prop_name_to_col_id(&p.key))
+            .collect();
+
+        let mut result: Vec<(NodeId, NodeId, String)> = Vec::new();
+
+        for (catalog_rel_id, effective_src_lid, effective_dst_lid, rel_type) in &rel_tables {
+            let catalog_rel_id_u32 =
+                u32::try_from(*catalog_rel_id).expect("catalog_rel_id overflowed u32");
+
+            // ── Checkpointed edges (CSR) ──────────────────────────────────────
+            let hwm_src = match self.snapshot.store.hwm_for_label(*effective_src_lid) {
+                Ok(hwm) => hwm,
+                Err(_) => continue,
+            };
+            for src_slot in 0..hwm_src {
+                let src_node = NodeId(((*effective_src_lid as u64) << 32) | src_slot);
+                if self.is_node_tombstoned(src_node) {
+                    continue;
+                }
+                if !self.node_matches_prop_filter(
+                    src_node,
+                    &src_filter_col_ids,
+                    &src_node_pat.props,
+                ) {
+                    continue;
+                }
+                for dst_slot in self.csr_neighbors(catalog_rel_id_u32, src_slot) {
+                    let dst_node = NodeId(((*effective_dst_lid as u64) << 32) | dst_slot);
+                    if self.is_node_tombstoned(dst_node) {
+                        continue;
+                    }
+                    if !self.node_matches_prop_filter(
+                        dst_node,
+                        &dst_filter_col_ids,
+                        &dst_node_pat.props,
+                    ) {
+                        continue;
+                    }
+                    result.push((src_node, dst_node, rel_type.clone()));
+                }
+            }
+
+            // ── Uncheckpointed edges (delta log) ──────────────────────────────
+            for rec in self.read_delta_for(catalog_rel_id_u32) {
+                let r_src_label = (rec.src.0 >> 32) as u32;
+                let r_dst_label = (rec.dst.0 >> 32) as u32;
+                if src_label_id_opt
+                    .map(|id| id != r_src_label)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if dst_label_id_opt
+                    .map(|id| id != r_dst_label)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if self.is_node_tombstoned(rec.src) || self.is_node_tombstoned(rec.dst) {
+                    continue;
+                }
+                if !self.node_matches_prop_filter(rec.src, &src_filter_col_ids, &src_node_pat.props)
+                {
+                    continue;
+                }
+                if !self.node_matches_prop_filter(rec.dst, &dst_filter_col_ids, &dst_node_pat.props)
+                {
+                    continue;
+                }
+                result.push((rec.src, rec.dst, rel_type.clone()));
+            }
+        }
+
+        Ok(result)
+    }
+
     // ── Node-scan helpers (shared by scan_match_create and scan_match_create_rows) ──
 
     /// Returns `true` if the given node has been tombstoned (col 0 == u64::MAX).

@@ -337,48 +337,74 @@ impl EdgeStore {
 
     /// Remove the first delta-log record matching `(src, dst)` from this store.
     ///
-    /// The delta log is rewritten in-place with the matching record excised.
-    /// Returns [`Error::InvalidArgument`] if no such record exists.
+    /// Remove the directed edge `src → dst` from this rel table.
     ///
-    /// This is an O(n) operation proportional to the current delta log size.
-    /// For bulk deletions, prefer a CHECKPOINT after all deletions are staged.
+    /// Searches the delta log first; if not found there, falls back to the
+    /// checkpointed CSR.  For delta edges the log is rewritten in-place with
+    /// the record excised.  For CSR edges the forward and backward CSR files
+    /// are atomically rewritten without the matching (src_slot, dst_slot) pair.
+    ///
+    /// Returns [`Error::InvalidArgument`] if the edge is found in neither.
     pub fn delete_edge(&mut self, src: NodeId, dst: NodeId) -> Result<()> {
+        let src_slot = src.0 & 0xFFFF_FFFF;
+        let dst_slot = dst.0 & 0xFFFF_FFFF;
+
         let mut records = self.read_delta()?;
 
-        // Find the first record that matches (src, dst); rel_id is implicit from
-        // the store's own rel_table_id.
-        let pos = records
-            .iter()
-            .position(|r| r.src == src && r.dst == dst)
-            .ok_or_else(|| {
-                Error::InvalidArgument(format!(
+        // ── Delta path ────────────────────────────────────────────────────────
+        if let Some(pos) = records.iter().position(|r| r.src == src && r.dst == dst) {
+            records.remove(pos);
+
+            // Rewrite the delta log without the removed record.
+            let tmp_path = self.rel_dir.join("delta.log.tmp");
+            {
+                use std::io::Write as IoWrite;
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp_path)
+                    .map_err(Error::Io)?;
+                for r in &records {
+                    f.write_all(&r.encode()).map_err(Error::Io)?;
+                }
+                f.flush().map_err(Error::Io)?;
+            }
+            fs::rename(&tmp_path, self.delta_path()).map_err(Error::Io)?;
+            self.next_edge_id = records.len() as u64;
+            return Ok(());
+        }
+
+        // ── CSR (checkpointed) path ───────────────────────────────────────────
+        let fwd = match CsrForward::open(&self.fwd_path()) {
+            Ok(f) => f,
+            Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(Error::InvalidArgument(format!(
                     "edge {src:?} → {dst:?} not found in rel_table {:?}",
                     self.rel_table_id
-                ))
-            })?;
-
-        records.remove(pos);
-
-        // Rewrite the entire delta log without the removed record.
-        // Write to a temp file then rename for crash-safety.
-        let tmp_path = self.rel_dir.join("delta.log.tmp");
-        {
-            use std::io::Write as IoWrite;
-            let mut f = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp_path)
-                .map_err(Error::Io)?;
-            for r in &records {
-                f.write_all(&r.encode()).map_err(Error::Io)?;
+                )));
             }
-            f.flush().map_err(Error::Io)?;
-        }
-        fs::rename(&tmp_path, self.delta_path()).map_err(Error::Io)?;
+            Err(e) => return Err(e),
+        };
 
-        // Update the in-memory counter to reflect the new record count.
-        self.next_edge_id = records.len() as u64;
+        if !fwd.neighbors(src_slot).contains(&dst_slot) {
+            return Err(Error::InvalidArgument(format!(
+                "edge {src:?} → {dst:?} not found in rel_table {:?}",
+                self.rel_table_id
+            )));
+        }
+
+        // Rebuild edge list without the target (src_slot, dst_slot).
+        let n_nodes = fwd.n_nodes();
+        let mut edges: Vec<(u64, u64)> = Vec::new();
+        for s in 0..n_nodes {
+            for &d in fwd.neighbors(s) {
+                if !(s == src_slot && d == dst_slot) {
+                    edges.push((s, d));
+                }
+            }
+        }
+        self.write_csr_atomic(&edges, n_nodes)?;
         Ok(())
     }
 
