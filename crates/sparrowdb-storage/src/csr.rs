@@ -14,23 +14,164 @@
 //!
 //! - Forward edges: `base.fwd.csr`   — `offsets[src]` → neighbor = dst
 //! - Backward edges: `base.bwd.csr`  — `offsets[dst]` → neighbor = src
+//!
+//! ## Lazy loading (SPA-222)
+//!
+//! `open()` memory-maps the file instead of reading it into heap-allocated
+//! vectors.  The OS pages data in on first access and evicts cold pages under
+//! memory pressure.  `Clone` on a mapped CSR is an `Arc` bump — no data copy.
 
-use std::fs;
+use std::fs::{self, File};
 use std::path::Path;
+use std::sync::Arc;
 
+use memmap2::Mmap;
 use sparrowdb_common::{Error, Result};
+
+// ── Shared backing store ────────────────────────────────────────────────────
+
+/// Backing data for CSR arrays — either heap-owned or memory-mapped.
+enum CsrData {
+    Owned {
+        offsets: Vec<u64>,
+        neighbors: Vec<u64>,
+    },
+    Mapped {
+        mmap: Arc<Mmap>,
+        /// Byte offset where the offsets array starts (always 8).
+        offsets_byte_start: usize,
+        /// Number of u64 entries in the offsets array (n_nodes + 1).
+        offsets_count: usize,
+        /// Byte offset where the neighbors array starts.
+        neighbors_byte_start: usize,
+        /// Number of u64 entries in the neighbors array.
+        neighbors_count: usize,
+    },
+}
+
+impl Clone for CsrData {
+    fn clone(&self) -> Self {
+        match self {
+            CsrData::Owned { offsets, neighbors } => CsrData::Owned {
+                offsets: offsets.clone(),
+                neighbors: neighbors.clone(),
+            },
+            CsrData::Mapped {
+                mmap,
+                offsets_byte_start,
+                offsets_count,
+                neighbors_byte_start,
+                neighbors_count,
+            } => CsrData::Mapped {
+                mmap: Arc::clone(mmap),
+                offsets_byte_start: *offsets_byte_start,
+                offsets_count: *offsets_count,
+                neighbors_byte_start: *neighbors_byte_start,
+                neighbors_count: *neighbors_count,
+            },
+        }
+    }
+}
+
+impl CsrData {
+    /// Interpret mmap bytes as a `&[u64]` slice (little-endian, naturally aligned).
+    ///
+    /// # Safety
+    /// The CSR binary layout stores u64 values at 8-byte aligned offsets
+    /// starting from the beginning of the file, so alignment is guaranteed.
+    #[inline]
+    fn slice_from_mmap(mmap: &Mmap, byte_start: usize, count: usize) -> &[u64] {
+        if count == 0 {
+            return &[];
+        }
+        let ptr = mmap[byte_start..].as_ptr();
+        debug_assert!(ptr as usize % std::mem::align_of::<u64>() == 0);
+        unsafe { std::slice::from_raw_parts(ptr as *const u64, count) }
+    }
+
+    fn offsets(&self) -> &[u64] {
+        match self {
+            CsrData::Owned { offsets, .. } => offsets,
+            CsrData::Mapped {
+                mmap,
+                offsets_byte_start,
+                offsets_count,
+                ..
+            } => Self::slice_from_mmap(mmap, *offsets_byte_start, *offsets_count),
+        }
+    }
+
+    fn neighbors(&self) -> &[u64] {
+        match self {
+            CsrData::Owned { neighbors, .. } => neighbors,
+            CsrData::Mapped {
+                mmap,
+                neighbors_byte_start,
+                neighbors_count,
+                ..
+            } => Self::slice_from_mmap(mmap, *neighbors_byte_start, *neighbors_count),
+        }
+    }
+
+    /// Create mapped data from a validated mmap.
+    fn from_mmap(mmap: Mmap) -> Result<(u64, Self)> {
+        let bytes = &mmap[..];
+        if bytes.len() < 8 {
+            return Err(Error::Corruption("CSR file too short for n_nodes".into()));
+        }
+        let n_nodes = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let offsets_count = n_nodes as usize + 1;
+        let offsets_byte_start = 8;
+        let offsets_byte_end = offsets_byte_start + offsets_count * 8;
+
+        if bytes.len() < offsets_byte_end {
+            return Err(Error::Corruption(format!(
+                "CSR file too short for offsets: need {} bytes, have {}",
+                offsets_byte_end,
+                bytes.len()
+            )));
+        }
+
+        // Read n_edges from the sentinel offset[n_nodes].
+        let sentinel_start = offsets_byte_start + n_nodes as usize * 8;
+        let n_edges =
+            u64::from_le_bytes(bytes[sentinel_start..sentinel_start + 8].try_into().unwrap())
+                as usize;
+
+        let neighbors_byte_start = offsets_byte_end;
+        let neighbors_byte_end = neighbors_byte_start + n_edges * 8;
+
+        if bytes.len() < neighbors_byte_end {
+            return Err(Error::Corruption(format!(
+                "CSR file too short for neighbors: need {} bytes, have {}",
+                neighbors_byte_end,
+                bytes.len()
+            )));
+        }
+
+        Ok((
+            n_nodes,
+            CsrData::Mapped {
+                mmap: Arc::new(mmap),
+                offsets_byte_start,
+                offsets_count,
+                neighbors_byte_start,
+                neighbors_count: n_edges,
+            },
+        ))
+    }
+}
 
 // ── CSR Forward ───────────────────────────────────────────────────────────────
 
 /// CSR forward-edge file: for each source node, the set of destination nodes.
 ///
-/// Memory-maps (or copies) the entire file into a flat byte buffer, then provides
-/// zero-copy slice access to neighbor lists.
+/// When opened from disk, the file is memory-mapped for lazy, OS-managed
+/// paging.  `Clone` on a mapped CSR is an `Arc` reference-count bump.
 #[derive(Clone)]
 pub struct CsrForward {
     n_nodes: u64,
-    offsets: Vec<u64>,   // length = n_nodes + 1
-    neighbors: Vec<u64>, // length = n_edges
+    data: CsrData,
 }
 
 impl CsrForward {
@@ -62,29 +203,29 @@ impl CsrForward {
 
         CsrForward {
             n_nodes,
-            offsets,
-            neighbors,
+            data: CsrData::Owned { offsets, neighbors },
         }
     }
 
-    /// Open an existing CSR forward file from disk.
+    /// Open an existing CSR forward file from disk via memory-map (SPA-222).
     pub fn open(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path).map_err(Error::Io)?;
-        Self::decode(&bytes)
+        let file = File::open(path).map_err(Error::Io)?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(Error::Io)?;
+        let (n_nodes, data) = CsrData::from_mmap(mmap)?;
+        Ok(CsrForward { n_nodes, data })
     }
 
     /// Encode this CSR to its binary representation.
     pub fn encode(&self) -> Vec<u8> {
-        encode_csr(self.n_nodes, &self.offsets, &self.neighbors)
+        encode_csr(self.n_nodes, self.data.offsets(), self.data.neighbors())
     }
 
-    /// Decode a CSR from its binary representation.
+    /// Decode a CSR from its binary representation (heap-allocated).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let (n_nodes, offsets, neighbors) = decode_csr(bytes)?;
         Ok(CsrForward {
             n_nodes,
-            offsets,
-            neighbors,
+            data: CsrData::Owned { offsets, neighbors },
         })
     }
 
@@ -101,9 +242,10 @@ impl CsrForward {
         if node_id >= self.n_nodes {
             return &[];
         }
-        let start = self.offsets[node_id as usize] as usize;
-        let end = self.offsets[node_id as usize + 1] as usize;
-        &self.neighbors[start..end]
+        let offsets = self.data.offsets();
+        let start = offsets[node_id as usize] as usize;
+        let end = offsets[node_id as usize + 1] as usize;
+        &self.data.neighbors()[start..end]
     }
 
     pub fn n_nodes(&self) -> u64 {
@@ -111,7 +253,7 @@ impl CsrForward {
     }
 
     pub fn n_edges(&self) -> u64 {
-        self.neighbors.len() as u64
+        self.data.neighbors().len() as u64
     }
 }
 
@@ -120,8 +262,7 @@ impl CsrForward {
 /// CSR backward-edge file: for each destination node, the set of source nodes.
 pub struct CsrBackward {
     n_nodes: u64,
-    offsets: Vec<u64>,
-    neighbors: Vec<u64>,
+    data: CsrData,
 }
 
 impl CsrBackward {
@@ -134,29 +275,29 @@ impl CsrBackward {
         let fwd = CsrForward::build(n_nodes, &reversed);
         CsrBackward {
             n_nodes: fwd.n_nodes,
-            offsets: fwd.offsets,
-            neighbors: fwd.neighbors,
+            data: fwd.data,
         }
     }
 
-    /// Open an existing CSR backward file from disk.
+    /// Open an existing CSR backward file from disk via memory-map (SPA-222).
     pub fn open(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path).map_err(Error::Io)?;
-        Self::decode(&bytes)
+        let file = File::open(path).map_err(Error::Io)?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(Error::Io)?;
+        let (n_nodes, data) = CsrData::from_mmap(mmap)?;
+        Ok(CsrBackward { n_nodes, data })
     }
 
     /// Encode this CSR to its binary representation.
     pub fn encode(&self) -> Vec<u8> {
-        encode_csr(self.n_nodes, &self.offsets, &self.neighbors)
+        encode_csr(self.n_nodes, self.data.offsets(), self.data.neighbors())
     }
 
-    /// Decode a CSR from its binary representation.
+    /// Decode a CSR from its binary representation (heap-allocated).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let (n_nodes, offsets, neighbors) = decode_csr(bytes)?;
         Ok(CsrBackward {
             n_nodes,
-            offsets,
-            neighbors,
+            data: CsrData::Owned { offsets, neighbors },
         })
     }
 
@@ -173,9 +314,10 @@ impl CsrBackward {
         if node_id >= self.n_nodes {
             return &[];
         }
-        let start = self.offsets[node_id as usize] as usize;
-        let end = self.offsets[node_id as usize + 1] as usize;
-        &self.neighbors[start..end]
+        let offsets = self.data.offsets();
+        let start = offsets[node_id as usize] as usize;
+        let end = offsets[node_id as usize + 1] as usize;
+        &self.data.neighbors()[start..end]
     }
 
     pub fn n_nodes(&self) -> u64 {
@@ -183,7 +325,7 @@ impl CsrBackward {
     }
 
     pub fn n_edges(&self) -> u64 {
-        self.neighbors.len() as u64
+        self.data.neighbors().len() as u64
     }
 }
 
@@ -480,5 +622,69 @@ mod tests {
         // Round-trip: re-encode must be byte-exact.
         let rebuilt = CsrBackward::build(5, TEST_EDGES).encode();
         assert_eq!(bytes, rebuilt, "golden fixture byte mismatch on re-encode");
+    }
+
+    // ── Mmap-specific tests (SPA-222) ───────────────────────────────────────
+
+    #[test]
+    fn test_mmap_open_returns_correct_neighbors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.fwd.csr");
+
+        let built = CsrForward::build(N_NODES, TEST_EDGES);
+        built.write(&path).unwrap();
+
+        // open() now uses mmap instead of fs::read
+        let mapped = CsrForward::open(&path).unwrap();
+        assert_eq!(mapped.n_nodes(), N_NODES);
+        assert_eq!(mapped.n_edges(), TEST_EDGES.len() as u64);
+        for node in 0..N_NODES {
+            assert_eq!(built.neighbors(node), mapped.neighbors(node));
+        }
+    }
+
+    #[test]
+    fn test_mmap_clone_is_cheap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.fwd.csr");
+
+        CsrForward::build(N_NODES, TEST_EDGES)
+            .write(&path)
+            .unwrap();
+        let mapped = CsrForward::open(&path).unwrap();
+
+        // Clone should work and produce identical results.
+        let cloned = mapped.clone();
+        assert_eq!(mapped.neighbors(0), cloned.neighbors(0));
+        assert_eq!(mapped.neighbors(4), cloned.neighbors(4));
+        assert_eq!(mapped.n_edges(), cloned.n_edges());
+    }
+
+    #[test]
+    fn test_mmap_large_graph() {
+        // 50K nodes with edges to verify mmap works at scale.
+        let n: u64 = 50_000;
+        let edges: Vec<(u64, u64)> = (0..n)
+            .flat_map(|i| {
+                let next = (i + 1) % n;
+                let skip = (i + 7) % n;
+                vec![(i, next), (i, skip)]
+            })
+            .collect();
+
+        let dir = tempdir().unwrap();
+        let fwd_path = dir.path().join("large.fwd.csr");
+
+        let built = CsrForward::build(n, &edges);
+        built.write(&fwd_path).unwrap();
+
+        let mapped = CsrForward::open(&fwd_path).unwrap();
+        assert_eq!(mapped.n_nodes(), n);
+        assert_eq!(mapped.n_edges(), edges.len() as u64);
+
+        // Spot-check some neighbors.
+        assert_eq!(mapped.neighbors(0), built.neighbors(0));
+        assert_eq!(mapped.neighbors(25_000), built.neighbors(25_000));
+        assert_eq!(mapped.neighbors(49_999), built.neighbors(49_999));
     }
 }
