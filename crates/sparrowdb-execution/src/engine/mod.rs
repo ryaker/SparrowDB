@@ -174,6 +174,9 @@ pub struct ReadSnapshot {
     /// `OnceLock` is used instead of `OnceCell` so that `ReadSnapshot` remains
     /// `Sync` and can safely be shared across parallel BFS threads.
     rel_degree_stats: std::sync::OnceLock<HashMap<u32, DegreeStats>>,
+    /// Shared edge-property cache (SPA-261).
+    edge_props_cache:
+        std::sync::Arc<std::sync::RwLock<HashMap<u32, HashMap<(u64, u64), Vec<(u32, u64)>>>>>,
 }
 
 impl ReadSnapshot {
@@ -213,6 +216,38 @@ impl ReadSnapshot {
                 })
                 .collect()
         })
+    }
+
+    /// Return the cached edge-props map for `rel_table_id` (SPA-261).
+    pub fn edge_props_for_rel(&self, rel_table_id: u32) -> HashMap<(u64, u64), Vec<(u32, u64)>> {
+        {
+            let cache = self
+                .edge_props_cache
+                .read()
+                .expect("edge_props_cache poisoned");
+            if let Some(cached) = cache.get(&rel_table_id) {
+                return cached.clone();
+            }
+        }
+        let raw: Vec<(u64, u64, u32, u64)> =
+            EdgeStore::open(&self.db_root, RelTableId(rel_table_id))
+                .and_then(|s| s.read_all_edge_props())
+                .unwrap_or_default();
+        let mut grouped: HashMap<(u64, u64), Vec<(u32, u64)>> = HashMap::new();
+        for (src_s, dst_s, col_id, value) in raw {
+            let entry = grouped.entry((src_s, dst_s)).or_default();
+            if let Some(existing) = entry.iter_mut().find(|(c, _)| *c == col_id) {
+                existing.1 = value;
+            } else {
+                entry.push((col_id, value));
+            }
+        }
+        let mut cache = self
+            .edge_props_cache
+            .write()
+            .expect("edge_props_cache poisoned");
+        cache.insert(rel_table_id, grouped.clone());
+        grouped
     }
 }
 
@@ -298,7 +333,7 @@ impl Engine {
         db_root: &Path,
         cached_index: Option<&std::sync::RwLock<PropertyIndex>>,
     ) -> Self {
-        Self::new_with_all_caches(store, catalog, csrs, db_root, cached_index, None)
+        Self::new_with_all_caches(store, catalog, csrs, db_root, cached_index, None, None)
     }
 
     /// Like [`Engine::new_with_cached_index`] but also accepts a pre-built
@@ -310,6 +345,9 @@ impl Engine {
         db_root: &Path,
         cached_index: Option<&std::sync::RwLock<PropertyIndex>>,
         cached_row_counts: Option<HashMap<LabelId, usize>>,
+        shared_edge_props_cache: Option<
+            std::sync::Arc<std::sync::RwLock<HashMap<u32, HashMap<(u64, u64), Vec<(u32, u64)>>>>>,
+        >,
     ) -> Self {
         // SPA-249 (lazy fix): property index is built on demand per
         // (label_id, col_id) pair via PropertyIndex::build_for, called from
@@ -358,6 +396,8 @@ impl Engine {
             db_root: db_root.to_path_buf(),
             label_row_counts,
             rel_degree_stats: std::sync::OnceLock::new(),
+            edge_props_cache: shared_edge_props_cache
+                .unwrap_or_else(|| std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()))),
         };
 
         // If a shared cached index was provided, clone it out so we start
