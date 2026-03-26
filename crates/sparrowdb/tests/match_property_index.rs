@@ -28,7 +28,7 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
 
 #[test]
 fn match_by_uid_returns_correct_node() {
-    let (_dir, mut db) = make_db();
+    let (_dir, db) = make_db();
 
     // Insert three User nodes with distinct uid values.
     db.execute("CREATE (:User {uid: 10, name: 'Alice'})")
@@ -68,7 +68,7 @@ fn match_by_uid_returns_correct_node() {
 
 #[test]
 fn match_create_edge_connects_correct_nodes() {
-    let (_dir, mut db) = make_db();
+    let (_dir, db) = make_db();
 
     db.execute("CREATE (:User {uid: 1})").unwrap();
     db.execute("CREATE (:User {uid: 2})").unwrap();
@@ -105,7 +105,7 @@ fn match_create_edge_connects_correct_nodes() {
 
 #[test]
 fn match_create_edge_oi_performance() {
-    let (_dir, mut db) = make_db();
+    let (_dir, db) = make_db();
 
     const N_NODES: i64 = 10_000;
     const N_EDGES: usize = 1_000;
