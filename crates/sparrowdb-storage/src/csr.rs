@@ -200,6 +200,7 @@ impl CsrForward {
         let file = File::open(path).map_err(Error::Io)?;
         // SAFETY: see doc comment above.
         let mmap = unsafe { Mmap::map(&file) }.map_err(Error::Io)?;
+        let _ = mmap.advise(memmap2::Advice::Sequential);
         let (n_nodes, data) = CsrData::from_mmap(mmap)?;
         Ok(CsrForward { n_nodes, data })
     }
@@ -279,6 +280,7 @@ impl CsrBackward {
         let file = File::open(path).map_err(Error::Io)?;
         // SAFETY: see doc comment above.
         let mmap = unsafe { Mmap::map(&file) }.map_err(Error::Io)?;
+        let _ = mmap.advise(memmap2::Advice::Sequential);
         let (n_nodes, data) = CsrData::from_mmap(mmap)?;
         Ok(CsrBackward { n_nodes, data })
     }
