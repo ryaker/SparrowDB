@@ -24,10 +24,11 @@ clap                = { workspace = true }
 tracing             = { workspace = true }
 
 [dev-dependencies]
-tempfile   = { workspace = true }
-serde_json = { workspace = true }
-criterion  = { workspace = true }
-crc32fast  = { workspace = true }
+tempfile        = { workspace = true }
+serde_json      = { workspace = true }
+criterion       = { workspace = true }
+crc32fast       = { workspace = true }
+sparrowdb-bench = { path = "../sparrowdb-bench" }
 
 [[bin]]
 name = "sparrowdb-mcp"
