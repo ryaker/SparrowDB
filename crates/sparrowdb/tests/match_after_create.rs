@@ -23,6 +23,7 @@
 //! boundary.
 
 use sparrowdb::open;
+use sparrowdb_storage::node_store::NodeStore;
 use sparrowdb_storage::property_index::PropertyIndex;
 
 fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
@@ -150,9 +151,20 @@ fn generation_prevents_stale_writeback() {
     let mut engine_index = shared.read().unwrap().clone();
     assert_eq!(engine_index.generation, 0, "fresh index must be gen=0");
 
-    // Simulate build_for adding a fake entry to the engine's index.
-    // label=1, col=42, slot=0, raw_value=1.
-    engine_index.insert(1, 42, 0, 0x0000_0000_0000_0001u64);
+    // Simulate build_for loading a column into the engine's index so that the
+    // key ends up in both `loaded` and `index`.  Using `insert` alone would not
+    // mark the key in `loaded`, making `merge_from` a no-op regardless of the
+    // generation guard and rendering the test unable to detect regressions.
+    let tmp_store = tempfile::tempdir().expect("tempdir for NodeStore");
+    let store = NodeStore::open(tmp_store.path()).expect("open NodeStore");
+    engine_index
+        .build_for(&store, 1, 42)
+        .expect("build_for on empty NodeStore must succeed");
+    // Confirm the key is now loaded (a stale write-back would pollute the cache).
+    assert!(
+        engine_index.is_indexed(1, 42),
+        "build_for must mark (1,42) as loaded"
+    );
 
     // Step 2: simulate a write commit — clear the shared cache (gen → 1).
     {

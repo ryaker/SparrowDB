@@ -415,9 +415,9 @@ impl Engine {
     /// runs will rebuild the index from the freshly committed column files.
     pub fn write_back_prop_index(&self, shared: &std::sync::RwLock<PropertyIndex>) {
         if let Ok(mut guard) = shared.write() {
-            let engine_gen = self.prop_index.borrow().generation;
-            if guard.generation == engine_gen {
-                guard.merge_from(&self.prop_index.borrow());
+            let engine_index = self.prop_index.borrow();
+            if guard.generation == engine_index.generation {
+                guard.merge_from(&engine_index);
             }
             // If generations differ a write committed since this engine was
             // created — its index is stale and must not pollute the shared cache.
