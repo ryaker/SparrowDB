@@ -127,6 +127,15 @@ pub struct IndexKey {
 /// `Arc::make_mut` to obtain exclusive access (copy-on-write semantics):
 /// only the first mutation of a shared Arc copies the BTreeMap; subsequent
 /// mutations on the same Engine's private copy are in-place.
+///
+/// ## Generation counter (SPA-242 fix)
+///
+/// A monotonically increasing `generation` counter tracks each invalidation
+/// of the shared property-index cache.  When a read `Engine` clones the
+/// shared cache it records the generation.  `write_back_prop_index` only
+/// merges data back when the shared cache's generation matches the clone
+/// generation, preventing a slow read from writing stale index data back
+/// after a write transaction has cleared the cache.
 #[derive(Default, Clone)]
 pub struct PropertyIndex {
     /// `index[(label_id, col_id)] = Arc<BTreeMap<raw_value, [slot, ...]>>`
@@ -140,6 +149,16 @@ pub struct PropertyIndex {
     /// loaded into `index`.  A pair is present here even when its column file
     /// contained no indexable values, so that `build_for` can skip repeated I/O.
     loaded: HashSet<IndexKey>,
+    /// Invalidation generation counter (SPA-242).
+    ///
+    /// Incremented by `clear()` each time the shared cache is invalidated by a
+    /// write-transaction commit.  Cloned with the rest of the struct so that
+    /// each per-Engine copy remembers the generation it was derived from.
+    /// `write_back_prop_index` compares the engine's `generation` against the
+    /// shared cache's current `generation` before merging: if they differ, a
+    /// write committed and cleared the cache since this engine was created, so
+    /// the engine's index data is stale and must not be written back.
+    pub generation: u64,
 }
 
 impl PropertyIndex {
@@ -152,9 +171,13 @@ impl PropertyIndex {
     ///
     /// Used by `GraphDb` to invalidate the shared property-index cache after
     /// a write transaction commits (the on-disk column files may have changed).
+    ///
+    /// Increments `generation` so that any `Engine` that cloned the cache
+    /// before this clear knows its data is stale (SPA-242).
     pub fn clear(&mut self) {
         self.index.clear();
         self.loaded.clear();
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Merge column data from `other` into `self` using union semantics.
