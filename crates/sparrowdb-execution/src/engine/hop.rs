@@ -1796,6 +1796,12 @@ impl Engine {
         // We read all delta edges once up front to avoid repeated file I/O.
         let delta_all = self.read_delta_all();
 
+        // Pre-resolve per-hop rel-table IDs so the inner loop uses filtered
+        // CSR lookups instead of scanning every relation type (SPA-284).
+        let rel_ids_per_hop: Vec<Vec<u32>> = (0..n_rels)
+            .map(|i| self.resolve_rel_ids_for_type(&pat.rels[i].rel_type))
+            .collect();
+
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
         for src_slot in 0..hwm_src {
@@ -1841,7 +1847,9 @@ impl Engine {
 
                 for (cur_slot, cur_vals) in frontier {
                     // Gather neighbors from CSR + delta for this hop.
-                    let csr_nb: Vec<u64> = self.csr_neighbors_all(cur_slot);
+                    // SPA-284: use filtered CSR lookup when rel type is specified.
+                    let csr_nb: Vec<u64> =
+                        self.csr_neighbors_filtered(cur_slot, &rel_ids_per_hop[hop_idx]);
                     let delta_nb: Vec<u64> = delta_all
                         .iter()
                         .filter(|r| {

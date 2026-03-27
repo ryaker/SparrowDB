@@ -635,6 +635,42 @@ impl Engine {
         out
     }
 
+    /// Return neighbor slots from the CSR, filtered to a specific set of
+    /// relation-type IDs.  When `rel_ids` is empty, falls back to scanning
+    /// all CSR tables (equivalent to [`csr_neighbors_all`]).
+    ///
+    /// This avoids the overhead of merging neighbors from irrelevant relation
+    /// types on heterogeneous graphs where only one or a few types are needed.
+    fn csr_neighbors_filtered(&self, src_slot: u64, rel_ids: &[u32]) -> Vec<u64> {
+        if rel_ids.is_empty() {
+            return self.csr_neighbors_all(src_slot);
+        }
+        let mut out: Vec<u64> = Vec::new();
+        for &rid in rel_ids {
+            if let Some(csr) = self.snapshot.csrs.get(&rid) {
+                out.extend_from_slice(csr.neighbors(src_slot));
+            }
+        }
+        out
+    }
+
+    /// Resolve all rel-table IDs whose type name matches `rel_type`.
+    ///
+    /// When `rel_type` is empty (no type constraint), returns an empty vec
+    /// which signals callers to scan all types.
+    fn resolve_rel_ids_for_type(&self, rel_type: &str) -> Vec<u32> {
+        if rel_type.is_empty() {
+            return vec![];
+        }
+        self.snapshot
+            .catalog
+            .list_rel_tables_with_ids()
+            .into_iter()
+            .filter(|(_, _, _, rt)| rt == rel_type)
+            .map(|(id, _, _, _)| id as u32)
+            .collect()
+    }
+
     /// Ensure the [`DegreeCache`] is populated, building it lazily on first call.
     ///
     /// Reads all delta-log records for every known rel type and scans every CSR
