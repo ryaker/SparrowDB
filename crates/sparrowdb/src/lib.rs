@@ -665,10 +665,9 @@ impl GraphDb {
         let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         let catalog = self.catalog_snapshot();
         let node_store = NodeStore::open(&self.inner.path)?;
-        let (rel_table_ids, n_nodes) =
-            collect_maintenance_params(&catalog, &node_store, &self.inner.path);
+        let rel_tables = collect_maintenance_params(&catalog, &node_store, &self.inner.path);
         let engine = MaintenanceEngine::new(&self.inner.path);
-        engine.checkpoint(&rel_table_ids, n_nodes)?;
+        engine.checkpoint(&rel_tables)?;
         self.invalidate_csr_map();
         self.invalidate_edge_props_cache();
         Ok(())
@@ -686,10 +685,9 @@ impl GraphDb {
         let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         let catalog = self.catalog_snapshot();
         let node_store = NodeStore::open(&self.inner.path)?;
-        let (rel_table_ids, n_nodes) =
-            collect_maintenance_params(&catalog, &node_store, &self.inner.path);
+        let rel_tables = collect_maintenance_params(&catalog, &node_store, &self.inner.path);
         let engine = MaintenanceEngine::new(&self.inner.path);
-        engine.optimize(&rel_table_ids, n_nodes)?;
+        engine.optimize(&rel_tables)?;
         self.invalidate_csr_map();
         self.invalidate_edge_props_cache();
         Ok(())
@@ -3809,59 +3807,75 @@ fn collect_maintenance_params(
     catalog: &Catalog,
     node_store: &NodeStore,
     db_root: &Path,
-) -> (Vec<u32>, u64) {
+) -> Vec<(u32, u64)> {
     // SPA-185: collect all registered rel table IDs from the catalog instead
     // of hardcoding [0].  This ensures every per-type edge store is checkpointed.
     // Always include table-0 so that any edges written before the catalog had
     // entries (legacy data or pre-SPA-185 databases) are also checkpointed.
     let rel_table_entries = catalog.list_rel_table_ids();
-    let mut rel_table_ids: Vec<u32> = rel_table_entries
+    // Build (rel_table_id, src_label_id, dst_label_id) triples.
+    let mut rel_triples: Vec<(u32, Option<u16>, Option<u16>)> = rel_table_entries
         .iter()
-        .map(|(id, _, _, _)| *id as u32)
+        .map(|(id, src, dst, _)| (*id as u32, Some(*src), Some(*dst)))
         .collect();
     // Always include the legacy table-0 slot.  Dedup if already present.
-    if !rel_table_ids.contains(&0u32) {
-        rel_table_ids.push(0u32);
+    if !rel_triples.iter().any(|(id, _, _)| *id == 0u32) {
+        rel_triples.push((0u32, None, None));
     }
 
-    // n_nodes must cover the highest node-store HWM AND the highest node ID
-    // present in any delta record, so that the CSR bounds check passes even
-    // when edges were inserted without going through the node-store API.
-    let hwm_n_nodes: u64 = catalog
+    // Fallback: max HWM across all known labels (for legacy table-0 or when
+    // label HWMs are not available from the catalog).
+    let global_max_hwm: u64 = catalog
         .list_labels()
         .unwrap_or_default()
         .iter()
         .map(|(label_id, _name)| node_store.hwm_for_label(*label_id as u32).unwrap_or(0))
-        .sum::<u64>();
-
-    // Also scan delta records for the maximum *slot* index used.
-    // NodeIds encode `(label_id << 32) | slot`; the CSR is indexed by slot,
-    // so we must strip the label bits before computing n_nodes.  Using the
-    // full NodeId here would inflate n_nodes into the billions (e.g. label_id=1
-    // → slot 0 appears as 0x0000_0001_0000_0000) and the CSR would be built
-    // with nonsensical degree arrays — the SPA-186 root cause.
-    let delta_max: u64 = rel_table_ids
-        .iter()
-        .filter_map(|&rel_id| {
-            EdgeStore::open(db_root, RelTableId(rel_id))
-                .ok()
-                .and_then(|s| s.read_delta().ok())
-        })
-        .flat_map(|records| {
-            records.into_iter().flat_map(|r| {
-                // Strip label bits — CSR needs slot indices only.
-                let src_slot = r.src.0 & 0xFFFF_FFFF;
-                let dst_slot = r.dst.0 & 0xFFFF_FFFF;
-                [src_slot, dst_slot].into_iter()
-            })
-        })
         .max()
-        .map(|max_slot| max_slot + 1)
         .unwrap_or(0);
 
-    let n_nodes = hwm_n_nodes.max(delta_max).max(1);
+    // For each rel table, compute n_nodes as max(hwm(src_label), hwm(dst_label)).
+    // This replaces the old sum-of-all-labels approach that overcounted (#309).
+    rel_triples
+        .iter()
+        .map(|&(rel_id, src_label, dst_label)| {
+            // Per-label HWM: max of src and dst label HWMs.
+            // Query the node store directly -- labels may not be formally registered
+            // in the catalog (e.g. low-level create_node by label_id).
+            let hwm_n_nodes = match (src_label, dst_label) {
+                (Some(src), Some(dst)) => {
+                    let src_hwm = node_store.hwm_for_label(src as u32).unwrap_or(0);
+                    let dst_hwm = node_store.hwm_for_label(dst as u32).unwrap_or(0);
+                    src_hwm.max(dst_hwm)
+                }
+                // Legacy table-0 or unknown: use global max.
+                _ => global_max_hwm,
+            };
 
-    (rel_table_ids, n_nodes)
+            // Also scan this rel table's delta records for the maximum slot index,
+            // so the CSR bounds check passes even when edges were inserted without
+            // going through the node-store API.
+            let delta_max: u64 = EdgeStore::open(db_root, RelTableId(rel_id))
+                .ok()
+                .and_then(|s| s.read_delta().ok())
+                .map(|records| {
+                    records
+                        .iter()
+                        .flat_map(|r| {
+                            // Strip label bits -- CSR needs slot indices only.
+                            let src_slot = r.src.0 & 0xFFFF_FFFF;
+                            let dst_slot = r.dst.0 & 0xFFFF_FFFF;
+                            [src_slot, dst_slot].into_iter()
+                        })
+                        .max()
+                        .map(|max_slot| max_slot + 1)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+
+            let n_nodes = hwm_n_nodes.max(delta_max).max(1);
+            (rel_id, n_nodes)
+        })
+        .collect()
 }
 
 /// Open all per-type CSR forward files that exist on disk, keyed by rel_table_id.
@@ -4128,6 +4142,85 @@ mod tests {
         drop(tx);
         db.checkpoint()
             .expect("checkpoint must succeed after WriteTx dropped");
+    }
+
+    /// Issue #309: checkpoint must use per-label HWM, not the sum of all labels.
+    ///
+    /// When a graph has two labels (e.g. Person with 5 nodes, City with 3 nodes),
+    /// the CSR for a (:Person)-[:LIVES_IN]->(:City) rel table should be sized to
+    /// max(5, 3) = 5, not 5 + 3 = 8.  The overcounted sum wastes memory and can
+    /// produce incorrect degree arrays.
+    #[test]
+    fn checkpoint_uses_per_label_hwm_not_sum() {
+        use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        // Create nodes with two distinct labels.
+        // Label 0 ("Person"): 5 nodes  ->  HWM = 5
+        // Label 1 ("City"):   3 nodes  ->  HWM = 3
+        {
+            let mut tx = db.begin_write().unwrap();
+            for _ in 0..5 {
+                tx.create_node(0, &[]).unwrap();
+            }
+            for _ in 0..3 {
+                tx.create_node(1, &[]).unwrap();
+            }
+            // Create edges from Person -> City (LIVES_IN).
+            // Person slot 0 -> City slot 0
+            // Person slot 1 -> City slot 1
+            let person_0 = sparrowdb_common::NodeId(0 << 32 | 0);
+            let person_1 = sparrowdb_common::NodeId(0 << 32 | 1);
+            let city_0 = sparrowdb_common::NodeId(1u64 << 32 | 0);
+            let city_1 = sparrowdb_common::NodeId(1u64 << 32 | 1);
+            tx.create_edge(
+                person_0,
+                city_0,
+                "LIVES_IN",
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+            tx.create_edge(
+                person_1,
+                city_1,
+                "LIVES_IN",
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Checkpoint should succeed and produce correctly sized CSR.
+        db.checkpoint()
+            .expect("checkpoint with multi-label graph must succeed");
+
+        // Verify the CSR n_nodes is max(5, 3) = 5, not 5 + 3 = 8.
+        // Find the LIVES_IN rel table and open its CSR.
+        let catalog = sparrowdb_catalog::catalog::Catalog::open(dir.path()).unwrap();
+        let rel_tables = catalog.list_rel_table_ids();
+        let lives_in = rel_tables
+            .iter()
+            .find(|(_, _, _, rt)| rt == "LIVES_IN")
+            .expect("LIVES_IN rel table must exist");
+        let store = EdgeStore::open(dir.path(), RelTableId(lives_in.0 as u32)).unwrap();
+        let fwd = store
+            .open_fwd()
+            .expect("CSR forward must exist after checkpoint");
+
+        // The key assertion: n_nodes should be max(5, 3) = 5, not 8.
+        assert_eq!(
+            fwd.n_nodes(),
+            5,
+            "CSR n_nodes should be max of per-label HWMs (5), not sum (8)"
+        );
+
+        // Verify the edges are actually correct.
+        let neighbors_0 = fwd.neighbors(0);
+        let neighbors_1 = fwd.neighbors(1);
+        assert_eq!(neighbors_0, &[0], "Person 0 -> City 0 (slot 0)");
+        assert_eq!(neighbors_1, &[1], "Person 1 -> City 1 (slot 1)");
     }
 
     /// SPA-181: Dropping a WriteTx without calling commit() must not persist

@@ -54,25 +54,25 @@ impl MaintenanceEngine {
 
     /// Run CHECKPOINT over the given relationship tables.
     ///
-    /// `rel_table_ids` is the list of relationship tables to checkpoint.
-    /// `n_nodes` is passed to each `EdgeStore::checkpoint` call for bounds
-    /// checking.
+    /// `rel_tables` is a slice of `(rel_table_id, n_nodes)` pairs.  Each
+    /// rel table gets its own `n_nodes` so the CSR degree array is sized to
+    /// the per-label HWM rather than the sum of all labels (fixes #309).
     ///
     /// WAL sequence:
     ///   1. Write + fsync `CheckpointBegin`.
     ///   2. For each rel_table: fold delta → CSR atomically.
     ///   3. Write + fsync `CheckpointEnd`.
     ///   4. Publish new `wal_checkpoint_lsn` to metapage.
-    pub fn checkpoint(&self, rel_table_ids: &[u32], n_nodes: u64) -> Result<()> {
-        self.run_maintenance(rel_table_ids, n_nodes, false)
+    pub fn checkpoint(&self, rel_tables: &[(u32, u64)]) -> Result<()> {
+        self.run_maintenance(rel_tables, false)
     }
 
     /// Run OPTIMIZE over the given relationship tables.
     ///
     /// Same as CHECKPOINT but uses `EdgeStore::optimize`, which sorts neighbor
     /// lists by `(dst_node_id)` ascending.
-    pub fn optimize(&self, rel_table_ids: &[u32], n_nodes: u64) -> Result<()> {
-        self.run_maintenance(rel_table_ids, n_nodes, true)
+    pub fn optimize(&self, rel_tables: &[(u32, u64)]) -> Result<()> {
+        self.run_maintenance(rel_tables, true)
     }
 
     // ── Private ───────────────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ impl MaintenanceEngine {
         self.db_root.join("wal")
     }
 
-    fn run_maintenance(&self, rel_table_ids: &[u32], n_nodes: u64, sorted: bool) -> Result<()> {
+    fn run_maintenance(&self, rel_tables: &[(u32, u64)], sorted: bool) -> Result<()> {
         let wal_dir = self.wal_dir();
 
         // Step 1: emit CheckpointBegin and fsync.
@@ -94,7 +94,9 @@ impl MaintenanceEngine {
         wal.fsync()?;
 
         // Step 2: fold each rel_table's delta into CSR base files.
-        for &rel_id in rel_table_ids {
+        // Each rel table receives its own n_nodes bound so the CSR degree
+        // array is sized correctly for the labels it connects (#309).
+        for &(rel_id, n_nodes) in rel_tables {
             let mut store = EdgeStore::open(&self.db_root, RelTableId(rel_id))?;
             if sorted {
                 store.optimize(n_nodes)?;
@@ -260,7 +262,7 @@ mod tests {
 
         // Run checkpoint via maintenance engine.
         let engine = MaintenanceEngine::new(db_root);
-        engine.checkpoint(&[REL], 4).unwrap();
+        engine.checkpoint(&[(REL, 4)]).unwrap();
 
         // WAL directory must exist with at least one segment.
         let wal_dir = db_root.join("wal");
@@ -288,7 +290,7 @@ mod tests {
         }
 
         let engine = MaintenanceEngine::new(db_root);
-        engine.checkpoint(&[REL], 4).unwrap();
+        engine.checkpoint(&[(REL, 4)]).unwrap();
 
         // Read the WAL segment and look for CheckpointBegin and CheckpointEnd.
         let wal_dir = db_root.join("wal");
@@ -345,7 +347,7 @@ mod tests {
             store.create_edge(nid(0), RelTableId(REL), nid(1)).unwrap();
         }
         let engine = MaintenanceEngine::new(db_root);
-        engine.checkpoint(&[REL], 4).unwrap();
+        engine.checkpoint(&[(REL, 4)]).unwrap();
 
         // Read the catalog.bin and verify metapage has a non-zero checkpoint LSN.
         let catalog_path = db_root.join("catalog.bin");
@@ -387,7 +389,7 @@ mod tests {
         }
 
         let engine = MaintenanceEngine::new(db_root);
-        engine.optimize(&[REL], 4).unwrap();
+        engine.optimize(&[(REL, 4)]).unwrap();
 
         // Read the CSR and check neighbor list for node 0 is sorted.
         let store = EdgeStore::open(db_root, RelTableId(REL)).unwrap();
