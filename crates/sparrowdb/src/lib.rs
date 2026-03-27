@@ -1516,7 +1516,6 @@ impl GraphDb {
             }
             tx.commit()?;
             self.invalidate_csr_map();
-            self.invalidate_prop_index();
             self.invalidate_catalog();
             return Ok(QueryResult::empty(vec![]));
         }
@@ -1543,7 +1542,6 @@ impl GraphDb {
         }
 
         tx.commit()?;
-        self.invalidate_prop_index();
         self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
