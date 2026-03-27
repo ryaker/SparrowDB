@@ -16,6 +16,7 @@ impl Engine {
     /// destinations the label is looked up in the `node_label` hint map (built
     /// from the delta by the caller); if absent, `src_label_id` is used as a
     /// conservative fallback (correct for homogeneous graphs).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn get_node_neighbors_labeled(
         &self,
         src_slot: u64,
