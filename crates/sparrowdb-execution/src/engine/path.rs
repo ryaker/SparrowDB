@@ -444,6 +444,54 @@ impl Engine {
                 remaining,
             );
 
+            // ── SPA-285: batch-read dst properties ────────────────────────
+            // Collect all destination slots grouped by label_id, then read
+            // their properties in one pass per label (matching hop.rs:279-287).
+            // This replaces the per-node read_node_props() call that caused
+            // excessive file seeks on variable-length traversals.
+            let dst_props_map: std::collections::HashMap<(u64, u32), Vec<(u32, u64)>> =
+                if !dst_all_col_ids.is_empty() && !dst_nodes.is_empty() {
+                    // Group dst slots by their resolved label_id.
+                    let mut by_label: std::collections::HashMap<u32, Vec<u32>> =
+                        std::collections::HashMap::new();
+                    for &(slot, actual_label_id) in &dst_nodes {
+                        // Apply the same label filter early to avoid reading props
+                        // for nodes we will skip anyway.
+                        if let Some(required_label) = dst_label_id {
+                            if actual_label_id != required_label {
+                                continue;
+                            }
+                        }
+                        let resolved = dst_label_id.unwrap_or(actual_label_id);
+                        by_label.entry(resolved).or_default().push(slot as u32);
+                    }
+
+                    let mut map: std::collections::HashMap<(u64, u32), Vec<(u32, u64)>> =
+                        std::collections::HashMap::new();
+                    for (label_id, mut slots) in by_label {
+                        // Deduplicate slots within each label group.
+                        slots.sort_unstable();
+                        slots.dedup();
+                        let batch = self.snapshot.store.batch_read_node_props(
+                            label_id,
+                            &slots,
+                            &dst_all_col_ids,
+                        )?;
+                        for (i, slot) in slots.iter().enumerate() {
+                            let props: Vec<(u32, u64)> = dst_all_col_ids
+                                .iter()
+                                .copied()
+                                .zip(batch[i].iter().copied())
+                                .filter(|&(_, v)| v != 0)
+                                .collect();
+                            map.insert((*slot as u64, label_id), props);
+                        }
+                    }
+                    map
+                } else {
+                    std::collections::HashMap::new()
+                };
+
             for (dst_slot, actual_label_id) in dst_nodes {
                 // When the destination pattern specifies a label, only include nodes
                 // whose actual label (recovered from the delta) matches.
@@ -457,12 +505,18 @@ impl Engine {
                 // heterogeneous graph nodes are addressed correctly.
                 let resolved_dst_label_id = dst_label_id.unwrap_or(actual_label_id);
 
-                let dst_node = NodeId(((resolved_dst_label_id as u64) << 32) | dst_slot);
-                // SPA-224: read dst props using the full column set (projection +
-                // inline filter + WHERE), not just the projection set.  Without the
-                // filter columns the inline prop check below always fails silently
-                // when the dst variable is not referenced in RETURN.
-                let dst_props = read_node_props(&self.snapshot.store, dst_node, &dst_all_col_ids)?;
+                // SPA-285: look up pre-batched dst properties instead of
+                // reading per-node.  Fall back to individual read for slots
+                // that were not in the batch (e.g. delta-only edge targets).
+                let dst_props =
+                    if let Some(props) = dst_props_map.get(&(dst_slot, resolved_dst_label_id)) {
+                        props.clone()
+                    } else if !dst_all_col_ids.is_empty() {
+                        let dst_node = NodeId(((resolved_dst_label_id as u64) << 32) | dst_slot);
+                        read_node_props(&self.snapshot.store, dst_node, &dst_all_col_ids)?
+                    } else {
+                        vec![]
+                    };
 
                 if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
                     continue;
