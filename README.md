@@ -78,7 +78,7 @@ SparrowDB is the right choice when:
 
 SparrowDB is *not* the right choice when:
 
-- **Deep multi-hop traversal is your primary workload.** 1-hop to 5-hop queries on high-fanout graphs (social networks, web graphs) are where Neo4j's battle-hardened CSR layout and parallel execution show. SparrowDB is currently 26–476x behind on those queries (1-hop: 76x, 2-hop: 240x, mutual friends: 476x). That gap narrows over time, but if deep traversal is your core workload, use Neo4j.
+- **Deep multi-hop traversal is your primary workload.** 1-hop to 5-hop queries on high-fanout graphs (social networks, web graphs) are where Neo4j's battle-hardened CSR layout and parallel execution show. SparrowDB is currently 25–453x behind on those queries (1-hop: 67x, 2-hop: 233x, mutual friends: 453x). That gap narrows over time, but if deep traversal is your core workload, use Neo4j.
 - **You need distributed writes across many nodes**, or your graph has billions of edges and requires horizontal sharding. Use Neo4j Aura or DGraph for that.
 
 ---
@@ -518,7 +518,7 @@ sparrowdb import --neo4j-csv nodes.csv,relationships.csv --db my.db
 
 ## Performance Characteristics
 
-### Benchmark Results: SNAP Facebook Dataset
+### Benchmark Results: SNAP Facebook Dataset (v0.1.10)
 
 Measured against Neo4j 5.x (server, JVM warmed) and Kùzu (Shi et al. VLDB 2023). All figures are p50 latency in microseconds. Dataset: SNAP Facebook social graph (4,039 nodes, 88,234 edges), 100 warmup + 500 iterations.
 
@@ -526,24 +526,24 @@ Measured against Neo4j 5.x (server, JVM warmed) and Kùzu (Shi et al. VLDB 2023)
 
 | Query | SparrowDB (µs) | Neo4j (µs) | Kùzu (µs) | vs Neo4j |
 |-------|---------------|-----------|-----------|---------|
-| Q1 Point Lookup (indexed) | **133** | 321 | 280 | **2.4x faster** |
-| Q2 Range Filter | 3,660 | 333 | n/a | 11x slower |
-| Q3 1-Hop Traversal | 47,849 | 632 | 410 | 76x slower |
-| Q4 2-Hop Traversal | 90,405 | 376 | 490 | 240x slower |
-| Q5 Variable Path 1..3 | 13,226 | 501 | 620 | 26x slower |
-| Q6 Global COUNT(*) | **24** | 202 | 150 | **8.4x faster** |
-| Q7 Top-10 by Degree | **441** | 17,588 | n/a | **40x faster** |
-| Q8 Mutual Friends | 167,523 | 352 | n/a | 476x slower |
+| Q1 Point Lookup (indexed) | **105** | 321 | 280 | **3x faster** |
+| Q2 Range Filter | 3,400 | 333 | n/a | 10x slower |
+| Q3 1-Hop Traversal | 42,300 | 632 | 410 | 67x slower |
+| Q4 2-Hop Traversal | 87,500 | 376 | 490 | 233x slower |
+| Q5 Variable Path 1..3 | 12,300 | 501 | 620 | 25x slower |
+| Q6 Global COUNT(*) | **2.2** | 202 | 150 | **91x faster** |
+| Q7 Top-10 by Degree | **401** | 17,588 | n/a | **44x faster** |
+| Q8 Mutual Friends | 159,600 | 352 | n/a | 453x slower |
 
 Neo4j reference: measured locally, Neo4j Docker v5.x, Bolt TCP. Kùzu reference: Shi et al. VLDB 2023 Table 5, in-process.
 
 **Where SparrowDB wins:**
-- **Q1 (point lookup):** B-tree property index delivers O(log n) lookup at 133µs. 2.4x faster than Neo4j's Bolt round-trip with JVM overhead.
-- **Q6 (global COUNT):** 24µs — 8.4x faster. Catalog-level metadata lookup, no scan.
-- **Q7 (top-10 by degree):** 441µs — 40x faster than Neo4j's 17.6ms. Pre-computed degree cache delivers O(1) lookup vs Neo4j's full adjacency scan.
+- **Q1 (point lookup):** B-tree property index delivers O(log n) lookup at 105µs. 3x faster than Neo4j's Bolt round-trip with JVM overhead.
+- **Q6 (global COUNT):** 2.2µs — 91x faster. Catalog-level metadata lookup, no scan.
+- **Q7 (top-10 by degree):** 401µs — 44x faster than Neo4j's 17.6ms. Pre-computed degree cache delivers O(1) lookup vs Neo4j's full adjacency scan.
 - **Cold start:** opens in ~27ms on macOS SSD — viable for serverless functions and short-lived CLI processes where Neo4j's server startup is disqualifying.
 
-**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5, Q8) and range scans (Q2). Neo4j's CSR layout is battle-hardened for high-fanout graph walks with parallel execution. The gap on deep traversals (76x–476x) is structural, not a tuning issue. It narrows over time as the engine matures (see Roadmap), but it is real today.
+**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5, Q8) and range scans (Q2). Neo4j's CSR layout is battle-hardened for high-fanout graph walks with parallel execution. The gap on deep traversals (67x–453x) is structural, not a tuning issue. It narrows over time as the engine matures (see Roadmap), but it is real today.
 
 **What this means in practice:**
 - Use SparrowDB for: embedded apps, CLIs, agents, edge services, recommendation engines, and workloads dominated by point lookups, writes, aggregations, and shallow traversals.
@@ -728,12 +728,14 @@ These are the active workstreams that will close the most meaningful gaps, order
 | SPA-226 | Publish SparrowOntology to crates.io | Makes the ontology layer reusable as a standalone dependency. |
 
 **Recently shipped** (reflected in benchmark numbers above):
-- **Degree cache** — Q7 (Top-10 Degree) went from 1,279ms → 441µs, now 40x *faster* than Neo4j
-- **B-tree property index** — Q1 (Point Lookup) went from ~444µs → 133µs
+- **Degree cache** — Q7 (Top-10 Degree) went from 1,279ms → 401µs, now 44x *faster* than Neo4j
+- **B-tree property index** — Q1 (Point Lookup) went from ~444µs → 105µs, now 3x faster than Neo4j
+- **Global COUNT optimization** — Q6 went from 24µs → 2.2µs, now 91x *faster* than Neo4j
 - **ReadSnapshot label_row_counts cache** — eliminated ~116µs per-query overhead on Q1
 - **Edge property reads** (#240, #243) — edge properties now correctly returned after CHECKPOINT
 - **Two-hop intermediate node prop reads** (#241, #244) — multi-hop traversal returns correct intermediate node values
 - **edge_props.bin skip** (#245) — queries without edge variables no longer pay the edge-props read cost
+- **2-hop aggregate fix** (#263, #281, #282) — COUNT(*) on multi-hop queries no longer returns null
 
 The traversal gap (Q3, Q4, Q8) remains the largest open challenge. SparrowDB uses a CSR adjacency store on disk (see Architecture), but the current execution engine is single-threaded and does not exploit that layout for in-memory traversal walks. Parallel traversal and a tighter runtime adjacency representation are the two structural changes that will move those numbers.
 
