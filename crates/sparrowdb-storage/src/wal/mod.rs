@@ -21,5 +21,5 @@ pub mod writer;
 
 pub use codec::{WalPayload, WalRecord, WalRecordKind};
 pub use migrate::{migrate_wal, MigrationResult};
-pub use replay::{WalReplayer, WalSchema};
+pub use replay::{CommittedMutation, WalReplayer, WalSchema};
 pub use writer::WalWriter;

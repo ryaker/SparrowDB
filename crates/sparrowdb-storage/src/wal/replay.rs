@@ -232,6 +232,157 @@ impl WalReplayer {
     }
 }
 
+/// A committed structural mutation record extracted from the WAL.
+///
+/// These records represent graph mutations (`NodeCreate`, `EdgeCreate`, etc.)
+/// that were durably written to the WAL but may not yet have been applied to
+/// the data files (e.g. after a crash between WAL fsync and disk write).
+#[derive(Debug, Clone)]
+pub struct CommittedMutation {
+    /// The LSN of this WAL record (used for ordering).
+    pub lsn: u64,
+    /// The transaction ID that committed this mutation.
+    pub txn_id: u64,
+    /// The structured payload for this mutation.
+    pub payload: WalPayload,
+}
+
+impl WalReplayer {
+    /// Scan the WAL and return all committed structural mutation records
+    /// (`NodeCreate`, `NodeUpdate`, `NodeDelete`, `EdgeCreate`, `EdgeDelete`)
+    /// in LSN order.
+    ///
+    /// Used by `GraphDb::open` for crash recovery: the caller compares each
+    /// returned mutation against the on-disk state and re-applies any that
+    /// were not yet reflected on disk.
+    ///
+    /// Stops cleanly at the first CRC failure (torn page boundary).
+    /// Returns an empty `Vec` when the WAL directory does not exist.
+    pub fn scan_mutations(wal_dir: &Path) -> Result<Vec<CommittedMutation>> {
+        Self::scan_mutations_inner(wal_dir, EncryptionContext::none())
+    }
+
+    /// Encrypted variant of [`scan_mutations`].
+    pub fn scan_mutations_encrypted(
+        wal_dir: &Path,
+        key: [u8; 32],
+    ) -> Result<Vec<CommittedMutation>> {
+        Self::scan_mutations_inner(wal_dir, EncryptionContext::with_key(key))
+    }
+
+    fn scan_mutations_inner(
+        wal_dir: &Path,
+        enc: EncryptionContext,
+    ) -> Result<Vec<CommittedMutation>> {
+        let segments = match collect_segments(wal_dir) {
+            Ok(s) => s,
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+
+        if segments.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pass 1: read all records, stopping at the first CRC failure.
+        let mut all_records: BTreeMap<u64, WalRecord> = BTreeMap::new();
+
+        'outer: for seg_no in &segments {
+            let path = segment_path(wal_dir, *seg_no);
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::Io(e)),
+            };
+            if data.is_empty() {
+                continue;
+            }
+            let version = data[0];
+            if version != WAL_FORMAT_VERSION && version != WAL_FORMAT_VERSION_LEGACY {
+                return Err(Error::Corruption(format!(
+                    "WAL segment {seg_no} has unrecognised version byte {version}."
+                )));
+            }
+            let mut offset = 1usize;
+            while offset < data.len() {
+                if data[offset..].iter().all(|&b| b == 0) {
+                    break;
+                }
+                match WalRecord::decode_with_version(&data[offset..], version) {
+                    Ok((rec, consumed)) => {
+                        all_records.insert(rec.lsn.0, rec);
+                        offset += consumed;
+                    }
+                    Err(Error::ChecksumMismatch) | Err(Error::Corruption(_)) => break 'outer,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // Pass 2: identify committed transactions.
+        let mut begun: HashSet<u64> = HashSet::new();
+        let mut committed: HashSet<u64> = HashSet::new();
+        for rec in all_records.values() {
+            match rec.kind {
+                WalRecordKind::Begin => {
+                    begun.insert(rec.txn_id.0);
+                }
+                WalRecordKind::Commit => {
+                    if begun.contains(&rec.txn_id.0) {
+                        committed.insert(rec.txn_id.0);
+                    }
+                }
+                WalRecordKind::Abort => {
+                    begun.remove(&rec.txn_id.0);
+                }
+                _ => {}
+            }
+        }
+
+        // Pass 3: collect committed structural mutation records in LSN order.
+        let structural_kinds = [
+            WalRecordKind::NodeCreate,
+            WalRecordKind::NodeUpdate,
+            WalRecordKind::NodeDelete,
+            WalRecordKind::EdgeCreate,
+            WalRecordKind::EdgeDelete,
+        ];
+
+        let mut mutations = Vec::new();
+        for (lsn, rec) in &all_records {
+            if !committed.contains(&rec.txn_id.0) {
+                continue;
+            }
+            if !structural_kinds.contains(&rec.kind) {
+                continue;
+            }
+
+            // Resolve the payload — decrypt if needed, then decode from raw bytes.
+            let payload = match &rec.payload {
+                WalPayload::Raw(raw_bytes) => {
+                    let plaintext = if enc.is_encrypted() {
+                        enc.decrypt_wal_payload(*lsn, raw_bytes)?
+                    } else {
+                        raw_bytes.clone()
+                    };
+                    WalPayload::decode_plaintext(rec.kind, &plaintext)?
+                }
+                other => other.clone(),
+            };
+
+            mutations.push(CommittedMutation {
+                lsn: *lsn,
+                txn_id: rec.txn_id.0,
+                payload,
+            });
+        }
+
+        Ok(mutations)
+    }
+}
+
 /// Schema information extracted from the WAL.
 ///
 /// Maps `label_id → set of property names` for nodes, and

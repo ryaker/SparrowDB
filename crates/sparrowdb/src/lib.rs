@@ -92,6 +92,7 @@ use sparrowdb_storage::maintenance::MaintenanceEngine;
 use sparrowdb_storage::node_store::NodeStore;
 use sparrowdb_storage::wal::codec::{WalPayload, WalRecordKind};
 use sparrowdb_storage::wal::writer::WalWriter;
+use sparrowdb_storage::wal::WalReplayer;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -411,9 +412,16 @@ impl GraphDb {
     /// Open (or create) a SparrowDB database at `path`.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
-        let catalog = Catalog::open(path)?;
         let wal_dir = path.join("wal");
         let wal_writer = WalWriter::open(&wal_dir)?;
+        // Replay any WAL records that were fsync'd but not yet written to disk
+        // (crash between Step 4 WAL-fsync and Step 5 disk-write in commit).
+        // This must run before we build the in-memory caches (label_row_counts,
+        // csr_map) so those are constructed from the post-recovery state.
+        replay_wal_mutations(path, None)?;
+        // Open the catalog after replay: replay may have called
+        // get_or_create_rel_type_id which updates catalog on disk.
+        let catalog = Catalog::open(path)?;
         let label_row_counts = RwLock::new(build_label_row_counts_from_disk(&catalog, path));
         // SPA-286: load persisted property index from disk if available,
         // otherwise start with an empty index (lazy rebuild from column files).
@@ -458,9 +466,12 @@ impl GraphDb {
     /// Returns an error if the directory cannot be created.
     pub fn open_encrypted(path: &Path, key: [u8; 32]) -> Result<Self> {
         std::fs::create_dir_all(path)?;
-        let catalog = Catalog::open(path)?;
         let wal_dir = path.join("wal");
         let wal_writer = WalWriter::open_encrypted(&wal_dir, key)?;
+        // Replay any WAL records that were fsync'd but not yet written to disk.
+        replay_wal_mutations(path, Some(key))?;
+        // Open the catalog after replay (may have been mutated by EdgeCreate replay).
+        let catalog = Catalog::open(path)?;
         let label_row_counts = RwLock::new(build_label_row_counts_from_disk(&catalog, path));
         // SPA-286: load persisted property index (not encrypted; index data is
         // derived from column files which are also unencrypted on disk).
@@ -4180,6 +4191,205 @@ fn is_reserved_label(label: &str) -> bool {
 }
 
 /// Return an [`Error::InvalidArgument`] for a reserved label/type.
+// ── WAL crash recovery ────────────────────────────────────────────────────────
+
+/// Decode a WAL property value byte slice back to a `Value`.
+///
+/// WAL prop bytes are produced by `value_to_wal_bytes`:
+/// - `Int64`  → `v.to_u64().to_le_bytes()` — top byte = 0x00 (TAG_INT64)
+/// - `Bytes`  → `v.to_u64().to_le_bytes()` — top byte = 0x01 (TAG_BYTES), inline ≤7 bytes
+/// - `Float`  → `f.to_bits().to_le_bytes()` — raw IEEE-754, no tag
+///
+/// For inline Int64 and Bytes this is a lossless round-trip via `Value::from_u64`.
+/// Float values are distinguished by the absence of a known tag byte: any top
+/// byte that is neither 0x00 (Int64) nor 0x01 (inline Bytes) is treated as a
+/// raw float bit pattern and decoded via `f64::from_bits`.
+///
+/// Known limitation: `Value::Bytes` longer than 7 characters requires a heap
+/// pointer (`TAG_BYTES_OVERFLOW = 0x02`) that cannot be recovered from WAL
+/// alone.  Such values are decoded as `Int64(heap_ptr)` which is wrong; a
+/// future enhancement should store overflow bytes inline in WAL records.
+fn wal_bytes_to_value(bytes: &[u8]) -> Value {
+    if bytes.len() < 8 {
+        return Value::Int64(0);
+    }
+    let raw = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+    let tag = (raw >> 56) as u8;
+    match tag {
+        0x00 => {
+            // TAG_INT64: sign-extend from 56 bits
+            let shifted = (raw << 8) as i64;
+            Value::Int64(shifted >> 8)
+        }
+        0x01 => {
+            // TAG_BYTES inline: bytes[0..7] hold data, strip trailing zeros
+            let arr = raw.to_le_bytes();
+            let data: Vec<u8> = arr[..7].iter().copied().take_while(|&b| b != 0).collect();
+            Value::Bytes(data)
+        }
+        _ => {
+            // Float (or overflow pointer) — treat as raw f64 bits.
+            // TAG_FLOAT (0x03) heap pointers would produce a wrong value, but
+            // TAG_BYTES_OVERFLOW (0x02) heap pointers and actual floats both
+            // land here.  Floats with top byte ≠ 0x00/0x01 are correctly
+            // recovered; overflow heap pointers cannot be recovered from WAL.
+            Value::Float(f64::from_bits(raw))
+        }
+    }
+}
+
+/// Replay committed WAL mutations that were not yet reflected on disk.
+///
+/// Called by `GraphDb::open` immediately after opening the WAL writer.
+/// Scans committed structural WAL records and applies those whose effects are
+/// not yet visible in the on-disk data files.
+///
+/// ## Idempotency
+///
+/// * `NodeCreate`: skip if `disk_hwm_for_label(label_id) > slot`.
+/// * `NodeUpdate`: skip if the column file already contains a non-zero value
+///   at the target slot.
+/// * `EdgeCreate`: skip if the on-disk delta log already has `>= edge_id + 1`
+///   entries for the relation table.
+/// * `NodeDelete` / `EdgeDelete`: applied unconditionally (tombstoning is
+///   idempotent; a missing entry is treated as already deleted).
+fn replay_wal_mutations(db_path: &Path, encryption_key: Option<[u8; 32]>) -> Result<()> {
+    let wal_dir = db_path.join("wal");
+    if !wal_dir.exists() {
+        return Ok(());
+    }
+
+    let mutations = match encryption_key {
+        Some(key) => WalReplayer::scan_mutations_encrypted(&wal_dir, key)?,
+        None => WalReplayer::scan_mutations(&wal_dir)?,
+    };
+
+    if mutations.is_empty() {
+        return Ok(());
+    }
+
+    let mut node_store = NodeStore::open(db_path)?;
+    let mut catalog = Catalog::open(db_path)?;
+
+    for m in &mutations {
+        match &m.payload {
+            WalPayload::NodeCreate {
+                node_id,
+                label_id,
+                props,
+            } => {
+                let slot = (*node_id & 0xFFFF_FFFF) as u32;
+                // Idempotency check: if the on-disk HWM already covers this
+                // slot, the write completed before the crash.
+                let disk_hwm = node_store.disk_hwm_for_label(*label_id).unwrap_or(0);
+                if disk_hwm > slot as u64 {
+                    continue; // already on disk
+                }
+                // Decode properties from WAL bytes and apply.
+                let decoded_props: Vec<(u32, Value)> = props
+                    .iter()
+                    .map(|(name, val_bytes)| {
+                        let col_id = col_id_of(name);
+                        let value = wal_bytes_to_value(val_bytes);
+                        (col_id, value)
+                    })
+                    .collect();
+                node_store.create_node_at_slot(*label_id, slot, &decoded_props)?;
+                node_store.flush_hwms()?;
+            }
+
+            WalPayload::NodeUpdate {
+                node_id,
+                col_id,
+                after,
+                ..
+            } => {
+                let label_id = (*node_id >> 32) as u32;
+                let slot = (*node_id & 0xFFFF_FFFF) as u32;
+                // Skip if the node slot is not yet on disk (would have been
+                // replayed by the NodeCreate path above).
+                let disk_hwm = node_store.disk_hwm_for_label(label_id).unwrap_or(0);
+                if disk_hwm <= slot as u64 {
+                    continue; // node itself not on disk
+                }
+                let value = wal_bytes_to_value(after);
+                let node_id_typed = sparrowdb_common::NodeId(*node_id);
+                node_store.upsert_node_col(node_id_typed, *col_id, &value)?;
+            }
+
+            WalPayload::NodeDelete { node_id } => {
+                let node_id_typed = sparrowdb_common::NodeId(*node_id);
+                // tombstone_node is idempotent (missing node is not an error).
+                let _ = node_store.tombstone_node(node_id_typed);
+            }
+
+            WalPayload::EdgeCreate {
+                edge_id,
+                src,
+                dst,
+                rel_type,
+                props,
+            } => {
+                let src_label_id = (*src >> 32) as u16;
+                let dst_label_id = (*dst >> 32) as u16;
+
+                // Ensure the rel type is registered.
+                let catalog_rel_id =
+                    catalog.get_or_create_rel_type_id(src_label_id, dst_label_id, rel_type)?;
+                let rel_table_id = RelTableId(catalog_rel_id as u32);
+
+                // Idempotency: skip if this edge_id is already in the delta log.
+                let current_edge_id = sparrowdb_storage::edge_store::EdgeStore::peek_next_edge_id(
+                    db_path,
+                    rel_table_id,
+                )?;
+                if current_edge_id.0 > *edge_id {
+                    continue; // already written
+                }
+
+                let src_node = sparrowdb_common::NodeId(*src);
+                let dst_node = sparrowdb_common::NodeId(*dst);
+                let mut es = EdgeStore::open(db_path, rel_table_id)?;
+                es.create_edge(src_node, rel_table_id, dst_node)?;
+
+                // Re-apply edge properties if present.
+                if !props.is_empty() {
+                    let src_slot = *src & 0xFFFF_FFFF;
+                    let dst_slot = *dst & 0xFFFF_FFFF;
+                    for (name, val_bytes) in props {
+                        let col_id = col_id_of(name);
+                        let value = wal_bytes_to_value(val_bytes);
+                        let raw_u64 = node_store.encode_value(&value)?;
+                        es.set_edge_prop(src_slot, dst_slot, col_id, raw_u64)?;
+                    }
+                }
+            }
+
+            WalPayload::EdgeDelete { src, dst, rel_type } => {
+                let src_label_id = (*src >> 32) as u16;
+                let dst_label_id = (*dst >> 32) as u16;
+
+                // Look up the rel type — if it doesn't exist, edge was never
+                // written so skip silently.
+                let rel_id_opt = catalog.get_rel_table(src_label_id, dst_label_id, rel_type)?;
+                if let Some(catalog_rel_id) = rel_id_opt {
+                    let rel_table_id = RelTableId(catalog_rel_id as u32);
+                    let src_node = sparrowdb_common::NodeId(*src);
+                    let dst_node = sparrowdb_common::NodeId(*dst);
+                    if let Ok(mut es) = EdgeStore::open(db_path, rel_table_id) {
+                        let _ = es.delete_edge(src_node, dst_node);
+                    }
+                }
+            }
+
+            // Non-structural payloads — no action needed during open.
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
 fn reserved_label_error(label: &str) -> sparrowdb_common::Error {
     sparrowdb_common::Error::InvalidArgument(format!(
         "invalid argument: label \"{label}\" is reserved — the __SO_ prefix is for internal use only"
@@ -4546,5 +4756,210 @@ mod tests {
             matches!(result, Err(Error::QueryTimeout)),
             "expected QueryTimeout, got {result:?}"
         );
+    }
+
+    // ── WAL crash recovery tests (issue #303) ──────────────────────────────────
+
+    /// Simulate a crash between WAL fsync (step 4) and disk write (step 5) for
+    /// a NodeCreate operation, then verify that re-opening the database replays
+    /// the missing record from WAL.
+    ///
+    /// Test steps:
+    ///   1. Create a fresh DB, register a label, commit one node normally.
+    ///   2. Write a second NodeCreate record to the WAL directly (BEGIN +
+    ///      NodeCreate + COMMIT + fsync) WITHOUT writing to the NodeStore — this
+    ///      simulates the crash window.
+    ///   3. Drop the DB handle.
+    ///   4. Re-open the DB — WAL replay must fire.
+    ///   5. Assert that the second node is visible (HWM = 2).
+    #[test]
+    fn wal_replay_on_open_recovers_node_create_after_crash() {
+        use sparrowdb_catalog::catalog::Catalog as RawCatalog;
+        use sparrowdb_common::TxnId;
+        use sparrowdb_storage::wal::codec::{WalPayload as StorageWalPayload, WalRecordKind};
+        use sparrowdb_storage::wal::writer::WalWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("crash_test.sparrow");
+
+        // ── Step 1: normal first commit ──────────────────────────────────────
+        let label_id: u32;
+        {
+            let db = GraphDb::open(&db_path).expect("open");
+
+            // Register the label via Cypher (also registers in catalog).
+            db.execute("CREATE (n:CrashNode {val: 1})").expect("create");
+
+            // Discover the label_id assigned by the catalog.
+            let mut cat = RawCatalog::open(&db_path).expect("catalog");
+            label_id = cat
+                .get_label("CrashNode")
+                .expect("get_label")
+                .expect("label exists") as u32;
+
+            drop(db);
+        }
+
+        // ── Step 2: simulate crash — write WAL for second node, skip disk ────
+        {
+            let wal_dir = db_path.join("wal");
+            let mut wal = WalWriter::open(&wal_dir).expect("wal open");
+            let txn_id = TxnId(9999); // use a high txn_id to avoid collision
+
+            // The second node's slot will be 1 (first node occupied slot 0).
+            let slot: u32 = 1;
+            let node_id: u64 = (label_id as u64) << 32 | slot as u64;
+
+            wal.append(WalRecordKind::Begin, txn_id, StorageWalPayload::Empty)
+                .expect("begin");
+            wal.append(
+                WalRecordKind::NodeCreate,
+                txn_id,
+                StorageWalPayload::NodeCreate {
+                    node_id,
+                    label_id,
+                    props: vec![("val".to_string(), 2i64.to_le_bytes().to_vec())],
+                },
+            )
+            .expect("node create");
+            wal.append(WalRecordKind::Commit, txn_id, StorageWalPayload::Empty)
+                .expect("commit");
+            wal.fsync().expect("fsync");
+            // Drop wal WITHOUT writing anything to NodeStore — crash simulation.
+            drop(wal);
+        }
+
+        // ── Step 3: verify disk state before replay (node not on disk yet) ───
+        {
+            use sparrowdb_storage::node_store::NodeStore;
+            let store = NodeStore::open(&db_path).expect("node store");
+            let disk_hwm = store.disk_hwm_for_label(label_id).unwrap_or(0);
+            assert_eq!(
+                disk_hwm, 1,
+                "before replay: disk HWM should be 1 (only first node was written)"
+            );
+        }
+
+        // ── Step 4: re-open the database — replay must fire ──────────────────
+        let db = GraphDb::open(&db_path).expect("re-open after crash");
+
+        // ── Step 5: the replayed node must be visible ─────────────────────────
+        {
+            use sparrowdb_storage::node_store::NodeStore;
+            let store = NodeStore::open(&db_path).expect("node store after replay");
+            let disk_hwm = store.disk_hwm_for_label(label_id).unwrap_or(0);
+            assert_eq!(
+                disk_hwm, 2,
+                "after replay: disk HWM should be 2 (both nodes written)"
+            );
+        }
+
+        // Also verify via Cypher query.
+        let result = db
+            .execute("MATCH (n:CrashNode) RETURN n.val ORDER BY n.val")
+            .expect("query");
+        assert_eq!(
+            result.rows.len(),
+            2,
+            "should see 2 CrashNode rows after WAL replay, got: {result:?}"
+        );
+    }
+
+    /// Simulate a crash after WAL fsync for a NodeUpdate (SET) operation.
+    /// The node is already on disk; only the property update is missing.
+    #[test]
+    fn wal_replay_on_open_recovers_node_update_after_crash() {
+        use sparrowdb_common::TxnId;
+        use sparrowdb_storage::wal::codec::{WalPayload as StorageWalPayload, WalRecordKind};
+        use sparrowdb_storage::wal::writer::WalWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("update_crash.sparrow");
+
+        // ── Step 1: create a node normally ───────────────────────────────────
+        let node_id_raw: u64;
+        let score_col_id: u32;
+        {
+            let db = GraphDb::open(&db_path).expect("open");
+            db.execute("CREATE (n:UpdateNode {score: 10})")
+                .expect("create");
+            let result = db
+                .execute("MATCH (n:UpdateNode) RETURN id(n)")
+                .expect("query id");
+            node_id_raw = match &result.rows[0][0] {
+                sparrowdb_execution::Value::Int64(v) => *v as u64,
+                other => panic!("unexpected id type: {other:?}"),
+            };
+            score_col_id = col_id_of("score");
+            drop(db);
+        }
+
+        // ── Step 2: simulate crash — WAL update written, disk update missing ─
+        {
+            let wal_dir = db_path.join("wal");
+            let mut wal = WalWriter::open(&wal_dir).expect("wal open");
+            let txn_id = TxnId(9998);
+
+            // score = 99, encoded as i64 little-endian (TAG_INT64 = 0x00 in top byte)
+            let after_bytes = 99i64.to_le_bytes().to_vec();
+
+            wal.append(WalRecordKind::Begin, txn_id, StorageWalPayload::Empty)
+                .expect("begin");
+            wal.append(
+                WalRecordKind::NodeUpdate,
+                txn_id,
+                StorageWalPayload::NodeUpdate {
+                    node_id: node_id_raw,
+                    key: "score".to_string(),
+                    col_id: score_col_id,
+                    before: 10i64.to_le_bytes().to_vec(),
+                    after: after_bytes,
+                },
+            )
+            .expect("node update");
+            wal.append(WalRecordKind::Commit, txn_id, StorageWalPayload::Empty)
+                .expect("commit");
+            wal.fsync().expect("fsync");
+            drop(wal);
+        }
+
+        // ── Step 3: re-open the DB — WAL replay must restore score = 99 ──────
+        let db = GraphDb::open(&db_path).expect("re-open");
+
+        let result = db
+            .execute("MATCH (n:UpdateNode) RETURN n.score")
+            .expect("query score");
+        assert_eq!(result.rows.len(), 1, "should see one UpdateNode");
+        let score = match &result.rows[0][0] {
+            sparrowdb_execution::Value::Int64(v) => *v,
+            other => panic!("unexpected score type: {other:?}"),
+        };
+        assert_eq!(
+            score, 99,
+            "WAL replay must restore score=99 from crash-recovered update"
+        );
+    }
+
+    /// A normal re-open with no crash — WAL replay is a no-op.
+    #[test]
+    fn wal_replay_noop_when_data_already_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("noop.sparrow");
+
+        {
+            let db = GraphDb::open(&db_path).expect("open");
+            db.execute("CREATE (n:Noop {x: 42})").expect("create");
+            drop(db);
+        }
+
+        // Re-open — should work cleanly with no double-apply.
+        let db = GraphDb::open(&db_path).expect("re-open");
+        let result = db.execute("MATCH (n:Noop) RETURN n.x").expect("query");
+        assert_eq!(result.rows.len(), 1);
+        let x = match &result.rows[0][0] {
+            sparrowdb_execution::Value::Int64(v) => *v,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(x, 42, "value must not be corrupted by no-op replay");
     }
 }
