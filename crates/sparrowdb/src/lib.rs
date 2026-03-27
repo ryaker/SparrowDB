@@ -2334,12 +2334,7 @@ impl GraphDb {
         // Edge count: for each registered rel table, sum CSR base edges (post-checkpoint)
         // plus delta-log records (pre-checkpoint / unflushed).
         let rel_table_ids = catalog.list_rel_table_ids();
-        let ids_to_scan: Vec<u64> = if rel_table_ids.is_empty() {
-            // No rel tables in catalog yet — fall back to the default table (id=0).
-            vec![0]
-        } else {
-            rel_table_ids.iter().map(|(id, _, _, _)| *id).collect()
-        };
+        let ids_to_scan: Vec<u64> = rel_table_ids.iter().map(|(id, _, _, _)| *id).collect();
         let edge_count: u64 = ids_to_scan
             .iter()
             .map(|&id| {
