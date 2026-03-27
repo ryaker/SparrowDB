@@ -595,6 +595,16 @@ impl GraphDb {
             .clear();
     }
 
+    /// Check whether `deadline` has passed, returning `Err(QueryTimeout)` if
+    /// so.  Used by the deadline-aware mutation paths (fixes #310).
+    #[inline]
+    fn check_deadline(deadline: std::time::Instant) -> Result<()> {
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::QueryTimeout);
+        }
+        Ok(())
+    }
+
     fn invalidate_csr_map(&self) {
         if let Ok(fresh) = try_open_csr_map(&self.inner.path) {
             *self.inner.csr_map.write().expect("csr_map RwLock poisoned") = fresh;
@@ -840,10 +850,10 @@ impl GraphDb {
     /// loop.  If the deadline passes before the query completes,
     /// [`Error::QueryTimeout`] is returned.
     ///
-    /// `execute_with_timeout` only supports read-only (`MATCH … RETURN`)
-    /// statements today; mutation statements are forwarded to the existing
-    /// write-transaction code path **without** a timeout (they typically
-    /// complete in O(1) writes and are not the source of runaway queries).
+    /// Both read-only and mutation statements (`MATCH … SET`,
+    /// `MATCH … DELETE`, `MATCH … CREATE`) honour the deadline.  The
+    /// engine checks elapsed time in every hot scan/traversal loop and
+    /// in mutation iteration loops (fixes #310).
     ///
     /// # Example
     /// ```no_run
@@ -889,20 +899,22 @@ impl GraphDb {
             _ => {}
         }
 
+        let deadline = std::time::Instant::now() + timeout;
+
         if Engine::is_mutation(&bound.inner) {
-            // Mutation statements go through the standard write-transaction
-            // path; they are not the source of runaway queries.
+            // Thread the deadline into mutation code paths so that
+            // MATCH…SET / MATCH…DELETE / MATCH…CREATE honour the caller's
+            // timeout instead of running unbounded (fixes #310).
             return match bound.inner {
                 Statement::Merge(ref m) => self.execute_merge(m),
-                Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
-                Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
+                Statement::MatchMutate(ref mm) => self.execute_match_mutate_deadline(mm, deadline),
+                Statement::MatchCreate(ref mc) => self.execute_match_create_deadline(mc, deadline),
                 Statement::Create(ref c) => self.execute_create_standalone(c),
                 _ => unreachable!(),
             };
         }
 
         let _span = info_span!("sparrowdb.query_with_timeout").entered();
-        let deadline = std::time::Instant::now() + timeout;
 
         let mut engine = {
             let _open_span = info_span!("sparrowdb.open_engine").entered();
@@ -1491,6 +1503,68 @@ impl GraphDb {
         Ok(QueryResult::empty(vec![]))
     }
 
+    /// Deadline-aware variant of [`execute_match_mutate`] (fixes #310).
+    ///
+    /// Identical to the non-deadline version but the engine is configured
+    /// with a deadline so that the MATCH scan checks elapsed time, and the
+    /// SET / DELETE iteration loop checks the deadline between writes.
+    fn execute_match_mutate_deadline(
+        &self,
+        mm: &sparrowdb_cypher::ast::MatchMutateStatement,
+        deadline: std::time::Instant,
+    ) -> Result<QueryResult> {
+        let mut tx = self.begin_write()?;
+
+        let csrs = self.cached_csr_map();
+        let engine = Engine::new(
+            NodeStore::open(&self.inner.path)?,
+            self.catalog_snapshot(),
+            csrs,
+            &self.inner.path,
+        )
+        .with_deadline(deadline);
+
+        // SPA-219: edge delete path.
+        if is_edge_delete_mutation(mm) {
+            let edges = engine.scan_match_mutate_edges(mm)?;
+            for (src, dst, rel_type) in edges {
+                Self::check_deadline(deadline)?;
+                tx.delete_edge(src, dst, &rel_type)?;
+            }
+            tx.commit()?;
+            self.invalidate_csr_map();
+            self.invalidate_prop_index();
+            self.invalidate_catalog();
+            return Ok(QueryResult::empty(vec![]));
+        }
+
+        let matching_ids = engine.scan_match_mutate(mm)?;
+        if matching_ids.is_empty() {
+            return Ok(QueryResult::empty(vec![]));
+        }
+
+        match &mm.mutation {
+            sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
+                let sv = expr_to_value(value);
+                for node_id in matching_ids {
+                    Self::check_deadline(deadline)?;
+                    tx.set_property(node_id, prop, sv.clone())?;
+                }
+            }
+            sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                for node_id in matching_ids {
+                    Self::check_deadline(deadline)?;
+                    tx.delete_node(node_id)?;
+                }
+            }
+        }
+
+        tx.commit()?;
+        self.invalidate_prop_index();
+        self.invalidate_catalog();
+        Ok(QueryResult::empty(vec![]))
+    }
+
     /// Internal: execute a `MATCH … CREATE (a)-[:R]->(b)` statement.
     ///
     /// 1. Acquires the write lock (preventing concurrent writes).
@@ -1600,6 +1674,78 @@ impl GraphDb {
         // Note: do NOT call invalidate_prop_index() here — MATCH…CREATE only
         // creates edges, not node properties, so the cached column data remains
         // valid.  Only invalidate the catalog in case a new rel-type was registered.
+        self.invalidate_catalog();
+        Ok(QueryResult::empty(vec![]))
+    }
+
+    /// Deadline-aware variant of [`execute_match_create`] (fixes #310).
+    fn execute_match_create_deadline(
+        &self,
+        mc: &sparrowdb_cypher::ast::MatchCreateStatement,
+        deadline: std::time::Instant,
+    ) -> Result<QueryResult> {
+        let mut tx = self.begin_write()?;
+
+        let csrs = self.cached_csr_map();
+        let engine = self
+            .build_read_engine(
+                NodeStore::open(&self.inner.path)?,
+                self.catalog_snapshot(),
+                csrs,
+            )
+            .with_deadline(deadline);
+
+        for (_, rel_pat, _) in &mc.create.edges {
+            if is_reserved_label(&rel_pat.rel_type) {
+                return Err(reserved_label_error(&rel_pat.rel_type));
+            }
+        }
+        if mc.create.edges.is_empty() {
+            return Err(Error::Unimplemented);
+        }
+
+        let matched_rows = engine.scan_match_create_rows(mc)?;
+        engine.write_back_prop_index(&self.inner.prop_index);
+        self.persist_prop_index();
+
+        if matched_rows.is_empty() {
+            return Ok(QueryResult::empty(vec![]));
+        }
+
+        for row in &matched_rows {
+            Self::check_deadline(deadline)?;
+            for (left_var, rel_pat, right_var) in &mc.create.edges {
+                let src = row.get(left_var).copied().ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "CREATE references unbound variable: {left_var}"
+                    ))
+                })?;
+                let dst = row.get(right_var).copied().ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "CREATE references unbound variable: {right_var}"
+                    ))
+                })?;
+                let edge_props: HashMap<String, Value> = rel_pat
+                    .props
+                    .iter()
+                    .map(|pe| {
+                        let val = match &pe.value {
+                            sparrowdb_cypher::ast::Expr::Literal(lit) => literal_to_value(lit),
+                            _ => {
+                                return Err(Error::InvalidArgument(format!(
+                                    "CREATE edge property '{}' must be a literal value",
+                                    pe.key
+                                )))
+                            }
+                        };
+                        Ok((pe.key.clone(), val))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                tx.create_edge(src, dst, &rel_pat.rel_type, edge_props)?;
+            }
+        }
+
+        tx.commit()?;
         self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
@@ -4321,5 +4467,35 @@ mod tests {
         db.checkpoint().unwrap();
         let after = db.stats().unwrap();
         assert_eq!(after.edge_count, before.edge_count);
+    }
+
+    /// Regression test for #310: MATCH…SET must respect the deadline passed
+    /// to `execute_with_timeout`.  We insert enough nodes that the scan +
+    /// mutation loop will exceed a near-zero timeout, then assert that the
+    /// call returns `Error::QueryTimeout` instead of silently completing.
+    #[test]
+    fn mutation_respects_timeout() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        // Insert a batch of nodes so the MATCH…SET has work to do.
+        for i in 0..500 {
+            db.execute(&format!("CREATE (n:Sensor {{id: {i}, reading: 0}})"))
+                .unwrap();
+        }
+
+        // A near-zero timeout should cause the mutation scan to exceed the
+        // deadline before it finishes scanning + mutating all 500 nodes.
+        let result = db.execute_with_timeout(
+            "MATCH (n:Sensor) SET n.reading = 42",
+            Duration::from_nanos(1),
+        );
+
+        assert!(
+            matches!(result, Err(Error::QueryTimeout)),
+            "expected QueryTimeout, got {result:?}"
+        );
     }
 }
