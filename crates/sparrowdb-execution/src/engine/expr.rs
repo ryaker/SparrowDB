@@ -301,6 +301,8 @@ impl Engine {
         }
         // Hoist delta read out of the BFS loop to avoid repeated I/O.
         let delta_all = self.read_delta_all();
+        // SPA-283: build HashMap index for O(1) per-node delta lookups.
+        let delta_idx = build_delta_index(&delta_all);
         let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
         visited.insert(src_slot);
         let mut frontier: Vec<u64> = vec![src_slot];
@@ -309,7 +311,7 @@ impl Engine {
             let mut next_frontier: Vec<u64> = Vec::new();
             for &node_slot in &frontier {
                 let neighbors =
-                    self.get_node_neighbors_by_slot(node_slot, src_label_id, &delta_all);
+                    self.get_node_neighbors_by_slot(node_slot, src_label_id, &delta_idx);
                 for nb in neighbors {
                     if nb == dst_slot {
                         return Some(depth);

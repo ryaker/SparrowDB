@@ -32,6 +32,43 @@ use sparrowdb_storage::wal::WalReplayer;
 
 use crate::types::{QueryResult, Value};
 
+// ── Delta index (SPA-283) ─────────────────────────────────────────────────────
+//
+// Instead of scanning the entire delta log O(n) for every neighbor lookup,
+// pre-index records by `(src_label_id, src_slot)`.  Lookups become O(1)
+// amortized, which turns multi-hop traversals from O(k × n) into O(k).
+
+/// Pre-indexed delta log keyed by `(src_label_id, src_slot)`.
+///
+/// Each entry holds the list of `DeltaRecord`s whose source matches that key.
+/// Built once per query from the flat `Vec<DeltaRecord>` and passed into
+/// traversal code for O(1) neighbor lookups.
+pub(crate) type DeltaIndex = HashMap<(u32, u64), Vec<DeltaRecord>>;
+
+/// Build a [`DeltaIndex`] from a flat slice of delta records.
+pub(crate) fn build_delta_index(records: &[DeltaRecord]) -> DeltaIndex {
+    let mut idx: DeltaIndex = HashMap::with_capacity(records.len() / 4);
+    for r in records {
+        let src_label = (r.src.0 >> 32) as u32;
+        let src_slot = r.src.0 & 0xFFFF_FFFF;
+        idx.entry((src_label, src_slot)).or_default().push(*r);
+    }
+    idx
+}
+
+/// Look up delta neighbors for a given `(src_label_id, src_slot)` and return
+/// their destination slots (lower 32 bits of `dst.0`).
+pub(crate) fn delta_neighbors_from_index(
+    index: &DeltaIndex,
+    src_label_id: u32,
+    src_slot: u64,
+) -> Vec<u64> {
+    index
+        .get(&(src_label_id, src_slot))
+        .map(|recs| recs.iter().map(|r| r.dst.0 & 0xFFFF_FFFF).collect())
+        .unwrap_or_default()
+}
+
 // ── DegreeCache (SPA-272) ─────────────────────────────────────────────────────
 
 /// Pre-computed out-degree for every node slot across all relationship types.
