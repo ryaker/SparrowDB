@@ -166,10 +166,7 @@ sparrowdb = "0.1"
 ### Python
 
 ```bash
-# Once published to PyPI:
-pip install sparrowdb
-
-# Build from source:
+# Build from source (requires Rust toolchain):
 cd crates/sparrowdb-python && maturin develop
 ```
 
@@ -182,6 +179,7 @@ npm install sparrowdb
 ### Ruby
 
 ```bash
+# Build from source (requires Rust toolchain):
 cd crates/sparrowdb-ruby && bundle install && rake compile
 ```
 
