@@ -3871,10 +3871,10 @@ fn collect_maintenance_params(
     (rel_table_ids, n_nodes)
 }
 
-/// Open all per-type CSR forward files that exist on disk, keyed by rel_table_id.
-///
-/// SPA-185: replaces the old `open_csr_forward` that only opened `RelTableId(0)`.
-/// The catalog is used to discover all registered rel types.
+// Open all per-type CSR forward files that exist on disk, keyed by rel_table_id.
+//
+// SPA-185: replaces the old `open_csr_forward` that only opened `RelTableId(0)`.
+// The catalog is used to discover all registered rel types.
 // ── Constraint persistence helpers (issue #306) ─────────────────────────────
 
 const CONSTRAINTS_FILE: &str = "constraints.bin";
