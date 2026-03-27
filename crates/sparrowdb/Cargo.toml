@@ -18,6 +18,7 @@ sparrowdb-catalog   = { workspace = true }
 sparrowdb-cypher    = { workspace = true }
 sparrowdb-execution = { workspace = true }
 rand                = { workspace = true }
+rand_chacha         = { workspace = true }
 serde               = { workspace = true }
 serde_json          = { workspace = true }
 clap                = { workspace = true }

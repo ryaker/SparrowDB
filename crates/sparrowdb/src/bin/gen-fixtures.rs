@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use rand::prelude::*;
+use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
@@ -328,42 +329,42 @@ fn main() {
 
     // social_small — 50 nodes, 100 edges
     {
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(args.seed.wrapping_add(0));
+        let mut rng = ChaCha8Rng::seed_from_u64(args.seed.wrapping_add(0));
         let graph = gen_social_graph(50, 100, &mut rng);
         write_json(&args.out, "social_small.json", &graph);
     }
 
     // deps_small — 20 nodes, 50 edges
     {
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(args.seed.wrapping_add(1));
+        let mut rng = ChaCha8Rng::seed_from_u64(args.seed.wrapping_add(1));
         let graph = gen_deps_graph(20, 50, &mut rng);
         write_json(&args.out, "deps_small.json", &graph);
     }
 
     // social_10k — 10,000 nodes, 50,000 edges
     {
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(args.seed.wrapping_add(2));
+        let mut rng = ChaCha8Rng::seed_from_u64(args.seed.wrapping_add(2));
         let graph = gen_social_graph(10_000, 50_000, &mut rng);
         write_json(&args.out, "social_10k.json", &graph);
     }
 
     // social_100k — 100,000 nodes, 500,000 edges
     {
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(args.seed.wrapping_add(3));
+        let mut rng = ChaCha8Rng::seed_from_u64(args.seed.wrapping_add(3));
         let graph = gen_social_graph(100_000, 500_000, &mut rng);
         write_json(&args.out, "social_100k.json", &graph);
     }
 
     // deps_500 — 500 nodes, 2,000 edges
     {
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(args.seed.wrapping_add(4));
+        let mut rng = ChaCha8Rng::seed_from_u64(args.seed.wrapping_add(4));
         let graph = gen_deps_graph(500, 2_000, &mut rng);
         write_json(&args.out, "deps_500.json", &graph);
     }
 
     // concepts_1k — 1,000 nodes, 3,000 edges
     {
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(args.seed.wrapping_add(5));
+        let mut rng = ChaCha8Rng::seed_from_u64(args.seed.wrapping_add(5));
         let graph = gen_concepts_graph(1_000, 3_000, &mut rng);
         write_json(&args.out, "concepts_1k.json", &graph);
     }
