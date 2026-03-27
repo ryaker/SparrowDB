@@ -941,13 +941,23 @@ impl Engine {
             })
             .map(|(id, _, _, _)| *id)
             .collect();
+        // #294: when the second hop is Incoming, the pattern is
+        // (mid)<-[:R]-(fof), meaning edges are stored as (fof)-[:R]->(mid)
+        // in the catalog (src=fof_label, dst=mid_label).  We must swap the
+        // label filter so we actually find matching rel tables.
         let hop2_rel_ids: Vec<u64> = all_rel_tables_2hop
             .iter()
             .filter(|(_, sid, did, rt)| {
                 let type_ok = rel2.rel_type.is_empty() || rt == &rel2.rel_type;
-                let src_ok = *sid as u32 == mid_label_id;
-                let dst_ok = *did as u32 == fof_label_id;
-                type_ok && src_ok && dst_ok
+                if second_hop_incoming {
+                    let src_ok = *sid as u32 == fof_label_id;
+                    let dst_ok = *did as u32 == mid_label_id;
+                    type_ok && src_ok && dst_ok
+                } else {
+                    let src_ok = *sid as u32 == mid_label_id;
+                    let dst_ok = *did as u32 == fof_label_id;
+                    type_ok && src_ok && dst_ok
+                }
             })
             .map(|(id, _, _, _)| *id)
             .collect();
