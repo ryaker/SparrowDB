@@ -3033,7 +3033,8 @@ impl WriteTx {
     /// SPA-125: Delete a node, with edge-attachment check.
     ///
     /// Returns [`Error::NodeHasEdges`] if the node is referenced by any edge
-    /// in the delta log.  On success, queues a `NodeDelete` WAL record and
+    /// in the delta log or checkpointed CSR files (SPA-304).  On success,
+    /// queues a `NodeDelete` WAL record and
     /// buffers the tombstone write; the on-disk tombstone is only applied when
     /// [`commit`] is called.
     ///
@@ -3051,11 +3052,34 @@ impl WriteTx {
             rel_ids_to_check.push(0u32);
         }
         for rel_id in rel_ids_to_check {
-            let delta = EdgeStore::open(&self.inner.path, RelTableId(rel_id))
-                .and_then(|s| s.read_delta())
-                .unwrap_or_default();
-            if delta.iter().any(|r| r.src == node_id || r.dst == node_id) {
-                return Err(Error::NodeHasEdges { node_id: node_id.0 });
+            let store = EdgeStore::open(&self.inner.path, RelTableId(rel_id));
+
+            // Check delta log (un-checkpointed edges).
+            if let Ok(ref s) = store {
+                let delta = s.read_delta().unwrap_or_default();
+                if delta.iter().any(|r| r.src == node_id || r.dst == node_id) {
+                    return Err(Error::NodeHasEdges { node_id: node_id.0 });
+                }
+            }
+
+            // SPA-304: Check CSR forward file — the node may be a *source* of
+            // checkpointed edges that are no longer in the delta log.
+            if let Ok(ref s) = store {
+                if let Ok(csr) = s.open_fwd() {
+                    if !csr.neighbors(node_id.0).is_empty() {
+                        return Err(Error::NodeHasEdges { node_id: node_id.0 });
+                    }
+                }
+            }
+
+            // SPA-304: Check CSR backward file — the node may be a *destination*
+            // of checkpointed edges.
+            if let Ok(ref s) = store {
+                if let Ok(csr) = s.open_bwd() {
+                    if !csr.predecessors(node_id.0).is_empty() {
+                        return Err(Error::NodeHasEdges { node_id: node_id.0 });
+                    }
+                }
             }
         }
 

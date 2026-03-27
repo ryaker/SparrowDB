@@ -648,3 +648,64 @@ fn merge_node_idempotent_within_single_tx() {
 
     drop(dir);
 }
+
+// ── SPA-304: DELETE node after checkpoint must still detect CSR edges ─────────
+
+#[test]
+fn delete_node_blocked_by_csr_edges_after_checkpoint() {
+    let (dir, db) = make_db();
+
+    // Create two nodes with label_id=0 so packed IDs equal slot numbers.
+    let (src, dst);
+    {
+        let mut tx = db.begin_write().unwrap();
+        src = tx.create_node(0, &[(0u32, Value::Int64(1))]).unwrap();
+        dst = tx.create_node(0, &[(0u32, Value::Int64(2))]).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Create an edge src → dst and commit.
+    {
+        let mut tx = db.begin_write().unwrap();
+        tx.create_edge(src, dst, "KNOWS", HashMap::new())
+            .expect("create_edge");
+        tx.commit().unwrap();
+    }
+
+    // Checkpoint: folds the delta log into CSR base files and clears the delta.
+    db.checkpoint().expect("checkpoint");
+
+    // Verify delta log is now empty (the bug: only delta was checked before).
+    {
+        use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
+        let store = EdgeStore::open(dir.path(), RelTableId(0)).unwrap();
+        let records = store.read_delta().unwrap();
+        assert!(
+            records.is_empty(),
+            "delta log must be empty after checkpoint, got {} records",
+            records.len()
+        );
+    }
+
+    // Try to delete src — must STILL fail because CSR has the edge.
+    {
+        let mut tx = db.begin_write().unwrap();
+        let result = tx.delete_node(src);
+        assert!(
+            matches!(result, Err(Error::NodeHasEdges { .. })),
+            "expected NodeHasEdges for src (outgoing CSR edge), got {result:?}"
+        );
+    }
+
+    // Try to delete dst — must STILL fail because CSR backward has the edge.
+    {
+        let mut tx = db.begin_write().unwrap();
+        let result = tx.delete_node(dst);
+        assert!(
+            matches!(result, Err(Error::NodeHasEdges { .. })),
+            "expected NodeHasEdges for dst (incoming CSR edge), got {result:?}"
+        );
+    }
+
+    drop(dir);
+}
