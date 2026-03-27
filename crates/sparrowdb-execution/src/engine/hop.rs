@@ -1,6 +1,10 @@
 //! Auto-generated submodule — see engine/mod.rs for context.
 use super::*;
 
+/// Precomputed neighbor entry for the `b`-slot in a mutual-friends (FoF)
+/// hash-set intersection: `(b_slot, forward_neighbor_set, b_property_values)`.
+type BNeighborEntry = (u64, HashSet<u64>, Vec<(u32, u64)>);
+
 impl Engine {
     // ── 1-hop traversal: (a)-[:R]->(f) ───────────────────────────────────────
 
@@ -1074,6 +1078,47 @@ impl Engine {
         let use_agg = has_aggregate_in_return(&m.return_clause.items);
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
 
+        // ── #287: HashSet intersection for mutual neighbor queries ────────────
+        //
+        // For the incoming second-hop pattern (a)-[:R]->(m)<-[:R]-(b), the naive
+        // algorithm iterates all predecessors of each mid-node M, which is
+        // O(|neighbors(a)| × avg_predecessor_degree).  When both endpoints have
+        // inline property filters (the typical Q8 mutual-friends case), we can
+        // pre-identify qualifying b-nodes and collect their forward neighbors
+        // into HashSets.  Finding mutual mid-nodes then becomes a set
+        // intersection in O(min(deg_a, deg_b)) per (a, b) pair.
+        //
+        // Pre-compute: for each qualifying b-slot, its forward neighbor set via
+        // hop2 (since b→m means m ∈ hop2_fwd_neighbors(b)).
+        let b_neighbor_sets: Option<Vec<BNeighborEntry>> =
+            if second_hop_incoming && !fof_node_pat.props.is_empty() {
+                let hwm_fof = self.snapshot.store.hwm_for_label(fof_label_id)?;
+                let mut sets: Vec<BNeighborEntry> = Vec::new();
+                for b_slot in 0..hwm_fof {
+                    let b_node = NodeId(((fof_label_id as u64) << 32) | b_slot);
+                    let b_props = read_node_props(&self.snapshot.store, b_node, &col_ids_fof)?;
+                    if !self.matches_prop_filter(&b_props, &fof_node_pat.props) {
+                        continue;
+                    }
+                    // Collect forward neighbors of b via hop2 rel tables.
+                    let mut nbrs: HashSet<u64> = HashSet::new();
+                    for &n in hop2_csr.neighbors(b_slot) {
+                        nbrs.insert(n);
+                    }
+                    if let Some(delta) = delta_adj_hop2.get(&b_slot) {
+                        for &n in delta {
+                            nbrs.insert(n);
+                        }
+                    }
+                    if !nbrs.is_empty() {
+                        sets.push((b_slot, nbrs, b_props));
+                    }
+                }
+                Some(sets)
+            } else {
+                None
+            };
+
         // Scan source nodes.
         for src_slot in 0..hwm_src {
             // SPA-254: check per-query deadline at every slot boundary.
@@ -1109,6 +1154,159 @@ impl Engine {
                 // Semantics: find all mid-nodes M such that (a→M) AND (b→M) where
                 // b matches the fof_node_pat filter.  The result rows project M
                 // (the common neighbor / mutual friend), not B.
+
+                // Collect all candidate M slots from the forward first hop.
+                let neighbors_a: HashSet<u64> = {
+                    let mut set: HashSet<u64> =
+                        hop1_csr.neighbors(src_slot).iter().copied().collect();
+                    if let Some(delta_first) = delta_adj_hop1.get(&src_slot) {
+                        for &mid in delta_first {
+                            set.insert(mid);
+                        }
+                    }
+                    set
+                };
+
+                // ── #287 fast path: HashSet intersection ──────────────────────
+                if let Some(ref b_sets) = b_neighbor_sets {
+                    for (b_slot, neighbors_b, b_props) in b_sets {
+                        // Intersect neighbors_a ∩ neighbors_b to find mutual
+                        // mid-nodes.  Iterate the smaller set for O(min) time.
+                        let mutual_mids: Vec<u64> = if neighbors_a.len() <= neighbors_b.len() {
+                            neighbors_a
+                                .iter()
+                                .filter(|m| neighbors_b.contains(m))
+                                .copied()
+                                .collect()
+                        } else {
+                            neighbors_b
+                                .iter()
+                                .filter(|m| neighbors_a.contains(m))
+                                .copied()
+                                .collect()
+                        };
+
+                        let b_node = NodeId(((fof_label_id as u64) << 32) | *b_slot);
+
+                        for mid_slot in mutual_mids {
+                            let mid_node = NodeId(((mid_label_id as u64) << 32) | mid_slot);
+                            let mid_props = if !col_ids_mid.is_empty() {
+                                read_node_props(&self.snapshot.store, mid_node, &col_ids_mid)?
+                            } else {
+                                vec![]
+                            };
+
+                            // Apply mid inline prop filter.
+                            if !self.matches_prop_filter(&mid_props, &mid_node_pat.props) {
+                                continue;
+                            }
+
+                            // Apply WHERE clause.
+                            if let Some(ref where_expr) = m.where_clause {
+                                let mut row_vals = build_row_vals(
+                                    &src_props,
+                                    &src_node_pat.var,
+                                    &col_ids_src_where,
+                                    &self.snapshot.store,
+                                );
+                                row_vals.extend(build_row_vals(
+                                    &mid_props,
+                                    &mid_node_pat.var,
+                                    &col_ids_mid,
+                                    &self.snapshot.store,
+                                ));
+                                row_vals.extend(build_row_vals(
+                                    b_props,
+                                    &fof_node_pat.var,
+                                    &col_ids_fof,
+                                    &self.snapshot.store,
+                                ));
+                                if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                                    row_vals.insert(
+                                        format!("{}.__labels__", src_node_pat.var),
+                                        Value::List(vec![Value::String(src_label.clone())]),
+                                    );
+                                }
+                                if !mid_node_pat.var.is_empty() && !mid_label.is_empty() {
+                                    row_vals.insert(
+                                        format!("{}.__labels__", mid_node_pat.var),
+                                        Value::List(vec![Value::String(mid_label.clone())]),
+                                    );
+                                }
+                                if !fof_node_pat.var.is_empty() && !fof_label.is_empty() {
+                                    row_vals.insert(
+                                        format!("{}.__labels__", fof_node_pat.var),
+                                        Value::List(vec![Value::String(fof_label.clone())]),
+                                    );
+                                }
+                                if !pat.rels[0].var.is_empty() {
+                                    row_vals.insert(
+                                        format!("{}.__type__", pat.rels[0].var),
+                                        Value::String(pat.rels[0].rel_type.clone()),
+                                    );
+                                }
+                                if !pat.rels[1].var.is_empty() {
+                                    row_vals.insert(
+                                        format!("{}.__type__", pat.rels[1].var),
+                                        Value::String(pat.rels[1].rel_type.clone()),
+                                    );
+                                }
+                                row_vals.extend(self.dollar_params());
+                                if !self.eval_where_graph(where_expr, &row_vals) {
+                                    continue;
+                                }
+                            }
+
+                            if use_agg {
+                                let mut row_vals = build_row_vals(
+                                    &src_props,
+                                    &src_node_pat.var,
+                                    &col_ids_src_where,
+                                    &self.snapshot.store,
+                                );
+                                row_vals.extend(build_row_vals(
+                                    &mid_props,
+                                    &mid_node_pat.var,
+                                    &col_ids_mid,
+                                    &self.snapshot.store,
+                                ));
+                                row_vals.extend(build_row_vals(
+                                    b_props,
+                                    &fof_node_pat.var,
+                                    &col_ids_fof,
+                                    &self.snapshot.store,
+                                ));
+                                if !src_node_pat.var.is_empty() {
+                                    row_vals
+                                        .insert(src_node_pat.var.clone(), Value::NodeRef(src_node));
+                                }
+                                if !mid_node_pat.var.is_empty() {
+                                    row_vals
+                                        .insert(mid_node_pat.var.clone(), Value::NodeRef(mid_node));
+                                }
+                                if !fof_node_pat.var.is_empty() {
+                                    row_vals
+                                        .insert(fof_node_pat.var.clone(), Value::NodeRef(b_node));
+                                }
+                                raw_rows.push(row_vals);
+                            } else {
+                                let row = project_three_var_row(
+                                    &src_props,
+                                    &mid_props,
+                                    b_props,
+                                    column_names,
+                                    &src_node_pat.var,
+                                    &mid_node_pat.var,
+                                    &self.snapshot.store,
+                                );
+                                rows.push(row);
+                            }
+                        }
+                    }
+                    continue; // Skip old path for this src_slot.
+                }
+
+                // ── Fallback: original predecessor-scan path (no b-side filter) ──
                 //
                 // Algorithm:
                 //   1. First-hop forward: candidate M slots = CSR neighbors of src + delta.
@@ -1116,19 +1314,7 @@ impl Engine {
                 //   3. Read B props, apply fof_node_pat filter — if any B passes, M is valid.
                 //   4. For valid M: read mid props, apply mid prop filter, build result row.
 
-                // Collect all candidate M slots from the forward first hop.
-                let mid_slots: Vec<u64> = {
-                    let mut csr_mids: Vec<u64> = hop1_csr.neighbors(src_slot).to_vec();
-                    // Delta first hop from src.
-                    if let Some(delta_first) = delta_adj_hop1.get(&src_slot) {
-                        for &mid in delta_first {
-                            if !csr_mids.contains(&mid) {
-                                csr_mids.push(mid);
-                            }
-                        }
-                    }
-                    csr_mids
-                };
+                let mid_slots: Vec<u64> = neighbors_a.into_iter().collect();
 
                 for mid_slot in mid_slots {
                     // Read mid props for projection (and mid prop filter).
