@@ -283,12 +283,10 @@ impl Engine {
 
     /// BFS from `src_slot` to `dst_slot`, returning the hop count or None.
     ///
-    /// `src_label_id` is used to look up edges in the WAL delta for every hop.
-    /// When all nodes in the shortest path share the same label (the typical
-    /// single-label homogeneous graph), this is correct.  Heterogeneous graphs
-    /// with intermediate nodes of a different label will still find paths via
-    /// the CSR (`csr_neighbors_all`), which is label-agnostic; only in-flight
-    /// WAL edges from intermediate nodes of a different label may be missed.
+    /// Each frontier node carries its own `label_id` so that delta-log edge
+    /// lookups use the correct `(label_id, slot)` key at every hop.  Without
+    /// this, BFS through heterogeneous graphs would use the source label for
+    /// all intermediate nodes, missing WAL edges on label-boundary crossings.
     pub(crate) fn bfs_shortest_path(
         &self,
         src_slot: u64,
@@ -301,21 +299,36 @@ impl Engine {
         }
         // Hoist delta read out of the BFS loop to avoid repeated I/O.
         let delta_all = self.read_delta_all();
+        // SPA-283: build HashMap index for O(1) per-node delta lookups.
+        let delta_idx = build_delta_index(&delta_all);
+        // Frontier carries (slot, label_id) so each hop uses the correct label
+        // when probing the delta index.
         let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
         visited.insert(src_slot);
-        let mut frontier: Vec<u64> = vec![src_slot];
+        let mut frontier: Vec<(u64, u32)> = vec![(src_slot, src_label_id)];
 
         for depth in 1..=max_hops {
-            let mut next_frontier: Vec<u64> = Vec::new();
-            for &node_slot in &frontier {
+            let mut next_frontier: Vec<(u64, u32)> = Vec::new();
+            for &(node_slot, node_label_id) in &frontier {
                 let neighbors =
-                    self.get_node_neighbors_by_slot(node_slot, src_label_id, &delta_all);
-                for nb in neighbors {
-                    if nb == dst_slot {
+                    self.get_node_neighbors_by_slot(node_slot, node_label_id, &delta_idx);
+                for nb_slot in neighbors {
+                    if nb_slot == dst_slot {
                         return Some(depth);
                     }
-                    if visited.insert(nb) {
-                        next_frontier.push(nb);
+                    if visited.insert(nb_slot) {
+                        // Recover the neighbor's label from the delta index; fall
+                        // back to node_label_id for CSR-only nodes in homogeneous
+                        // graphs (the same conservative default used elsewhere).
+                        let nb_label = delta_neighbors_labeled_from_index(
+                            &delta_idx,
+                            node_label_id,
+                            node_slot,
+                        )
+                        .find(|&(s, _)| s == nb_slot)
+                        .map(|(_, l)| l)
+                        .unwrap_or(node_label_id);
+                        next_frontier.push((nb_slot, nb_label));
                     }
                 }
             }

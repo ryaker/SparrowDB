@@ -20,7 +20,7 @@ impl Engine {
         &self,
         src_slot: u64,
         src_label_id: u32,
-        delta_all: &[sparrowdb_storage::edge_store::DeltaRecord],
+        delta_idx: &DeltaIndex,
         node_label: &std::collections::HashSet<(u64, u32)>,
         all_label_ids: &[u32],
         out: &mut std::collections::HashSet<(u64, u32)>,
@@ -32,15 +32,13 @@ impl Engine {
         let csr_slots: Vec<u64> = self.csr_neighbors_all(src_slot);
 
         // ── Delta neighbors (full NodeId available) ───────────────────────────
-        // Insert delta neighbors first — their labels are authoritative.
-        for r in delta_all.iter().filter(|r| {
-            let r_src_label = (r.src.0 >> 32) as u32;
-            let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-            r_src_label == src_label_id && r_src_slot == src_slot
-        }) {
-            let dst_slot = r.dst.0 & 0xFFFF_FFFF;
-            let dst_label = (r.dst.0 >> 32) as u32;
-            out.insert((dst_slot, dst_label));
+        // SPA-283: O(1) indexed lookup instead of linear scan.
+        if let Some(recs) = delta_idx.get(&(src_label_id, src_slot)) {
+            for r in recs {
+                let dst_slot = r.dst.0 & 0xFFFF_FFFF;
+                let dst_label = (r.dst.0 >> 32) as u32;
+                out.insert((dst_slot, dst_label));
+            }
         }
 
         // For each CSR slot, determine label: prefer a delta-confirmed label,
@@ -99,7 +97,7 @@ impl Engine {
         src_label_id: u32,
         min_hops: u32,
         max_hops: u32,
-        delta_all: &[sparrowdb_storage::edge_store::DeltaRecord],
+        delta_idx: &DeltaIndex,
         node_label: &std::collections::HashSet<(u64, u32)>,
         all_label_ids: &[u32],
         neighbors_buf: &mut std::collections::HashSet<(u64, u32)>,
@@ -145,7 +143,7 @@ impl Engine {
                 self.get_node_neighbors_labeled(
                     cur_slot,
                     cur_label,
-                    delta_all,
+                    delta_idx,
                     node_label,
                     all_label_ids,
                     neighbors_buf,
@@ -192,7 +190,7 @@ impl Engine {
             self.get_node_neighbors_labeled(
                 src_slot,
                 src_label_id,
-                delta_all,
+                delta_idx,
                 node_label,
                 all_label_ids,
                 neighbors_buf,
@@ -242,7 +240,7 @@ impl Engine {
                             self.get_node_neighbors_labeled(
                                 nb_slot,
                                 nb_label,
-                                delta_all,
+                                delta_idx,
                                 node_label,
                                 all_label_ids,
                                 neighbors_buf,
@@ -264,20 +262,15 @@ impl Engine {
         &self,
         src_slot: u64,
         src_label_id: u32,
-        delta_all: &[sparrowdb_storage::edge_store::DeltaRecord],
+        delta_idx: &DeltaIndex,
     ) -> Vec<u64> {
         let csr_neighbors: Vec<u64> = self.csr_neighbors_all(src_slot);
-        let delta_neighbors: Vec<u64> = delta_all
-            .iter()
-            .filter(|r| {
-                let r_src_label = (r.src.0 >> 32) as u32;
-                let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                r_src_label == src_label_id && r_src_slot == src_slot
-            })
-            .map(|r| r.dst.0 & 0xFFFF_FFFF)
-            .collect();
+        // SPA-283: O(1) indexed lookup instead of linear scan.
+        // Extend the dedup set directly from the index iterator — no intermediate Vec.
         let mut all: std::collections::HashSet<u64> = csr_neighbors.into_iter().collect();
-        all.extend(delta_neighbors);
+        if let Some(recs) = delta_idx.get(&(src_label_id, src_slot)) {
+            all.extend(recs.iter().map(|r| node_id_parts(r.dst.0).1));
+        }
         all.into_iter().collect()
     }
 
@@ -363,6 +356,8 @@ impl Engine {
         // delta reads and O(sources × delta_records) HashMap insertions per query.
         // Now we build them once and pass references into the BFS.
         let delta_all = self.read_delta_all();
+        // SPA-283: build HashMap index for O(1) per-node delta lookups.
+        let delta_idx = build_delta_index(&delta_all);
         let mut node_label: std::collections::HashSet<(u64, u32)> =
             std::collections::HashSet::new();
         for r in &delta_all {
@@ -436,7 +431,7 @@ impl Engine {
                 src_label_id,
                 min_hops,
                 max_hops,
-                &delta_all,
+                &delta_idx,
                 &node_label,
                 &all_label_ids,
                 &mut neighbors_buf,

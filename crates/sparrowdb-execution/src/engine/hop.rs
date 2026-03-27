@@ -158,6 +158,10 @@ impl Engine {
                 edge_store.and_then(|s| s.read_delta()).unwrap_or_default()
             };
 
+            // SPA-283: build a HashMap index keyed by (src_label_id, src_slot)
+            // so each per-node neighbor lookup is O(1) instead of O(n).
+            let delta_index = build_delta_index(&delta_records_all);
+
             // SPA-240: Pre-read all edge props for this rel table if any edge
             // property access is needed (inline filter, projection, or WHERE).
             //
@@ -223,17 +227,10 @@ impl Engine {
                     continue;
                 }
 
-                // SPA-163 / SPA-195: read delta edges for this src node from
-                // the correct per-rel-table delta log (no longer hardcoded to 0).
-                let delta_neighbors: Vec<u64> = delta_records_all
-                    .iter()
-                    .filter(|r| {
-                        let r_src_label = (r.src.0 >> 32) as u32;
-                        let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                        r_src_label == effective_src_label_id && r_src_slot == src_slot
-                    })
-                    .map(|r| r.dst.0 & 0xFFFF_FFFF)
-                    .collect();
+                // SPA-163 / SPA-195 / SPA-283: O(1) indexed delta lookup
+                // instead of linear scan over all delta records.
+                let delta_neighbors: Vec<u64> =
+                    delta_neighbors_from_index(&delta_index, effective_src_label_id, src_slot);
 
                 // Look up the CSR for this specific rel table.  open_csr_map
                 // builds a per-table map keyed by catalog_rel_id, so each rel

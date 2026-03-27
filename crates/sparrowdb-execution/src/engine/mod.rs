@@ -32,6 +32,68 @@ use sparrowdb_storage::wal::WalReplayer;
 
 use crate::types::{QueryResult, Value};
 
+// ── Delta index (SPA-283) ─────────────────────────────────────────────────────
+//
+// Instead of scanning the entire delta log O(n) for every neighbor lookup,
+// pre-index records by `(src_label_id, src_slot)`.  Lookups become O(1)
+// amortized, which turns multi-hop traversals from O(k × n) into O(k).
+
+/// Pre-indexed delta log keyed by `(src_label_id, src_slot)`.
+///
+/// Each entry holds the list of `DeltaRecord`s whose source matches that key.
+/// Built once per query from the flat `Vec<DeltaRecord>` and passed into
+/// traversal code for O(1) neighbor lookups.
+pub(crate) type DeltaIndex = HashMap<(u32, u64), Vec<DeltaRecord>>;
+
+/// Decompose a raw `NodeId` value into `(label_id, slot)`.
+///
+/// The encoding is: high 32 bits = label_id, low 32 bits = slot.
+#[inline]
+pub(crate) fn node_id_parts(raw: u64) -> (u32, u64) {
+    ((raw >> 32) as u32, raw & 0xFFFF_FFFF)
+}
+
+/// Build a [`DeltaIndex`] from a flat slice of delta records.
+pub(crate) fn build_delta_index(records: &[DeltaRecord]) -> DeltaIndex {
+    let mut idx: DeltaIndex = HashMap::with_capacity(records.len() / 4);
+    for r in records {
+        let (src_label, src_slot) = node_id_parts(r.src.0);
+        idx.entry((src_label, src_slot)).or_default().push(*r);
+    }
+    idx
+}
+
+/// Look up delta neighbors for a given `(src_label_id, src_slot)` and return
+/// their destination slots (lower 32 bits of `dst.0`).
+pub(crate) fn delta_neighbors_from_index(
+    index: &DeltaIndex,
+    src_label_id: u32,
+    src_slot: u64,
+) -> Vec<u64> {
+    index
+        .get(&(src_label_id, src_slot))
+        .map(|recs| recs.iter().map(|r| node_id_parts(r.dst.0).1).collect())
+        .unwrap_or_default()
+}
+
+/// Look up delta neighbors for a given `(src_label_id, src_slot)` and return
+/// `(dst_slot, dst_label_id)` pairs extracted from the full dst `NodeId`.
+pub(crate) fn delta_neighbors_labeled_from_index(
+    index: &DeltaIndex,
+    src_label_id: u32,
+    src_slot: u64,
+) -> impl Iterator<Item = (u64, u32)> + '_ {
+    index
+        .get(&(src_label_id, src_slot))
+        .into_iter()
+        .flat_map(|recs| {
+            recs.iter().map(|r| {
+                let (dst_label, dst_slot) = node_id_parts(r.dst.0);
+                (dst_slot, dst_label)
+            })
+        })
+}
+
 // ── DegreeCache (SPA-272) ─────────────────────────────────────────────────────
 
 /// Pre-computed out-degree for every node slot across all relationship types.
@@ -91,7 +153,7 @@ impl DegreeCache {
         // 2. Accumulate from delta log: each record increments src's slot.
         //    Lower 32 bits of NodeId = within-label slot number.
         for rec in delta {
-            let src_slot = rec.src.0 & 0xFFFF_FFFF;
+            let src_slot = node_id_parts(rec.src.0).1;
             cache.increment(src_slot);
         }
 
