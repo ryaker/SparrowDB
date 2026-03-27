@@ -4190,7 +4190,7 @@ fn is_reserved_label(label: &str) -> bool {
     label.starts_with("__SO_")
 }
 
-/// Return an [`Error::InvalidArgument`] for a reserved label/type.
+// Return an [`Error::InvalidArgument`] for a reserved label/type.
 // ── WAL crash recovery ────────────────────────────────────────────────────────
 
 /// Decode a WAL property value byte slice back to a `Value`.
