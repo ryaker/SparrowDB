@@ -185,6 +185,11 @@ impl PropertyIndex {
         self.index.clear();
         self.loaded.clear();
         self.generation = self.generation.wrapping_add(1);
+        // Reset the persistence watermark so that persist_if_grew will write
+        // again after the index is repopulated (the on-disk file is removed
+        // separately via remove_persisted, but the count must be zeroed here
+        // so the threshold comparison starts from scratch).
+        self.persisted_key_count = 0;
     }
 
     /// Merge column data from `other` into `self` using union semantics.
