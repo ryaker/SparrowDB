@@ -1339,6 +1339,33 @@ impl NodeStore {
         Ok(out)
     }
 
+    /// Read the null-bitmap for `(label_id, col_id)` and return a `Vec<bool>`
+    /// where index `i` is `true` iff slot `i` has a real value (was explicitly
+    /// written, as opposed to zero-padded for alignment or never written).
+    ///
+    /// If no bitmap file exists (old data written before SPA-207), returns
+    /// `None` to signal backward-compat mode — callers should fall back to the
+    /// `raw != 0` sentinel in that case.
+    ///
+    /// Used by [`PropertyIndex::build_for`] and [`PropertyIndex::build`] to
+    /// correctly index slots whose value is `Int64(0)` (raw = 0), which is
+    /// otherwise indistinguishable from the absent sentinel without the bitmap.
+    pub fn read_null_bitmap_all(&self, label_id: u32, col_id: u32) -> Result<Option<Vec<bool>>> {
+        let path = self.null_bitmap_path(label_id, col_id);
+        if !path.exists() {
+            return Ok(None); // backward compat: no bitmap file
+        }
+        let bits = fs::read(&path).map_err(Error::Io)?;
+        // Each byte encodes 8 slots: bit i of byte j → slot (j*8 + i).
+        let mut out = Vec::with_capacity(bits.len() * 8);
+        for &byte in &bits {
+            for bit_idx in 0..8u32 {
+                out.push((byte >> bit_idx) & 1 == 1);
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Selective sorted-slot read — O(K) seeks instead of O(N) reads.
     ///
     /// For each column, opens the file once and reads only the `slots` needed,

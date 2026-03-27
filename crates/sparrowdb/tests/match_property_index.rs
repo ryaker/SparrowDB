@@ -110,8 +110,8 @@ fn match_create_edge_oi_performance() {
     const N_NODES: i64 = 10_000;
     const N_EDGES: usize = 1_000;
 
-    // Insert N_NODES User nodes each with a unique uid (1-based to avoid the
-    // Int64(0) == ABSENT encoding sentinel that prevents uid=0 from being indexed).
+    // Insert N_NODES User nodes each with a unique uid (1-based; uid=0 is
+    // now also correctly indexed since SPA-325 fixed the null-bitmap wiring).
     for uid in 1..=N_NODES {
         db.execute(&format!("CREATE (:User {{uid: {uid}}})",))
             .unwrap();
