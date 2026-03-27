@@ -494,17 +494,6 @@ impl GraphDb {
         })
     }
 
-    /// Invalidate the shared property-index cache (SPA-187).
-    ///
-    /// Called after every write-transaction commit so the next read query
-    /// re-populates from the updated column files on disk.
-    ///
-    /// SPA-286: also removes the persisted `prop_index.bin` file so that a
-    /// subsequent `open` does not load stale index data.
-    fn invalidate_prop_index(&self) {
-        self.inner.invalidate_prop_index();
-    }
-
     /// Persist the shared property-index cache to disk if new columns have
     /// been loaded since the last persist (SPA-286).
     ///
@@ -1141,7 +1130,6 @@ impl GraphDb {
         }
 
         tx.commit()?;
-        self.invalidate_prop_index();
         self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
@@ -1227,7 +1215,6 @@ impl GraphDb {
         let mut tx = self.begin_write()?;
         let node_id = tx.merge_node(&m.label, props.clone())?;
         tx.commit()?;
-        self.invalidate_prop_index();
         self.invalidate_catalog();
 
         // If the statement has a RETURN clause, project the merged node's properties.
@@ -1323,7 +1310,6 @@ impl GraphDb {
         let mut tx = self.begin_write()?;
         let node_id = tx.merge_node(&m.label, props.clone())?;
         tx.commit()?;
-        self.invalidate_prop_index();
         self.invalidate_catalog();
         if let Some(ref ret) = m.return_clause {
             use sparrowdb_cypher::ast::Expr;
@@ -1398,7 +1384,6 @@ impl GraphDb {
             }
             tx.commit()?;
             self.invalidate_csr_map();
-            self.invalidate_prop_index();
             self.invalidate_catalog();
             return Ok(QueryResult::empty(vec![]));
         }
@@ -1421,7 +1406,6 @@ impl GraphDb {
             }
         }
         tx.commit()?;
-        self.invalidate_prop_index();
         self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
@@ -1459,7 +1443,6 @@ impl GraphDb {
             }
             tx.commit()?;
             self.invalidate_csr_map();
-            self.invalidate_prop_index();
             self.invalidate_catalog();
             return Ok(QueryResult::empty(vec![]));
         }
@@ -1486,7 +1469,6 @@ impl GraphDb {
         }
 
         tx.commit()?;
-        self.invalidate_prop_index();
         self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
@@ -1740,7 +1722,6 @@ impl GraphDb {
         }
 
         tx.commit()?;
-        self.invalidate_prop_index();
         self.invalidate_catalog();
         Ok(QueryResult::empty(vec![]))
     }
@@ -1883,7 +1864,6 @@ impl GraphDb {
 
         // Single fsync commit — all mutations land in one WAL transaction.
         tx.commit()?;
-        self.invalidate_prop_index();
         self.invalidate_catalog();
 
         // Merge early (CHECKPOINT/OPTIMIZE) and mutation results in order.
@@ -2414,7 +2394,6 @@ impl GraphDb {
         let mut tx = self.begin_write()?;
         let result = tx.merge_node_by_property(label, match_key, match_value, properties)?;
         tx.commit()?;
-        self.invalidate_prop_index();
         self.invalidate_catalog();
         Ok(result)
     }
@@ -3477,11 +3456,9 @@ impl WriteTx {
 
         // Step 12: Invalidate the shared property-index cache (SPA-259).
         //
-        // GraphDb-level execute functions (execute_create_standalone, etc.)
-        // call invalidate_prop_index() again after this — the extra clear
-        // is harmless (just bumps the generation counter).  The critical
-        // case is when a caller uses WriteTx directly without going through
-        // a GraphDb::execute path, which previously left the cache stale.
+        // This is the single canonical invalidation point (#312).
+        // Callers using WriteTx directly (without GraphDb::execute) still
+        // get correct cache invalidation.
         self.inner.invalidate_prop_index();
 
         self.committed = true;
