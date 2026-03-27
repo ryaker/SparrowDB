@@ -389,6 +389,10 @@ impl GraphDb {
         let wal_dir = path.join("wal");
         let wal_writer = WalWriter::open(&wal_dir)?;
         let label_row_counts = RwLock::new(build_label_row_counts_from_disk(&catalog, path));
+        // SPA-286: load persisted property index from disk if available,
+        // otherwise start with an empty index (lazy rebuild from column files).
+        let prop_index = sparrowdb_storage::property_index::PropertyIndex::load_from_dir(path)
+            .unwrap_or_default();
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -398,7 +402,7 @@ impl GraphDb {
                 node_versions: RwLock::new(NodeVersions::default()),
                 encryption_key: None,
                 unique_constraints: RwLock::new(HashSet::new()),
-                prop_index: RwLock::new(sparrowdb_storage::property_index::PropertyIndex::new()),
+                prop_index: RwLock::new(prop_index),
                 catalog: RwLock::new(catalog),
                 csr_map: RwLock::new(open_csr_map(path)),
                 label_row_counts,
@@ -423,6 +427,10 @@ impl GraphDb {
         let wal_dir = path.join("wal");
         let wal_writer = WalWriter::open_encrypted(&wal_dir, key)?;
         let label_row_counts = RwLock::new(build_label_row_counts_from_disk(&catalog, path));
+        // SPA-286: load persisted property index (not encrypted; index data is
+        // derived from column files which are also unencrypted on disk).
+        let prop_index = sparrowdb_storage::property_index::PropertyIndex::load_from_dir(path)
+            .unwrap_or_default();
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -432,7 +440,7 @@ impl GraphDb {
                 node_versions: RwLock::new(NodeVersions::default()),
                 encryption_key: Some(key),
                 unique_constraints: RwLock::new(HashSet::new()),
-                prop_index: RwLock::new(sparrowdb_storage::property_index::PropertyIndex::new()),
+                prop_index: RwLock::new(prop_index),
                 catalog: RwLock::new(catalog),
                 csr_map: RwLock::new(open_csr_map(path)),
                 label_row_counts,
@@ -446,12 +454,31 @@ impl GraphDb {
     ///
     /// Called after every write-transaction commit so the next read query
     /// re-populates from the updated column files on disk.
+    ///
+    /// SPA-286: also removes the persisted `prop_index.bin` file so that a
+    /// subsequent `open` does not load stale index data.
     fn invalidate_prop_index(&self) {
         self.inner
             .prop_index
             .write()
             .expect("prop_index RwLock poisoned")
             .clear();
+        // SPA-286: remove stale persisted index.
+        sparrowdb_storage::property_index::PropertyIndex::remove_persisted(&self.inner.path);
+    }
+
+    /// Persist the shared property-index cache to disk if new columns have
+    /// been loaded since the last persist (SPA-286).
+    ///
+    /// Called after `write_back_prop_index` so the next `GraphDb::open` can
+    /// load the index from disk instead of rebuilding from column files.
+    /// Only writes when the index has grown (new `(label_id, col_id)` pairs
+    /// were loaded), avoiding redundant I/O on repeated queries that hit the
+    /// same already-persisted columns.
+    fn persist_prop_index(&self) {
+        if let Ok(mut guard) = self.inner.prop_index.write() {
+            guard.persist_if_grew(&self.inner.path);
+        }
     }
 
     /// Refresh the shared catalog cache from disk (SPA-188) and simultaneously
@@ -762,6 +789,7 @@ impl GraphDb {
 
             // Write lazily-loaded columns back to the shared cache.
             engine.write_back_prop_index(&self.inner.prop_index);
+            self.persist_prop_index();
 
             tracing::debug!(rows = result.rows.len(), "query complete");
             Ok(result)
@@ -853,6 +881,7 @@ impl GraphDb {
         };
 
         engine.write_back_prop_index(&self.inner.prop_index);
+        self.persist_prop_index();
 
         tracing::debug!(rows = result.rows.len(), "query_with_timeout complete");
         Ok(result)
@@ -1146,6 +1175,7 @@ impl GraphDb {
         };
 
         engine.write_back_prop_index(&self.inner.prop_index);
+        self.persist_prop_index();
 
         tracing::debug!(rows = result.rows.len(), "query_with_params complete");
         Ok(result)
@@ -1490,6 +1520,7 @@ impl GraphDb {
         // Node property columns are NOT changed by this operation (only edges
         // are created), so the cache remains valid.
         engine.write_back_prop_index(&self.inner.prop_index);
+        self.persist_prop_index();
 
         if matched_rows.is_empty() {
             return Ok(QueryResult::empty(vec![]));
@@ -2544,6 +2575,10 @@ impl ReadTx {
         // Write lazily-loaded columns back to the shared property-index cache
         // so subsequent queries benefit from warm column data.
         engine.write_back_prop_index(&self.inner.prop_index);
+        // SPA-286: persist updated index to disk if new columns were loaded.
+        if let Ok(mut guard) = self.inner.prop_index.write() {
+            guard.persist_if_grew(&self.inner.path);
+        }
 
         tracing::debug!(
             rows = result.rows.len(),
@@ -3418,6 +3453,8 @@ impl WriteTx {
             .write()
             .expect("prop_index RwLock poisoned")
             .clear();
+        // SPA-286: remove stale persisted index after write commit.
+        sparrowdb_storage::property_index::PropertyIndex::remove_persisted(&self.inner.path);
 
         self.committed = true;
         Ok(TxnId(new_id))
