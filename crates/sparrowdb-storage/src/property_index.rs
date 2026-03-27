@@ -52,6 +52,9 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::fs;
+use std::io::Write;
+use std::path::Path;
 
 use sparrowdb_common::{NodeId, Result};
 
@@ -159,6 +162,10 @@ pub struct PropertyIndex {
     /// write committed and cleared the cache since this engine was created, so
     /// the engine's index data is stale and must not be written back.
     pub generation: u64,
+    /// Number of index keys at the time of the last successful `save_to_dir`.
+    /// Used by `persist_if_grew` to skip redundant disk writes when the
+    /// shared cache has not actually gained new columns since the last persist.
+    persisted_key_count: usize,
 }
 
 impl PropertyIndex {
@@ -178,6 +185,11 @@ impl PropertyIndex {
         self.index.clear();
         self.loaded.clear();
         self.generation = self.generation.wrapping_add(1);
+        // Reset the persistence watermark so that persist_if_grew will write
+        // again after the index is repopulated (the on-disk file is removed
+        // separately via remove_persisted, but the count must be zeroed here
+        // so the threshold comparison starts from scratch).
+        self.persisted_key_count = 0;
     }
 
     /// Merge column data from `other` into `self` using union semantics.
@@ -502,6 +514,174 @@ impl PropertyIndex {
     pub fn node_id_to_slot(node_id: NodeId) -> u32 {
         (node_id.0 & 0xFFFF_FFFF) as u32
     }
+
+    // ── Persistence (SPA-286) ────────────────────────────────────────────────
+
+    /// File name for the persisted property index within the db root directory.
+    const INDEX_FILE: &'static str = "prop_index.bin";
+
+    /// Persist the current in-memory property index to disk as a flat binary
+    /// file at `{db_root}/prop_index.bin`.
+    ///
+    /// ## Binary format
+    ///
+    /// ```text
+    /// HEADER: [magic: u32 = 0x50524F50] [version: u32 = 1] [num_keys: u32]
+    /// for each indexed (label_id, col_id):
+    ///   [label_id: u32] [col_id: u32] [num_entries: u32]
+    ///   for each BTree entry:
+    ///     [sort_key: u64] [num_slots: u32] [slot_0: u32 .. slot_N: u32]
+    /// ```
+    ///
+    /// Errors are logged and suppressed — failing to persist an index is not
+    /// fatal; the next `Engine` will simply rebuild from column files.
+    pub fn save_to_dir(&mut self, db_root: &Path) {
+        if self.index.is_empty() {
+            // Nothing to persist — remove any stale file.
+            let _ = fs::remove_file(db_root.join(Self::INDEX_FILE));
+            self.persisted_key_count = 0;
+            return;
+        }
+        if let Err(e) = self.save_to_dir_inner(db_root) {
+            tracing::warn!(error = ?e, "PropertyIndex::save_to_dir: failed to persist index");
+        } else {
+            self.persisted_key_count = self.index.len();
+        }
+    }
+
+    /// Persist the index to disk only if new columns have been loaded since the
+    /// last persist (i.e. `self.index.len() > self.persisted_key_count`).
+    ///
+    /// This avoids redundant disk writes on queries that don't load any new
+    /// index columns (e.g. repeated MATCH queries on already-indexed columns).
+    pub fn persist_if_grew(&mut self, db_root: &Path) {
+        if self.index.len() > self.persisted_key_count {
+            self.save_to_dir(db_root);
+        }
+    }
+
+    fn save_to_dir_inner(&self, db_root: &Path) -> std::io::Result<()> {
+        let path = db_root.join(Self::INDEX_FILE);
+        let tmp_path = db_root.join("prop_index.bin.tmp");
+
+        let mut buf: Vec<u8> = Vec::new();
+
+        // Magic + version + num_keys
+        buf.write_all(&0x50524F50u32.to_le_bytes())?;
+        buf.write_all(&1u32.to_le_bytes())?;
+        buf.write_all(&(self.index.len() as u32).to_le_bytes())?;
+
+        for (key, btree) in &self.index {
+            buf.write_all(&key.label_id.to_le_bytes())?;
+            buf.write_all(&key.col_id.to_le_bytes())?;
+            buf.write_all(&(btree.len() as u32).to_le_bytes())?;
+            for (&sort_key_val, slots) in btree.as_ref() {
+                buf.write_all(&sort_key_val.to_le_bytes())?;
+                buf.write_all(&(slots.len() as u32).to_le_bytes())?;
+                for &slot in slots {
+                    buf.write_all(&slot.to_le_bytes())?;
+                }
+            }
+        }
+
+        // Atomic write: write to tmp then rename.
+        fs::write(&tmp_path, &buf)?;
+        fs::rename(&tmp_path, &path)?;
+        Ok(())
+    }
+
+    /// Load a persisted property index from `{db_root}/prop_index.bin`.
+    ///
+    /// Returns a fully populated `PropertyIndex` on success, or `None` if the
+    /// file does not exist, is corrupt, or has an unsupported version.  In the
+    /// `None` case the caller should fall back to the default empty index
+    /// (lazy rebuild from column files).
+    pub fn load_from_dir(db_root: &Path) -> Option<PropertyIndex> {
+        let path = db_root.join(Self::INDEX_FILE);
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => return None,
+        };
+        Self::decode(&data)
+    }
+
+    fn decode(data: &[u8]) -> Option<PropertyIndex> {
+        let mut cursor = 0usize;
+
+        // Helper to read N bytes.
+        let read_bytes = |cursor: &mut usize, n: usize| -> Option<&[u8]> {
+            if *cursor + n > data.len() {
+                return None;
+            }
+            let slice = &data[*cursor..*cursor + n];
+            *cursor += n;
+            Some(slice)
+        };
+        let read_u32 = |cursor: &mut usize| -> Option<u32> {
+            let b = read_bytes(cursor, 4)?;
+            Some(u32::from_le_bytes(b.try_into().ok()?))
+        };
+        let read_u64 = |cursor: &mut usize| -> Option<u64> {
+            let b = read_bytes(cursor, 8)?;
+            Some(u64::from_le_bytes(b.try_into().ok()?))
+        };
+
+        // Check magic and version.
+        let magic = read_u32(&mut cursor)?;
+        if magic != 0x50524F50 {
+            return None;
+        }
+        let version = read_u32(&mut cursor)?;
+        if version != 1 {
+            return None;
+        }
+
+        let num_keys = read_u32(&mut cursor)? as usize;
+        let mut index = std::collections::HashMap::with_capacity(num_keys);
+        let mut loaded = HashSet::with_capacity(num_keys);
+
+        for _ in 0..num_keys {
+            let label_id = read_u32(&mut cursor)?;
+            let col_id = read_u32(&mut cursor)?;
+            let num_entries = read_u32(&mut cursor)? as usize;
+
+            let mut btree = BTreeMap::new();
+            for _ in 0..num_entries {
+                let sk = read_u64(&mut cursor)?;
+                let num_slots = read_u32(&mut cursor)? as usize;
+                let mut slots = Vec::with_capacity(num_slots);
+                for _ in 0..num_slots {
+                    slots.push(read_u32(&mut cursor)?);
+                }
+                btree.insert(sk, slots);
+            }
+
+            let key = IndexKey { label_id, col_id };
+            index.insert(key, std::sync::Arc::new(btree));
+            loaded.insert(key);
+        }
+
+        // Verify we consumed exactly all bytes (guards against trailing garbage).
+        if cursor != data.len() {
+            return None;
+        }
+
+        let persisted_key_count = index.len();
+        Some(PropertyIndex {
+            index,
+            loaded,
+            generation: 0,
+            persisted_key_count,
+        })
+    }
+
+    /// Remove the persisted property index file from disk.
+    ///
+    /// Called when the index is invalidated (e.g. after a write-transaction
+    /// commit) so that stale data is never loaded on the next open.
+    pub fn remove_persisted(db_root: &Path) {
+        let _ = fs::remove_file(db_root.join(Self::INDEX_FILE));
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -556,5 +736,89 @@ mod tests {
         assert!(!idx.is_indexed(1, 0));
         idx.insert(1, 0, 0, 42u64);
         assert!(idx.is_indexed(1, 0));
+    }
+
+    // ── Persistence tests (SPA-286) ──────────────────────────────────────
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = PropertyIndex::new();
+        idx.insert(1, 2, 0, 42u64);
+        idx.insert(1, 2, 1, 42u64);
+        idx.insert(1, 2, 2, 99u64);
+        idx.insert(3, 5, 10, 7u64);
+
+        idx.save_to_dir(dir.path());
+
+        let loaded = PropertyIndex::load_from_dir(dir.path()).expect("should load persisted index");
+        assert_eq!(loaded.lookup(1, 2, 42u64), &[0u32, 1]);
+        assert_eq!(loaded.lookup(1, 2, 99u64), &[2u32]);
+        assert_eq!(loaded.lookup(3, 5, 7u64), &[10u32]);
+        assert!(loaded.is_indexed(1, 2));
+        assert!(loaded.is_indexed(3, 5));
+    }
+
+    #[test]
+    fn load_returns_none_when_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(PropertyIndex::load_from_dir(dir.path()).is_none());
+    }
+
+    #[test]
+    fn load_returns_none_on_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("prop_index.bin"), b"garbage").unwrap();
+        assert!(PropertyIndex::load_from_dir(dir.path()).is_none());
+    }
+
+    #[test]
+    fn remove_persisted_deletes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = PropertyIndex::new();
+        idx.insert(1, 1, 0, 1u64);
+        idx.save_to_dir(dir.path());
+        assert!(dir.path().join("prop_index.bin").exists());
+
+        PropertyIndex::remove_persisted(dir.path());
+        assert!(!dir.path().join("prop_index.bin").exists());
+    }
+
+    #[test]
+    fn empty_index_removes_file_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a file first.
+        let mut idx = PropertyIndex::new();
+        idx.insert(1, 1, 0, 1u64);
+        idx.save_to_dir(dir.path());
+        assert!(dir.path().join("prop_index.bin").exists());
+
+        // Saving an empty index removes it.
+        let mut empty = PropertyIndex::new();
+        empty.save_to_dir(dir.path());
+        assert!(!dir.path().join("prop_index.bin").exists());
+    }
+
+    #[test]
+    fn range_lookup_survives_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = PropertyIndex::new();
+        // Insert integer values (tag byte 0x00 + payload).
+        // sort_key flips sign bit for INT64 tag, so we use sort_key directly.
+        for i in 0u64..10 {
+            let raw = i; // simplified: raw values without INT64 tag
+            idx.insert(1, 1, i as u32, raw);
+        }
+        idx.save_to_dir(dir.path());
+
+        let loaded = PropertyIndex::load_from_dir(dir.path()).unwrap();
+        // Range query: sort_key(3) .. sort_key(7) inclusive.
+        let results =
+            loaded.lookup_range(1, 1, Some((sort_key(3), true)), Some((sort_key(7), true)));
+        // Should contain slots 3, 4, 5, 6, 7.
+        assert_eq!(results.len(), 5);
+        for s in [3u32, 4, 5, 6, 7] {
+            assert!(results.contains(&s), "expected slot {s} in range results");
+        }
     }
 }
