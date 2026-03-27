@@ -266,9 +266,11 @@ impl Engine {
     ) -> Vec<u64> {
         let csr_neighbors: Vec<u64> = self.csr_neighbors_all(src_slot);
         // SPA-283: O(1) indexed lookup instead of linear scan.
-        let delta_neighbors = delta_neighbors_from_index(delta_idx, src_label_id, src_slot);
+        // Extend the dedup set directly from the index iterator — no intermediate Vec.
         let mut all: std::collections::HashSet<u64> = csr_neighbors.into_iter().collect();
-        all.extend(delta_neighbors);
+        if let Some(recs) = delta_idx.get(&(src_label_id, src_slot)) {
+            all.extend(recs.iter().map(|r| node_id_parts(r.dst.0).1));
+        }
         all.into_iter().collect()
     }
 
