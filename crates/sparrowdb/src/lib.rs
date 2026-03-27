@@ -436,7 +436,7 @@ impl GraphDb {
                 versions: RwLock::new(VersionStore::default()),
                 node_versions: RwLock::new(NodeVersions::default()),
                 encryption_key: None,
-                unique_constraints: RwLock::new(HashSet::new()),
+                unique_constraints: RwLock::new(load_constraints(path)),
                 prop_index: RwLock::new(prop_index),
                 catalog: RwLock::new(catalog),
                 csr_map: RwLock::new(open_csr_map(path)),
@@ -483,7 +483,7 @@ impl GraphDb {
                 versions: RwLock::new(VersionStore::default()),
                 node_versions: RwLock::new(NodeVersions::default()),
                 encryption_key: Some(key),
-                unique_constraints: RwLock::new(HashSet::new()),
+                unique_constraints: RwLock::new(load_constraints(path)),
                 prop_index: RwLock::new(prop_index),
                 catalog: RwLock::new(catalog),
                 csr_map: RwLock::new(open_csr_map(path)),
@@ -952,11 +952,12 @@ impl GraphDb {
             }
         };
         let col_id = sparrowdb_common::col_id_of(property);
-        self.inner
-            .unique_constraints
-            .write()
-            .unwrap()
-            .insert((label_id, col_id));
+        {
+            let mut guard = self.inner.unique_constraints.write().unwrap();
+            guard.insert((label_id, col_id));
+            // Persist to disk so the constraint survives restart (issue #306).
+            save_constraints(&self.inner.path, &guard)?;
+        }
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -3874,6 +3875,60 @@ fn collect_maintenance_params(
 ///
 /// SPA-185: replaces the old `open_csr_forward` that only opened `RelTableId(0)`.
 /// The catalog is used to discover all registered rel types.
+// ── Constraint persistence helpers (issue #306) ─────────────────────────────
+
+const CONSTRAINTS_FILE: &str = "constraints.bin";
+
+/// Serialize the unique-constraint set to `<db_root>/constraints.bin`.
+///
+/// Format: `[count: u32 LE][label_id: u32 LE, col_id: u32 LE]*`
+fn save_constraints(db_root: &Path, constraints: &HashSet<(u32, u32)>) -> Result<()> {
+    use std::io::Write;
+    let path = db_root.join(CONSTRAINTS_FILE);
+    let mut buf = Vec::with_capacity(4 + constraints.len() * 8);
+    buf.extend_from_slice(&(constraints.len() as u32).to_le_bytes());
+    for &(label_id, col_id) in constraints {
+        buf.extend_from_slice(&label_id.to_le_bytes());
+        buf.extend_from_slice(&col_id.to_le_bytes());
+    }
+    // Atomic write: write to a temp file then rename so a crash mid-write
+    // never leaves a truncated constraints file.
+    let tmp_path = db_root.join("constraints.bin.tmp");
+    let mut f = std::fs::File::create(&tmp_path)?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(())
+}
+
+/// Load the unique-constraint set from `<db_root>/constraints.bin`.
+///
+/// Returns an empty set if the file does not exist (fresh database).
+fn load_constraints(db_root: &Path) -> HashSet<(u32, u32)> {
+    let path = db_root.join(CONSTRAINTS_FILE);
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(_) => return HashSet::new(),
+    };
+    if data.len() < 4 {
+        return HashSet::new();
+    }
+    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let expected_len = 4 + count * 8;
+    if data.len() < expected_len {
+        return HashSet::new();
+    }
+    let mut set = HashSet::with_capacity(count);
+    for i in 0..count {
+        let off = 4 + i * 8;
+        let label_id = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let col_id =
+            u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
+        set.insert((label_id, col_id));
+    }
+    set
+}
+
 /// Build a `LabelId → node count` map by reading each label's HWM from disk
 /// (SPA-190).  Called at `GraphDb::open()` and after node-mutating writes.
 fn build_label_row_counts_from_disk(catalog: &Catalog, db_root: &Path) -> HashMap<LabelId, usize> {
