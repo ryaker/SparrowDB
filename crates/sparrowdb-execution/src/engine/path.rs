@@ -482,7 +482,6 @@ impl Engine {
                                 .iter()
                                 .copied()
                                 .zip(batch[i].iter().copied())
-                                .filter(|&(_, v)| v != 0)
                                 .collect();
                             map.insert((*slot as u64, label_id), props);
                         }
