@@ -1,0 +1,21 @@
+[package]
+name = "sparrow-ontology"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Schema and ontology management layer for SparrowDB"
+documentation = "https://docs.rs/sparrow-ontology"
+readme = "README.md"
+keywords = ["graph-database", "ontology", "schema", "sparrowdb"]
+categories = ["database", "data-structures"]
+
+[dependencies]
+sparrowdb           = { path = "../sparrowdb", version = "0.1.12" }
+sparrowdb-execution = { path = "../sparrowdb-execution", version = "0.1.12" }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

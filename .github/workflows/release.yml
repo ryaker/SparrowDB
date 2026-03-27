@@ -134,10 +134,66 @@ jobs:
   # Re-enable by uncommenting the publish-pypi and publish-rubygems jobs
   # and adding PYPI_TOKEN / RUBYGEMS_TOKEN secrets to the repo.
 
+  # ── Publish crates to crates.io ─────────────────────────────────────────
+  publish-crates:
+    name: Publish to crates.io
+    needs: [meta]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Crates must be published in dependency order.
+      # Each publish waits ~30 s for crates.io to index before the next.
+
+      - name: Publish sparrowdb-common
+        run: cargo publish -p sparrowdb-common --token ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish sparrowdb-storage
+        run: cargo publish -p sparrowdb-storage --token ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish sparrowdb-catalog
+        run: cargo publish -p sparrowdb-catalog --token ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish sparrowdb-cypher
+        run: cargo publish -p sparrowdb-cypher --token ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish sparrowdb-execution
+        run: cargo publish -p sparrowdb-execution --token ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish sparrowdb
+        run: cargo publish -p sparrowdb --token ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish sparrow-ontology
+        run: cargo publish -p sparrow-ontology --token ${{ secrets.CRATES_IO_TOKEN }}
+
   # ── Create GitHub Release ────────────────────────────────────────────────
   github-release:
     name: Create GitHub Release
-    needs: [meta, npm-publish]
+    needs: [meta, npm-publish, publish-crates]
     if: always()
     runs-on: ubuntu-latest
     permissions:

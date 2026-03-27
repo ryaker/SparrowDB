@@ -14,6 +14,7 @@ members = [
     "crates/sparrowdb-metrics",
     "crates/sparrowdb-bench",
     "crates/sparrowdb-ruby",
+    "crates/sparrow-ontology",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ sparrowdb-cypher  = { path = "crates/sparrowdb-cypher", version = "0.1.0" }
 sparrowdb-execution = { path = "crates/sparrowdb-execution", version = "0.1.0" }
 sparrowdb = { path = "crates/sparrowdb", version = "0.1.0" }
 sparrowdb-metrics = { path = "crates/sparrowdb-metrics", version = "0.1.0" }
+sparrow-ontology  = { path = "crates/sparrow-ontology",  version = "0.1.12" }
 tiny_http         = "0.12"
 tempfile          = "3"
 crc32fast         = "1"
