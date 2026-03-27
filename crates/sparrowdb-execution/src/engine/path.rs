@@ -35,8 +35,12 @@ impl Engine {
 
         // ── Delta neighbors (full NodeId available) ───────────────────────────
         // SPA-283: O(1) indexed lookup instead of linear scan.
+        // SPA-284: filter by relation-table IDs when a type constraint exists.
         if let Some(recs) = delta_idx.get(&(src_label_id, src_slot)) {
             for r in recs {
+                if !rel_ids.is_empty() && !rel_ids.contains(&r.rel_id.0) {
+                    continue;
+                }
                 let dst_slot = r.dst.0 & 0xFFFF_FFFF;
                 let dst_label = (r.dst.0 >> 32) as u32;
                 out.insert((dst_slot, dst_label));
@@ -274,9 +278,14 @@ impl Engine {
         // SPA-284: use filtered CSR lookup when rel type IDs are provided.
         let csr_neighbors: Vec<u64> = self.csr_neighbors_filtered(src_slot, rel_ids);
         // SPA-283: O(1) indexed lookup instead of linear scan.
+        // SPA-284: filter by relation-table IDs when a type constraint exists.
         let mut all: std::collections::HashSet<u64> = csr_neighbors.into_iter().collect();
         if let Some(recs) = delta_idx.get(&(src_label_id, src_slot)) {
-            all.extend(recs.iter().map(|r| node_id_parts(r.dst.0).1));
+            all.extend(
+                recs.iter()
+                    .filter(|r| rel_ids.is_empty() || rel_ids.contains(&r.rel_id.0))
+                    .map(|r| node_id_parts(r.dst.0).1),
+            );
         }
         all.into_iter().collect()
     }
@@ -381,6 +390,14 @@ impl Engine {
 
         // SPA-284: pre-resolve rel-type IDs so the BFS/DFS uses filtered CSR lookups.
         let rel_ids = self.resolve_rel_ids_for_type(&rel_pat.rel_type);
+        // If a rel type was specified but doesn't exist in the catalog, no edges of
+        // that type can exist — return empty rather than falling back to "all neighbors".
+        if !rel_pat.rel_type.is_empty() && rel_ids.is_empty() {
+            return Ok(QueryResult {
+                columns: column_names.to_vec(),
+                rows: vec![],
+            });
+        }
 
         // Reusable neighbors buffer: allocated once, cleared between frontier nodes.
         let mut neighbors_buf: std::collections::HashSet<(u64, u32)> =
