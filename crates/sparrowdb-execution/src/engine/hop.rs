@@ -1,6 +1,10 @@
 //! Auto-generated submodule — see engine/mod.rs for context.
 use super::*;
 
+/// Precomputed neighbor entry for the `b`-slot in a mutual-friends (FoF)
+/// hash-set intersection: `(b_slot, forward_neighbor_set, b_property_values)`.
+type BNeighborEntry = (u64, HashSet<u64>, Vec<(u32, u64)>);
+
 impl Engine {
     // ── 1-hop traversal: (a)-[:R]->(f) ───────────────────────────────────────
 
@@ -1086,23 +1090,13 @@ impl Engine {
         //
         // Pre-compute: for each qualifying b-slot, its forward neighbor set via
         // hop2 (since b→m means m ∈ hop2_fwd_neighbors(b)).
-        let b_neighbor_sets: Option<Vec<(u64, HashSet<u64>, Vec<(u32, u64)>)>> =
+        let b_neighbor_sets: Option<Vec<BNeighborEntry>> =
             if second_hop_incoming && !fof_node_pat.props.is_empty() {
                 let hwm_fof = self.snapshot.store.hwm_for_label(fof_label_id)?;
-                let mut sets: Vec<(u64, HashSet<u64>, Vec<(u32, u64)>)> = Vec::new();
-                let fof_prop_col_ids: Vec<u32> = {
-                    let mut v = col_ids_fof.clone();
-                    for p in &fof_node_pat.props {
-                        let col_id = prop_name_to_col_id(&p.key);
-                        if !v.contains(&col_id) {
-                            v.push(col_id);
-                        }
-                    }
-                    v
-                };
+                let mut sets: Vec<BNeighborEntry> = Vec::new();
                 for b_slot in 0..hwm_fof {
                     let b_node = NodeId(((fof_label_id as u64) << 32) | b_slot);
-                    let b_props = read_node_props(&self.snapshot.store, b_node, &fof_prop_col_ids)?;
+                    let b_props = read_node_props(&self.snapshot.store, b_node, &col_ids_fof)?;
                     if !self.matches_prop_filter(&b_props, &fof_node_pat.props) {
                         continue;
                     }
