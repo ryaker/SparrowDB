@@ -13,6 +13,7 @@
 //! | 0x0003 | Column definition                    |
 //! | 0x0004 | Secondary-label reverse-index entry  |
 //! | 0x0005 | Format metadata                      |
+//! | 0x0006 | Node label set (multi-label, SPA-200)|
 
 use sparrowdb_common::{Error, Result};
 
@@ -22,6 +23,8 @@ pub const TAG_REL_TABLE: u16 = 0x0002;
 pub const TAG_COLUMN: u16 = 0x0003;
 pub const TAG_REVERSE_INDEX: u16 = 0x0004;
 pub const TAG_FORMAT_META: u16 = 0x0005;
+/// Tag for a node's secondary label assignment (SPA-200 multi-label support).
+pub const TAG_NODE_LABEL_SET: u16 = 0x0006;
 
 /// A single decoded TLV entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +39,8 @@ pub enum TlvEntry {
     ReverseIndex(ReverseIndexEntry),
     /// Tag 0x0005 — format metadata.
     FormatMeta(FormatMetaEntry),
+    /// Tag 0x0006 — node label set (multi-label assignment, SPA-200).
+    NodeLabelSet(NodeLabelSetEntry),
 }
 
 /// Label definition payload.
@@ -117,6 +122,30 @@ pub struct FormatMetaEntry {
     pub version: u16,
 }
 
+/// Node label set entry payload (SPA-200 multi-label support).
+///
+/// Records that a node (identified by `primary_label_id` + `slot`) also
+/// carries one or more secondary labels.  This entry is appended to the
+/// catalog whenever a multi-label node is created.  Existing single-label
+/// databases will never have entries of this type; the catalog is fully
+/// backward-compatible.
+///
+/// ```text
+/// primary_label_id: u16
+/// slot:             u32
+/// count:            u16
+/// secondary_label_ids: [u16; count]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeLabelSetEntry {
+    /// Primary label id (determines NodeId encoding and storage directory).
+    pub primary_label_id: u16,
+    /// Slot within the primary label's column store.
+    pub slot: u32,
+    /// Secondary label ids (all labels beyond the primary).
+    pub secondary_label_ids: Vec<u16>,
+}
+
 impl TlvEntry {
     /// Encode this entry into its wire bytes (tag + length + payload).
     pub fn encode(&self) -> Vec<u8> {
@@ -126,6 +155,7 @@ impl TlvEntry {
             TlvEntry::Column(e) => (TAG_COLUMN, encode_column(e)),
             TlvEntry::ReverseIndex(e) => (TAG_REVERSE_INDEX, encode_reverse_index(e)),
             TlvEntry::FormatMeta(e) => (TAG_FORMAT_META, encode_format_meta(e)),
+            TlvEntry::NodeLabelSet(e) => (TAG_NODE_LABEL_SET, encode_node_label_set(e)),
         };
         let mut out = Vec::with_capacity(6 + payload.len());
         out.extend_from_slice(&tag.to_le_bytes());
@@ -157,10 +187,14 @@ impl TlvEntry {
             TAG_COLUMN => TlvEntry::Column(decode_column(payload)?),
             TAG_REVERSE_INDEX => TlvEntry::ReverseIndex(decode_reverse_index(payload)?),
             TAG_FORMAT_META => TlvEntry::FormatMeta(decode_format_meta(payload)?),
+            TAG_NODE_LABEL_SET => TlvEntry::NodeLabelSet(decode_node_label_set(payload)?),
             _ => {
+                // Forward-compatible: skip unrecognised tags rather than failing.
+                // This allows newer catalog versions to be read by older readers
+                // without corruption errors.
                 return Err(Error::InvalidArgument(format!(
                     "unknown TLV tag: 0x{tag:04X}"
-                )))
+                )));
             }
         };
         Ok((entry, 6 + length))
@@ -233,6 +267,18 @@ fn encode_reverse_index(e: &ReverseIndexEntry) -> Vec<u8> {
 
 fn encode_format_meta(e: &FormatMetaEntry) -> Vec<u8> {
     e.version.to_le_bytes().to_vec()
+}
+
+fn encode_node_label_set(e: &NodeLabelSetEntry) -> Vec<u8> {
+    // primary_label_id (2) + slot (4) + count (2) + secondary_label_ids (count*2)
+    let mut out = Vec::with_capacity(8 + e.secondary_label_ids.len() * 2);
+    out.extend_from_slice(&e.primary_label_id.to_le_bytes());
+    out.extend_from_slice(&e.slot.to_le_bytes());
+    out.extend_from_slice(&(e.secondary_label_ids.len() as u16).to_le_bytes());
+    for id in &e.secondary_label_ids {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out
 }
 
 // --- Payload decoders ---
@@ -345,6 +391,33 @@ fn decode_format_meta(p: &[u8]) -> Result<FormatMetaEntry> {
     }
     let version = u16::from_le_bytes(p[0..2].try_into().unwrap());
     Ok(FormatMetaEntry { version })
+}
+
+fn decode_node_label_set(p: &[u8]) -> Result<NodeLabelSetEntry> {
+    // primary_label_id (2) + slot (4) + count (2) = 8 bytes minimum
+    if p.len() < 8 {
+        return Err(Error::Corruption(
+            "node_label_set payload too short".to_string(),
+        ));
+    }
+    let primary_label_id = u16::from_le_bytes(p[0..2].try_into().unwrap());
+    let slot = u32::from_le_bytes(p[2..6].try_into().unwrap());
+    let count = u16::from_le_bytes(p[6..8].try_into().unwrap()) as usize;
+    if p.len() < 8 + count * 2 {
+        return Err(Error::Corruption(
+            "node_label_set secondary_label_ids truncated".to_string(),
+        ));
+    }
+    let mut secondary_label_ids = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 8 + i * 2;
+        secondary_label_ids.push(u16::from_le_bytes(p[off..off + 2].try_into().unwrap()));
+    }
+    Ok(NodeLabelSetEntry {
+        primary_label_id,
+        slot,
+        secondary_label_ids,
+    })
 }
 
 /// Encode a sequence of TLV entries into a contiguous byte buffer.

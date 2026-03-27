@@ -1615,6 +1615,12 @@ impl Engine {
         }
 
         let label = node.labels.first().cloned().unwrap_or_default();
+
+        // SPA-200: multi-label pattern — use intersection-based scan.
+        if node.labels.len() > 1 {
+            return self.execute_scan_multi_label(m, column_names, &node.labels);
+        }
+
         // SPA-245: unknown label → 0 rows (standard Cypher semantics, not an error).
         let label_id = match self.snapshot.catalog.get_label(&label)? {
             Some(id) => id as u32,
@@ -1924,11 +1930,12 @@ impl Engine {
             if let Some(ref where_expr) = m.where_clause {
                 let mut row_vals =
                     build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
-                // Inject label metadata so labels(n) works in WHERE.
-                if !var_name.is_empty() && !label.is_empty() {
+                // SPA-200: inject full label set (primary + secondary) so labels(n)
+                // works in WHERE and returns the correct multi-label list.
+                if !var_name.is_empty() {
                     row_vals.insert(
                         format!("{}.__labels__", var_name),
-                        Value::List(vec![Value::String(label.clone())]),
+                        self.labels_value_for_node(node_id),
                     );
                 }
                 // SPA-196: inject NodeRef so id(n) works in WHERE clauses.
@@ -1946,11 +1953,12 @@ impl Engine {
                 // Build eval_expr-compatible map for aggregation / id() path.
                 let mut row_vals =
                     build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
-                // Inject label metadata for aggregation.
-                if !var_name.is_empty() && !label.is_empty() {
+                // SPA-200: inject full label set (primary + secondary) so labels(n)
+                // returns all labels in RETURN/aggregation context.
+                if !var_name.is_empty() {
                     row_vals.insert(
                         format!("{}.__labels__", var_name),
-                        Value::List(vec![Value::String(label.clone())]),
+                        self.labels_value_for_node(node_id),
                     );
                 }
                 if !var_name.is_empty() {
@@ -1996,6 +2004,140 @@ impl Engine {
             }
         }
 
+        // SPA-200: also emit rows for nodes where `label` is a secondary label
+        // (i.e. nodes created as `(:B:A)` where A is being queried).
+        // We collect the set of primary-scan node IDs to avoid duplicates, then
+        // iterate the reverse index for secondary hits.
+        {
+            // `var_name` is defined inside the slot loop above; use `node.var` here.
+            let sec_var_name = node.var.as_str();
+
+            let primary_scan_ids: HashSet<NodeId> = if use_eval_path {
+                raw_rows
+                    .iter()
+                    .filter_map(|r| {
+                        r.get(&format!("{sec_var_name}.__node_id__")).and_then(|v| {
+                            if let Value::NodeRef(nid) = v {
+                                Some(*nid)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect()
+            } else {
+                // For the fast path we don't have NodeIds readily; skip dedup
+                // since secondary hits will have different primary label IDs.
+                HashSet::new()
+            };
+
+            let lid = label_id_u32 as sparrowdb_catalog::LabelId;
+            for sec_node_id in self.snapshot.catalog.nodes_with_secondary_label(lid) {
+                if primary_scan_ids.contains(&sec_node_id) {
+                    continue;
+                }
+                if self.is_node_tombstoned(sec_node_id) {
+                    continue;
+                }
+                // Read properties from the node's actual primary-label store.
+                let nullable_props = match self
+                    .snapshot
+                    .store
+                    .get_node_raw_nullable(sec_node_id, &all_col_ids)
+                {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let props: Vec<(u32, u64)> = nullable_props
+                    .iter()
+                    .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
+                    .collect();
+
+                if !self.matches_prop_filter(&props, &node.props) {
+                    continue;
+                }
+
+                if let Some(ref where_expr) = m.where_clause {
+                    let mut row_vals =
+                        build_row_vals(&props, sec_var_name, &all_col_ids, &self.snapshot.store);
+                    if !sec_var_name.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", sec_var_name),
+                            self.labels_value_for_node(sec_node_id),
+                        );
+                        row_vals.insert(sec_var_name.to_string(), Value::NodeRef(sec_node_id));
+                    }
+                    row_vals.extend(self.dollar_params());
+                    if !self.eval_where_graph(where_expr, &row_vals) {
+                        continue;
+                    }
+                }
+
+                if use_eval_path {
+                    let mut row_vals =
+                        build_row_vals(&props, sec_var_name, &all_col_ids, &self.snapshot.store);
+                    if !sec_var_name.is_empty() {
+                        row_vals.insert(
+                            format!("{}.__labels__", sec_var_name),
+                            self.labels_value_for_node(sec_node_id),
+                        );
+                        if bare_vars.contains(&sec_var_name.to_string())
+                            && !all_label_col_ids.is_empty()
+                        {
+                            // Read all columns for bare-variable projection.
+                            let sec_primary_lid = (sec_node_id.0 >> 32) as u32;
+                            let all_sec_col_ids = self
+                                .snapshot
+                                .store
+                                .col_ids_for_label(sec_primary_lid)
+                                .unwrap_or_default();
+                            let all_nullable = self
+                                .snapshot
+                                .store
+                                .get_node_raw_nullable(sec_node_id, &all_sec_col_ids)
+                                .unwrap_or_default();
+                            let all_props: Vec<(u32, u64)> = all_nullable
+                                .iter()
+                                .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
+                                .collect();
+                            row_vals.insert(
+                                sec_var_name.to_string(),
+                                build_node_map(&all_props, &self.snapshot.store),
+                            );
+                        } else {
+                            row_vals.insert(sec_var_name.to_string(), Value::NodeRef(sec_node_id));
+                        }
+                        row_vals.insert(
+                            format!("{}.__node_id__", sec_var_name),
+                            Value::NodeRef(sec_node_id),
+                        );
+                    }
+                    raw_rows.push(row_vals);
+                } else {
+                    // Fast path: find the primary label name for project_row.
+                    let sec_primary_lid = (sec_node_id.0 >> 32) as u32;
+                    let sec_primary_label = self
+                        .snapshot
+                        .catalog
+                        .list_labels()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|(id, _)| *id as u32 == sec_primary_lid)
+                        .map(|(_, name)| name)
+                        .unwrap_or_default();
+                    let row = project_row(
+                        &props,
+                        column_names,
+                        &all_col_ids,
+                        sec_var_name,
+                        &sec_primary_label,
+                        &self.snapshot.store,
+                    );
+                    rows.push(row);
+                }
+            }
+        }
+
         if use_eval_path {
             rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
         } else {
@@ -2019,6 +2161,190 @@ impl Engine {
         }
 
         tracing::debug!(rows = rows.len(), "node scan complete");
+        Ok(QueryResult {
+            columns: column_names.to_vec(),
+            rows,
+        })
+    }
+
+    /// Execute a MATCH scan for a multi-label node pattern `(n:A:B:...)`.
+    ///
+    /// Computes the intersection of all nodes that carry each of the specified
+    /// labels (as primary or secondary), then emits a row per node in the
+    /// intersection.  Uses the same column-reading and aggregation logic as
+    /// `execute_scan` but sources node IDs from `resolve_multi_label_node_ids`
+    /// rather than a slot-based primary-label scan.
+    ///
+    /// # Phase 1 limitation
+    ///
+    /// This path does not use the property equality / range / text indexes for
+    /// inline prop filters — it always performs an O(N) check per node.
+    /// Cross-label property index support is planned for Phase 2 (issue #289).
+    fn execute_scan_multi_label(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+        labels: &[String],
+    ) -> Result<QueryResult> {
+        let pat = &m.pattern[0];
+        let node = &pat.nodes[0];
+        let var_name = node.var.as_str();
+
+        // Compute the intersection of NodeIds across all labels.
+        let candidate_ids = match self.resolve_multi_label_node_ids(labels)? {
+            Some(ids) => ids,
+            None => {
+                return Ok(QueryResult {
+                    columns: column_names.to_vec(),
+                    rows: vec![],
+                })
+            }
+        };
+
+        if candidate_ids.is_empty() {
+            return Ok(QueryResult {
+                columns: column_names.to_vec(),
+                rows: vec![],
+            });
+        }
+
+        // Collect col_ids.
+        let mut all_col_ids: Vec<u32> = collect_col_ids_from_columns(column_names);
+        if let Some(ref where_expr) = m.where_clause {
+            collect_col_ids_from_expr(where_expr, &mut all_col_ids);
+        }
+        for p in &node.props {
+            let cid = prop_name_to_col_id(&p.key);
+            if !all_col_ids.contains(&cid) {
+                all_col_ids.push(cid);
+            }
+        }
+
+        let use_agg = has_aggregate_in_return(&m.return_clause.items);
+        let use_eval_path = use_agg || needs_node_ref_in_return(&m.return_clause.items);
+        if use_eval_path {
+            for item in &m.return_clause.items {
+                collect_col_ids_from_expr(&item.expr, &mut all_col_ids);
+            }
+        }
+        let bare_vars = bare_var_names_in_return(&m.return_clause.items);
+
+        let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+
+        for node_id in &candidate_ids {
+            let node_id = *node_id;
+            if self.is_node_tombstoned(node_id) {
+                continue;
+            }
+
+            let nullable_props = match self
+                .snapshot
+                .store
+                .get_node_raw_nullable(node_id, &all_col_ids)
+            {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let props: Vec<(u32, u64)> = nullable_props
+                .iter()
+                .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
+                .collect();
+
+            if !self.matches_prop_filter(&props, &node.props) {
+                continue;
+            }
+
+            let labels_val = self.labels_value_for_node(node_id);
+
+            if let Some(ref where_expr) = m.where_clause {
+                let mut row_vals =
+                    build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
+                if !var_name.is_empty() {
+                    row_vals.insert(format!("{}.__labels__", var_name), labels_val.clone());
+                    row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+                }
+                row_vals.extend(self.dollar_params());
+                if !self.eval_where_graph(where_expr, &row_vals) {
+                    continue;
+                }
+            }
+
+            if use_eval_path {
+                let mut row_vals =
+                    build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
+                if !var_name.is_empty() {
+                    row_vals.insert(format!("{}.__labels__", var_name), labels_val);
+                    if bare_vars.contains(&var_name.to_string()) {
+                        let prim_lid = (node_id.0 >> 32) as u32;
+                        let all_sec_col_ids = self
+                            .snapshot
+                            .store
+                            .col_ids_for_label(prim_lid)
+                            .unwrap_or_default();
+                        let all_nullable = self
+                            .snapshot
+                            .store
+                            .get_node_raw_nullable(node_id, &all_sec_col_ids)
+                            .unwrap_or_default();
+                        let all_props: Vec<(u32, u64)> = all_nullable
+                            .iter()
+                            .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
+                            .collect();
+                        row_vals.insert(
+                            var_name.to_string(),
+                            build_node_map(&all_props, &self.snapshot.store),
+                        );
+                    } else {
+                        row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
+                    }
+                    row_vals.insert(format!("{}.__node_id__", var_name), Value::NodeRef(node_id));
+                }
+                raw_rows.push(row_vals);
+            } else {
+                let prim_lid = (node_id.0 >> 32) as u32;
+                let prim_label_name = self
+                    .snapshot
+                    .catalog
+                    .list_labels()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|(id, _)| *id as u32 == prim_lid)
+                    .map(|(_, name)| name)
+                    .unwrap_or_default();
+                let row = project_row(
+                    &props,
+                    column_names,
+                    &all_col_ids,
+                    var_name,
+                    &prim_label_name,
+                    &self.snapshot.store,
+                );
+                rows.push(row);
+            }
+        }
+
+        if use_eval_path {
+            rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
+        } else {
+            if m.distinct {
+                deduplicate_rows(&mut rows);
+            }
+            apply_order_by(&mut rows, m, column_names);
+            if let Some(skip) = m.skip {
+                let skip = (skip as usize).min(rows.len());
+                rows.drain(0..skip);
+            }
+            if let Some(lim) = m.limit {
+                rows.truncate(lim as usize);
+            }
+        }
+
+        tracing::debug!(
+            labels = ?labels,
+            rows = rows.len(),
+            "multi-label intersection scan complete"
+        );
         Ok(QueryResult {
             columns: column_names.to_vec(),
             rows,
@@ -2115,10 +2441,11 @@ impl Engine {
                 if let Some(ref where_expr) = m.where_clause {
                     let mut row_vals =
                         build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
+                    // SPA-200: inject full label set (primary + secondary).
                     if !var_name.is_empty() {
                         row_vals.insert(
                             format!("{}.__labels__", var_name),
-                            Value::List(vec![Value::String(label_name.clone())]),
+                            self.labels_value_for_node(node_id),
                         );
                         row_vals.insert(var_name.to_string(), Value::NodeRef(node_id));
                     }
@@ -2131,10 +2458,11 @@ impl Engine {
                 if use_eval_path_all {
                     let mut row_vals =
                         build_row_vals(&props, var_name, &all_col_ids, &self.snapshot.store);
+                    // SPA-200: inject full label set (primary + secondary).
                     if !var_name.is_empty() {
                         row_vals.insert(
                             format!("{}.__labels__", var_name),
-                            Value::List(vec![Value::String(label_name.clone())]),
+                            self.labels_value_for_node(node_id),
                         );
                         // SPA-213: bare variable → Value::Map; otherwise NodeRef.
                         if bare_vars_all.contains(&var_name.to_string())
@@ -2196,5 +2524,115 @@ impl Engine {
             columns: column_names.to_vec(),
             rows,
         })
+    }
+
+    // ── Multi-label MATCH helpers (SPA-200) ────────────────────────────────────
+
+    /// Return a `HashSet<NodeId>` of all nodes that carry `label_id` —
+    /// whether it is their **primary** label or a **secondary** label.
+    ///
+    /// Primary-label nodes are discovered by iterating `0..hwm` slots (same
+    /// as the existing scan path, but collecting NodeIds into a set instead of
+    /// emitting rows).  Secondary-label nodes come from the catalog's reverse
+    /// index (`nodes_with_secondary_label`).
+    ///
+    /// This is used by `resolve_multi_label_node_ids` to build per-label sets
+    /// for intersection (multi-label patterns) and union (single-label MATCH
+    /// finding secondary hits).
+    pub(crate) fn all_node_ids_for_label(&self, label_id: u32) -> Result<HashSet<NodeId>> {
+        // Primary-label nodes.
+        let mut set: HashSet<NodeId> = HashSet::new();
+        let hwm = self.snapshot.store.hwm_for_label(label_id)?;
+        for slot in 0..hwm {
+            let node_id = NodeId(((label_id as u64) << 32) | slot);
+            if !self.is_node_tombstoned(node_id) {
+                set.insert(node_id);
+            }
+        }
+
+        // Secondary-label nodes (from the catalog reverse index).
+        let lid = label_id as sparrowdb_catalog::LabelId;
+        for node_id in self.snapshot.catalog.nodes_with_secondary_label(lid) {
+            if !self.is_node_tombstoned(node_id) {
+                set.insert(node_id);
+            }
+        }
+
+        Ok(set)
+    }
+
+    /// Resolve the complete `HashSet<NodeId>` for a multi-label node pattern.
+    ///
+    /// - **Single label** (`labels.len() == 1`): returns the union of primary
+    ///   scan and secondary-label reverse-index hits.
+    /// - **Multiple labels** (`labels.len() > 1`): intersects the per-label
+    ///   sets; only nodes that carry **all** specified labels are returned.
+    ///
+    /// Returns `None` if any label in `labels` is not registered in the
+    /// catalog (unknown label → no nodes can match).
+    ///
+    /// # Phase 1 limitation
+    ///
+    /// This method performs a full primary-label scan for each label in the
+    /// pattern.  For the common single-label case this is identical to the
+    /// existing scan path.  For multi-label patterns the intersection provides
+    /// correct semantics with an O(N) cost per label.  Property-index fast
+    /// paths are not yet wired through this method; see Phase 2 (issue #289).
+    pub(crate) fn resolve_multi_label_node_ids(
+        &self,
+        labels: &[String],
+    ) -> Result<Option<HashSet<NodeId>>> {
+        if labels.is_empty() {
+            return Ok(None); // caller handles label-less scan separately
+        }
+
+        // Resolve each label name to a LabelId.
+        let mut label_ids: Vec<u32> = Vec::with_capacity(labels.len());
+        for label_name in labels {
+            match self.snapshot.catalog.get_label(label_name)? {
+                Some(id) => label_ids.push(id as u32),
+                None => {
+                    // Unknown label → no nodes can satisfy the pattern.
+                    return Ok(Some(HashSet::new()));
+                }
+            }
+        }
+
+        // Build the set for the first label.
+        let mut result = self.all_node_ids_for_label(label_ids[0])?;
+
+        // Intersect with remaining labels (multi-label pattern).
+        for &lid in &label_ids[1..] {
+            let other = self.all_node_ids_for_label(lid)?;
+            result.retain(|nid| other.contains(nid));
+            if result.is_empty() {
+                break; // early exit — intersection is already empty
+            }
+        }
+
+        Ok(Some(result))
+    }
+
+    /// Return the full ordered label set for `node_id` as a `Value::List`.
+    ///
+    /// The primary label (encoded in the NodeId) always comes first; secondary
+    /// labels are appended in sorted order for deterministic output.
+    ///
+    /// Returns an empty list if the primary label ID is not registered in the
+    /// catalog (which should not happen in practice).
+    pub(crate) fn labels_value_for_node(&self, node_id: NodeId) -> Value {
+        let all_label_ids = self.snapshot.catalog.get_node_labels(node_id);
+        let label_strings: Vec<Value> = all_label_ids
+            .into_iter()
+            .filter_map(|lid| {
+                self.snapshot.catalog.list_labels().ok().and_then(|pairs| {
+                    pairs
+                        .into_iter()
+                        .find(|(id, _)| *id == lid)
+                        .map(|(_, name)| Value::String(name))
+                })
+            })
+            .collect();
+        Value::List(label_strings)
     }
 }

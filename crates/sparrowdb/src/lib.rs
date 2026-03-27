@@ -1104,6 +1104,28 @@ impl GraphDb {
 
             let node_id = tx.create_node_named(label_id, &named_props)?;
 
+            // SPA-289: record secondary labels (labels[1..]) in the catalog
+            // side table so that MATCH on secondary labels and labels(n)
+            // return the full label set.
+            if node.labels.len() > 1 {
+                // Reject reserved __SO_ prefix on secondary labels.
+                for secondary_name in node.labels.iter().skip(1) {
+                    if is_reserved_label(secondary_name) {
+                        return Err(reserved_label_error(secondary_name));
+                    }
+                }
+                let mut secondary_label_ids: Vec<LabelId> = Vec::new();
+                for secondary_name in node.labels.iter().skip(1) {
+                    let sid = match tx.catalog.get_label(secondary_name)? {
+                        Some(id) => id,
+                        None => tx.catalog.create_label(secondary_name)?,
+                    };
+                    secondary_label_ids.push(sid);
+                }
+                tx.catalog
+                    .record_secondary_labels(node_id, &secondary_label_ids)?;
+            }
+
             // Record the binding so edge patterns can resolve (src_var, dst_var).
             if !node.var.is_empty() {
                 var_to_node.insert(node.var.clone(), node_id);

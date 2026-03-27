@@ -578,19 +578,18 @@ impl Engine {
                             Value::String(rel_pat.rel_type.clone()),
                         );
                     }
-                    // Inject node label metadata so labels(n) works in WHERE.
-                    if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                    // SPA-200: inject full label set (primary + secondary).
+                    if !src_node_pat.var.is_empty() {
                         row_vals.insert(
                             format!("{}.__labels__", src_node_pat.var),
-                            Value::List(vec![Value::String(src_label.clone())]),
+                            self.labels_value_for_node(src_node),
                         );
                     }
-                    // Use resolved_dst_label_name so labels(x) works even for unlabeled
-                    // destination patterns (dst_label is empty but actual_label_id is known).
-                    if !dst_node_pat.var.is_empty() && !resolved_dst_label_name.is_empty() {
+                    if !dst_node_pat.var.is_empty() {
+                        let dst_nid = NodeId(((resolved_dst_label_id as u64) << 32) | dst_slot);
                         row_vals.insert(
                             format!("{}.__labels__", dst_node_pat.var),
-                            Value::List(vec![Value::String(resolved_dst_label_name.clone())]),
+                            self.labels_value_for_node(dst_nid),
                         );
                     }
                     row_vals.extend(self.dollar_params());
