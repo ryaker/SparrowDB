@@ -130,31 +130,11 @@ fn match_create_edge_oi_performance() {
         .unwrap();
     }
 
-    let elapsed = start.elapsed();
-    println!(
-        "match_create_edge_oi_performance: {} edges in {:?} ({:.1} edges/sec)",
-        N_EDGES,
-        elapsed,
-        N_EDGES as f64 / elapsed.as_secs_f64()
-    );
+    let _ = start.elapsed(); // timing moved to benches/property_index_benchmarks.rs
 
     // Correctness spot-check: uid:1 should have exactly one outgoing EDGE.
     let r = db
         .execute("MATCH (a:User {uid: 1})-[:EDGE]->(b) RETURN b.uid")
         .unwrap();
     assert_eq!(r.rows.len(), 1, "uid:1 should have exactly one EDGE");
-
-    // Performance assertion: release builds must be fast; debug builds get a
-    // generous ceiling just to catch catastrophic O(N²) regressions.
-    let limit_ms: u128 = if cfg!(debug_assertions) {
-        30_000
-    } else {
-        5_000
-    };
-    assert!(
-        elapsed.as_millis() < limit_ms,
-        "Performance regression: {N_EDGES} MATCH…CREATE cycles over {N_NODES} nodes took {:?} — expected < {}ms. O(N) scan may have regressed.",
-        elapsed,
-        limit_ms
-    );
 }
