@@ -87,6 +87,50 @@ impl Catalog {
         self.create_label(name)
     }
 
+    /// Reserve a label id in memory **without** writing to disk.
+    ///
+    /// Used by `WriteTx` to buffer label creations so they can be committed
+    /// atomically with the rest of the transaction.  The caller is responsible
+    /// for calling [`flush_label`] for each staged label at commit time.
+    ///
+    /// Returns `Err(AlreadyExists)` if the label is already present (either
+    /// persisted or already staged in this catalog instance).
+    ///
+    /// [`flush_label`]: Catalog::flush_label
+    pub fn stage_label(&mut self, name: &str) -> Result<LabelId> {
+        if self.labels.iter().any(|e| e.name == name) {
+            return Err(Error::AlreadyExists);
+        }
+        let id = self.next_label_id;
+        let entry = LabelEntry {
+            label_id: id,
+            name: name.to_string(),
+        };
+        let next = self
+            .next_label_id
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidArgument("label_id overflow".to_string()))?;
+        // In-memory only — no disk write.
+        self.labels.push(entry);
+        self.next_label_id = next;
+        Ok(id)
+    }
+
+    /// Write a previously-staged label (by id) to the catalog file on disk.
+    ///
+    /// Called at `WriteTx::commit()` time to durably persist labels that were
+    /// reserved in memory via [`stage_label`].
+    ///
+    /// [`stage_label`]: Catalog::stage_label
+    pub fn flush_label(&self, label_id: LabelId) -> Result<()> {
+        let entry = self
+            .labels
+            .iter()
+            .find(|e| e.label_id == label_id)
+            .ok_or_else(|| Error::InvalidArgument(format!("label_id {label_id} not in catalog")))?;
+        self.append_entry(TlvEntry::Label(entry.clone()))
+    }
+
     /// Look up a label by name.
     pub fn get_label(&self, name: &str) -> Result<Option<LabelId>> {
         Ok(self
@@ -121,6 +165,60 @@ impl Catalog {
             return Ok(id);
         }
         self.create_rel_table(src_label_id, dst_label_id, rel_type)
+    }
+
+    /// Reserve a relationship table id in memory **without** writing to disk.
+    ///
+    /// Used by `WriteTx` to buffer rel-type creations so they can be committed
+    /// atomically with the rest of the transaction.  The caller is responsible
+    /// for calling [`flush_rel_table`] for each staged entry at commit time.
+    ///
+    /// Returns the existing id (no staging needed) if the entry is already
+    /// present, or the newly-reserved id otherwise.
+    ///
+    /// [`flush_rel_table`]: Catalog::flush_rel_table
+    pub fn stage_rel_table(
+        &mut self,
+        src_label_id: u16,
+        dst_label_id: u16,
+        rel_type: &str,
+    ) -> Result<(RelTableId, bool)> {
+        // Return (id, is_new).  Caller only needs to flush if is_new.
+        if let Some(id) = self.get_rel_table(src_label_id, dst_label_id, rel_type)? {
+            return Ok((id, false));
+        }
+        let id = self.next_rel_table_id;
+        let entry = RelTableEntry {
+            rel_table_id: id,
+            src_label_id,
+            dst_label_id,
+            rel_type: rel_type.to_string(),
+        };
+        let next = self
+            .next_rel_table_id
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidArgument("rel_table_id overflow".to_string()))?;
+        // In-memory only — no disk write.
+        self.rel_tables.push(entry);
+        self.next_rel_table_id = next;
+        Ok((id, true))
+    }
+
+    /// Write a previously-staged rel table entry (by id) to the catalog file on disk.
+    ///
+    /// Called at `WriteTx::commit()` time to durably persist rel types that were
+    /// reserved in memory via [`stage_rel_table`].
+    ///
+    /// [`stage_rel_table`]: Catalog::stage_rel_table
+    pub fn flush_rel_table(&self, rel_table_id: RelTableId) -> Result<()> {
+        let entry = self
+            .rel_tables
+            .iter()
+            .find(|e| e.rel_table_id == rel_table_id)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!("rel_table_id {rel_table_id} not in catalog"))
+            })?;
+        self.append_entry(TlvEntry::RelTable(entry.clone()))
     }
 
     /// Create a new relationship table entry.

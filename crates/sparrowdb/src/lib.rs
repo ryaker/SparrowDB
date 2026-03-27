@@ -31,7 +31,7 @@
 //! db.optimize().unwrap();
 //! ```
 
-use sparrowdb_catalog::catalog::{Catalog, LabelId};
+use sparrowdb_catalog::catalog::{Catalog, LabelId, RelTableId as CatalogRelTableId};
 use sparrowdb_common::{col_id_of, TxnId};
 use sparrowdb_execution::Engine;
 
@@ -225,8 +225,8 @@ enum WalMutation {
 /// before commit.
 ///
 /// Note: catalog schema changes (`create_label`, `get_or_create_rel_type_id`)
-/// are still written immediately because labels are idempotent metadata.
-/// Full schema-change atomicity is deferred to a future phase.
+/// are staged in the `WriteTx` pending buffers and flushed to disk at commit,
+/// so a dropped transaction leaves no ghost labels or rel-type entries (closes #305).
 enum PendingOp {
     /// Create a node: write to the node-store at the pre-reserved `slot` and
     /// advance the on-disk HWM.
@@ -649,6 +649,8 @@ impl GraphDb {
             committed: false,
             fulltext_pending: HashMap::new(),
             pending_ops: Vec::new(),
+            pending_label_creates: Vec::new(),
+            pending_rel_type_creates: Vec::new(),
         })
     }
 
@@ -1013,10 +1015,7 @@ impl GraphDb {
 
         for node in &create.nodes {
             let label = node.labels.first().cloned().unwrap_or_default();
-            let label_id: u32 = match tx.catalog.get_label(&label)? {
-                Some(id) => id as u32,
-                None => tx.catalog.create_label(&label)? as u32,
-            };
+            let label_id: u32 = tx.get_or_create_label_id(&label)?;
 
             let named_props: Vec<(String, Value)> = node
                 .props
@@ -2073,10 +2072,7 @@ impl GraphDb {
                 let mut var_to_node: HashMap<String, NodeId> = HashMap::new();
                 for node in &c.nodes {
                     let label = node.labels.first().cloned().unwrap_or_default();
-                    let label_id: u32 = match tx.catalog.get_label(&label)? {
-                        Some(id) => id as u32,
-                        None => tx.catalog.create_label(&label)? as u32,
-                    };
+                    let label_id: u32 = tx.get_or_create_label_id(&label)?;
                     let named_props: Vec<(String, Value)> = node
                         .props
                         .iter()
@@ -2785,6 +2781,12 @@ pub struct WriteTx {
     /// Buffered structural mutations (create_node, delete_node, create_edge,
     /// create_label) not yet written to disk.  Flushed atomically on commit.
     pending_ops: Vec<PendingOp>,
+    /// Label ids that were staged in-memory during this transaction and must be
+    /// flushed to the catalog TLV file on commit (closes #305).
+    pending_label_creates: Vec<LabelId>,
+    /// Rel-table ids that were staged in-memory during this transaction and must
+    /// be flushed to the catalog TLV file on commit (closes #305).
+    pending_rel_type_creates: Vec<CatalogRelTableId>,
 }
 
 impl WriteTx {
@@ -2914,15 +2916,17 @@ impl WriteTx {
 
     /// Create a label in the schema catalog.
     ///
-    /// # Note on atomicity
+    /// The label is staged in memory and only written to the catalog file
+    /// when [`commit`] is called.  Dropping the transaction without committing
+    /// discards the label — no ghost entries are left on disk (closes #305).
     ///
-    /// Schema changes (label creation) are written to the catalog file
-    /// immediately and are not rolled back if the transaction is later
-    /// dropped without committing.  Label creation is idempotent at the
-    /// catalog level: a duplicate name returns `Error::AlreadyExists`.
-    /// Full schema-change atomicity is deferred to a future phase.
+    /// Returns `Err(AlreadyExists)` if a label with that name already exists.
+    ///
+    /// [`commit`]: WriteTx::commit
     pub fn create_label(&mut self, name: &str) -> Result<u16> {
-        self.catalog.create_label(name)
+        let id = self.catalog.stage_label(name)?;
+        self.pending_label_creates.push(id);
+        Ok(id)
     }
 
     /// Look up `name` in the catalog, creating it if it does not yet exist.
@@ -2931,14 +2935,21 @@ impl WriteTx {
     /// Unlike [`create_label`], this method is idempotent: calling it multiple
     /// times with the same name always returns the same id.
     ///
+    /// New labels are staged in memory and written to disk only on [`commit`].
+    ///
     /// Primarily used by the bulk-import path (SPA-148) where labels may be
     /// seen for the first time on any row.
     ///
     /// [`create_label`]: WriteTx::create_label
+    /// [`commit`]: WriteTx::commit
     pub fn get_or_create_label_id(&mut self, name: &str) -> Result<u32> {
         match self.catalog.get_label(name)? {
             Some(id) => Ok(id as u32),
-            None => Ok(self.catalog.create_label(name)? as u32),
+            None => {
+                let id = self.catalog.stage_label(name)?;
+                self.pending_label_creates.push(id);
+                Ok(id as u32)
+            }
         }
     }
 
@@ -2953,10 +2964,14 @@ impl WriteTx {
     ///
     /// The label is resolved (or created) in the catalog.
     pub fn merge_node(&mut self, label: &str, props: HashMap<String, Value>) -> Result<NodeId> {
-        // Resolve / create label.
+        // Resolve / create label (staged — not written to disk until commit).
         let label_id: u32 = match self.catalog.get_label(label)? {
             Some(id) => id as u32,
-            None => self.catalog.create_label(label)? as u32,
+            None => {
+                let id = self.catalog.stage_label(label)?;
+                self.pending_label_creates.push(id);
+                id as u32
+            }
         };
 
         // Build col list from props keys.
@@ -3241,12 +3256,14 @@ impl WriteTx {
         let dst_label_id = (dst.0 >> 32) as u16;
 
         // Register (or retrieve) the rel type in the catalog.
-        // Catalog mutation is immediate and not transactional. This is acceptable
-        // for now as rel type creation is idempotent. Full schema-change
-        // atomicity is deferred to a future phase.
-        let catalog_rel_id =
+        // New entries are staged in memory and only written to disk on commit
+        // so that a dropped transaction leaves no ghost rel-type entries (closes #305).
+        let (catalog_rel_id, is_new_rel_type) =
             self.catalog
-                .get_or_create_rel_type_id(src_label_id, dst_label_id, rel_type)?;
+                .stage_rel_table(src_label_id, dst_label_id, rel_type)?;
+        if is_new_rel_type {
+            self.pending_rel_type_creates.push(catalog_rel_id);
+        }
         let rel_table_id = RelTableId(catalog_rel_id as u32);
 
         // Compute the edge ID from the on-disk delta log size, offset by the
@@ -3475,6 +3492,16 @@ impl WriteTx {
             &updates,
             &self.wal_mutations,
         )?;
+
+        // Step 4b: Flush catalog mutations that were staged in memory during
+        // this transaction (closes #305).  WAL is already durable at this point.
+        // Labels are flushed first (rel-table entries reference label ids).
+        for label_id in self.pending_label_creates.drain(..) {
+            self.catalog.flush_label(label_id)?;
+        }
+        for rel_table_id in self.pending_rel_type_creates.drain(..) {
+            self.catalog.flush_rel_table(rel_table_id)?;
+        }
 
         // Step 5: Apply buffered structural operations to disk (SPA-181).
         // WAL is already durable at this point; a crash here is safe.
@@ -4545,6 +4572,106 @@ mod tests {
         assert!(
             matches!(result, Err(Error::QueryTimeout)),
             "expected QueryTimeout, got {result:?}"
+        );
+    }
+
+    // ── #305: catalog mutations must be transactional ─────────────────────────
+
+    /// #305: A WriteTx that calls create_label and is then dropped without
+    /// committing must NOT leave a ghost label in the catalog.
+    #[test]
+    fn dropped_write_tx_leaves_no_ghost_labels() {
+        use sparrowdb_catalog::catalog::Catalog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        {
+            let mut tx = db.begin_write().unwrap();
+            // Stage a label creation — should NOT be written to catalog on disk.
+            tx.create_label("GhostLabel").unwrap();
+            // Drop WITHOUT calling commit().
+        }
+
+        // Reopen the catalog from disk and verify the label is NOT present.
+        let catalog = Catalog::open(dir.path()).unwrap();
+        let ghost = catalog
+            .get_label("GhostLabel")
+            .expect("catalog lookup must not error");
+        assert!(
+            ghost.is_none(),
+            "dropped WriteTx must not leave ghost label in catalog (#305)"
+        );
+
+        // A subsequent write transaction must still be obtainable.
+        let tx2 = db
+            .begin_write()
+            .expect("write lock must be released after drop");
+        tx2.commit().unwrap();
+    }
+
+    /// #305: A WriteTx that calls create_label and commits successfully MUST
+    /// persist the label to the catalog on disk.
+    #[test]
+    fn committed_write_tx_persists_label() {
+        use sparrowdb_catalog::catalog::Catalog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        {
+            let mut tx = db.begin_write().unwrap();
+            tx.create_label("PersistedLabel").unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Reopen the catalog from disk and verify the label IS present.
+        let catalog = Catalog::open(dir.path()).unwrap();
+        let id = catalog
+            .get_label("PersistedLabel")
+            .expect("catalog lookup must not error");
+        assert!(
+            id.is_some(),
+            "committed WriteTx must persist label to catalog (#305)"
+        );
+    }
+
+    /// #305: A WriteTx that calls create_edge (which stages a new rel type) and
+    /// is dropped without committing must NOT leave a ghost rel-type entry.
+    #[test]
+    fn dropped_write_tx_leaves_no_ghost_rel_types() {
+        use sparrowdb_catalog::catalog::Catalog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        // Commit two nodes so we have valid src/dst node IDs.
+        let (src, dst) = {
+            let mut tx = db.begin_write().unwrap();
+            // Use label 0 (already exists as a virtual/implicit label).
+            let src = tx.create_node(0, &[]).unwrap();
+            let dst = tx.create_node(0, &[]).unwrap();
+            tx.commit().unwrap();
+            (src, dst)
+        };
+
+        {
+            let mut tx = db.begin_write().unwrap();
+            // Stage an edge with a new rel type — should NOT be written to
+            // the catalog on disk when the transaction is dropped.
+            tx.create_edge(src, dst, "GHOST_REL", std::collections::HashMap::new())
+                .unwrap();
+            // Drop WITHOUT calling commit().
+        }
+
+        // Reopen the catalog from disk and verify no rel-table entry exists.
+        let catalog = Catalog::open(dir.path()).unwrap();
+        let rel_tables = catalog
+            .list_rel_tables()
+            .expect("list_rel_tables must not error");
+        assert!(
+            rel_tables.iter().all(|(_, _, t)| t != "GHOST_REL"),
+            "dropped WriteTx must not leave ghost rel-type in catalog (#305)"
         );
     }
 }
