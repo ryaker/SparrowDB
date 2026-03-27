@@ -1796,6 +1796,22 @@ impl Engine {
         // We read all delta edges once up front to avoid repeated file I/O.
         let delta_all = self.read_delta_all();
 
+        // Pre-resolve per-hop rel-table IDs so the inner loop uses filtered
+        // CSR lookups instead of scanning every relation type (SPA-284).
+        let rel_ids_per_hop: Vec<Vec<u32>> = (0..n_rels)
+            .map(|i| self.resolve_rel_ids_for_type(&pat.rels[i].rel_type))
+            .collect();
+        // If any hop specifies a rel type that doesn't exist in the catalog, no
+        // traversal can produce results — return empty immediately.
+        for (i, rel_ids) in rel_ids_per_hop.iter().enumerate() {
+            if !pat.rels[i].rel_type.is_empty() && rel_ids.is_empty() {
+                return Ok(QueryResult {
+                    columns: column_names.to_vec(),
+                    rows: vec![],
+                });
+            }
+        }
+
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
         for src_slot in 0..hwm_src {
@@ -1841,13 +1857,20 @@ impl Engine {
 
                 for (cur_slot, cur_vals) in frontier {
                     // Gather neighbors from CSR + delta for this hop.
-                    let csr_nb: Vec<u64> = self.csr_neighbors_all(cur_slot);
+                    // SPA-284: use filtered CSR lookup when rel type is specified.
+                    let csr_nb: Vec<u64> =
+                        self.csr_neighbors_filtered(cur_slot, &rel_ids_per_hop[hop_idx]);
+                    let hop_rel_ids = &rel_ids_per_hop[hop_idx];
                     let delta_nb: Vec<u64> = delta_all
                         .iter()
                         .filter(|r| {
                             let r_src_label = (r.src.0 >> 32) as u32;
                             let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                            r_src_label == cur_label_id && r_src_slot == cur_slot
+                            if r_src_label != cur_label_id || r_src_slot != cur_slot {
+                                return false;
+                            }
+                            // Filter by relation-table IDs when a type constraint exists.
+                            hop_rel_ids.is_empty() || hop_rel_ids.contains(&r.rel_id.0)
                         })
                         .map(|r| r.dst.0 & 0xFFFF_FFFF)
                         .collect();

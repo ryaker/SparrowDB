@@ -16,6 +16,7 @@ impl Engine {
     /// destinations the label is looked up in the `node_label` hint map (built
     /// from the delta by the caller); if absent, `src_label_id` is used as a
     /// conservative fallback (correct for homogeneous graphs).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn get_node_neighbors_labeled(
         &self,
         src_slot: u64,
@@ -24,17 +25,23 @@ impl Engine {
         node_label: &std::collections::HashSet<(u64, u32)>,
         all_label_ids: &[u32],
         out: &mut std::collections::HashSet<(u64, u32)>,
+        rel_ids: &[u32],
     ) {
         out.clear();
 
         // ── CSR neighbors (slot only; label recovered by scanning all label HWMs
         //    or falling back to src_label_id for homogeneous graphs) ────────────
-        let csr_slots: Vec<u64> = self.csr_neighbors_all(src_slot);
+        // SPA-284: use filtered CSR lookup when rel type IDs are provided.
+        let csr_slots: Vec<u64> = self.csr_neighbors_filtered(src_slot, rel_ids);
 
         // ── Delta neighbors (full NodeId available) ───────────────────────────
         // SPA-283: O(1) indexed lookup instead of linear scan.
+        // SPA-284: filter by relation-table IDs when a type constraint exists.
         if let Some(recs) = delta_idx.get(&(src_label_id, src_slot)) {
             for r in recs {
+                if !rel_ids.is_empty() && !rel_ids.contains(&r.rel_id.0) {
+                    continue;
+                }
                 let dst_slot = r.dst.0 & 0xFFFF_FFFF;
                 let dst_label = (r.dst.0 >> 32) as u32;
                 out.insert((dst_slot, dst_label));
@@ -103,6 +110,7 @@ impl Engine {
         neighbors_buf: &mut std::collections::HashSet<(u64, u32)>,
         use_reachability: bool,
         result_limit: usize,
+        rel_ids: &[u32],
     ) -> Vec<(u64, u32)> {
         const SAFETY_CAP: u32 = 10;
         let max_hops = max_hops.min(SAFETY_CAP);
@@ -147,6 +155,7 @@ impl Engine {
                     node_label,
                     all_label_ids,
                     neighbors_buf,
+                    rel_ids,
                 );
                 for (nb_slot, nb_label) in neighbors_buf.iter().copied().collect::<Vec<_>>() {
                     if global_visited.insert((nb_slot, nb_label)) {
@@ -194,6 +203,7 @@ impl Engine {
                 node_label,
                 all_label_ids,
                 neighbors_buf,
+                rel_ids,
             );
             let src_nbrs: Vec<(u64, u32)> = neighbors_buf.iter().copied().collect();
 
@@ -244,6 +254,7 @@ impl Engine {
                                 node_label,
                                 all_label_ids,
                                 neighbors_buf,
+                                rel_ids,
                             );
                             let next_nbrs: Vec<(u64, u32)> =
                                 neighbors_buf.iter().copied().collect();
@@ -263,13 +274,19 @@ impl Engine {
         src_slot: u64,
         src_label_id: u32,
         delta_idx: &DeltaIndex,
+        rel_ids: &[u32],
     ) -> Vec<u64> {
-        let csr_neighbors: Vec<u64> = self.csr_neighbors_all(src_slot);
+        // SPA-284: use filtered CSR lookup when rel type IDs are provided.
+        let csr_neighbors: Vec<u64> = self.csr_neighbors_filtered(src_slot, rel_ids);
         // SPA-283: O(1) indexed lookup instead of linear scan.
-        // Extend the dedup set directly from the index iterator — no intermediate Vec.
+        // SPA-284: filter by relation-table IDs when a type constraint exists.
         let mut all: std::collections::HashSet<u64> = csr_neighbors.into_iter().collect();
         if let Some(recs) = delta_idx.get(&(src_label_id, src_slot)) {
-            all.extend(recs.iter().map(|r| node_id_parts(r.dst.0).1));
+            all.extend(
+                recs.iter()
+                    .filter(|r| rel_ids.is_empty() || rel_ids.contains(&r.rel_id.0))
+                    .map(|r| node_id_parts(r.dst.0).1),
+            );
         }
         all.into_iter().collect()
     }
@@ -372,6 +389,17 @@ impl Engine {
         all_label_ids.sort_unstable();
         all_label_ids.dedup();
 
+        // SPA-284: pre-resolve rel-type IDs so the BFS/DFS uses filtered CSR lookups.
+        let rel_ids = self.resolve_rel_ids_for_type(&rel_pat.rel_type);
+        // If a rel type was specified but doesn't exist in the catalog, no edges of
+        // that type can exist — return empty rather than falling back to "all neighbors".
+        if !rel_pat.rel_type.is_empty() && rel_ids.is_empty() {
+            return Ok(QueryResult {
+                columns: column_names.to_vec(),
+                rows: vec![],
+            });
+        }
+
         // Reusable neighbors buffer: allocated once, cleared between frontier nodes.
         let mut neighbors_buf: std::collections::HashSet<(u64, u32)> =
             std::collections::HashSet::new();
@@ -437,6 +465,7 @@ impl Engine {
                 &mut neighbors_buf,
                 use_reachability,
                 remaining,
+                &rel_ids,
             );
 
             // ── SPA-285: batch-read dst properties ────────────────────────
@@ -633,3 +662,4 @@ impl Engine {
         })
     }
 }
+// CSR rel-type filtering (#284)

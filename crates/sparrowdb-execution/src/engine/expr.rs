@@ -311,7 +311,7 @@ impl Engine {
             let mut next_frontier: Vec<(u64, u32)> = Vec::new();
             for &(node_slot, node_label_id) in &frontier {
                 let neighbors =
-                    self.get_node_neighbors_by_slot(node_slot, node_label_id, &delta_idx);
+                    self.get_node_neighbors_by_slot(node_slot, node_label_id, &delta_idx, &[]);
                 for nb_slot in neighbors {
                     if nb_slot == dst_slot {
                         return Some(depth);
