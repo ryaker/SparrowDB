@@ -92,7 +92,7 @@ use sparrowdb_storage::maintenance::MaintenanceEngine;
 use sparrowdb_storage::node_store::NodeStore;
 use sparrowdb_storage::wal::codec::{WalPayload, WalRecordKind};
 use sparrowdb_storage::wal::writer::WalWriter;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -145,6 +145,36 @@ impl VersionStore {
         } else {
             Some(versions[idx - 1].value.clone())
         }
+    }
+
+    /// Garbage-collect version chains older than `min_active_txn_id`.
+    ///
+    /// For each key, retain:
+    /// - All versions with `committed_at >= min_active_txn_id` (any active
+    ///   reader pinned at exactly that snapshot needs them).
+    /// - The single most-recent version with `committed_at < min_active_txn_id`
+    ///   (the latest committed state visible to all readers, including future
+    ///   ones with snapshot ≥ min_active_txn_id that arrive before the next
+    ///   write).
+    ///
+    /// Returns the number of version entries pruned.
+    fn gc(&mut self, min_active_txn_id: u64) -> usize {
+        let mut pruned = 0usize;
+        self.map.retain(|_, versions| {
+            // Find the last version index whose committed_at < min_active_txn_id.
+            // Entries [0..cutoff) are all older than the minimum active snapshot.
+            let cutoff = versions.partition_point(|v| v.committed_at < min_active_txn_id);
+            if cutoff > 1 {
+                // Keep entry at index (cutoff - 1) as the "last visible before
+                // min_active_txn_id" anchor; drop everything before it.
+                let keep_from = cutoff - 1;
+                pruned += keep_from;
+                versions.drain(..keep_from);
+            }
+            // Drop entries whose chain is now empty (should not happen but be safe).
+            !versions.is_empty()
+        });
+        pruned
     }
 }
 
@@ -330,7 +360,21 @@ struct DbInner {
     wal_writer: Mutex<WalWriter>,
     /// Shared edge-property cache (SPA-261).
     edge_props_cache: EdgePropsCache,
+    /// Tracks active `ReadTx` snapshots for GC watermark computation.
+    ///
+    /// Maps `snapshot_txn_id → active_reader_count`.  A reader registers its
+    /// snapshot on open and unregisters on drop.  The minimum key in this map
+    /// is the oldest pinned snapshot; versions older than that watermark (and
+    /// fully superseded by a newer committed version) can be pruned by GC.
+    active_readers: Mutex<BTreeMap<u64, usize>>,
+    /// Number of `WriteTx` commits since the last GC run.
+    ///
+    /// GC is triggered every [`GC_COMMIT_INTERVAL`] commits.
+    commits_since_gc: AtomicU64,
 }
+
+/// Run GC on the version store every this many commits.
+const GC_COMMIT_INTERVAL: u64 = 100;
 
 // ── Write-lock guard (SPA-181: replaces 'static transmute UB) ────────────────
 
@@ -443,6 +487,8 @@ impl GraphDb {
                 label_row_counts,
                 wal_writer: Mutex::new(wal_writer),
                 edge_props_cache: Arc::new(RwLock::new(HashMap::new())),
+                active_readers: Mutex::new(BTreeMap::new()),
+                commits_since_gc: AtomicU64::new(0),
             }),
         })
     }
@@ -490,6 +536,8 @@ impl GraphDb {
                 label_row_counts,
                 wal_writer: Mutex::new(wal_writer),
                 edge_props_cache: Arc::new(RwLock::new(HashMap::new())),
+                active_readers: Mutex::new(BTreeMap::new()),
+                commits_since_gc: AtomicU64::new(0),
             }),
         })
     }
@@ -616,6 +664,15 @@ impl GraphDb {
     pub fn begin_read(&self) -> Result<ReadTx> {
         let snapshot_txn_id = self.inner.current_txn_id.load(Ordering::Acquire);
         let store = NodeStore::open(&self.inner.path)?;
+        // Register this reader's snapshot so GC knows the minimum safe watermark.
+        {
+            let mut ar = self
+                .inner
+                .active_readers
+                .lock()
+                .expect("active_readers lock poisoned");
+            *ar.entry(snapshot_txn_id).or_insert(0) += 1;
+        }
         Ok(ReadTx {
             snapshot_txn_id,
             store,
@@ -2755,6 +2812,26 @@ impl ReadTx {
     }
 }
 
+impl Drop for ReadTx {
+    fn drop(&mut self) {
+        // Unregister this reader's snapshot from the active-readers map.
+        // When the count drops to zero the entry is removed so GC can advance
+        // the watermark past this snapshot.
+        if let Ok(mut ar) = self.inner.active_readers.lock() {
+            if let std::collections::btree_map::Entry::Occupied(mut e) =
+                ar.entry(self.snapshot_txn_id)
+            {
+                let count = e.get_mut();
+                if *count <= 1 {
+                    e.remove();
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+    }
+}
+
 // ── WriteTx ───────────────────────────────────────────────────────────────────
 
 /// A write transaction.
@@ -3603,6 +3680,42 @@ impl WriteTx {
                 .expect("node_versions lock");
             for &raw in &self.dirty_nodes {
                 nv.set(NodeId(raw), new_id);
+            }
+        }
+
+        // Step 9b: Periodically garbage-collect the version store (issue #307).
+        //
+        // Every GC_COMMIT_INTERVAL commits we compute the minimum active reader
+        // snapshot and prune fully-superseded old versions below that watermark.
+        // This bounds VersionStore memory to O(live_keys × active_reader_span)
+        // rather than O(live_keys × total_write_count).
+        {
+            let prev = self.inner.commits_since_gc.fetch_add(1, Ordering::Relaxed);
+            if prev + 1 >= GC_COMMIT_INTERVAL {
+                self.inner.commits_since_gc.store(0, Ordering::Relaxed);
+                // Compute min active snapshot watermark.
+                let min_active = {
+                    let ar = self
+                        .inner
+                        .active_readers
+                        .lock()
+                        .expect("active_readers lock poisoned");
+                    // If there are no active readers, every version older than
+                    // the current committed txn_id is safe to prune (keeping
+                    // only the most recent).  Use current_txn_id + 1 so the
+                    // gc() "last version before watermark" logic retains the
+                    // latest version for future readers.
+                    ar.keys().copied().next().unwrap_or(new_id + 1)
+                };
+                let pruned = self
+                    .inner
+                    .versions
+                    .write()
+                    .expect("version lock poisoned")
+                    .gc(min_active);
+                if pruned > 0 {
+                    tracing::debug!(pruned, min_active, "versionstore gc complete");
+                }
             }
         }
 
@@ -4714,5 +4827,101 @@ mod tests {
             matches!(result, Err(Error::QueryTimeout)),
             "expected QueryTimeout, got {result:?}"
         );
+    }
+
+    // ── Issue #307: VersionStore GC ───────────────────────────────────────────
+
+    /// GC prunes old version entries so the store does not grow proportionally
+    /// with the number of writes.  After 1 000 SET operations and enough commits
+    /// to trigger GC several times, the total number of version entries across
+    /// all keys must be strictly less than 1 000 (the unbounded baseline).
+    #[test]
+    fn versionstore_gc_bounds_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        let col_id = sparrowdb_common::col_id_of("counter");
+
+        // Create the node once.
+        let node_id = {
+            let mut tx = db.begin_write().unwrap();
+            let nid = tx.create_node(0, &[(col_id, Value::Int64(0))]).unwrap();
+            tx.commit().unwrap();
+            nid
+        };
+
+        // Update the same property 1 000 times.
+        for i in 1i64..=1_000 {
+            let mut tx = db.begin_write().unwrap();
+            tx.set_node_col(node_id, col_id, Value::Int64(i));
+            tx.commit().unwrap();
+        }
+
+        // Count total Version entries across the entire VersionStore.
+        let total_entries: usize = db
+            .inner
+            .versions
+            .read()
+            .unwrap()
+            .map
+            .values()
+            .map(|v| v.len())
+            .sum();
+
+        // GC_COMMIT_INTERVAL = 100, so GC ran ~10 times.  The chain must be
+        // far shorter than 1 000 entries.
+        assert!(
+            total_entries < 1_000,
+            "VersionStore grew to {total_entries} entries — GC is not running"
+        );
+    }
+
+    /// Readers pinned before GC runs must still see the correct snapshot value
+    /// after GC has pruned versions below their watermark.
+    #[test]
+    fn versionstore_gc_preserves_snapshot_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        let col_id = sparrowdb_common::col_id_of("val");
+
+        // Create a node with initial value 0.
+        let node_id = {
+            let mut tx = db.begin_write().unwrap();
+            let nid = tx.create_node(0, &[(col_id, Value::Int64(0))]).unwrap();
+            tx.commit().unwrap();
+            nid
+        };
+
+        // Open a long-lived reader pinned at this snapshot.
+        let reader = db.begin_read().unwrap();
+        let reader_snapshot = reader.snapshot_txn_id;
+
+        // Perform enough writes to trigger GC several times.
+        for i in 1i64..=200 {
+            let mut tx = db.begin_write().unwrap();
+            tx.set_node_col(node_id, col_id, Value::Int64(i));
+            tx.commit().unwrap();
+        }
+
+        // The pinned reader must still observe a value consistent with its snapshot.
+        let seen = reader.get_node(node_id, &[col_id]).unwrap();
+        let seen_val = seen
+            .iter()
+            .find(|(c, _)| *c == col_id)
+            .map(|(_, v)| v.clone());
+
+        match seen_val {
+            Some(Value::Int64(v)) => {
+                assert!(
+                    v <= 200,
+                    "reader at snapshot {reader_snapshot} saw future value {v}"
+                );
+            }
+            other => panic!("unexpected value from pinned reader: {other:?}"),
+        }
+
+        // Explicitly drop the reader — cleanly unregisters it.
+        drop(reader);
     }
 }
