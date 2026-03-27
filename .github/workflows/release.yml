@@ -129,138 +129,15 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  # ── Publish Python wheel to PyPI ─────────────────────────────────────────
-  publish-pypi:
-    name: Publish PyPI (Python bindings)
-    needs: meta
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Check if Python bindings are implemented
-        id: py_check
-        run: |
-          if grep -r '#\[pymodule\]' crates/sparrowdb-python/src/ 2>/dev/null; then
-            echo "implemented=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "implemented=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::sparrowdb-python not yet implemented — skipping PyPI publish"
-          fi
-
-      - name: Install maturin
-        if: steps.py_check.outputs.implemented == 'true'
-        run: pip install maturin twine
-
-      - name: Sync version to pyproject.toml
-        if: steps.py_check.outputs.implemented == 'true'
-        run: |
-          VERSION="${{ needs.meta.outputs.version }}"
-          cd crates/sparrowdb-python
-          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
-          echo "pyproject.toml version set to $VERSION"
-          grep '^version' pyproject.toml
-
-      - name: Build wheel
-        if: steps.py_check.outputs.implemented == 'true'
-        run: |
-          cd crates/sparrowdb-python
-          maturin build --release --strip
-
-      - name: Publish to PyPI
-        if: steps.py_check.outputs.implemented == 'true'
-        run: twine upload target/wheels/*.whl
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-
-  # ── Publish Ruby gem to RubyGems ─────────────────────────────────────────
-  publish-rubygems:
-    name: Publish RubyGems (Ruby bindings)
-    needs: meta
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Set up Ruby 3.3
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.3'
-          bundler-cache: false
-
-      - name: Check if Ruby bindings compile
-        id: rb_check
-        run: |
-          if cargo check -p sparrowdb-ruby 2>/dev/null; then
-            echo "compiles=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "compiles=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::sparrowdb-ruby does not compile — skipping RubyGems publish"
-          fi
-
-      - name: Build native extension
-        if: steps.rb_check.outputs.compiles == 'true'
-        run: |
-          cargo build --release -p sparrowdb-ruby
-          ARTIFACT=$(ls target/release/libsparrowdb_ruby.so \
-                        target/release/libsparrowdb_ruby.dylib \
-                        2>/dev/null | head -1)
-          if [ -z "$ARTIFACT" ]; then
-            echo "::warning::Could not find compiled sparrowdb-ruby artifact — skipping"
-            echo "compiles=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          mkdir -p crates/sparrowdb-ruby/lib
-          cp "$ARTIFACT" crates/sparrowdb-ruby/lib/sparrowdb_ruby.so
-
-      - name: Create gemspec
-        if: steps.rb_check.outputs.compiles == 'true'
-        run: |
-          VERSION="${{ needs.meta.outputs.version }}"
-          cat > crates/sparrowdb-ruby/sparrowdb.gemspec <<GEMSPEC
-          Gem::Specification.new do |s|
-            s.name        = 'sparrowdb'
-            s.version     = '$VERSION'
-            s.summary     = 'Ruby bindings for SparrowDB embedded graph database'
-            s.description = 'Native Ruby bindings for SparrowDB, an embedded graph database with Cypher query support.'
-            s.authors     = ['Rich Yaker']
-            s.license     = 'MIT'
-            s.homepage    = 'https://github.com/ryaker/SparrowDB'
-            s.files       = ['lib/sparrowdb.rb', 'lib/sparrowdb_ruby.so']
-            s.require_paths = ['lib']
-            s.required_ruby_version = '>= 3.1'
-          end
-          GEMSPEC
-
-      - name: Build and publish gem
-        if: steps.rb_check.outputs.compiles == 'true'
-        run: |
-          cd crates/sparrowdb-ruby
-          gem build sparrowdb.gemspec
-          gem push sparrowdb-*.gem
-        env:
-          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_TOKEN }}
+  # ── PyPI and RubyGems publishing disabled until registry auth is resolved ──
+  # See: https://github.com/ryaker/SparrowDB/issues/292 (tracking)
+  # Re-enable by uncommenting the publish-pypi and publish-rubygems jobs
+  # and adding PYPI_TOKEN / RUBYGEMS_TOKEN secrets to the repo.
 
   # ── Create GitHub Release ────────────────────────────────────────────────
   github-release:
     name: Create GitHub Release
-    needs: [meta, npm-publish, publish-pypi, publish-rubygems]
+    needs: [meta, npm-publish]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -275,14 +152,14 @@ jobs:
           echo "" >> release-notes.md
           echo "### Published packages" >> release-notes.md
           echo "- **npm**: \`sparrowdb@${{ needs.meta.outputs.version }}\`" >> release-notes.md
-          echo "- **PyPI**: \`sparrowdb==${{ needs.meta.outputs.version }}\`" >> release-notes.md
-          echo "- **RubyGems**: \`sparrowdb ${{ needs.meta.outputs.version }}\`" >> release-notes.md
+          echo "- **crates.io**: \`sparrowdb = \"${{ needs.meta.outputs.version }}\"\`" >> release-notes.md
+          echo "- **PyPI**: _disabled pending auth_ " >> release-notes.md
+          echo "- **RubyGems**: _disabled pending auth_" >> release-notes.md
           echo "" >> release-notes.md
           echo "### Install" >> release-notes.md
           echo '```bash' >> release-notes.md
           echo "npm install sparrowdb@${{ needs.meta.outputs.version }}" >> release-notes.md
-          echo "pip install sparrowdb==${{ needs.meta.outputs.version }}" >> release-notes.md
-          echo 'gem install sparrowdb -v ${{ needs.meta.outputs.version }}' >> release-notes.md
+          echo "cargo add sparrowdb@${{ needs.meta.outputs.version }}" >> release-notes.md
           echo '```' >> release-notes.md
 
       - name: Create GitHub Release
