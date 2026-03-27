@@ -4171,8 +4171,8 @@ mod tests {
             // Create edges from Person -> City (LIVES_IN).
             // Person slot 0 -> City slot 0
             // Person slot 1 -> City slot 1
-            let person_0 = sparrowdb_common::NodeId(0 << 32 | 0);
-            let person_1 = sparrowdb_common::NodeId(0 << 32 | 1);
+            let person_0 = sparrowdb_common::NodeId(0u64 << 32 | 0);
+            let person_1 = sparrowdb_common::NodeId(0u64 << 32 | 1);
             let city_0 = sparrowdb_common::NodeId(1u64 << 32 | 0);
             let city_1 = sparrowdb_common::NodeId(1u64 << 32 | 1);
             tx.create_edge(
