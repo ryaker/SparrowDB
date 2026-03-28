@@ -683,6 +683,11 @@ impl Engine {
             }
         }
 
+        // ── Phase 3 chunked two-hop fast-path (SPA-299) ──────────────────────
+        if is_two_hop && self.can_use_two_hop_chunked(m) {
+            return self.execute_two_hop_chunked(m, &column_names);
+        }
+
         // ── Phase 2 chunked one-hop fast-path (SPA-299) ───────────────────────
         if is_one_hop && self.can_use_one_hop_chunked(m) {
             return self.execute_one_hop_chunked(m, &column_names);
