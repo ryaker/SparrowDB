@@ -347,15 +347,13 @@ fn chunk_predicate_signed_comparison_positive_vs_negative() {
     let score_col_id = sparrowdb_common::col_id_of("score");
 
     // Two-row chunk: row 0 = score +5, row 1 = score -5.
-    let chunk = DataChunk::from_columns(vec![
-        ColumnVector::from_data(
-            score_col_id,
-            vec![
-                StoreValue::Int64(5).to_u64(),
-                StoreValue::Int64(-5).to_u64(),
-            ],
-        ),
-    ]);
+    let chunk = DataChunk::from_columns(vec![ColumnVector::from_data(
+        score_col_id,
+        vec![
+            StoreValue::Int64(5).to_u64(),
+            StoreValue::Int64(-5).to_u64(),
+        ],
+    )]);
 
     // `score > -5`: row 0 passes (5 > -5), row 1 fails (-5 not > -5).
     let pred_gt = ChunkPredicate::Gt {
@@ -363,14 +361,20 @@ fn chunk_predicate_signed_comparison_positive_vs_negative() {
         rhs_raw: StoreValue::Int64(-5).to_u64(),
     };
     assert!(pred_gt.eval(&chunk, 0), "Int64(5) > Int64(-5) must be true");
-    assert!(!pred_gt.eval(&chunk, 1), "Int64(-5) > Int64(-5) must be false");
+    assert!(
+        !pred_gt.eval(&chunk, 1),
+        "Int64(-5) > Int64(-5) must be false"
+    );
 
     // `score < 0`: row 0 fails (5 not < 0), row 1 passes (-5 < 0).
     let pred_lt = ChunkPredicate::Lt {
         col_id: score_col_id,
         rhs_raw: StoreValue::Int64(0).to_u64(),
     };
-    assert!(!pred_lt.eval(&chunk, 0), "Int64(5) < Int64(0) must be false");
+    assert!(
+        !pred_lt.eval(&chunk, 0),
+        "Int64(5) < Int64(0) must be false"
+    );
     assert!(pred_lt.eval(&chunk, 1), "Int64(-5) < Int64(0) must be true");
 
     // `score >= -5`: both rows pass.
@@ -378,14 +382,26 @@ fn chunk_predicate_signed_comparison_positive_vs_negative() {
         col_id: score_col_id,
         rhs_raw: StoreValue::Int64(-5).to_u64(),
     };
-    assert!(pred_ge.eval(&chunk, 0), "Int64(5) >= Int64(-5) must be true");
-    assert!(pred_ge.eval(&chunk, 1), "Int64(-5) >= Int64(-5) must be true");
+    assert!(
+        pred_ge.eval(&chunk, 0),
+        "Int64(5) >= Int64(-5) must be true"
+    );
+    assert!(
+        pred_ge.eval(&chunk, 1),
+        "Int64(-5) >= Int64(-5) must be true"
+    );
 
     // `score <= -1`: row 1 passes (-5 <= -1), row 0 fails (5 not <= -1).
     let pred_le = ChunkPredicate::Le {
         col_id: score_col_id,
         rhs_raw: StoreValue::Int64(-1).to_u64(),
     };
-    assert!(!pred_le.eval(&chunk, 0), "Int64(5) <= Int64(-1) must be false");
-    assert!(pred_le.eval(&chunk, 1), "Int64(-5) <= Int64(-1) must be true");
+    assert!(
+        !pred_le.eval(&chunk, 0),
+        "Int64(5) <= Int64(-1) must be false"
+    );
+    assert!(
+        pred_le.eval(&chunk, 1),
+        "Int64(-5) <= Int64(-1) must be true"
+    );
 }
