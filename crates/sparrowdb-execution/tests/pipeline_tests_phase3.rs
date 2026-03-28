@@ -20,7 +20,11 @@ fn frontier_scratch_initial_state() {
     );
     // bytes_allocated is based on len(), not capacity(), so an empty frontier
     // reports 0 bytes even though backing storage was pre-allocated.
-    assert_eq!(fs.bytes_allocated(), 0, "empty frontier must report 0 bytes");
+    assert_eq!(
+        fs.bytes_allocated(),
+        0,
+        "empty frontier must report 0 bytes"
+    );
 }
 
 // ── T2: FrontierScratch::advance swaps and clears ─────────────────────────────
@@ -71,7 +75,11 @@ fn frontier_scratch_multiple_advances() {
 #[test]
 fn frontier_scratch_bytes_allocated() {
     let mut fs = FrontierScratch::new(0);
-    assert_eq!(fs.bytes_allocated(), 0, "empty frontier must report 0 bytes");
+    assert_eq!(
+        fs.bytes_allocated(),
+        0,
+        "empty frontier must report 0 bytes"
+    );
 
     // After pushing 1 element: len=1, bytes = 1 * size_of::<u64>() = 8.
     fs.current_mut().push(1u64);
