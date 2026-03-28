@@ -108,10 +108,7 @@ fn sort_rows(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
 ///
 /// Returns the sorted rows from the row-at-a-time engine so callers can
 /// make additional assertions on values if needed.
-fn assert_engines_agree(
-    dir: &std::path::Path,
-    cypher: &str,
-) -> (Vec<String>, Vec<Vec<Value>>) {
+fn assert_engines_agree(dir: &std::path::Path, cypher: &str) -> (Vec<String>, Vec<Vec<Value>>) {
     let row_result = row_engine(dir).execute(cypher).unwrap_or_else(|e| {
         panic!("row-at-a-time engine failed for `{cypher}`: {e}");
     });
@@ -135,10 +132,7 @@ fn assert_engines_agree(
         chunked_rows.len()
     );
 
-    assert_eq!(
-        row_rows, chunked_rows,
-        "row values differ for `{cypher}`"
-    );
+    assert_eq!(row_rows, chunked_rows, "row values differ for `{cypher}`");
 
     (row_result.columns, row_rows)
 }
@@ -148,9 +142,12 @@ fn assert_engines_agree(
 #[test]
 fn simple_match_return_single_label() {
     let (dir, db) = make_db();
-    db.execute("CREATE (:Animal {name: 'Dog', legs: 4})").unwrap();
-    db.execute("CREATE (:Animal {name: 'Bird', legs: 2})").unwrap();
-    db.execute("CREATE (:Animal {name: 'Snake', legs: 0})").unwrap();
+    db.execute("CREATE (:Animal {name: 'Dog', legs: 4})")
+        .unwrap();
+    db.execute("CREATE (:Animal {name: 'Bird', legs: 2})")
+        .unwrap();
+    db.execute("CREATE (:Animal {name: 'Snake', legs: 0})")
+        .unwrap();
 
     let (_, rows) = assert_engines_agree(dir.path(), "MATCH (a:Animal) RETURN a.name, a.legs");
     assert_eq!(rows.len(), 3, "all 3 animals must be returned");
@@ -166,8 +163,10 @@ fn where_integer_equality() {
             .unwrap();
     }
 
-    let (_, rows) =
-        assert_engines_agree(dir.path(), "MATCH (n:Item) WHERE n.id = 5 RETURN n.id, n.score");
+    let (_, rows) = assert_engines_agree(
+        dir.path(),
+        "MATCH (n:Item) WHERE n.id = 5 RETURN n.id, n.score",
+    );
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], Value::Int64(5));
     assert_eq!(rows[0][1], Value::Int64(50));
@@ -178,9 +177,12 @@ fn where_integer_equality() {
 #[test]
 fn where_string_equality() {
     let (dir, db) = make_db();
-    db.execute("CREATE (:City {name: 'Paris', pop: 2000000})").unwrap();
-    db.execute("CREATE (:City {name: 'Lyon', pop: 500000})").unwrap();
-    db.execute("CREATE (:City {name: 'Marseille', pop: 900000})").unwrap();
+    db.execute("CREATE (:City {name: 'Paris', pop: 2000000})")
+        .unwrap();
+    db.execute("CREATE (:City {name: 'Lyon', pop: 500000})")
+        .unwrap();
+    db.execute("CREATE (:City {name: 'Marseille', pop: 900000})")
+        .unwrap();
 
     let (_, rows) = assert_engines_agree(
         dir.path(),
@@ -197,9 +199,11 @@ fn where_string_equality() {
 fn where_property_is_null() {
     let (dir, db) = make_db();
     // Alice has an email; Bob does not (property missing = null).
-    db.execute("CREATE (:Member {name: 'Alice', email: 'alice@example.com'})").unwrap();
+    db.execute("CREATE (:Member {name: 'Alice', email: 'alice@example.com'})")
+        .unwrap();
     db.execute("CREATE (:Member {name: 'Bob'})").unwrap();
-    db.execute("CREATE (:Member {name: 'Carol', email: 'carol@example.com'})").unwrap();
+    db.execute("CREATE (:Member {name: 'Carol', email: 'carol@example.com'})")
+        .unwrap();
 
     let (_, rows) = assert_engines_agree(
         dir.path(),
@@ -219,8 +223,7 @@ fn match_with_limit_count_bounded() {
     }
 
     // LIMIT falls back to row-at-a-time in Phase 1 — both engines must agree.
-    let (_, rows) =
-        assert_engines_agree(dir.path(), "MATCH (l:Log) RETURN l.seq LIMIT 5");
+    let (_, rows) = assert_engines_agree(dir.path(), "MATCH (l:Log) RETURN l.seq LIMIT 5");
     assert_eq!(rows.len(), 5, "LIMIT 5 should return exactly 5 rows");
 }
 
@@ -263,8 +266,7 @@ fn large_graph_10k_nodes_full_scan() {
     db.execute_batch(&batch.iter().map(String::as_str).collect::<Vec<_>>())
         .expect("batch seed");
 
-    let (_, rows) =
-        assert_engines_agree(dir.path(), "MATCH (n:BigNode) RETURN n.n");
+    let (_, rows) = assert_engines_agree(dir.path(), "MATCH (n:BigNode) RETURN n.n");
     assert_eq!(rows.len(), 10_000, "all 10 000 nodes must be scanned");
 }
 
@@ -279,8 +281,7 @@ fn chunk_boundary_exactly_2048_nodes() {
     db.execute_batch(&batch.iter().map(String::as_str).collect::<Vec<_>>())
         .expect("seed 2048");
 
-    let (_, rows) =
-        assert_engines_agree(dir.path(), "MATCH (n:Chunk2048) RETURN n.id");
+    let (_, rows) = assert_engines_agree(dir.path(), "MATCH (n:Chunk2048) RETURN n.id");
     assert_eq!(rows.len(), 2048);
 }
 
@@ -295,8 +296,7 @@ fn chunk_boundary_2049_nodes_spills_to_second_chunk() {
     db.execute_batch(&batch.iter().map(String::as_str).collect::<Vec<_>>())
         .expect("seed 2049");
 
-    let (_, rows) =
-        assert_engines_agree(dir.path(), "MATCH (n:Chunk2049) RETURN n.id");
+    let (_, rows) = assert_engines_agree(dir.path(), "MATCH (n:Chunk2049) RETURN n.id");
     assert_eq!(rows.len(), 2049);
 }
 
@@ -311,8 +311,7 @@ fn chunk_boundary_exactly_4096_nodes_two_full_chunks() {
     db.execute_batch(&batch.iter().map(String::as_str).collect::<Vec<_>>())
         .expect("seed 4096");
 
-    let (_, rows) =
-        assert_engines_agree(dir.path(), "MATCH (n:Chunk4096) RETURN n.id");
+    let (_, rows) = assert_engines_agree(dir.path(), "MATCH (n:Chunk4096) RETURN n.id");
     assert_eq!(rows.len(), 4096);
 }
 
@@ -322,7 +321,8 @@ fn chunk_boundary_exactly_4096_nodes_two_full_chunks() {
 fn empty_result_where_matches_nothing() {
     let (dir, db) = make_db();
     for i in 1..=5i64 {
-        db.execute(&format!("CREATE (:Widget {{code: {i}}})")).unwrap();
+        db.execute(&format!("CREATE (:Widget {{code: {i}}})"))
+            .unwrap();
     }
 
     let (_, rows) = assert_engines_agree(
@@ -338,10 +338,14 @@ fn empty_result_where_matches_nothing() {
 fn multi_property_filter_where_and() {
     let (dir, db) = make_db();
     // Create nodes with varying combinations of (colour, size).
-    db.execute("CREATE (:Box {colour: 'red', size: 1})").unwrap();
-    db.execute("CREATE (:Box {colour: 'red', size: 2})").unwrap();
-    db.execute("CREATE (:Box {colour: 'blue', size: 1})").unwrap();
-    db.execute("CREATE (:Box {colour: 'blue', size: 2})").unwrap();
+    db.execute("CREATE (:Box {colour: 'red', size: 1})")
+        .unwrap();
+    db.execute("CREATE (:Box {colour: 'red', size: 2})")
+        .unwrap();
+    db.execute("CREATE (:Box {colour: 'blue', size: 1})")
+        .unwrap();
+    db.execute("CREATE (:Box {colour: 'blue', size: 2})")
+        .unwrap();
 
     let (_, rows) = assert_engines_agree(
         dir.path(),
@@ -400,11 +404,18 @@ fn integer_zero_values_found_regression_325() {
 
     // All three nodes must be returned.
     let (_, rows) = assert_engines_agree(dir.path(), "MATCH (s:Score) RETURN s.id, s.value");
-    assert_eq!(rows.len(), 3, "all 3 Score nodes must be returned (id=0 must not be dropped)");
+    assert_eq!(
+        rows.len(),
+        3,
+        "all 3 Score nodes must be returned (id=0 must not be dropped)"
+    );
 
     // The node with id = 0 must appear.
     let has_zero_id = rows.iter().any(|r| r[0] == Value::Int64(0));
-    assert!(has_zero_id, "node with id=0 must be present in results (#333 regression)");
+    assert!(
+        has_zero_id,
+        "node with id=0 must be present in results (#333 regression)"
+    );
 
     // Two nodes have value = 0; both must appear.
     let zero_value_count = rows.iter().filter(|r| r[1] == Value::Int64(0)).count();
@@ -423,10 +434,7 @@ fn integer_zero_exact_filter_returns_correct_rows_regression_325() {
     db.execute("CREATE (:Counter {n: 2})").unwrap();
 
     // Filter for n = 0; must return the 2 nodes with value zero, not 0 nodes.
-    let (_, rows) = assert_engines_agree(
-        dir.path(),
-        "MATCH (c:Counter) WHERE c.n = 0 RETURN c.n",
-    );
+    let (_, rows) = assert_engines_agree(dir.path(), "MATCH (c:Counter) WHERE c.n = 0 RETURN c.n");
     assert_eq!(
         rows.len(),
         2,
@@ -442,9 +450,12 @@ fn integer_zero_exact_filter_returns_correct_rows_regression_325() {
 #[test]
 fn inline_prop_filter_on_node_pattern() {
     let (dir, db) = make_db();
-    db.execute("CREATE (:Product {sku: 'ABC', qty: 10})").unwrap();
-    db.execute("CREATE (:Product {sku: 'DEF', qty: 5})").unwrap();
-    db.execute("CREATE (:Product {sku: 'ABC', qty: 20})").unwrap();
+    db.execute("CREATE (:Product {sku: 'ABC', qty: 10})")
+        .unwrap();
+    db.execute("CREATE (:Product {sku: 'DEF', qty: 5})")
+        .unwrap();
+    db.execute("CREATE (:Product {sku: 'ABC', qty: 20})")
+        .unwrap();
 
     // Inline prop filter `{sku: 'ABC'}` in the node pattern.
     let (_, rows) = assert_engines_agree(
@@ -504,8 +515,7 @@ fn i2_inline_prop_filter_equivalence() {
         db.execute(&format!("CREATE (:Item {{val: {i}}})")).unwrap();
     }
 
-    let (_, rows) =
-        assert_engines_agree(dir.path(), "MATCH (n:Item {val: 3}) RETURN n.val");
+    let (_, rows) = assert_engines_agree(dir.path(), "MATCH (n:Item {val: 3}) RETURN n.val");
     assert_eq!(rows.len(), 1, "exactly one Item with val=3");
     assert_eq!(rows[0][0], Value::Int64(3));
 }
@@ -519,8 +529,7 @@ fn i3_where_clause_equivalence() {
         db.execute(&format!("CREATE (:Num {{n: {i}}})")).unwrap();
     }
 
-    let (_, rows) =
-        assert_engines_agree(dir.path(), "MATCH (x:Num) WHERE x.n > 5 RETURN x.n");
+    let (_, rows) = assert_engines_agree(dir.path(), "MATCH (x:Num) WHERE x.n > 5 RETURN x.n");
     // n > 5 in range 0..9: values 6, 7, 8, 9 → 4 rows.
     assert_eq!(rows.len(), 4, "WHERE n > 5 must return 4 rows (6,7,8,9)");
     for row in &rows {
@@ -537,8 +546,7 @@ fn i4_empty_label_returns_zero_rows() {
     let (dir, db) = make_db();
     let _ = db; // no nodes created for label NoSuchLabel
 
-    let (_, rows) =
-        assert_engines_agree(dir.path(), "MATCH (n:NoSuchLabel) RETURN n.name");
+    let (_, rows) = assert_engines_agree(dir.path(), "MATCH (n:NoSuchLabel) RETURN n.name");
     assert_eq!(rows.len(), 0, "no nodes of label NoSuchLabel → 0 rows");
 }
 
@@ -548,7 +556,8 @@ fn i4_empty_label_returns_zero_rows() {
 fn i5_count_star_equivalence_7_widgets() {
     let (dir, db) = make_db();
     for i in 1..=7i64 {
-        db.execute(&format!("CREATE (:Widget {{id: {i}}})")).unwrap();
+        db.execute(&format!("CREATE (:Widget {{id: {i}}})"))
+            .unwrap();
     }
 
     let (_, rows) = assert_engines_agree(dir.path(), "MATCH (n:Widget) RETURN COUNT(*)");
