@@ -15,6 +15,7 @@ pub mod types;
 pub use engine::{DegreeStats, Engine, EngineBuilder};
 pub use json::{query_result_to_json, value_to_json};
 pub use operators::UnwindOperator;
+pub use pipeline::FrontierScratch;
 pub use types::{FactorizedChunk, QueryResult, Value, VectorGroup};
 
 #[cfg(test)]

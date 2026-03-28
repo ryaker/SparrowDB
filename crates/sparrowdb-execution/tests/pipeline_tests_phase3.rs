@@ -1,0 +1,107 @@
+//! Unit tests for Phase 3 pipeline additions (SPA-299, #339).
+//!
+//! Covers:
+//! - T1: `FrontierScratch::new` — initial state is empty.
+//! - T2: `FrontierScratch::advance` — swaps current ↔ next and clears next.
+//! - T3: `FrontierScratch::advance` multiple times — reuse without re-alloc.
+//! - T4: `FrontierScratch::bytes_allocated` — reflects live data (len) of both buffers.
+//! - T5: `FrontierScratch::clear` — resets both buffers to empty.
+
+use sparrowdb_execution::FrontierScratch;
+
+// ── T1: FrontierScratch initial state ─────────────────────────────────────────
+
+#[test]
+fn frontier_scratch_initial_state() {
+    let fs = FrontierScratch::new(64);
+    assert!(
+        fs.current().is_empty(),
+        "current must be empty on construction"
+    );
+    // bytes_allocated is based on len(), not capacity(), so an empty frontier
+    // reports 0 bytes even though backing storage was pre-allocated.
+    assert_eq!(
+        fs.bytes_allocated(),
+        0,
+        "empty frontier must report 0 bytes"
+    );
+}
+
+// ── T2: FrontierScratch::advance swaps and clears ─────────────────────────────
+
+#[test]
+fn frontier_scratch_advance_swaps() {
+    let mut fs = FrontierScratch::new(8);
+
+    // Push to current, then some entries to next.
+    fs.current_mut().extend([10u64, 20, 30]);
+    fs.next_mut().extend([40u64, 50]);
+
+    fs.advance();
+
+    // After advance: current == old next, next == empty.
+    assert_eq!(fs.current(), &[40u64, 50]);
+    assert!(
+        fs.next_mut().is_empty(),
+        "next must be cleared after advance"
+    );
+}
+
+// ── T3: multiple advance cycles ───────────────────────────────────────────────
+
+#[test]
+fn frontier_scratch_multiple_advances() {
+    let mut fs = FrontierScratch::new(4);
+
+    // Level 0 → 1.
+    fs.current_mut().push(1u64);
+    fs.next_mut().push(2u64);
+    fs.advance(); // current=[2], next=[]
+    assert_eq!(fs.current(), &[2u64]);
+
+    // Level 1 → 2.
+    fs.next_mut().extend([3u64, 4]);
+    fs.advance(); // current=[3,4], next=[]
+    assert_eq!(fs.current(), &[3u64, 4]);
+    assert!(fs.next_mut().is_empty());
+
+    // Level 2 → 3 (nothing found).
+    fs.advance(); // current=[], next=[]
+    assert!(fs.current().is_empty());
+}
+
+// ── T4: bytes_allocated reflects live data (len) ──────────────────────────────
+
+#[test]
+fn frontier_scratch_bytes_allocated() {
+    let mut fs = FrontierScratch::new(0);
+    assert_eq!(
+        fs.bytes_allocated(),
+        0,
+        "empty frontier must report 0 bytes"
+    );
+
+    // After pushing 1 element: len=1, bytes = 1 * size_of::<u64>() = 8.
+    fs.current_mut().push(1u64);
+    assert_eq!(
+        fs.bytes_allocated(),
+        8,
+        "one element in current = 8 bytes of live data"
+    );
+
+    // Add one element to next as well: total live = 2 * 8 = 16 bytes.
+    fs.next_mut().push(2u64);
+    assert_eq!(fs.bytes_allocated(), 16);
+}
+
+// ── T5: FrontierScratch::clear resets both buffers ────────────────────────────
+
+#[test]
+fn frontier_scratch_clear_resets() {
+    let mut fs = FrontierScratch::new(8);
+    fs.current_mut().extend([1u64, 2, 3]);
+    fs.next_mut().push(4u64);
+    fs.clear();
+    assert!(fs.current().is_empty(), "current must be empty after clear");
+    assert!(fs.next_mut().is_empty(), "next must be empty after clear");
+}

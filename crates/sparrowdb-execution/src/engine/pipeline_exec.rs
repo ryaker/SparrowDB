@@ -1,7 +1,7 @@
-//! Opt-in chunked pipeline execution entry points (Phase 1 + Phase 2, #299).
+//! Opt-in chunked pipeline execution entry points (Phase 1 + Phase 2 + Phase 3, #299).
 //!
-//! This module wires the Phase 1 and Phase 2 pipeline data structures into the
-//! existing engine without modifying any row-at-a-time code paths.
+//! This module wires the Phase 1, Phase 2, and Phase 3 pipeline data structures
+//! into the existing engine without modifying any row-at-a-time code paths.
 //!
 //! When `Engine::use_chunked_pipeline` is `true` AND the query shape qualifies,
 //! these methods are called instead of the row-at-a-time equivalents.
@@ -15,6 +15,11 @@
 //!
 //! Single-label, single-hop, directed (outgoing or incoming):
 //! `MATCH (a:SrcLabel)-[:R]->(b:DstLabel) [WHERE ...] RETURN a.p, b.q [LIMIT n]`
+//!
+//! # Phase 3 supported shape
+//!
+//! Single-label, two-hop same-rel, both hops outgoing:
+//! `MATCH (a:L)-[:R]->(b:L)-[:R]->(c:L) [WHERE ...] RETURN ... [LIMIT n]`
 //!
 //! All other shapes fall back to the row-at-a-time engine.
 
@@ -534,6 +539,672 @@ impl Engine {
                     if let Some(lim) = limit {
                         if rows.len() >= lim {
                             break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(QueryResult {
+            columns: column_names.to_vec(),
+            rows,
+        })
+    }
+
+    /// Return `true` when `m` qualifies for Phase 3 two-hop chunked execution.
+    ///
+    /// Eligibility (spec §4.3):
+    /// - `use_chunked_pipeline` flag is set.
+    /// - Exactly 3 nodes, 2 relationships (two hops).
+    /// - Both hops resolve to the **same relationship table**.
+    /// - Both hops same direction (both Outgoing).
+    /// - No `OPTIONAL MATCH`, no subquery in `WHERE`.
+    /// - No aggregate, no `ORDER BY`, no `DISTINCT`.
+    /// - No edge-property references in RETURN or WHERE.
+    /// - No variable-length hops.
+    pub(crate) fn can_use_two_hop_chunked(&self, m: &MatchStatement) -> bool {
+        use sparrowdb_cypher::ast::EdgeDir;
+
+        if !self.use_chunked_pipeline {
+            return false;
+        }
+        // Exactly 1 path pattern with 3 nodes and 2 rels.
+        if m.pattern.len() != 1 {
+            return false;
+        }
+        let pat = &m.pattern[0];
+        if pat.rels.len() != 2 || pat.nodes.len() != 3 {
+            return false;
+        }
+        // Both hops must be directed Outgoing (Phase 3 constraint).
+        if pat.rels[0].dir != EdgeDir::Outgoing || pat.rels[1].dir != EdgeDir::Outgoing {
+            return false;
+        }
+        // No variable-length hops.
+        if pat.rels[0].min_hops.is_some() || pat.rels[1].min_hops.is_some() {
+            return false;
+        }
+        // No aggregation.
+        if has_aggregate_in_return(&m.return_clause.items) {
+            return false;
+        }
+        // No DISTINCT.
+        if m.distinct {
+            return false;
+        }
+        // No ORDER BY.
+        if !m.order_by.is_empty() {
+            return false;
+        }
+        // No edge-property references.
+        for rel in &pat.rels {
+            if !rel.var.is_empty() {
+                let ref_in_return = m.return_clause.items.iter().any(|item| {
+                    column_name_for_item(item)
+                        .split_once('.')
+                        .is_some_and(|(v, _)| v == rel.var.as_str())
+                });
+                if ref_in_return {
+                    return false;
+                }
+                if let Some(ref wexpr) = m.where_clause {
+                    if expr_references_var(wexpr, rel.var.as_str()) {
+                        return false;
+                    }
+                }
+            }
+        }
+        // Only simple WHERE predicates.
+        if let Some(ref wexpr) = m.where_clause {
+            if !is_simple_where_for_chunked(wexpr) {
+                return false;
+            }
+        }
+        // Both hops must resolve to the same relationship table.
+        let src_label = pat.nodes[0].labels.first().cloned().unwrap_or_default();
+        let mid_label = pat.nodes[1].labels.first().cloned().unwrap_or_default();
+        let dst_label = pat.nodes[2].labels.first().cloned().unwrap_or_default();
+        let rel_type1 = &pat.rels[0].rel_type;
+        let rel_type2 = &pat.rels[1].rel_type;
+
+        // Both rel types must be identical (including both-empty).
+        // Allowing one empty + one non-empty would silently ignore the typed hop
+        // in execute_two_hop_chunked which only uses rels[0].rel_type.
+        if rel_type1 != rel_type2 {
+            return false;
+        }
+
+        // Resolve the shared rel table: src→mid and mid→dst must map to same table.
+        let catalog = &self.snapshot.catalog;
+        let tables = catalog.list_rel_tables_with_ids();
+
+        let hop1_matches: Vec<_> = tables
+            .iter()
+            .filter(|(_, sid, did, rt)| {
+                let type_ok = rel_type1.is_empty() || rt == rel_type1;
+                let src_ok = catalog
+                    .get_label(&src_label)
+                    .ok()
+                    .flatten()
+                    .map(|id| id as u32 == *sid as u32)
+                    .unwrap_or(false);
+                let mid_ok = catalog
+                    .get_label(&mid_label)
+                    .ok()
+                    .flatten()
+                    .map(|id| id as u32 == *did as u32)
+                    .unwrap_or(false);
+                type_ok && src_ok && mid_ok
+            })
+            .collect();
+
+        // Only enter chunked path if there is exactly one matching rel table.
+        let n_tables = hop1_matches.len();
+        if n_tables != 1 {
+            return false;
+        }
+
+        let hop2_id = tables.iter().find(|(_, sid, did, rt)| {
+            let type_ok = rel_type2.is_empty() || rt == rel_type2;
+            let mid_ok = catalog
+                .get_label(&mid_label)
+                .ok()
+                .flatten()
+                .map(|id| id as u32 == *sid as u32)
+                .unwrap_or(false);
+            let dst_ok = catalog
+                .get_label(&dst_label)
+                .ok()
+                .flatten()
+                .map(|id| id as u32 == *did as u32)
+                .unwrap_or(false);
+            type_ok && mid_ok && dst_ok
+        });
+
+        // Both hops must resolve, and to the same table.
+        match (hop1_matches.first(), hop2_id) {
+            (Some((id1, _, _, _)), Some((id2, _, _, _))) => id1 == id2,
+            _ => false,
+        }
+    }
+
+    /// Execute a 2-hop query using the Phase 3 chunked pipeline.
+    ///
+    /// Pipeline shape (spec §4.3, same-rel 2-hop):
+    /// ```text
+    /// MaterializeRows(limit?)
+    ///   <- optional Filter(ChunkPredicate, dst)
+    ///   <- ReadNodeProps(dst)             [only if dst props referenced]
+    ///   <- GetNeighbors(hop2, mid_label)  [second hop]
+    ///   <- optional Filter(ChunkPredicate, mid)   [intermediate predicates]
+    ///   <- ReadNodeProps(mid)             [only if mid props referenced in WHERE]
+    ///   <- GetNeighbors(hop1, src_label)  [first hop]
+    ///   <- optional Filter(ChunkPredicate, src)
+    ///   <- ReadNodeProps(src)             [only if src props referenced]
+    ///   <- ScanByLabel(hwm)
+    /// ```
+    ///
+    /// Memory-limit enforcement: if the accumulated output row count in bytes
+    /// exceeds `self.memory_limit_bytes`, returns `Error::QueryMemoryExceeded`.
+    ///
+    /// Path multiplicity: duplicate destination slots from distinct source paths
+    /// are emitted as distinct output rows (no implicit dedup — spec §4.1).
+    pub(crate) fn execute_two_hop_chunked(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<QueryResult> {
+        use sparrowdb_common::Error as DbError;
+
+        let pat = &m.pattern[0];
+        let src_node_pat = &pat.nodes[0];
+        let mid_node_pat = &pat.nodes[1];
+        let dst_node_pat = &pat.nodes[2];
+
+        let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
+        let mid_label = mid_node_pat.labels.first().cloned().unwrap_or_default();
+        let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
+        let rel_type = pat.rels[0].rel_type.clone();
+
+        // Resolve label IDs.
+        let src_label_id = match self.snapshot.catalog.get_label(&src_label)? {
+            Some(id) => id as u32,
+            None => {
+                return Ok(QueryResult {
+                    columns: column_names.to_vec(),
+                    rows: vec![],
+                });
+            }
+        };
+        let mid_label_id = if mid_label.is_empty() {
+            src_label_id
+        } else {
+            match self.snapshot.catalog.get_label(&mid_label)? {
+                Some(id) => id as u32,
+                None => {
+                    return Ok(QueryResult {
+                        columns: column_names.to_vec(),
+                        rows: vec![],
+                    });
+                }
+            }
+        };
+        let dst_label_id = match self.snapshot.catalog.get_label(&dst_label)? {
+            Some(id) => id as u32,
+            None => {
+                return Ok(QueryResult {
+                    columns: column_names.to_vec(),
+                    rows: vec![],
+                });
+            }
+        };
+
+        // Resolve the shared rel table ID.
+        let catalog_rel_id = self
+            .snapshot
+            .catalog
+            .list_rel_tables_with_ids()
+            .into_iter()
+            .find(|(_, sid, did, rt)| {
+                let type_ok = rel_type.is_empty() || rt == &rel_type;
+                let src_ok = *sid as u32 == src_label_id;
+                let mid_ok = *did as u32 == mid_label_id;
+                type_ok && src_ok && mid_ok
+            })
+            .map(|(cid, _, _, _)| cid as u32)
+            .ok_or_else(|| {
+                sparrowdb_common::Error::InvalidArgument(
+                    "no matching relationship table found for 2-hop".into(),
+                )
+            })?;
+
+        let hwm_src = self.snapshot.store.hwm_for_label(src_label_id).unwrap_or(0);
+        tracing::debug!(
+            engine = "chunked",
+            src_label = %src_label,
+            mid_label = %mid_label,
+            dst_label = %dst_label,
+            rel_type = %rel_type,
+            hwm_src,
+            "executing via chunked pipeline (2-hop)"
+        );
+
+        // Variable names from the query.
+        let src_var = src_node_pat.var.as_str();
+        let mid_var = mid_node_pat.var.as_str();
+        let dst_var = dst_node_pat.var.as_str();
+
+        // Collect property col_ids needed for each node.
+        // Late materialization: only read what WHERE or RETURN references.
+        let mut col_ids_src = collect_col_ids_for_var(src_var, column_names, src_label_id);
+        let mut col_ids_dst = collect_col_ids_for_var(dst_var, column_names, dst_label_id);
+
+        // Mid node properties: only needed if WHERE references them.
+        let mut col_ids_mid: Vec<u32> = vec![];
+
+        if let Some(ref wexpr) = m.where_clause {
+            collect_col_ids_from_expr_for_var(wexpr, src_var, &mut col_ids_src);
+            collect_col_ids_from_expr_for_var(wexpr, dst_var, &mut col_ids_dst);
+            collect_col_ids_from_expr_for_var(wexpr, mid_var, &mut col_ids_mid);
+        }
+        // Inline prop filters.
+        for p in &src_node_pat.props {
+            let cid = sparrowdb_common::col_id_of(&p.key);
+            if !col_ids_src.contains(&cid) {
+                col_ids_src.push(cid);
+            }
+        }
+        for p in &mid_node_pat.props {
+            let cid = sparrowdb_common::col_id_of(&p.key);
+            if !col_ids_mid.contains(&cid) {
+                col_ids_mid.push(cid);
+            }
+        }
+        for p in &dst_node_pat.props {
+            let cid = sparrowdb_common::col_id_of(&p.key);
+            if !col_ids_dst.contains(&cid) {
+                col_ids_dst.push(cid);
+            }
+        }
+        // If mid var is referenced in RETURN, read those props too.
+        if !mid_var.is_empty() {
+            let mid_return_ids = collect_col_ids_for_var(mid_var, column_names, mid_label_id);
+            for cid in mid_return_ids {
+                if !col_ids_mid.contains(&cid) {
+                    col_ids_mid.push(cid);
+                }
+            }
+        }
+
+        // Build delta index for this rel table.
+        let delta_records = {
+            let edge_store = sparrowdb_storage::edge_store::EdgeStore::open(
+                &self.snapshot.db_root,
+                sparrowdb_storage::edge_store::RelTableId(catalog_rel_id),
+            );
+            edge_store.and_then(|s| s.read_delta()).unwrap_or_default()
+        };
+
+        // Get CSR for the shared rel table.
+        let csr = self
+            .snapshot
+            .csrs
+            .get(&catalog_rel_id)
+            .cloned()
+            .unwrap_or_else(|| sparrowdb_storage::csr::CsrForward::build(0, &[]));
+
+        let avg_degree_hint = self
+            .snapshot
+            .rel_degree_stats()
+            .get(&catalog_rel_id)
+            .map(|s| s.mean().ceil() as usize)
+            .unwrap_or(8);
+
+        // Compile WHERE predicates.
+        let src_pred_opt = m
+            .where_clause
+            .as_ref()
+            .and_then(|wexpr| try_compile_predicate(wexpr, src_var, &col_ids_src));
+        let mid_pred_opt = m
+            .where_clause
+            .as_ref()
+            .and_then(|wexpr| try_compile_predicate(wexpr, mid_var, &col_ids_mid));
+        let dst_pred_opt = m
+            .where_clause
+            .as_ref()
+            .and_then(|wexpr| try_compile_predicate(wexpr, dst_var, &col_ids_dst));
+
+        let store_arc = Arc::new(sparrowdb_storage::node_store::NodeStore::open(
+            self.snapshot.store.root_path(),
+        )?);
+
+        let limit = m.limit.map(|l| l as usize);
+        let memory_limit = self.memory_limit_bytes;
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+
+        // ── FrontierScratch: reused across both hops ──────────────────────────
+        //
+        // We use FrontierScratch to hold source-node slots for the current
+        // scan chunk, then expand to mid-node slots, then to dst-node slots.
+        // This avoids re-allocating Vec<u64> at every scan chunk boundary.
+        let mut frontier = crate::pipeline::FrontierScratch::new(
+            avg_degree_hint * (crate::chunk::CHUNK_CAPACITY / 2),
+        );
+
+        // ── Memory-limit tracking ─────────────────────────────────────────────
+        // We track accumulated output rows as a proxy for memory usage.
+        // Each output row is estimated as column_names.len() * 16 bytes.
+        let row_size_estimate = column_names.len().max(1) * 16;
+
+        let mut scan = ScanByLabel::new(hwm_src);
+
+        'outer: while let Some(scan_chunk) = scan.next_chunk()? {
+            // ── ReadNodeProps(src) ────────────────────────────────────────────
+            let src_chunk = if !col_ids_src.is_empty() {
+                let mut rnp = ReadNodeProps::new(
+                    SingleChunkSource::new(scan_chunk),
+                    Arc::clone(&store_arc),
+                    src_label_id,
+                    crate::chunk::COL_ID_SLOT,
+                    col_ids_src.clone(),
+                );
+                match rnp.next_chunk()? {
+                    Some(c) => c,
+                    None => continue,
+                }
+            } else {
+                scan_chunk
+            };
+
+            // ── Filter(src) ───────────────────────────────────────────────────
+            let src_chunk = if let Some(ref pred) = src_pred_opt {
+                let pred = pred.clone();
+                let keep: Vec<bool> = (0..src_chunk.len())
+                    .map(|i| pred.eval(&src_chunk, i))
+                    .collect();
+                let mut c = src_chunk;
+                c.filter_sel(|i| keep[i]);
+                if c.live_len() == 0 {
+                    continue;
+                }
+                c
+            } else {
+                src_chunk
+            };
+
+            // ── Hop 1: GetNeighbors(src → mid) ────────────────────────────────
+            let mut gn1 = GetNeighbors::new(
+                SingleChunkSource::new(src_chunk.clone()),
+                csr.clone(),
+                &delta_records,
+                src_label_id,
+                avg_degree_hint,
+            );
+
+            // For each hop-1 output chunk: (src_slot, mid_slot) pairs.
+            while let Some(hop1_chunk) = gn1.next_chunk()? {
+                // Memory-limit check: check after each hop-1 chunk.
+                let accum_bytes = rows.len() * row_size_estimate + frontier.bytes_allocated();
+                if accum_bytes > memory_limit {
+                    return Err(DbError::QueryMemoryExceeded);
+                }
+
+                // ── ReadNodeProps(mid) — only if WHERE references mid ─────────
+                let mid_chunk = if !col_ids_mid.is_empty() {
+                    let mut rnp = ReadNodeProps::new(
+                        SingleChunkSource::new(hop1_chunk),
+                        Arc::clone(&store_arc),
+                        mid_label_id,
+                        COL_ID_DST_SLOT,
+                        col_ids_mid.clone(),
+                    );
+                    match rnp.next_chunk()? {
+                        Some(c) => c,
+                        None => continue,
+                    }
+                } else {
+                    hop1_chunk
+                };
+
+                // ── Filter(mid) — intermediate hop predicate ─────────────────
+                let mid_chunk = if let Some(ref pred) = mid_pred_opt {
+                    let pred = pred.clone();
+                    let keep: Vec<bool> = (0..mid_chunk.len())
+                        .map(|i| pred.eval(&mid_chunk, i))
+                        .collect();
+                    let mut c = mid_chunk;
+                    c.filter_sel(|i| keep[i]);
+                    if c.live_len() == 0 {
+                        continue;
+                    }
+                    c
+                } else {
+                    mid_chunk
+                };
+
+                // ── Hop 2: GetNeighbors(mid → dst) ────────────────────────────
+                // Populate FrontierScratch.current with live mid-slots.
+                frontier.clear();
+                let mid_slot_col = mid_chunk.find_column(COL_ID_DST_SLOT);
+                let hop1_src_col = mid_chunk.find_column(COL_ID_SRC_SLOT);
+
+                // Collect (src_slot, mid_slot) pairs for live mid rows.
+                let live_pairs: Vec<(u64, u64)> = mid_chunk
+                    .live_rows()
+                    .map(|row_idx| {
+                        let mid_slot = mid_slot_col.map(|c| c.data[row_idx]).unwrap_or(0);
+                        let src_slot = hop1_src_col.map(|c| c.data[row_idx]).unwrap_or(0);
+                        (src_slot, mid_slot)
+                    })
+                    .collect();
+
+                // Populate FrontierScratch with DEDUPLICATED mid slots for hop-2.
+                // Deduplication here prevents GetNeighbors from expanding the same
+                // mid node multiple times (once per source path through it), which
+                // would produce N^2 output rows instead of N.
+                // Path multiplicity is preserved by iterating ALL live_pairs at
+                // materialization time — we emit one row per distinct (src, mid, dst)
+                // triple, which is the correct semantics.
+                //
+                // Use a HashSet for O(1) membership checks to avoid the O(N²)
+                // cost of Vec::contains when live_pairs grows large (up to 2048
+                // entries per chunk).
+                {
+                    use std::collections::HashSet;
+                    let dedup_set: HashSet<u64> = live_pairs.iter().map(|&(_, m)| m).collect();
+                    for mid_slot in dedup_set {
+                        frontier.current_mut().push(mid_slot);
+                    }
+                }
+
+                // Reuse FrontierScratch as input to GetNeighbors.
+                // Build a ScanByLabel-equivalent from deduplicated mid slots.
+                let mid_slots_chunk = {
+                    let data: Vec<u64> = frontier.current().to_vec();
+                    let col =
+                        crate::chunk::ColumnVector::from_data(crate::chunk::COL_ID_SLOT, data);
+                    DataChunk::from_columns(vec![col])
+                };
+
+                let mut gn2 = GetNeighbors::new(
+                    SingleChunkSource::new(mid_slots_chunk),
+                    csr.clone(),
+                    &delta_records,
+                    mid_label_id,
+                    avg_degree_hint,
+                );
+
+                while let Some(hop2_chunk) = gn2.next_chunk()? {
+                    // hop2_chunk: (mid_slot=COL_ID_SRC_SLOT, dst_slot=COL_ID_DST_SLOT)
+
+                    // ── ReadNodeProps(dst) ────────────────────────────────────
+                    let dst_chunk = if !col_ids_dst.is_empty() {
+                        let mut rnp = ReadNodeProps::new(
+                            SingleChunkSource::new(hop2_chunk),
+                            Arc::clone(&store_arc),
+                            dst_label_id,
+                            COL_ID_DST_SLOT,
+                            col_ids_dst.clone(),
+                        );
+                        match rnp.next_chunk()? {
+                            Some(c) => c,
+                            None => continue,
+                        }
+                    } else {
+                        hop2_chunk
+                    };
+
+                    // ── Filter(dst) ───────────────────────────────────────────
+                    let dst_chunk = if let Some(ref pred) = dst_pred_opt {
+                        let pred = pred.clone();
+                        let keep: Vec<bool> = (0..dst_chunk.len())
+                            .map(|i| pred.eval(&dst_chunk, i))
+                            .collect();
+                        let mut c = dst_chunk;
+                        c.filter_sel(|i| keep[i]);
+                        if c.live_len() == 0 {
+                            continue;
+                        }
+                        c
+                    } else {
+                        dst_chunk
+                    };
+
+                    // ── MaterializeRows ───────────────────────────────────────
+                    // For each live (mid_slot, dst_slot) pair, walk backwards
+                    // through live_pairs to find all (src_slot, mid_slot) pairs,
+                    // emitting one row per (src, mid, dst) path.
+                    let hop2_src_col = dst_chunk.find_column(COL_ID_SRC_SLOT); // mid_slot
+                    let dst_slot_col = dst_chunk.find_column(COL_ID_DST_SLOT);
+
+                    let src_slot_col_in_scan = src_chunk.find_column(crate::chunk::COL_ID_SLOT);
+
+                    // Build slot→row-index maps once before the triple loop to
+                    // avoid O(N) linear scans per output row (WARNING 2).
+                    let src_index: std::collections::HashMap<u64, usize> = src_slot_col_in_scan
+                        .map(|sc| (0..sc.data.len()).map(|i| (sc.data[i], i)).collect())
+                        .unwrap_or_default();
+
+                    let mid_index: std::collections::HashMap<u64, usize> = {
+                        let mid_slot_col_in_mid = mid_chunk.find_column(COL_ID_DST_SLOT);
+                        mid_slot_col_in_mid
+                            .map(|mc| (0..mc.data.len()).map(|i| (mc.data[i], i)).collect())
+                            .unwrap_or_default()
+                    };
+
+                    for row_idx in dst_chunk.live_rows() {
+                        let dst_slot = dst_slot_col.map(|c| c.data[row_idx]).unwrap_or(0);
+                        let via_mid_slot = hop2_src_col.map(|c| c.data[row_idx]).unwrap_or(0);
+
+                        // Find all (src, mid) pairs whose mid == via_mid_slot.
+                        for &(src_slot, mid_slot) in &live_pairs {
+                            if mid_slot != via_mid_slot {
+                                continue;
+                            }
+
+                            // Path multiplicity: each (src, mid, dst) triple is
+                            // a distinct path — emit as a distinct row (no dedup).
+                            let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
+                            let mid_node = NodeId(((mid_label_id as u64) << 32) | mid_slot);
+                            let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
+
+                            // Tombstone checks.
+                            if self.is_node_tombstoned(src_node)
+                                || self.is_node_tombstoned(mid_node)
+                                || self.is_node_tombstoned(dst_node)
+                            {
+                                continue;
+                            }
+
+                            // Read src props (from scan chunk, using pre-built index).
+                            let src_props = if src_slot_col_in_scan.is_some() {
+                                if let Some(&src_ri) = src_index.get(&src_slot) {
+                                    build_props_from_chunk(&src_chunk, src_ri, &col_ids_src)
+                                } else {
+                                    let nullable = self
+                                        .snapshot
+                                        .store
+                                        .get_node_raw_nullable(src_node, &col_ids_src)?;
+                                    nullable
+                                        .into_iter()
+                                        .filter_map(|(cid, opt)| opt.map(|v| (cid, v)))
+                                        .collect()
+                                }
+                            } else {
+                                vec![]
+                            };
+
+                            // Read mid props (from mid_chunk, using pre-built index).
+                            let mid_props: Vec<(u32, u64)> = if !col_ids_mid.is_empty() {
+                                if let Some(&mid_ri) = mid_index.get(&mid_slot) {
+                                    build_props_from_chunk(&mid_chunk, mid_ri, &col_ids_mid)
+                                } else {
+                                    let nullable = self
+                                        .snapshot
+                                        .store
+                                        .get_node_raw_nullable(mid_node, &col_ids_mid)?;
+                                    nullable
+                                        .into_iter()
+                                        .filter_map(|(cid, opt)| opt.map(|v| (cid, v)))
+                                        .collect()
+                                }
+                            } else {
+                                vec![]
+                            };
+
+                            // Read dst props (from dst_chunk).
+                            let dst_props =
+                                build_props_from_chunk(&dst_chunk, row_idx, &col_ids_dst);
+
+                            // Apply WHERE clause (fallback for complex predicates).
+                            if let Some(ref where_expr) = m.where_clause {
+                                let mut row_vals = build_row_vals(
+                                    &src_props,
+                                    src_var,
+                                    &col_ids_src,
+                                    &self.snapshot.store,
+                                );
+                                row_vals.extend(build_row_vals(
+                                    &mid_props,
+                                    mid_var,
+                                    &col_ids_mid,
+                                    &self.snapshot.store,
+                                ));
+                                row_vals.extend(build_row_vals(
+                                    &dst_props,
+                                    dst_var,
+                                    &col_ids_dst,
+                                    &self.snapshot.store,
+                                ));
+                                row_vals.extend(self.dollar_params());
+                                if !self.eval_where_graph(where_expr, &row_vals) {
+                                    continue;
+                                }
+                            }
+
+                            // Project output row using existing three-var helper.
+                            let row = project_three_var_row(
+                                &src_props,
+                                &mid_props,
+                                &dst_props,
+                                column_names,
+                                src_var,
+                                mid_var,
+                                &self.snapshot.store,
+                            );
+                            rows.push(row);
+
+                            // Memory-limit check on accumulated output.
+                            if rows.len() * row_size_estimate > memory_limit {
+                                return Err(DbError::QueryMemoryExceeded);
+                            }
+
+                            // LIMIT short-circuit.
+                            if let Some(lim) = limit {
+                                if rows.len() >= lim {
+                                    break 'outer;
+                                }
+                            }
                         }
                     }
                 }

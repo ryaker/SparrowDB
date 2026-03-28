@@ -1,4 +1,4 @@
-//! Pull-based vectorized pipeline operators (Phase 1 + Phase 2).
+//! Pull-based vectorized pipeline operators (Phase 1 + Phase 2 + Phase 3).
 //!
 //! # Architecture
 //!
@@ -15,6 +15,12 @@
 //! | [`GetNeighbors`] | child of src_slots | chunks of (src_slot, dst_slot) |
 //! | [`Filter`] | child + predicate | child chunks with sel vector updated |
 //! | [`ReadNodeProps`] | child chunk + NodeStore | child chunk + property columns |
+//!
+//! ## Phase 3 additions
+//!
+//! | Symbol | Purpose |
+//! |--------|---------|
+//! | [`FrontierScratch`] | Reusable double-buffer for BFS/multi-hop frontier |
 //!
 //! # Integration
 //!
@@ -597,6 +603,89 @@ impl ChunkPredicate {
             }
             ChunkPredicate::And(children) => children.iter().all(|c| c.eval(chunk, row_idx)),
         }
+    }
+}
+
+// ── FrontierScratch ───────────────────────────────────────────────────────────
+
+/// Reusable double-buffer for BFS / multi-hop frontier expansion.
+///
+/// Reduces per-level `Vec` allocation churn: instead of allocating fresh
+/// `Vec<u64>` buffers for `current` and `next` at every hop, a single
+/// `FrontierScratch` is allocated once and reused across all hops in a query.
+///
+/// # Semantics
+///
+/// `FrontierScratch` has **no visited-set semantics**. It does not deduplicate
+/// frontier entries. Callers that require reachability dedup must implement
+/// that separately. This is intentional — see spec §4.5.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut frontier = FrontierScratch::new(256);
+/// // populate initial frontier:
+/// frontier.current_mut().extend(src_slots);
+///
+/// // expand hop:
+/// for &slot in frontier.current() {
+///     frontier.next_mut().extend(neighbors(slot));
+/// }
+/// frontier.advance(); // swap: next → current, clear next
+///
+/// // read expanded frontier:
+/// for &slot in frontier.current() { ... }
+/// ```
+pub struct FrontierScratch {
+    current: Vec<u64>,
+    next: Vec<u64>,
+}
+
+impl FrontierScratch {
+    /// Allocate a `FrontierScratch` pre-reserving `capacity` slots in each
+    /// buffer.
+    pub fn new(capacity: usize) -> Self {
+        FrontierScratch {
+            current: Vec::with_capacity(capacity),
+            next: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Swap `current` ↔ `next` and clear `next`.
+    ///
+    /// Call this after populating `next_mut()` to advance to the next BFS level.
+    pub fn advance(&mut self) {
+        std::mem::swap(&mut self.current, &mut self.next);
+        self.next.clear();
+    }
+
+    /// Read-only view of the current frontier.
+    pub fn current(&self) -> &[u64] {
+        &self.current
+    }
+
+    /// Mutable reference to the current frontier (for initial population).
+    pub fn current_mut(&mut self) -> &mut Vec<u64> {
+        &mut self.current
+    }
+
+    /// Mutable reference to the next frontier (populated during expansion).
+    pub fn next_mut(&mut self) -> &mut Vec<u64> {
+        &mut self.next
+    }
+
+    /// Clear both buffers (reset for reuse in a new query).
+    pub fn clear(&mut self) {
+        self.current.clear();
+        self.next.clear();
+    }
+
+    /// Byte footprint of live data in both buffers (for memory-limit checks).
+    ///
+    /// Uses `len()` rather than `capacity()` so that pre-allocated but unused
+    /// capacity does not trigger the memory limit before any edges are traversed.
+    pub fn bytes_allocated(&self) -> usize {
+        (self.current.len() + self.next.len()) * std::mem::size_of::<u64>()
     }
 }
 

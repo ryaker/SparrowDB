@@ -374,6 +374,14 @@ pub struct Engine {
     ///
     /// Activate with [`Engine::with_chunked_pipeline`].
     pub use_chunked_pipeline: bool,
+    /// Per-query memory limit in bytes for Phase 3 BFS expansion (Phase 3+).
+    ///
+    /// When the accumulated frontier size exceeds this during 2-hop expansion,
+    /// the engine returns `Error::QueryMemoryExceeded` instead of OOM-ing.
+    /// Defaults to `usize::MAX` (unlimited).
+    ///
+    /// Set via `EngineBuilder::with_memory_limit`.
+    pub memory_limit_bytes: usize,
 }
 
 impl Engine {
@@ -487,6 +495,7 @@ impl Engine {
             degree_cache: std::cell::RefCell::new(None),
             unique_constraints: HashSet::new(),
             use_chunked_pipeline: false,
+            memory_limit_bytes: usize::MAX,
         }
     }
 
@@ -542,10 +551,14 @@ impl Engine {
         crate::chunk::CHUNK_CAPACITY
     }
 
-    /// Return the `memory_limit_bytes` field.  Defaults to `usize::MAX`
-    /// (unlimited) until Phase 3 wires memory-limit enforcement into BFS.
+    /// Return the configured per-query memory limit in bytes.
+    ///
+    /// Defaults to `usize::MAX` (unlimited). Set via
+    /// `EngineBuilder::with_memory_limit` to enforce a budget on Phase 3
+    /// BFS expansion. When the frontier exceeds this, the engine returns
+    /// `Error::QueryMemoryExceeded`.
     pub fn memory_limit_bytes(&self) -> usize {
-        usize::MAX
+        self.memory_limit_bytes
     }
 
     /// Merge the engine's lazily-populated property index into the shared cache
@@ -878,8 +891,7 @@ pub struct EngineBuilder {
     /// Reserved for Phase 4: overrides `CHUNK_CAPACITY` at runtime.
     #[allow(dead_code)]
     chunk_capacity: usize,
-    /// Reserved for Phase 3: aborts BFS expansion when frontier exceeds this.
-    #[allow(dead_code)]
+    /// Per-query memory limit in bytes for Phase 3 BFS expansion.
     memory_limit: usize,
 }
 
@@ -920,8 +932,11 @@ impl EngineBuilder {
 
     /// Set the per-query memory limit in bytes (Phase 3).
     ///
-    /// Currently a no-op — stored for future use when Phase 3 BFS expansion
-    /// aborts with `Error::QueryMemoryExceeded` when the frontier exceeds this.
+    /// When the accumulated frontier during two-hop BFS expansion exceeds
+    /// this budget, the engine returns `Error::QueryMemoryExceeded` instead
+    /// of continuing and potentially running out of memory.
+    ///
+    /// Default: `usize::MAX` (unlimited).
     pub fn with_memory_limit(mut self, bytes: usize) -> Self {
         self.memory_limit = bytes;
         self
@@ -933,6 +948,7 @@ impl EngineBuilder {
         if self.chunked_pipeline {
             engine = engine.with_chunked_pipeline();
         }
+        engine.memory_limit_bytes = self.memory_limit;
         engine
     }
 }

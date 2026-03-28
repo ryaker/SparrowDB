@@ -64,6 +64,12 @@ pub enum Error {
     /// Use [`GraphDb::execute`] for `CREATE`, `MERGE`, `MATCH … SET`,
     /// `MATCH … DELETE`, `CHECKPOINT`, and `OPTIMIZE`.
     ReadOnly,
+    /// The configured per-query memory limit was exceeded during BFS expansion.
+    ///
+    /// Returned by the Phase 3 chunked pipeline when the frontier buffer
+    /// grows beyond the limit set via `EngineBuilder::with_memory_limit`.
+    /// Use a larger limit or restructure the query to reduce fan-out.
+    QueryMemoryExceeded,
 }
 
 impl std::fmt::Display for Error {
@@ -97,6 +103,10 @@ impl std::fmt::Display for Error {
             Error::ReadOnly => write!(
                 f,
                 "read-only transaction: mutation statements are not allowed in ReadTx::query"
+            ),
+            Error::QueryMemoryExceeded => write!(
+                f,
+                "query memory exceeded: BFS frontier exceeded the configured memory limit"
             ),
         }
     }
