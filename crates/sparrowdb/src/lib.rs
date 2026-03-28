@@ -39,6 +39,10 @@ use sparrowdb_execution::Engine;
 pub mod export;
 pub use export::{EdgeDump, GraphDump, NodeDump};
 
+// ── Bulk loader ───────────────────────────────────────────────────────────────
+pub mod bulk;
+pub use bulk::BulkLoader;
+
 // ── Public re-exports ─────────────────────────────────────────────────────────
 //
 // Re-export the types that consumers of the top-level `sparrowdb` crate need
@@ -5328,7 +5332,7 @@ mod tests {
             db.execute("CREATE (n:CrashNode {val: 1})").expect("create");
 
             // Discover the label_id assigned by the catalog.
-            let mut cat = RawCatalog::open(&db_path).expect("catalog");
+            let cat = RawCatalog::open(&db_path).expect("catalog");
             label_id = cat
                 .get_label("CrashNode")
                 .expect("get_label")
