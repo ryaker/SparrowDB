@@ -91,6 +91,10 @@ impl Engine {
         if has_aggregate_in_return(&m.return_clause.items) {
             return false;
         }
+        // No DISTINCT — chunked materializer has no dedup.
+        if m.distinct {
+            return false;
+        }
         // No ORDER BY.
         if !m.order_by.is_empty() {
             return false;
@@ -100,16 +104,24 @@ impl Engine {
             return false;
         }
         // No edge-property references (Phase 2 spec §3.7 — no edge prop reads).
+        // Guard both RETURN items and WHERE clause: a `WHERE r.weight > 5` with
+        // no `r.*` in RETURN would silently return 0 rows because the chunked
+        // materializer does not populate edge-property row_vals.
         let rel_var = &pat.rels[0].var;
         if !rel_var.is_empty() {
             let ref_in_return = m.return_clause.items.iter().any(|item| {
-                // If a return column references rel_var.* it needs edge props.
                 column_name_for_item(item)
                     .split_once('.')
                     .is_some_and(|(v, _)| v == rel_var.as_str())
             });
             if ref_in_return {
                 return false;
+            }
+            // Also reject if the WHERE clause accesses rel-variable properties.
+            if let Some(ref wexpr) = m.where_clause {
+                if expr_references_var(wexpr, rel_var.as_str()) {
+                    return false;
+                }
             }
         }
         // Only simple WHERE predicates supported (no CONTAINS, no subquery).
@@ -700,6 +712,28 @@ fn column_name_for_item(item: &ReturnItem) -> String {
 /// Returns `false` for CONTAINS/STARTS WITH/EXISTS/subquery shapes that would
 /// require the full row-engine evaluator in a way that the chunked path can't
 /// trivially support at the sink.
+/// Returns `true` if `expr` contains any `var.prop` access for the given variable name.
+///
+/// Used to guard the chunked path against edge-property predicates in WHERE:
+/// `WHERE r.weight > 5` must fall back to the row engine because the chunked
+/// materializer does not populate edge-property row_vals, which would silently
+/// return zero results rather than the correct filtered set.
+fn expr_references_var(expr: &Expr, var_name: &str) -> bool {
+    match expr {
+        Expr::PropAccess { var, .. } => var.as_str() == var_name,
+        Expr::BinOp { left, right, .. } => {
+            expr_references_var(left, var_name) || expr_references_var(right, var_name)
+        }
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            expr_references_var(a, var_name) || expr_references_var(b, var_name)
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            expr_references_var(inner, var_name)
+        }
+        _ => false,
+    }
+}
+
 fn is_simple_where_for_chunked(expr: &Expr) -> bool {
     match expr {
         Expr::BinOp { left, op, right } => {

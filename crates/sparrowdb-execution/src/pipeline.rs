@@ -513,6 +513,21 @@ pub enum ChunkPredicate {
     And(Vec<ChunkPredicate>),
 }
 
+/// Sign-extend a raw stored `u64` (56-bit two's-complement Int64) to a full `i64`.
+///
+/// The storage encoding stores `Int64(v)` as the lower 56 bits of `v` with
+/// TAG_INT64 (0x00) in the top byte.  To compare two encoded values with correct
+/// signed ordering, both operands must be sign-extended back to 64 bits first.
+/// Without this, a stored negative value (e.g. `Int64(-5)` = `0x00FF_FFFF_FFFF_FFFB`)
+/// compares greater than a stored positive value (`Int64(5)` = `0x0000_0000_0000_0005`)
+/// under raw `u64` ordering, producing wrong results for cross-sign comparisons.
+#[inline(always)]
+fn raw_to_i64(raw: u64) -> i64 {
+    // Shift left 8 to bring bit 55 (the 56-bit sign bit) into the i64 sign position,
+    // then arithmetic-shift right 8 to propagate the sign through the top byte.
+    ((raw << 8) as i64) >> 8
+}
+
 impl ChunkPredicate {
     /// Evaluate this predicate for a single physical row index.
     ///
@@ -535,28 +550,32 @@ impl ChunkPredicate {
             }
             ChunkPredicate::Gt { col_id, rhs_raw } => {
                 if let Some(col) = chunk.find_column(*col_id) {
-                    !col.nulls.is_null(row_idx) && col.data[row_idx] > *rhs_raw
+                    !col.nulls.is_null(row_idx)
+                        && raw_to_i64(col.data[row_idx]) > raw_to_i64(*rhs_raw)
                 } else {
                     false
                 }
             }
             ChunkPredicate::Ge { col_id, rhs_raw } => {
                 if let Some(col) = chunk.find_column(*col_id) {
-                    !col.nulls.is_null(row_idx) && col.data[row_idx] >= *rhs_raw
+                    !col.nulls.is_null(row_idx)
+                        && raw_to_i64(col.data[row_idx]) >= raw_to_i64(*rhs_raw)
                 } else {
                     false
                 }
             }
             ChunkPredicate::Lt { col_id, rhs_raw } => {
                 if let Some(col) = chunk.find_column(*col_id) {
-                    !col.nulls.is_null(row_idx) && col.data[row_idx] < *rhs_raw
+                    !col.nulls.is_null(row_idx)
+                        && raw_to_i64(col.data[row_idx]) < raw_to_i64(*rhs_raw)
                 } else {
                     false
                 }
             }
             ChunkPredicate::Le { col_id, rhs_raw } => {
                 if let Some(col) = chunk.find_column(*col_id) {
-                    !col.nulls.is_null(row_idx) && col.data[row_idx] <= *rhs_raw
+                    !col.nulls.is_null(row_idx)
+                        && raw_to_i64(col.data[row_idx]) <= raw_to_i64(*rhs_raw)
                 } else {
                     false
                 }
