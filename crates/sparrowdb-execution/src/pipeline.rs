@@ -251,6 +251,10 @@ impl<C: PipelineOperator> PipelineOperator for GetNeighbors<C> {
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// Predicate function used by [`Filter`]: given a chunk and a physical row
+/// index, returns `true` to keep the row.
+type FilterPredicate = Box<dyn Fn(&DataChunk, usize) -> bool + Send + Sync>;
+
 /// Updates the selection vector without copying column data.
 ///
 /// Evaluates a predicate on each live row of each incoming chunk. Failing rows
@@ -259,7 +263,7 @@ impl<C: PipelineOperator> PipelineOperator for GetNeighbors<C> {
 /// next chunk so callers always receive non-empty chunks (or `None`).
 pub struct Filter<C: PipelineOperator> {
     child: C,
-    predicate: Box<dyn Fn(&DataChunk, usize) -> bool + Send + Sync>,
+    predicate: FilterPredicate,
 }
 
 impl<C: PipelineOperator> Filter<C> {

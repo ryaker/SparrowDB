@@ -32,7 +32,7 @@ pub struct NullBitmap {
 impl NullBitmap {
     /// Create a bitmap with `len` bits, all clear (non-null).
     pub fn with_len(len: usize) -> Self {
-        let words = (len + 63) / 64;
+        let words = len.div_ceil(64);
         NullBitmap {
             words: vec![0u64; words],
             len,
