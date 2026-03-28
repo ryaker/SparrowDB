@@ -1351,7 +1351,15 @@ impl Engine {
 
             // For each hop-1 output chunk: (src_slot, mid_slot) pairs.
             while let Some(hop1_chunk) = gn1.next_chunk()? {
+                // Reset the BfsArena for this hop-1 chunk. clear() is O(1)
+                // amortized — no allocations, just length resets + bitmap clear.
+                // Must happen BEFORE the memory-limit check so frontier.bytes_used()
+                // reflects the cleared (zero) state rather than the previous iteration.
+                frontier.clear();
+
                 // Memory-limit check: check after each hop-1 chunk.
+                // frontier.bytes_used() is 0 after clear(), so this measures row
+                // accumulation only.
                 let accum_bytes = rows.len() * row_size_estimate + frontier.bytes_used();
                 if accum_bytes > memory_limit {
                     return Err(DbError::QueryMemoryExceeded);
@@ -1391,9 +1399,6 @@ impl Engine {
                 };
 
                 // ── Hop 2: GetNeighbors(mid → dst) ────────────────────────────
-                // Reset the BfsArena for this hop-1 chunk. clear() is O(1)
-                // amortized — no allocations, just length resets + bitmap clear.
-                frontier.clear();
                 let mid_slot_col = mid_chunk.find_column(COL_ID_DST_SLOT);
                 let hop1_src_col = mid_chunk.find_column(COL_ID_SRC_SLOT);
 

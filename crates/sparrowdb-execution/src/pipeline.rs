@@ -814,12 +814,17 @@ impl BfsArena {
         self.visited.contains(slot as u32)
     }
 
-    /// Byte footprint of live frontier entries (NOT pre-allocated capacity).
+    /// Byte footprint of live frontier entries plus the visited bitmap heap.
     ///
-    /// Uses `len()` so pre-allocated but unused capacity does not skew
-    /// memory-limit accounting.
+    /// Uses `len()` on the frontier vecs so pre-allocated but unused capacity
+    /// does not skew memory-limit accounting. Adds the RoaringBitmap's
+    /// serialized size via `serialized_size()` (O(1)) to capture actual bitmap
+    /// heap overhead, which would otherwise allow large bitmaps to bypass the
+    /// QueryMemoryExceeded guard.
     pub fn bytes_used(&self) -> usize {
-        (self.buf_a.len() + self.buf_b.len()) * std::mem::size_of::<u64>()
+        let frontier_bytes = (self.buf_a.len() + self.buf_b.len()) * std::mem::size_of::<u64>();
+        let bitmap_bytes = self.visited.serialized_size() as usize;
+        frontier_bytes + bitmap_bytes
     }
 }
 
@@ -906,19 +911,19 @@ impl<L: PipelineOperator, R: PipelineOperator> SlotIntersect<L, R> {
         // RoaringBitmap avoids per-query HashSet allocation and provides
         // compact, cache-friendly membership testing for u32-range slot IDs.
         let mut build_bitmap = roaring::RoaringBitmap::new();
-        let mut build_len: usize = 0;
         while let Some(chunk) = self.right.next_chunk()? {
             if let Some(col) = chunk.find_column(self.right_key_col) {
                 for row_idx in chunk.live_rows() {
                     build_bitmap.insert(col.data[row_idx] as u32);
-                    build_len += 1;
                 }
             }
         }
 
-        if build_len > self.spill_threshold {
+        // Use build_bitmap.len() (distinct inserted slots) rather than a raw
+        // row counter so duplicates do not inflate the spill-threshold check.
+        if build_bitmap.len() > self.spill_threshold as u64 {
             tracing::warn!(
-                build_side_len = build_len,
+                build_side_len = build_bitmap.len(),
                 spill_threshold = self.spill_threshold,
                 "SlotIntersect: build side exceeds spill threshold — consider join_spill"
             );
