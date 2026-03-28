@@ -816,6 +816,8 @@ impl BfsArena {
         let bit = 1u64 << (slot % 64);
         if word_idx >= self.visited_bits.len() {
             // Slot out of pre-allocated range — grow to fit.
+            // resize fills with 0u64 — new words will be tracked by the
+            // `*word == 0` dirty-list guard below on their first bit-set.
             self.visited_bits.resize(word_idx + 1, 0);
         }
         let word = &mut self.visited_bits[word_idx];
@@ -838,13 +840,16 @@ impl BfsArena {
         self.visited_bits[word_idx] & (1u64 << (slot % 64)) != 0
     }
 
-    /// Byte footprint of live frontier entries.
+    /// Byte footprint of live frontier entries plus the visited bitvector.
     ///
-    /// Only counts entries in the live frontier vecs — pre-allocated capacity
-    /// and the visited bitvector are fixed overhead, not per-query allocation.
+    /// Counts both the live frontier vecs and the pre-allocated bitvector so
+    /// that QueryMemoryExceeded fires correctly on large graphs.
     /// This is O(1) with no container iteration.
     pub fn bytes_used(&self) -> usize {
-        (self.buf_a.len() + self.buf_b.len()) * std::mem::size_of::<u64>()
+        let frontier_bytes = (self.buf_a.len() + self.buf_b.len()) * std::mem::size_of::<u64>();
+        // Include pre-allocated bitvector so QueryMemoryExceeded fires on large graphs
+        let bitmap_bytes = self.visited_bits.len() * std::mem::size_of::<u64>();
+        frontier_bytes + bitmap_bytes
     }
 }
 
