@@ -3,7 +3,7 @@ requires = ["maturin>=1.4,<2"]
 build-backend = "maturin"
 
 [project]
-name = "sparrowdb"
+name = "sparrowdb-py"
 version = "0.1.8"
 description = "Python bindings for SparrowDB embedded graph database"
 requires-python = ">=3.9"
