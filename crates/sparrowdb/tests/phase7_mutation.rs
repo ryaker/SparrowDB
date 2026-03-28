@@ -348,8 +348,8 @@ fn wal_node_update_round_trip() {
                     if rec.kind == WalRecordKind::NodeUpdate {
                         if let WalPayload::NodeUpdate { key, after, .. } = &rec.payload {
                             if key == "score" {
-                                let after_val =
-                                    i64::from_le_bytes(after.as_slice().try_into().unwrap());
+                                assert_eq!(after[0], 0x01, "expected WAL_TAG_INT64");
+                                let after_val = i64::from_le_bytes(after[1..9].try_into().unwrap());
                                 assert_eq!(after_val, 88i64);
                                 found = true;
                             }
