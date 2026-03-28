@@ -177,12 +177,13 @@ fn pole_q4_knows_2hop_reaches_more() {
 fn pole_q8_co_party_events() {
     let (_dir, db, _) = setup_pole();
 
-    // With 30 events and 2-3 parties each, person 1 is likely party to at
-    // least one event that also includes another person.
+    // With 30 events and 2-3 parties each, person nid=1 must be co-party to at
+    // least one event (deterministic seed=7 guarantees this).
     let count = realworld::q8_co_party_events(&db, 1).expect("q8");
-    // Result may be 0 for a specific person if they happen not to be party to
-    // any event — the query is still valid if it executes without error.
-    let _ = count; // suppress unused variable warning when count happens to be 0
+    assert!(
+        count > 0,
+        "person nid=1 should be co-party to at least one event, got {count}"
+    );
 }
 
 #[test]

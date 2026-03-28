@@ -531,6 +531,70 @@ impl GraphDb {
         }
     }
 
+    /// Execute a Cypher query through the chunked vectorized pipeline (#299).
+    ///
+    /// Identical to [`execute`](Self::execute) but enables `use_chunked_pipeline`
+    /// on the engine so that qualifying query shapes route through the pull-based
+    /// chunked pipeline instead of the row-at-a-time engine.  Benchmarks and any
+    /// caller that wants to measure the Phase 2+ pipeline should prefer this over
+    /// the plain `execute` method.
+    pub fn execute_chunked(&self, cypher: &str) -> Result<QueryResult> {
+        use sparrowdb_cypher::ast::Statement;
+        use sparrowdb_cypher::{bind, parse};
+
+        let stmt = parse(cypher)?;
+        let catalog_snap = self.catalog_snapshot();
+        let bound = bind(stmt, &catalog_snap)?;
+
+        match &bound.inner {
+            Statement::Checkpoint => {
+                self.checkpoint()?;
+                return Ok(QueryResult::empty(vec![]));
+            }
+            Statement::Optimize => {
+                self.optimize()?;
+                return Ok(QueryResult::empty(vec![]));
+            }
+            Statement::CreateConstraint { label, property } => {
+                return self.register_unique_constraint(label, property);
+            }
+            _ => {}
+        }
+
+        if Engine::is_mutation(&bound.inner) {
+            // Mutations don't use the read pipeline — fall through to the
+            // standard mutation paths (write transactions are unaffected).
+            match bound.inner {
+                Statement::Merge(ref m) => self.execute_merge(m),
+                Statement::MatchMergeRel(ref mm) => self.execute_match_merge_rel(mm),
+                Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
+                Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
+                Statement::Create(ref c) => self.execute_create_standalone(c),
+                _ => unreachable!(),
+            }
+        } else {
+            let _span = info_span!("sparrowdb.query_chunked").entered();
+
+            let mut engine = {
+                let _open_span = info_span!("sparrowdb.open_engine").entered();
+                let csrs = self.cached_csr_map();
+                self.build_read_engine(NodeStore::open(&self.inner.path)?, catalog_snap, csrs)
+            };
+            engine = engine.with_chunked_pipeline();
+
+            let result = {
+                let _exec_span = info_span!("sparrowdb.execute").entered();
+                engine.execute_statement(bound.inner)?
+            };
+
+            engine.write_back_prop_index(&self.inner.prop_index);
+            self.persist_prop_index();
+
+            tracing::debug!(rows = result.rows.len(), "chunked query complete");
+            Ok(result)
+        }
+    }
+
     /// Execute a Cypher query with a per-query timeout (SPA-254).
     ///
     /// Identical to [`execute`](Self::execute) but sets a deadline of

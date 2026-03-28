@@ -201,12 +201,15 @@ const RXN_TYPES: &[&str] = &[
 
 /// **Q3-Reactome**: 1-hop neighbour expansion — find all direct components of a
 /// pathway (reactions + sub-pathways).
+///
+/// Uses a WHERE clause for the source node's `pid` filter so the chunked
+/// pipeline's compiled-predicate path can apply it correctly.
 pub fn q3_pathway_components(db: &GraphDb, pid: u64) -> sparrowdb::Result<Vec<u64>> {
     let cypher = format!(
-        "MATCH (pw:Pathway {{pid: {pid}}})-[:HAS_COMPONENT]->(child) \
+        "MATCH (pw:Pathway)-[:HAS_COMPONENT]->(child) WHERE pw.pid = {pid} \
          RETURN child.pid, child.rid"
     );
-    let result = db.execute(&cypher)?;
+    let result = db.execute_chunked(&cypher)?;
     let ids: Vec<u64> = result
         .rows
         .iter()
@@ -234,10 +237,10 @@ pub fn q3_pathway_components(db: &GraphDb, pid: u64) -> sparrowdb::Result<Vec<u6
 /// the sub-pathway pid with a 1-hop `q3_pathway_components` call.
 pub fn q4_pathway_reactions_2hop(db: &GraphDb, sub_pid: u64) -> sparrowdb::Result<usize> {
     let cypher = format!(
-        "MATCH (sub:Pathway {{pid: {sub_pid}}})-[:HAS_COMPONENT]->(rx:Reaction) \
+        "MATCH (sub:Pathway)-[:HAS_COMPONENT]->(rx:Reaction) WHERE sub.pid = {sub_pid} \
          RETURN rx.rid"
     );
-    let result = db.execute(&cypher)?;
+    let result = db.execute_chunked(&cypher)?;
     Ok(result.rows.len())
 }
 
@@ -248,10 +251,10 @@ pub fn q4_pathway_reactions_2hop(db: &GraphDb, sub_pid: u64) -> sparrowdb::Resul
 /// <-[:HAS_COMPONENT]- Pathway`.
 pub fn q8_shared_catalysts(db: &GraphDb, sub_pid: u64) -> sparrowdb::Result<usize> {
     let cypher = format!(
-        "MATCH (e:PhysicalEntity)-[:CATALYSIS]->(rx:Reaction)<-[:HAS_COMPONENT]-(pw:Pathway {{pid: {sub_pid}}}) \
-         RETURN e.eid"
+        "MATCH (e:PhysicalEntity)-[:CATALYSIS]->(rx:Reaction)<-[:HAS_COMPONENT]-(pw:Pathway) \
+         WHERE pw.pid = {sub_pid} RETURN e.eid"
     );
-    let result = db.execute(&cypher)?;
+    let result = db.execute_chunked(&cypher)?;
     Ok(result.rows.len())
 }
 
@@ -461,37 +464,42 @@ const EVENT_TYPES: &[&str] = &["incident", "arrest", "sighting", "interview"];
 // ── POLE queries (Q3/Q4/Q8 equivalents) ──────────────────────────────────────
 
 /// **Q3-POLE**: 1-hop — find all persons known by a given person.
+///
+/// Uses a WHERE clause for the source node's `nid` filter rather than an
+/// inline prop filter so the chunked pipeline's compiled-predicate path
+/// applies the filter correctly.
 pub fn q3_knows_1hop(db: &GraphDb, nid: u64) -> sparrowdb::Result<usize> {
-    let cypher = format!(
-        "MATCH (p:Person {{nid: {nid}}})-[:KNOWS]->(friend:Person) \
-         RETURN friend.nid"
-    );
-    let result = db.execute(&cypher)?;
+    let cypher =
+        format!("MATCH (p:Person)-[:KNOWS]->(friend:Person) WHERE p.nid = {nid} RETURN friend.nid");
+    let result = db.execute_chunked(&cypher)?;
     Ok(result.rows.len())
 }
 
 /// **Q4-POLE**: 2-hop — find all persons within 2 KNOWS hops of a person.
+///
+/// Uses a WHERE clause for the source node's `nid` filter rather than an
+/// inline prop filter so the chunked pipeline's compiled-predicate path
+/// applies the filter correctly.  Variable-length paths fall back to the
+/// row engine automatically when the chunked plan does not apply.
 pub fn q4_knows_2hop(db: &GraphDb, nid: u64) -> sparrowdb::Result<usize> {
     let cypher = format!(
-        "MATCH (p:Person {{nid: {nid}}})-[:KNOWS*1..2]->(friend:Person) \
-         RETURN friend.nid"
+        "MATCH (p:Person)-[:KNOWS*1..2]->(friend:Person) WHERE p.nid = {nid} RETURN friend.nid"
     );
-    let result = db.execute(&cypher)?;
+    let result = db.execute_chunked(&cypher)?;
     Ok(result.rows.len())
 }
 
 /// **Q8-POLE**: Mutual connections — find persons sharing an event with a
 /// given person (proxy for mutual-neighbour / co-involvement query).
 ///
-/// Uses `MATCH ... WITH ... MATCH` to chain two traversals: first finds events
-/// the target person attended, then finds other persons attending those events.
+/// Uses a two-hop fork pattern `(p)-[:PARTY_TO]->(e)<-[:PARTY_TO]-(other)`
+/// with a WHERE predicate on the source instead of WITH-MATCH chaining,
+/// which the engine does not execute through the chunked pipeline.
 pub fn q8_co_party_events(db: &GraphDb, nid: u64) -> sparrowdb::Result<usize> {
     let cypher = format!(
-        "MATCH (p:Person {{nid: {nid}}})-[:PARTY_TO]->(e:Event) \
-         WITH e.nid AS event_id \
-         MATCH (other:Person)-[:PARTY_TO]->(e2:Event {{nid: event_id}}) \
-         RETURN other.nid"
+        "MATCH (p:Person)-[:PARTY_TO]->(e:Event)<-[:PARTY_TO]-(other:Person) \
+         WHERE p.nid = {nid} RETURN other.nid"
     );
-    let result = db.execute(&cypher)?;
+    let result = db.execute_chunked(&cypher)?;
     Ok(result.rows.len())
 }
