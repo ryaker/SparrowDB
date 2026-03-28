@@ -268,6 +268,12 @@ impl PropertyIndex {
             }
         };
 
+        // Read the null-bitmap sidecar (SPA-207) so that legitimately-stored
+        // Int64(0) values (raw == 0) are not mistaken for absent/zero-padded
+        // slots.  When no bitmap file exists (old data), fall back to the raw
+        // == 0 sentinel for backward compatibility.
+        let null_bitmap = store.read_null_bitmap_all(label_id, col_id).unwrap_or(None);
+
         // Build a fresh BTreeMap for this column (always a new key at this
         // point since we checked `self.loaded` above and returned early on
         // cache hit).  Insert as `Arc::new` so later clones of this
@@ -275,7 +281,14 @@ impl PropertyIndex {
         let mut btree: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         for (slot, raw) in raw_vals.into_iter().enumerate() {
             let slot = slot as u32;
-            if raw == ABSENT || tombstone_slots.contains(&slot) {
+            // Determine if this slot has a real value.  With a null bitmap,
+            // only slots marked present (bit set) are indexed.  Without one
+            // (backward compat), treat raw == 0 as absent.
+            let is_present = match &null_bitmap {
+                Some(bits) => bits.get(slot as usize).copied().unwrap_or(false),
+                None => raw != ABSENT,
+            };
+            if !is_present || tombstone_slots.contains(&slot) {
                 continue;
             }
             // Apply the same sort_key transform used by `build` and `lookup`
@@ -341,11 +354,22 @@ impl PropertyIndex {
                     }
                 };
 
+                // Read the null-bitmap sidecar (SPA-207) so that
+                // legitimately-stored Int64(0) values (raw == 0) are not
+                // mistaken for absent/zero-padded slots.  Fall back to raw ==
+                // 0 sentinel when no bitmap exists (backward compat).
+                let null_bitmap = store.read_null_bitmap_all(label_id, col_id).unwrap_or(None);
+
                 let mut btree: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
                 for (slot, raw) in raw_vals.into_iter().enumerate() {
                     let slot = slot as u32;
+                    // Determine if this slot has a real value.
+                    let is_present = match &null_bitmap {
+                        Some(bits) => bits.get(slot as usize).copied().unwrap_or(false),
+                        None => raw != ABSENT,
+                    };
                     // Skip absent and tombstoned slots.
-                    if raw == ABSENT || tombstone_slots.contains(&slot) {
+                    if !is_present || tombstone_slots.contains(&slot) {
                         continue;
                     }
                     btree.entry(sort_key(raw)).or_default().push(slot);

@@ -382,17 +382,17 @@ impl Engine {
                                 row_vals.insert(key, decode_raw_val(raw, &self.snapshot.store));
                             }
                         }
-                        // Inject node label metadata so labels(n) works in WHERE.
-                        if !src_node_pat.var.is_empty() && !effective_src_label.is_empty() {
+                        // SPA-200: inject full label set (primary + secondary).
+                        if !src_node_pat.var.is_empty() {
                             row_vals.insert(
                                 format!("{}.__labels__", src_node_pat.var),
-                                Value::List(vec![Value::String(effective_src_label.to_string())]),
+                                self.labels_value_for_node(src_node),
                             );
                         }
-                        if !dst_node_pat.var.is_empty() && !effective_dst_label.is_empty() {
+                        if !dst_node_pat.var.is_empty() {
                             row_vals.insert(
                                 format!("{}.__labels__", dst_node_pat.var),
-                                Value::List(vec![Value::String(effective_dst_label.to_string())]),
+                                self.labels_value_for_node(dst_node),
                             );
                         }
                         row_vals.extend(self.dollar_params());
@@ -421,16 +421,17 @@ impl Engine {
                                 Value::String(effective_rel_type.to_string()),
                             );
                         }
-                        if !src_node_pat.var.is_empty() && !effective_src_label.is_empty() {
+                        // SPA-200: inject full label set (primary + secondary).
+                        if !src_node_pat.var.is_empty() {
                             row_vals.insert(
                                 format!("{}.__labels__", src_node_pat.var),
-                                Value::List(vec![Value::String(effective_src_label.to_string())]),
+                                self.labels_value_for_node(src_node),
                             );
                         }
-                        if !dst_node_pat.var.is_empty() && !effective_dst_label.is_empty() {
+                        if !dst_node_pat.var.is_empty() {
                             row_vals.insert(
                                 format!("{}.__labels__", dst_node_pat.var),
-                                Value::List(vec![Value::String(effective_dst_label.to_string())]),
+                                self.labels_value_for_node(dst_node),
                             );
                         }
                         if !src_node_pat.var.is_empty() {
@@ -676,20 +677,17 @@ impl Engine {
                                     Value::String(effective_rel_type.to_string()),
                                 );
                             }
-                            if !src_node_pat.var.is_empty() && !effective_src_label.is_empty() {
+                            // SPA-200: inject full label set (primary + secondary).
+                            if !src_node_pat.var.is_empty() {
                                 row_vals.insert(
                                     format!("{}.__labels__", src_node_pat.var),
-                                    Value::List(vec![Value::String(
-                                        effective_src_label.to_string(),
-                                    )]),
+                                    self.labels_value_for_node(b_node),
                                 );
                             }
-                            if !dst_node_pat.var.is_empty() && !effective_dst_label.is_empty() {
+                            if !dst_node_pat.var.is_empty() {
                                 row_vals.insert(
                                     format!("{}.__labels__", dst_node_pat.var),
-                                    Value::List(vec![Value::String(
-                                        effective_dst_label.to_string(),
-                                    )]),
+                                    self.labels_value_for_node(a_node),
                                 );
                             }
                             row_vals.extend(self.dollar_params());
@@ -717,20 +715,17 @@ impl Engine {
                                     Value::String(effective_rel_type.to_string()),
                                 );
                             }
-                            if !src_node_pat.var.is_empty() && !effective_src_label.is_empty() {
+                            // SPA-200: inject full label set (primary + secondary).
+                            if !src_node_pat.var.is_empty() {
                                 row_vals.insert(
                                     format!("{}.__labels__", src_node_pat.var),
-                                    Value::List(vec![Value::String(
-                                        effective_src_label.to_string(),
-                                    )]),
+                                    self.labels_value_for_node(b_node),
                                 );
                             }
-                            if !dst_node_pat.var.is_empty() && !effective_dst_label.is_empty() {
+                            if !dst_node_pat.var.is_empty() {
                                 row_vals.insert(
                                     format!("{}.__labels__", dst_node_pat.var),
-                                    Value::List(vec![Value::String(
-                                        effective_dst_label.to_string(),
-                                    )]),
+                                    self.labels_value_for_node(a_node),
                                 );
                             }
                             if !src_node_pat.var.is_empty() {
@@ -1228,22 +1223,23 @@ impl Engine {
                                     &col_ids_fof,
                                     &self.snapshot.store,
                                 ));
-                                if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                                // SPA-200: inject full label set (primary + secondary).
+                                if !src_node_pat.var.is_empty() {
                                     row_vals.insert(
                                         format!("{}.__labels__", src_node_pat.var),
-                                        Value::List(vec![Value::String(src_label.clone())]),
+                                        self.labels_value_for_node(src_node),
                                     );
                                 }
-                                if !mid_node_pat.var.is_empty() && !mid_label.is_empty() {
+                                if !mid_node_pat.var.is_empty() {
                                     row_vals.insert(
                                         format!("{}.__labels__", mid_node_pat.var),
-                                        Value::List(vec![Value::String(mid_label.clone())]),
+                                        self.labels_value_for_node(mid_node),
                                     );
                                 }
-                                if !fof_node_pat.var.is_empty() && !fof_label.is_empty() {
+                                if !fof_node_pat.var.is_empty() {
                                     row_vals.insert(
                                         format!("{}.__labels__", fof_node_pat.var),
-                                        Value::List(vec![Value::String(fof_label.clone())]),
+                                        self.labels_value_for_node(b_node),
                                     );
                                 }
                                 if !pat.rels[0].var.is_empty() {
@@ -1386,23 +1382,23 @@ impl Engine {
                                 &col_ids_fof,
                                 &self.snapshot.store,
                             ));
-                            // Label metadata.
-                            if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                            // SPA-200: inject full label set (primary + secondary).
+                            if !src_node_pat.var.is_empty() {
                                 row_vals.insert(
                                     format!("{}.__labels__", src_node_pat.var),
-                                    Value::List(vec![Value::String(src_label.clone())]),
+                                    self.labels_value_for_node(src_node),
                                 );
                             }
-                            if !mid_node_pat.var.is_empty() && !mid_label.is_empty() {
+                            if !mid_node_pat.var.is_empty() {
                                 row_vals.insert(
                                     format!("{}.__labels__", mid_node_pat.var),
-                                    Value::List(vec![Value::String(mid_label.clone())]),
+                                    self.labels_value_for_node(mid_node),
                                 );
                             }
-                            if !fof_node_pat.var.is_empty() && !fof_label.is_empty() {
+                            if !fof_node_pat.var.is_empty() {
                                 row_vals.insert(
                                     format!("{}.__labels__", fof_node_pat.var),
-                                    Value::List(vec![Value::String(fof_label.clone())]),
+                                    self.labels_value_for_node(b_node),
                                 );
                             }
                             if !pat.rels[0].var.is_empty() {
@@ -1600,23 +1596,23 @@ impl Engine {
                             &col_ids_fof,
                             &self.snapshot.store,
                         ));
-                        // Inject label metadata so labels(n) works in WHERE.
-                        if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                        // SPA-200: inject full label set (primary + secondary).
+                        if !src_node_pat.var.is_empty() {
                             row_vals.insert(
                                 format!("{}.__labels__", src_node_pat.var),
-                                Value::List(vec![Value::String(src_label.clone())]),
+                                self.labels_value_for_node(src_node),
                             );
                         }
-                        if !mid_node_pat.var.is_empty() && !mid_label.is_empty() {
+                        if !mid_node_pat.var.is_empty() {
                             row_vals.insert(
                                 format!("{}.__labels__", mid_node_pat.var),
-                                Value::List(vec![Value::String(mid_label.clone())]),
+                                self.labels_value_for_node(mid_node),
                             );
                         }
-                        if !fof_node_pat.var.is_empty() && !fof_label.is_empty() {
+                        if !fof_node_pat.var.is_empty() {
                             row_vals.insert(
                                 format!("{}.__labels__", fof_node_pat.var),
-                                Value::List(vec![Value::String(fof_label.clone())]),
+                                self.labels_value_for_node(fof_node),
                             );
                         }
                         // Inject relationship type metadata so type(r) works in WHERE.
