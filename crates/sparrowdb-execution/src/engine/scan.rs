@@ -683,6 +683,24 @@ impl Engine {
             }
         }
 
+        // ── Phase 2 chunked one-hop fast-path (SPA-299) ───────────────────────
+        if is_one_hop && self.can_use_one_hop_chunked(m) {
+            return self.execute_one_hop_chunked(m, &column_names);
+        }
+
+        // ── Phase 1 chunked scan fast-path (SPA-299) ──────────────────────────
+        if !is_one_hop
+            && !is_two_hop
+            && !is_n_hop
+            && !is_var_len
+            && !is_multi_pattern
+            && m.pattern.len() == 1
+            && m.pattern[0].rels.is_empty()
+            && self.can_use_chunked_pipeline(m)
+        {
+            return self.execute_scan_chunked(m, &column_names);
+        }
+
         if is_var_len {
             self.execute_variable_length(m, &column_names)
         } else if is_two_hop {

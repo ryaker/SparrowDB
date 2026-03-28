@@ -181,6 +181,11 @@ impl NodeStore {
         })
     }
 
+    /// Return the root directory path of this node store.
+    pub fn root_path(&self) -> &Path {
+        &self.root
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn label_dir(&self, label_id: u32) -> PathBuf {
@@ -1426,6 +1431,103 @@ impl NodeStore {
         }
 
         Ok(result)
+    }
+
+    /// Batch-read multiple slots from multiple columns, returning nullable results.
+    ///
+    /// Like [`batch_read_node_props`] but preserves null semantics using the
+    /// null-bitmap sidecar (`col_{id}_null.bin`).  Each `Option<u64>` is:
+    /// - `Some(raw)` — the slot has a real stored value (may be 0 for `Int64(0)`).
+    /// - `None` — the slot was zero-padded, never written, or the null bitmap
+    ///   marks it absent.
+    ///
+    /// Backward compatible: if no bitmap file exists for a column (data written
+    /// before SPA-207), every slot whose column file entry is within bounds is
+    /// treated as present (`Some`).
+    ///
+    /// This replaces the raw-`0`-as-absent semantic of [`batch_read_node_props`]
+    /// and is the correct API for the chunked pipeline (Phase 2, SPA-299).
+    pub fn batch_read_node_props_nullable(
+        &self,
+        label_id: u32,
+        slots: &[u32],
+        col_ids: &[u32],
+    ) -> Result<Vec<Vec<Option<u64>>>> {
+        if slots.is_empty() {
+            return Ok(vec![]);
+        }
+        if col_ids.is_empty() {
+            return Ok(slots.iter().map(|_| vec![]).collect());
+        }
+
+        let hwm = self.hwm_for_label(label_id).unwrap_or(0) as usize;
+        // Use sorted-slot reads when K < 50% of N, identical heuristic as
+        // batch_read_node_props.
+        let use_sorted = hwm == 0 || slots.len() * 2 < hwm;
+
+        // Pre-load null bitmaps for each column (None = no bitmap = backward compat).
+        let null_bitmaps: Vec<Option<Vec<bool>>> = col_ids
+            .iter()
+            .map(|&col_id| self.read_null_bitmap_all(label_id, col_id))
+            .collect::<Result<_>>()?;
+
+        if use_sorted {
+            // Build sorted permutation for sequential I/O.
+            let mut order: Vec<usize> = (0..slots.len()).collect();
+            order.sort_unstable_by_key(|&i| slots[i]);
+            let sorted_slots: Vec<u32> = order.iter().map(|&i| slots[i]).collect();
+
+            // Raw values (0 for missing/out-of-range).
+            let raw = self.read_col_slots_sorted(label_id, &sorted_slots, col_ids)?;
+
+            // Build result in original order, applying null bitmaps.
+            let mut result = vec![vec![None; col_ids.len()]; slots.len()];
+            for (sorted_idx, orig_idx) in order.into_iter().enumerate() {
+                let slot = sorted_slots[sorted_idx];
+                for (col_idx, bm) in null_bitmaps.iter().enumerate() {
+                    let is_present = match bm {
+                        None => {
+                            // No bitmap — backward compat: treat as present if
+                            // the raw value is non-zero.  This mirrors the old
+                            // `raw != 0` sentinel from before SPA-207.
+                            raw[sorted_idx][col_idx] != 0
+                        }
+                        Some(bits) => bits.get(slot as usize).copied().unwrap_or(false),
+                    };
+                    if is_present {
+                        result[orig_idx][col_idx] = Some(raw[sorted_idx][col_idx]);
+                    }
+                }
+            }
+            Ok(result)
+        } else {
+            // Full-column load path.
+            let col_data: Vec<Vec<u64>> = col_ids
+                .iter()
+                .map(|&col_id| self.read_col_all(label_id, col_id))
+                .collect::<Result<_>>()?;
+            Ok(slots
+                .iter()
+                .map(|&slot| {
+                    col_ids
+                        .iter()
+                        .enumerate()
+                        .map(|(ci, _)| {
+                            let raw = col_data[ci].get(slot as usize).copied().unwrap_or(0);
+                            let is_present = match &null_bitmaps[ci] {
+                                None => raw != 0,
+                                Some(bits) => bits.get(slot as usize).copied().unwrap_or(false),
+                            };
+                            if is_present {
+                                Some(raw)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .collect())
+        }
     }
 
     /// Batch-read multiple slots from multiple columns.

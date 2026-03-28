@@ -535,6 +535,19 @@ impl Engine {
         self
     }
 
+    /// Return the `chunk_capacity` field (used by Phase 2+ operators when
+    /// building pipeline nodes).  Defaults to `CHUNK_CAPACITY` until
+    /// `EngineBuilder::with_chunk_capacity` is wired into pipeline construction.
+    pub fn chunk_capacity(&self) -> usize {
+        crate::chunk::CHUNK_CAPACITY
+    }
+
+    /// Return the `memory_limit_bytes` field.  Defaults to `usize::MAX`
+    /// (unlimited) until Phase 3 wires memory-limit enforcement into BFS.
+    pub fn memory_limit_bytes(&self) -> usize {
+        usize::MAX
+    }
+
     /// Merge the engine's lazily-populated property index into the shared cache
     /// so that future read queries can skip I/O for columns we already loaded.
     ///
@@ -846,6 +859,81 @@ impl Engine {
             Statement::Create(_) => true,
             _ => false,
         }
+    }
+}
+
+// ── EngineBuilder (Phase 2 configurability, SPA-299 §2.4) ─────────────────────
+
+/// Builder for [`Engine`] with Phase 2+ configuration options.
+///
+/// `with_chunk_capacity` and `with_memory_limit` are no-ops until the relevant
+/// pipeline operators use them — they are wired here so callers can set them now
+/// and Phase 3/4 work can plug in without API changes.
+pub struct EngineBuilder {
+    store: NodeStore,
+    catalog: Catalog,
+    csrs: HashMap<u32, CsrForward>,
+    db_root: std::path::PathBuf,
+    chunked_pipeline: bool,
+    /// Reserved for Phase 4: overrides `CHUNK_CAPACITY` at runtime.
+    #[allow(dead_code)]
+    chunk_capacity: usize,
+    /// Reserved for Phase 3: aborts BFS expansion when frontier exceeds this.
+    #[allow(dead_code)]
+    memory_limit: usize,
+}
+
+impl EngineBuilder {
+    /// Start building an engine from storage primitives.
+    pub fn new(
+        store: NodeStore,
+        catalog: Catalog,
+        csrs: HashMap<u32, CsrForward>,
+        db_root: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        EngineBuilder {
+            store,
+            catalog,
+            csrs,
+            db_root: db_root.into(),
+            chunked_pipeline: false,
+            chunk_capacity: crate::chunk::CHUNK_CAPACITY,
+            memory_limit: usize::MAX,
+        }
+    }
+
+    /// Enable the chunked vectorized pipeline (equivalent to
+    /// `Engine::with_chunked_pipeline`).
+    pub fn with_chunked_pipeline(mut self, enabled: bool) -> Self {
+        self.chunked_pipeline = enabled;
+        self
+    }
+
+    /// Override the chunk capacity used by pipeline operators (Phase 4).
+    ///
+    /// Currently a no-op — stored for future use when Phase 4 passes this
+    /// value into `ScanByLabel` and other operators.
+    pub fn with_chunk_capacity(mut self, n: usize) -> Self {
+        self.chunk_capacity = n;
+        self
+    }
+
+    /// Set the per-query memory limit in bytes (Phase 3).
+    ///
+    /// Currently a no-op — stored for future use when Phase 3 BFS expansion
+    /// aborts with `Error::QueryMemoryExceeded` when the frontier exceeds this.
+    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.memory_limit = bytes;
+        self
+    }
+
+    /// Construct the [`Engine`].
+    pub fn build(self) -> Engine {
+        let mut engine = Engine::new(self.store, self.catalog, self.csrs, &self.db_root);
+        if self.chunked_pipeline {
+            engine = engine.with_chunked_pipeline();
+        }
+        engine
     }
 }
 
