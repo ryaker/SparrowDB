@@ -366,6 +366,14 @@ pub struct Engine {
     /// value already exists in `prop_index` for that `(label_id, col_id)`, the
     /// insert is rejected with `Error::InvalidArgument`.
     pub unique_constraints: HashSet<(u32, u32)>,
+    /// Opt-in flag for the Phase 1 chunked vectorized pipeline (#299).
+    ///
+    /// When `true`, qualifying queries (currently: simple single-label scans with
+    /// no hops) route through the chunked pipeline instead of the row-at-a-time
+    /// engine. Defaults to `false` so all existing behaviour is unchanged.
+    ///
+    /// Activate with [`Engine::with_chunked_pipeline`].
+    pub use_chunked_pipeline: bool,
 }
 
 impl Engine {
@@ -478,6 +486,7 @@ impl Engine {
             deadline: None,
             degree_cache: std::cell::RefCell::new(None),
             unique_constraints: HashSet::new(),
+            use_chunked_pipeline: false,
         }
     }
 
@@ -512,6 +521,17 @@ impl Engine {
     /// `Instant::now() >= deadline` during any hot scan or traversal loop.
     pub fn with_deadline(mut self, deadline: std::time::Instant) -> Self {
         self.deadline = Some(deadline);
+        self
+    }
+
+    /// Enable the Phase 1 chunked vectorized pipeline (#299).
+    ///
+    /// When enabled, qualifying queries route through the pull-based chunked
+    /// pipeline instead of the row-at-a-time engine.  The existing engine
+    /// remains the default (`use_chunked_pipeline = false`) and all non-
+    /// qualifying queries continue to use it unchanged.
+    pub fn with_chunked_pipeline(mut self) -> Self {
+        self.use_chunked_pipeline = true;
         self
     }
 
@@ -835,6 +855,7 @@ mod expr;
 mod hop;
 mod mutation;
 mod path;
+mod pipeline_exec;
 mod procedure;
 mod scan;
 
