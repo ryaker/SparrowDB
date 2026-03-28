@@ -1,4 +1,4 @@
-//! Pull-based vectorized pipeline operators (Phase 1).
+//! Pull-based vectorized pipeline operators (Phase 1 + Phase 2).
 //!
 //! # Architecture
 //!
@@ -7,13 +7,14 @@
 //! recursively calls its child. This naturally supports LIMIT short-circuiting —
 //! when the sink has enough rows it stops pulling.
 //!
-//! ## Phase 1 Operators
+//! ## Operators
 //!
 //! | Operator | Input | Output |
 //! |----------|-------|--------|
 //! | [`ScanByLabel`] | hwm (u64) | chunks of slot numbers |
 //! | [`GetNeighbors`] | child of src_slots | chunks of (src_slot, dst_slot) |
 //! | [`Filter`] | child + predicate | child chunks with sel vector updated |
+//! | [`ReadNodeProps`] | child chunk + NodeStore | child chunk + property columns |
 //!
 //! # Integration
 //!
@@ -22,12 +23,16 @@
 //! `Engine::use_chunked_pipeline`. All existing tests continue to use the
 //! row-at-a-time engine unchanged.
 
+use std::sync::Arc;
+
 use sparrowdb_common::Result;
 use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::DeltaRecord;
+use sparrowdb_storage::node_store::NodeStore;
 
 use crate::chunk::{
-    ColumnVector, DataChunk, CHUNK_CAPACITY, COL_ID_DST_SLOT, COL_ID_SLOT, COL_ID_SRC_SLOT,
+    ColumnVector, DataChunk, NullBitmap, CHUNK_CAPACITY, COL_ID_DST_SLOT, COL_ID_SLOT,
+    COL_ID_SRC_SLOT,
 };
 use crate::engine::{build_delta_index, node_id_parts, DeltaIndex};
 
@@ -56,48 +61,81 @@ pub trait PipelineOperator {
 /// Yields chunks of node slot numbers for a single label.
 ///
 /// Each output chunk contains one `COL_ID_SLOT` column with at most
-/// `CHUNK_CAPACITY` consecutive slot numbers starting from 0.
+/// `CHUNK_CAPACITY` consecutive slot numbers.
 ///
-/// Phase 1 simplification: the slot list is pre-populated from `hwm` at
-/// construction time. Phase 2 will replace this with streaming reads
-/// directly from the label's column file.
+/// Phase 2: uses a cursor-based approach (`next_slot`/`end_slot`) rather than
+/// pre-allocating the entire `Vec<u64>` at construction time.  This reduces
+/// startup allocation from O(hwm) to O(1) — critical for large labels.
 pub struct ScanByLabel {
-    /// All slot numbers for this label (0..hwm).
-    slots: Vec<u64>,
-    /// Cursor into `slots` — next index to emit.
-    cursor: usize,
+    /// Next slot number to emit.
+    next_slot: u64,
+    /// One past the last slot to emit (exclusive upper bound).
+    end_slot: u64,
+    /// Optional pre-built slot list, used only by `from_slots` (tests / custom
+    /// scan patterns).  When `Some`, the cursor pair is unused.
+    slots_override: Option<Vec<u64>>,
+    /// Cursor into `slots_override` when `Some`.
+    override_cursor: usize,
 }
 
 impl ScanByLabel {
     /// Create a `ScanByLabel` operator.
     ///
     /// `hwm` — high-water mark from `NodeStore::hwm_for_label(label_id)`.
-    /// Emits slot numbers 0..hwm in order.
+    /// Emits slot numbers 0..hwm in order, allocating at most one chunk at a time.
     pub fn new(hwm: u64) -> Self {
-        let slots: Vec<u64> = (0..hwm).collect();
-        ScanByLabel { slots, cursor: 0 }
+        ScanByLabel {
+            next_slot: 0,
+            end_slot: hwm,
+            slots_override: None,
+            override_cursor: 0,
+        }
     }
 
     /// Create from a pre-built slot list (for tests and custom scan patterns).
+    ///
+    /// Retained for backward compatibility with existing unit tests and
+    /// special scan patterns.  Prefer [`ScanByLabel::new`] for production use.
     pub fn from_slots(slots: Vec<u64>) -> Self {
-        ScanByLabel { slots, cursor: 0 }
+        ScanByLabel {
+            next_slot: 0,
+            end_slot: 0,
+            slots_override: Some(slots),
+            override_cursor: 0,
+        }
     }
 }
 
 impl PipelineOperator for ScanByLabel {
     fn next_chunk(&mut self) -> Result<Option<DataChunk>> {
-        if self.cursor >= self.slots.len() {
+        // from_slots path (tests / custom).
+        if let Some(ref slots) = self.slots_override {
+            if self.override_cursor >= slots.len() {
+                return Ok(None);
+            }
+            let end = (self.override_cursor + CHUNK_CAPACITY).min(slots.len());
+            let data: Vec<u64> = slots[self.override_cursor..end].to_vec();
+            self.override_cursor = end;
+            let col = ColumnVector::from_data(COL_ID_SLOT, data);
+            return Ok(Some(DataChunk::from_columns(vec![col])));
+        }
+
+        // Cursor-based path (no startup allocation).
+        if self.next_slot >= self.end_slot {
             return Ok(None);
         }
-        let end = (self.cursor + CHUNK_CAPACITY).min(self.slots.len());
-        let data: Vec<u64> = self.slots[self.cursor..end].to_vec();
-        self.cursor = end;
+        let chunk_end = (self.next_slot + CHUNK_CAPACITY as u64).min(self.end_slot);
+        let data: Vec<u64> = (self.next_slot..chunk_end).collect();
+        self.next_slot = chunk_end;
         let col = ColumnVector::from_data(COL_ID_SLOT, data);
         Ok(Some(DataChunk::from_columns(vec![col])))
     }
 
     fn cardinality_hint(&self) -> Option<usize> {
-        Some(self.slots.len())
+        if let Some(ref s) = self.slots_override {
+            return Some(s.len());
+        }
+        Some((self.end_slot - self.next_slot) as usize)
     }
 }
 
@@ -305,6 +343,240 @@ impl<C: PipelineOperator> PipelineOperator for Filter<C> {
                 return Ok(Some(chunk));
             }
             // All rows dead — loop to the next chunk.
+        }
+    }
+}
+
+// ── ReadNodeProps ─────────────────────────────────────────────────────────────
+
+/// Appends property columns to a chunk for live (selection-vector-passing) rows
+/// only.
+///
+/// Reads one batch of node properties per `next_chunk()` call using
+/// [`NodeStore::batch_read_node_props_nullable`], building a [`NullBitmap`] from
+/// the `Option<u64>` results and appending one [`ColumnVector`] per `col_id` to
+/// the chunk.
+///
+/// Rows that are already dead (not in the selection vector) are **never read** —
+/// this enforces the late-materialization principle: no I/O for filtered rows.
+pub struct ReadNodeProps<C: PipelineOperator> {
+    child: C,
+    store: Arc<NodeStore>,
+    label_id: u32,
+    /// Which column in the child chunk holds slot numbers (typically `COL_ID_SLOT`
+    /// for src nodes or `COL_ID_DST_SLOT` for dst nodes).
+    slot_col_id: u32,
+    /// Property column IDs to read from storage.
+    col_ids: Vec<u32>,
+}
+
+impl<C: PipelineOperator> ReadNodeProps<C> {
+    /// Create a `ReadNodeProps` operator.
+    ///
+    /// - `child`       — upstream operator yielding chunks that contain a slot column.
+    /// - `store`       — shared reference to the node store.
+    /// - `label_id`    — label whose column files to read.
+    /// - `slot_col_id` — column ID in the child chunk that holds slot numbers.
+    /// - `col_ids`     — property column IDs to append to each output chunk.
+    pub fn new(
+        child: C,
+        store: Arc<NodeStore>,
+        label_id: u32,
+        slot_col_id: u32,
+        col_ids: Vec<u32>,
+    ) -> Self {
+        ReadNodeProps {
+            child,
+            store,
+            label_id,
+            slot_col_id,
+            col_ids,
+        }
+    }
+}
+
+impl<C: PipelineOperator> PipelineOperator for ReadNodeProps<C> {
+    fn next_chunk(&mut self) -> Result<Option<DataChunk>> {
+        loop {
+            let mut chunk = match self.child.next_chunk()? {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+
+            if chunk.is_empty() {
+                continue;
+            }
+
+            // If no property columns requested, pass through unchanged.
+            if self.col_ids.is_empty() {
+                return Ok(Some(chunk));
+            }
+
+            // Collect live slots only — no I/O for dead rows.
+            let slot_col = chunk
+                .find_column(self.slot_col_id)
+                .expect("slot column not found in ReadNodeProps input");
+            let live_slots: Vec<u32> = chunk.live_rows().map(|i| slot_col.data[i] as u32).collect();
+
+            // No live rows — skip I/O, return the chunk as-is (caller will skip
+            // it since live_len() == 0).
+            if live_slots.is_empty() {
+                return Ok(Some(chunk));
+            }
+
+            // Batch-read with null semantics.
+            // raw[i][j] = Option<u64> for live_slots[i], col_ids[j].
+            let raw = self.store.batch_read_node_props_nullable(
+                self.label_id,
+                &live_slots,
+                &self.col_ids,
+            )?;
+
+            // Build one ColumnVector per col_id, full chunk length with nulls for
+            // dead rows.
+            let n = chunk.len(); // physical (pre-selection) length
+            for (col_idx, &col_id) in self.col_ids.iter().enumerate() {
+                let mut data = vec![0u64; n];
+                let mut nulls = NullBitmap::with_len(n);
+                // Mark all rows null initially; we'll fill in live rows below.
+                for i in 0..n {
+                    nulls.set_null(i);
+                }
+
+                // Fill live rows from the batch result.
+                for (live_idx, phys_row) in chunk.live_rows().enumerate() {
+                    match raw[live_idx][col_idx] {
+                        Some(v) => {
+                            data[phys_row] = v;
+                            // Clear null bit (present) — NullBitmap uses set=null,
+                            // clear=present, so we rebuild without the null bit.
+                        }
+                        None => {
+                            // Already null by default; leave data[phys_row] = 0.
+                        }
+                    }
+                }
+
+                // Rebuild null bitmap correctly: clear bits for present rows.
+                let mut corrected_nulls = NullBitmap::with_len(n);
+                for (live_idx, phys_row) in chunk.live_rows().enumerate() {
+                    if raw[live_idx][col_idx].is_none() {
+                        corrected_nulls.set_null(phys_row);
+                    }
+                    // present rows leave the bit clear (default)
+                }
+
+                let col = ColumnVector {
+                    data,
+                    nulls: corrected_nulls,
+                    col_id,
+                };
+                chunk.push_column(col);
+            }
+
+            return Ok(Some(chunk));
+        }
+    }
+}
+
+// ── ChunkPredicate ────────────────────────────────────────────────────────────
+
+/// Narrow predicate representation for the vectorized pipeline (Phase 2).
+///
+/// Covers only simple conjunctive property predicates that can be compiled
+/// directly from a Cypher `WHERE` clause without a full expression evaluator.
+/// Unsupported `WHERE` shapes (CONTAINS, function calls, subqueries, cross-
+/// variable predicates) fall back to the row-at-a-time engine.
+///
+/// All comparisons are on the raw `u64` storage encoding.  NULL handling:
+/// `IsNull` matches rows where the column's null bitmap bit is set; all
+/// comparison variants (`Eq`, `Lt`, etc.) automatically fail for null rows.
+#[derive(Debug, Clone)]
+pub enum ChunkPredicate {
+    /// Equal: `col_id = rhs_raw`.
+    Eq { col_id: u32, rhs_raw: u64 },
+    /// Not equal: `col_id <> rhs_raw`.
+    Ne { col_id: u32, rhs_raw: u64 },
+    /// Greater-than: `col_id > rhs_raw` (unsigned comparison on raw bits).
+    Gt { col_id: u32, rhs_raw: u64 },
+    /// Greater-than-or-equal: `col_id >= rhs_raw`.
+    Ge { col_id: u32, rhs_raw: u64 },
+    /// Less-than: `col_id < rhs_raw`.
+    Lt { col_id: u32, rhs_raw: u64 },
+    /// Less-than-or-equal: `col_id <= rhs_raw`.
+    Le { col_id: u32, rhs_raw: u64 },
+    /// Is-null: matches rows where the column's null-bitmap bit is set.
+    IsNull { col_id: u32 },
+    /// Is-not-null: matches rows where the column's null-bitmap bit is clear.
+    IsNotNull { col_id: u32 },
+    /// Conjunction of child predicates (all must pass).
+    And(Vec<ChunkPredicate>),
+}
+
+impl ChunkPredicate {
+    /// Evaluate this predicate for a single physical row index.
+    ///
+    /// Returns `true` if the row should remain live.
+    pub fn eval(&self, chunk: &DataChunk, row_idx: usize) -> bool {
+        match self {
+            ChunkPredicate::Eq { col_id, rhs_raw } => {
+                if let Some(col) = chunk.find_column(*col_id) {
+                    !col.nulls.is_null(row_idx) && col.data[row_idx] == *rhs_raw
+                } else {
+                    false
+                }
+            }
+            ChunkPredicate::Ne { col_id, rhs_raw } => {
+                if let Some(col) = chunk.find_column(*col_id) {
+                    !col.nulls.is_null(row_idx) && col.data[row_idx] != *rhs_raw
+                } else {
+                    false
+                }
+            }
+            ChunkPredicate::Gt { col_id, rhs_raw } => {
+                if let Some(col) = chunk.find_column(*col_id) {
+                    !col.nulls.is_null(row_idx) && col.data[row_idx] > *rhs_raw
+                } else {
+                    false
+                }
+            }
+            ChunkPredicate::Ge { col_id, rhs_raw } => {
+                if let Some(col) = chunk.find_column(*col_id) {
+                    !col.nulls.is_null(row_idx) && col.data[row_idx] >= *rhs_raw
+                } else {
+                    false
+                }
+            }
+            ChunkPredicate::Lt { col_id, rhs_raw } => {
+                if let Some(col) = chunk.find_column(*col_id) {
+                    !col.nulls.is_null(row_idx) && col.data[row_idx] < *rhs_raw
+                } else {
+                    false
+                }
+            }
+            ChunkPredicate::Le { col_id, rhs_raw } => {
+                if let Some(col) = chunk.find_column(*col_id) {
+                    !col.nulls.is_null(row_idx) && col.data[row_idx] <= *rhs_raw
+                } else {
+                    false
+                }
+            }
+            ChunkPredicate::IsNull { col_id } => {
+                if let Some(col) = chunk.find_column(*col_id) {
+                    col.nulls.is_null(row_idx)
+                } else {
+                    // Column not present → property is absent → treat as null.
+                    true
+                }
+            }
+            ChunkPredicate::IsNotNull { col_id } => {
+                if let Some(col) = chunk.find_column(*col_id) {
+                    !col.nulls.is_null(row_idx)
+                } else {
+                    false
+                }
+            }
+            ChunkPredicate::And(children) => children.iter().all(|c| c.eval(chunk, row_idx)),
         }
     }
 }
