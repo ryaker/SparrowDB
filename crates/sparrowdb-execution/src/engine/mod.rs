@@ -959,7 +959,7 @@ mod expr;
 mod hop;
 mod mutation;
 mod path;
-mod pipeline_exec;
+pub mod pipeline_exec;
 mod procedure;
 mod scan;
 

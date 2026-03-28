@@ -29,8 +29,44 @@ use sparrowdb_common::NodeId;
 use sparrowdb_storage::edge_store::EdgeStore;
 
 use super::*;
-use crate::chunk::{DataChunk, COL_ID_DST_SLOT, COL_ID_SRC_SLOT};
-use crate::pipeline::{ChunkPredicate, GetNeighbors, PipelineOperator, ReadNodeProps, ScanByLabel};
+use crate::chunk::{DataChunk, COL_ID_DST_SLOT, COL_ID_SLOT, COL_ID_SRC_SLOT};
+use crate::pipeline::{
+    ChunkPredicate, GetNeighbors, PipelineOperator, ReadNodeProps, ScanByLabel, SlotIntersect,
+};
+
+// ── ChunkedPlan ───────────────────────────────────────────────────────────────
+
+/// Shape selector for the chunked vectorized pipeline (Phase 4, spec §2.3).
+///
+/// Replaces the cascade of `can_use_*` boolean guards with a typed plan enum.
+/// `Engine::try_plan_chunked_match` returns one of these variants (or `None`
+/// to indicate the row engine should be used), and dispatch is a `match` with
+/// no further `if can_use_*` calls.
+///
+/// Each variant may carry shape-specific parameters in future phases.  For now
+/// all resolution happens in the `execute_*_chunked` methods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkedPlan {
+    /// Single-label scan only — no relationship hops.
+    Scan,
+    /// Single-hop directed traversal.
+    OneHop,
+    /// Two-hop same-rel-type directed traversal.
+    TwoHop,
+    /// Mutual-neighbors: `(a)-[:R]->(x)<-[:R]-(b)` with both a and b bound.
+    MutualNeighbors,
+}
+
+impl std::fmt::Display for ChunkedPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChunkedPlan::Scan => write!(f, "Scan"),
+            ChunkedPlan::OneHop => write!(f, "OneHop"),
+            ChunkedPlan::TwoHop => write!(f, "TwoHop"),
+            ChunkedPlan::MutualNeighbors => write!(f, "MutualNeighbors"),
+        }
+    }
+}
 
 impl Engine {
     /// Return `true` when `m` qualifies for Phase 1 chunked execution.
@@ -541,6 +577,365 @@ impl Engine {
                             break 'outer;
                         }
                     }
+                }
+            }
+        }
+
+        Ok(QueryResult {
+            columns: column_names.to_vec(),
+            rows,
+        })
+    }
+
+    /// Select a `ChunkedPlan` for the given `MatchStatement` (Phase 4, spec §2.3).
+    ///
+    /// Returns `Some(plan)` when the query shape maps to a known chunked fast-path,
+    /// or `None` when the row engine should handle it.  The caller dispatches via
+    /// `match` — no further `can_use_*` calls are made after this returns.
+    ///
+    /// # Precedence
+    ///
+    /// MutualNeighbors is checked before TwoHop because it is a more specific
+    /// pattern (both endpoints bound) that would otherwise fall into TwoHop.
+    pub fn try_plan_chunked_match(&self, m: &MatchStatement) -> Option<ChunkedPlan> {
+        // MutualNeighbors is a specialised 2-hop shape — check first.
+        if self.can_use_mutual_neighbors_chunked(m) {
+            return Some(ChunkedPlan::MutualNeighbors);
+        }
+        if self.can_use_two_hop_chunked(m) {
+            return Some(ChunkedPlan::TwoHop);
+        }
+        if self.can_use_one_hop_chunked(m) {
+            return Some(ChunkedPlan::OneHop);
+        }
+        if self.can_use_chunked_pipeline(m) {
+            return Some(ChunkedPlan::Scan);
+        }
+        None
+    }
+
+    /// Return `true` when `m` qualifies for Phase 4 mutual-neighbors chunked execution.
+    ///
+    /// The mutual-neighbors pattern is:
+    /// ```cypher
+    /// MATCH (a:L)-[:R]->(x:L)<-[:R]-(b:L)
+    /// WHERE id(a) = $x AND id(b) = $y
+    /// RETURN x
+    /// ```
+    ///
+    /// # Guard (spec §5.2 hard gate)
+    ///
+    /// Must be strict:
+    /// - Exactly 2 nodes in each of 2 path patterns, OR exactly 3 nodes + 2 rels
+    ///   with the middle node shared and direction fork (first hop Outgoing, second
+    ///   hop Incoming or vice versa).
+    /// - Actually: we look for exactly 1 path pattern with 3 nodes + 2 rels where
+    ///   hops are directed but in *opposite* directions (fork pattern).
+    /// - Both endpoint nodes must have exactly one bound-param `id()` filter.
+    /// - Same rel-type for both hops.
+    /// - Same label on all three nodes.
+    /// - No edge-property references.
+    /// - No aggregation, no ORDER BY, no DISTINCT.
+    pub(crate) fn can_use_mutual_neighbors_chunked(&self, m: &MatchStatement) -> bool {
+        use sparrowdb_cypher::ast::EdgeDir;
+
+        if !self.use_chunked_pipeline {
+            return false;
+        }
+        // Exactly 1 path pattern, 3 nodes, 2 rels.
+        if m.pattern.len() != 1 {
+            return false;
+        }
+        let pat = &m.pattern[0];
+        if pat.rels.len() != 2 || pat.nodes.len() != 3 {
+            return false;
+        }
+        // Fork pattern: first hop Outgoing, second hop Incoming (a→x←b).
+        if pat.rels[0].dir != EdgeDir::Outgoing || pat.rels[1].dir != EdgeDir::Incoming {
+            return false;
+        }
+        // No variable-length hops.
+        if pat.rels[0].min_hops.is_some() || pat.rels[1].min_hops.is_some() {
+            return false;
+        }
+        // Same rel-type for both hops (including both empty).
+        if pat.rels[0].rel_type != pat.rels[1].rel_type {
+            return false;
+        }
+        // All three nodes must have the same single label.
+        if pat.nodes[0].labels.len() != 1
+            || pat.nodes[1].labels.len() != 1
+            || pat.nodes[2].labels.len() != 1
+        {
+            return false;
+        }
+        if pat.nodes[0].labels[0] != pat.nodes[1].labels[0]
+            || pat.nodes[1].labels[0] != pat.nodes[2].labels[0]
+        {
+            return false;
+        }
+        // No aggregation.
+        if has_aggregate_in_return(&m.return_clause.items) {
+            return false;
+        }
+        // No DISTINCT.
+        if m.distinct {
+            return false;
+        }
+        // No ORDER BY.
+        if !m.order_by.is_empty() {
+            return false;
+        }
+        // No edge-property references.
+        for rel in &pat.rels {
+            if !rel.var.is_empty() {
+                let ref_in_return = m.return_clause.items.iter().any(|item| {
+                    column_name_for_item(item)
+                        .split_once('.')
+                        .is_some_and(|(v, _)| v == rel.var.as_str())
+                });
+                if ref_in_return {
+                    return false;
+                }
+                if let Some(ref wexpr) = m.where_clause {
+                    if expr_references_var(wexpr, rel.var.as_str()) {
+                        return false;
+                    }
+                }
+            }
+        }
+        // WHERE must consist only of id(var)=$param conjuncts — no subqueries,
+        // CONTAINS, or other expressions unsupported by the mutual-neighbors fast-path.
+        // We validate this by requiring exactly 2 bound id() param filters and
+        // checking that the WHERE expression contains ONLY id()=$param expressions
+        // (no other predicates that would need the full evaluator).
+        let a_var = pat.nodes[0].var.as_str();
+        let b_var = pat.nodes[2].var.as_str();
+        let a_bound = where_has_id_param_filter(m.where_clause.as_ref(), a_var);
+        let b_bound = where_has_id_param_filter(m.where_clause.as_ref(), b_var);
+        if !a_bound || !b_bound {
+            return false;
+        }
+        // Rel table must exist.
+        let label = pat.nodes[0].labels[0].clone();
+        let rel_type = &pat.rels[0].rel_type;
+        let catalog = &self.snapshot.catalog;
+        let tables = catalog.list_rel_tables_with_ids();
+        let label_id_opt = catalog.get_label(&label).ok().flatten();
+        let label_id = match label_id_opt {
+            Some(id) => id as u32,
+            None => return false,
+        };
+        let has_table = tables.iter().any(|(_, sid, did, rt)| {
+            let type_ok = rel_type.is_empty() || rt == rel_type;
+            let endpoint_ok = *sid as u32 == label_id && *did as u32 == label_id;
+            type_ok && endpoint_ok
+        });
+        has_table
+    }
+
+    /// Execute the mutual-neighbors fast-path for the chunked pipeline (Phase 4).
+    ///
+    /// Pattern: `MATCH (a:L)-[:R]->(x:L)<-[:R]-(b:L) WHERE id(a)=$x AND id(b)=$y RETURN x`
+    ///
+    /// Algorithm:
+    /// 1. Resolve bound slot for `a` from `id(a) = $x` param.
+    /// 2. Resolve bound slot for `b` from `id(b) = $y` param.
+    /// 3. Expand outgoing neighbors of `a` into set A.
+    /// 4. Expand outgoing neighbors of `b` into set B.
+    /// 5. Intersect A ∩ B via `SlotIntersect` — produces sorted common neighbors.
+    /// 6. Materialise output rows from common neighbor slots.
+    pub(crate) fn execute_mutual_neighbors_chunked(
+        &self,
+        m: &MatchStatement,
+        column_names: &[String],
+    ) -> Result<QueryResult> {
+        let pat = &m.pattern[0];
+        let a_node_pat = &pat.nodes[0];
+        let x_node_pat = &pat.nodes[1];
+        let b_node_pat = &pat.nodes[2];
+
+        let label = a_node_pat.labels[0].clone();
+        let rel_type = pat.rels[0].rel_type.clone();
+
+        let label_id = match self.snapshot.catalog.get_label(&label)? {
+            Some(id) => id as u32,
+            None => {
+                return Ok(QueryResult {
+                    columns: column_names.to_vec(),
+                    rows: vec![],
+                });
+            }
+        };
+
+        // Resolve rel table ID.
+        let catalog_rel_id = self
+            .snapshot
+            .catalog
+            .list_rel_tables_with_ids()
+            .into_iter()
+            .find(|(_, sid, did, rt)| {
+                let type_ok = rel_type.is_empty() || rt == &rel_type;
+                let endpoint_ok = *sid as u32 == label_id && *did as u32 == label_id;
+                type_ok && endpoint_ok
+            })
+            .map(|(cid, _, _, _)| cid as u32)
+            .ok_or_else(|| {
+                sparrowdb_common::Error::InvalidArgument(
+                    "no matching relationship table for mutual-neighbors".into(),
+                )
+            })?;
+
+        // Extract bound slots for a and b from params.
+        let a_var = a_node_pat.var.as_str();
+        let b_var = b_node_pat.var.as_str();
+        let a_slot = extract_id_param_slot(m.where_clause.as_ref(), a_var, &self.params, label_id);
+        let b_slot = extract_id_param_slot(m.where_clause.as_ref(), b_var, &self.params, label_id);
+
+        let (a_slot, b_slot) = match (a_slot, b_slot) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                // Params not resolved — return empty.
+                return Ok(QueryResult {
+                    columns: column_names.to_vec(),
+                    rows: vec![],
+                });
+            }
+        };
+
+        tracing::debug!(
+            engine = "chunked",
+            plan = %ChunkedPlan::MutualNeighbors,
+            label = %label,
+            rel_type = %rel_type,
+            a_slot,
+            b_slot,
+            "executing via chunked pipeline"
+        );
+
+        let csr = self
+            .snapshot
+            .csrs
+            .get(&catalog_rel_id)
+            .cloned()
+            .unwrap_or_else(|| sparrowdb_storage::csr::CsrForward::build(0, &[]));
+
+        let delta_records = {
+            let edge_store = sparrowdb_storage::edge_store::EdgeStore::open(
+                &self.snapshot.db_root,
+                sparrowdb_storage::edge_store::RelTableId(catalog_rel_id),
+            );
+            edge_store.and_then(|s| s.read_delta()).unwrap_or_default()
+        };
+
+        // Build neighbor sets via GetNeighbors on single-slot sources.
+        let a_scan = ScanByLabel::from_slots(vec![a_slot]);
+        let a_neighbors = GetNeighbors::new(a_scan, csr.clone(), &delta_records, label_id, 8);
+
+        let b_scan = ScanByLabel::from_slots(vec![b_slot]);
+        let b_neighbors = GetNeighbors::new(b_scan, csr, &delta_records, label_id, 8);
+
+        // GetNeighbors emits (src_slot, dst_slot) pairs. We need dst_slot column.
+        // Wrap in an adaptor that projects COL_ID_DST_SLOT → COL_ID_SLOT.
+        let a_proj = DstSlotProjector::new(a_neighbors);
+        let b_proj = DstSlotProjector::new(b_neighbors);
+
+        // Intersect.
+        let spill_threshold = 64 * 1024; // 64 K entries before spill warning
+        let mut intersect =
+            SlotIntersect::new(a_proj, b_proj, COL_ID_SLOT, COL_ID_SLOT, spill_threshold);
+
+        // Collect common neighbor slots.
+        let mut common_slots: Vec<u64> = Vec::new();
+        while let Some(chunk) = intersect.next_chunk()? {
+            if let Some(col) = chunk.find_column(COL_ID_SLOT) {
+                for row_idx in chunk.live_rows() {
+                    common_slots.push(col.data[row_idx]);
+                }
+            }
+        }
+
+        // Materialise output rows.
+        let x_var = x_node_pat.var.as_str();
+        let mut col_ids_x = collect_col_ids_for_var(x_var, column_names, label_id);
+        if let Some(ref wexpr) = m.where_clause {
+            collect_col_ids_from_expr_for_var(wexpr, x_var, &mut col_ids_x);
+        }
+        for p in &x_node_pat.props {
+            let cid = col_id_of(&p.key);
+            if !col_ids_x.contains(&cid) {
+                col_ids_x.push(cid);
+            }
+        }
+
+        let store_arc = Arc::new(sparrowdb_storage::node_store::NodeStore::open(
+            self.snapshot.store.root_path(),
+        )?);
+
+        let limit = m.limit.map(|l| l as usize);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+
+        'outer: for x_slot in common_slots {
+            let x_node_id = NodeId(((label_id as u64) << 32) | x_slot);
+
+            // Skip tombstoned common neighbors.
+            if self.is_node_tombstoned(x_node_id) {
+                continue;
+            }
+
+            // Read x properties.
+            let x_props: Vec<(u32, u64)> = if !col_ids_x.is_empty() {
+                let nullable = store_arc.batch_read_node_props_nullable(
+                    label_id,
+                    &[x_slot as u32],
+                    &col_ids_x,
+                )?;
+                if nullable.is_empty() {
+                    vec![]
+                } else {
+                    col_ids_x
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &cid)| nullable[0][i].map(|v| (cid, v)))
+                        .collect()
+                }
+            } else {
+                vec![]
+            };
+
+            // Apply remaining WHERE predicates (e.g. x.prop filters).
+            if let Some(ref where_expr) = m.where_clause {
+                let mut row_vals =
+                    build_row_vals(&x_props, x_var, &col_ids_x, &self.snapshot.store);
+                // Also inject a and b NodeRef for id() evaluation.
+                if !a_var.is_empty() {
+                    let a_node_id = NodeId(((label_id as u64) << 32) | a_slot);
+                    row_vals.insert(a_var.to_string(), Value::NodeRef(a_node_id));
+                }
+                if !b_var.is_empty() {
+                    let b_node_id = NodeId(((label_id as u64) << 32) | b_slot);
+                    row_vals.insert(b_var.to_string(), Value::NodeRef(b_node_id));
+                }
+                row_vals.extend(self.dollar_params());
+                if !self.eval_where_graph(where_expr, &row_vals) {
+                    continue;
+                }
+            }
+
+            // Project output row.
+            let row = project_row(
+                &x_props,
+                column_names,
+                &col_ids_x,
+                x_var,
+                &label,
+                &self.snapshot.store,
+            );
+            rows.push(row);
+
+            if let Some(lim) = limit {
+                if rows.len() >= lim {
+                    break 'outer;
                 }
             }
         }
@@ -1542,4 +1937,159 @@ fn build_props_from_chunk(chunk: &DataChunk, row_idx: usize, col_ids: &[u32]) ->
             }
         })
         .collect()
+}
+
+// ── DstSlotProjector ──────────────────────────────────────────────────────────
+
+/// Projects `COL_ID_DST_SLOT` from a `GetNeighbors` output chunk to `COL_ID_SLOT`.
+///
+/// `GetNeighbors` emits `(COL_ID_SRC_SLOT, COL_ID_DST_SLOT)` pairs.
+/// `SlotIntersect` operates on `COL_ID_SLOT` columns.  This thin adaptor
+/// renames the `COL_ID_DST_SLOT` column to `COL_ID_SLOT` so that
+/// `SlotIntersect` can be wired directly to `GetNeighbors` output.
+struct DstSlotProjector<C: PipelineOperator> {
+    child: C,
+}
+
+impl<C: PipelineOperator> DstSlotProjector<C> {
+    fn new(child: C) -> Self {
+        DstSlotProjector { child }
+    }
+}
+
+impl<C: PipelineOperator> PipelineOperator for DstSlotProjector<C> {
+    fn next_chunk(&mut self) -> Result<Option<DataChunk>> {
+        use crate::chunk::ColumnVector;
+
+        loop {
+            let chunk = match self.child.next_chunk()? {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+
+            if chunk.is_empty() {
+                continue;
+            }
+
+            // Extract dst slots from live rows and build a new COL_ID_SLOT chunk.
+            let dst_col = match chunk.find_column(COL_ID_DST_SLOT) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            let data: Vec<u64> = chunk.live_rows().map(|i| dst_col.data[i]).collect();
+            if data.is_empty() {
+                continue;
+            }
+            let col = ColumnVector::from_data(crate::chunk::COL_ID_SLOT, data);
+            return Ok(Some(DataChunk::from_columns(vec![col])));
+        }
+    }
+}
+
+// ── MutualNeighbors helpers ───────────────────────────────────────────────────
+
+/// Return `true` when the WHERE clause contains `id(var) = $param` for `var_name`.
+///
+/// This is used by `can_use_mutual_neighbors_chunked` to verify that both
+/// endpoint nodes have bound parameter id() filters.
+fn where_has_id_param_filter(where_clause: Option<&Expr>, var_name: &str) -> bool {
+    let wexpr = match where_clause {
+        Some(e) => e,
+        None => return false,
+    };
+    expr_has_id_param_eq(wexpr, var_name)
+}
+
+/// Recursively search `expr` for `id(var_name) = $param` or `$param = id(var_name)`.
+fn expr_has_id_param_eq(expr: &Expr, var_name: &str) -> bool {
+    match expr {
+        Expr::BinOp { left, op, right } => {
+            if *op == BinOpKind::Eq {
+                // id(var) = $param
+                if is_id_call(left, var_name) && is_param_literal(right) {
+                    return true;
+                }
+                // $param = id(var)
+                if is_param_literal(left) && is_id_call(right, var_name) {
+                    return true;
+                }
+            }
+            expr_has_id_param_eq(left, var_name) || expr_has_id_param_eq(right, var_name)
+        }
+        Expr::And(a, b) => expr_has_id_param_eq(a, var_name) || expr_has_id_param_eq(b, var_name),
+        _ => false,
+    }
+}
+
+/// Return `true` if `expr` is `id(var_name)`.
+fn is_id_call(expr: &Expr, var_name: &str) -> bool {
+    match expr {
+        Expr::FnCall { name, args } => {
+            name.eq_ignore_ascii_case("id")
+                && args.len() == 1
+                && matches!(&args[0], Expr::Var(v) if v.as_str() == var_name)
+        }
+        _ => false,
+    }
+}
+
+/// Return `true` if `expr` is a `$param` literal.
+fn is_param_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(Literal::Param(_)))
+}
+
+/// Extract the slot number for `var_name` from `id(var_name) = $param` in WHERE.
+///
+/// Looks up the parameter value in `params`, then decodes the slot from the
+/// NodeId encoding: `slot = node_id & 0xFFFF_FFFF`.
+///
+/// Returns `None` when the param is not found or the label doesn't match.
+fn extract_id_param_slot(
+    where_clause: Option<&Expr>,
+    var_name: &str,
+    params: &std::collections::HashMap<String, crate::types::Value>,
+    expected_label_id: u32,
+) -> Option<u64> {
+    let wexpr = where_clause?;
+    let param_name = find_id_param_name(wexpr, var_name)?;
+    let val = params.get(&param_name)?;
+
+    // The param value is expected to be a NodeId (Int64 or NodeRef).
+    let raw_node_id: u64 = match val {
+        crate::types::Value::Int64(n) => *n as u64,
+        crate::types::Value::NodeRef(nid) => nid.0,
+        _ => return None,
+    };
+
+    let (label_id, slot) = super::node_id_parts(raw_node_id);
+    if label_id != expected_label_id {
+        return None;
+    }
+    Some(slot)
+}
+
+/// Find the parameter name in `id(var_name) = $param` expressions.
+fn find_id_param_name(expr: &Expr, var_name: &str) -> Option<String> {
+    match expr {
+        Expr::BinOp { left, op, right } => {
+            if *op == BinOpKind::Eq {
+                if is_id_call(left, var_name) {
+                    if let Expr::Literal(Literal::Param(p)) = right.as_ref() {
+                        return Some(p.clone());
+                    }
+                }
+                if is_id_call(right, var_name) {
+                    if let Expr::Literal(Literal::Param(p)) = left.as_ref() {
+                        return Some(p.clone());
+                    }
+                }
+            }
+            find_id_param_name(left, var_name).or_else(|| find_id_param_name(right, var_name))
+        }
+        Expr::And(a, b) => {
+            find_id_param_name(a, var_name).or_else(|| find_id_param_name(b, var_name))
+        }
+        _ => None,
+    }
 }

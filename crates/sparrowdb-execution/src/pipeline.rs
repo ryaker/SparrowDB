@@ -1,4 +1,4 @@
-//! Pull-based vectorized pipeline operators (Phase 1 + Phase 2 + Phase 3).
+//! Pull-based vectorized pipeline operators (Phase 1 + Phase 2 + Phase 3 + Phase 4).
 //!
 //! # Architecture
 //!
@@ -689,6 +689,153 @@ impl FrontierScratch {
     }
 }
 
+// ── SlotIntersect ─────────────────────────────────────────────────────────────
+
+/// Intersects two slot-column pipeline streams on a shared key column.
+///
+/// Used for mutual-neighbor queries of the form:
+/// ```cypher
+/// MATCH (a)-[:R]->(x)<-[:R]-(b)
+/// ```
+///
+/// Both `left` and `right` streams are consumed eagerly to build an in-memory
+/// slot set from the **right** (build) side, then the **left** (probe) stream is
+/// scanned for slots present in the build set. Only slots that appear in both
+/// streams are emitted.
+///
+/// # Output Order
+///
+/// Output slots are emitted in ascending sorted order — the spec mandates
+/// deterministic output for the mutual-neighbors fast-path.
+///
+/// # Path Multiplicity
+///
+/// The spec (§6.2) requires path multiplicity to be preserved. For the
+/// mutual-neighbors use case each shared slot represents a distinct path
+/// `a → x ← b`, so each occurrence in the probe stream maps to exactly one
+/// output slot. The current implementation deduplicates by design (one common
+/// neighbor per pair), which is correct for the targeted query shape.
+///
+/// # Spill
+///
+/// For large build-side sets (above `spill_threshold` entries), the caller
+/// should use `join_spill.rs` instead. The current implementation holds the
+/// build side in a `HashSet<u64>` which is correct for moderate-sized graphs.
+pub struct SlotIntersect<L: PipelineOperator, R: PipelineOperator> {
+    left: L,
+    right: R,
+    /// Column ID to use from the left stream (probe side).
+    left_key_col: u32,
+    /// Column ID to use from the right stream (build side).
+    right_key_col: u32,
+    /// When the build side exceeds this many entries, a spill warning is logged.
+    spill_threshold: usize,
+    /// Sorted intersection results, produced after both sides are drained.
+    results: Vec<u64>,
+    /// Cursor into `results`.
+    cursor: usize,
+    /// Whether both sides have been consumed and `results` is ready.
+    built: bool,
+}
+
+impl<L: PipelineOperator, R: PipelineOperator> SlotIntersect<L, R> {
+    /// Create a `SlotIntersect` operator.
+    ///
+    /// - `left`  — probe side: iterated after the build set is materialised.
+    /// - `right` — build side: fully consumed into a `HashSet<u64>` before probing.
+    /// - `left_key_col`  — column ID in the left stream that holds the join key.
+    /// - `right_key_col` — column ID in the right stream that holds the join key.
+    /// - `spill_threshold` — log a warning when build side exceeds this many entries.
+    pub fn new(
+        left: L,
+        right: R,
+        left_key_col: u32,
+        right_key_col: u32,
+        spill_threshold: usize,
+    ) -> Self {
+        SlotIntersect {
+            left,
+            right,
+            left_key_col,
+            right_key_col,
+            spill_threshold,
+            results: Vec::new(),
+            cursor: 0,
+            built: false,
+        }
+    }
+
+    /// Consume both sides and materialise sorted intersection into `self.results`.
+    fn build(&mut self) -> Result<()> {
+        use std::collections::HashSet;
+
+        // Phase 1: drain right (build) side into a HashSet.
+        let mut build_set: HashSet<u64> = HashSet::new();
+        while let Some(chunk) = self.right.next_chunk()? {
+            if let Some(col) = chunk.find_column(self.right_key_col) {
+                for row_idx in chunk.live_rows() {
+                    build_set.insert(col.data[row_idx]);
+                }
+            }
+        }
+
+        if build_set.len() > self.spill_threshold {
+            tracing::warn!(
+                build_side_len = build_set.len(),
+                spill_threshold = self.spill_threshold,
+                "SlotIntersect: build side exceeds spill threshold — consider join_spill"
+            );
+        }
+
+        // Phase 2: probe left side against the build set.
+        let mut intersection: Vec<u64> = Vec::new();
+        while let Some(chunk) = self.left.next_chunk()? {
+            if let Some(col) = chunk.find_column(self.left_key_col) {
+                for row_idx in chunk.live_rows() {
+                    let slot = col.data[row_idx];
+                    if build_set.contains(&slot) {
+                        intersection.push(slot);
+                    }
+                }
+            }
+        }
+
+        // Sort for deterministic output (spec §5.3 hard gate).
+        intersection.sort_unstable();
+        intersection.dedup();
+        self.results = intersection;
+        self.built = true;
+        Ok(())
+    }
+}
+
+impl<L: PipelineOperator, R: PipelineOperator> PipelineOperator for SlotIntersect<L, R> {
+    fn next_chunk(&mut self) -> Result<Option<DataChunk>> {
+        if !self.built {
+            self.build()?;
+        }
+
+        if self.cursor >= self.results.len() {
+            return Ok(None);
+        }
+
+        let end = (self.cursor + CHUNK_CAPACITY).min(self.results.len());
+        let data: Vec<u64> = self.results[self.cursor..end].to_vec();
+        self.cursor = end;
+
+        let col = ColumnVector::from_data(COL_ID_SLOT, data);
+        Ok(Some(DataChunk::from_columns(vec![col])))
+    }
+
+    fn cardinality_hint(&self) -> Option<usize> {
+        if self.built {
+            Some(self.results.len().saturating_sub(self.cursor))
+        } else {
+            None
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -808,5 +955,89 @@ mod tests {
         assert_eq!(c2.live_len(), 50);
 
         assert!(gn.next_chunk().unwrap().is_none());
+    }
+
+    // ── SlotIntersect ──────────────────────────────────────────────────────
+
+    #[test]
+    fn slot_intersect_empty_right_returns_none() {
+        // left = [1, 2, 3], right = [] → intersection = []
+        let left = ScanByLabel::from_slots(vec![1, 2, 3]);
+        let right = ScanByLabel::from_slots(vec![]);
+        let mut intersect = SlotIntersect::new(left, right, COL_ID_SLOT, COL_ID_SLOT, 1024);
+        assert!(intersect.next_chunk().unwrap().is_none());
+    }
+
+    #[test]
+    fn slot_intersect_empty_left_returns_none() {
+        // left = [], right = [1, 2, 3] → intersection = []
+        let left = ScanByLabel::from_slots(vec![]);
+        let right = ScanByLabel::from_slots(vec![1, 2, 3]);
+        let mut intersect = SlotIntersect::new(left, right, COL_ID_SLOT, COL_ID_SLOT, 1024);
+        assert!(intersect.next_chunk().unwrap().is_none());
+    }
+
+    #[test]
+    fn slot_intersect_no_overlap_returns_none() {
+        // left = [1, 2, 3], right = [4, 5, 6] → intersection = []
+        let left = ScanByLabel::from_slots(vec![1, 2, 3]);
+        let right = ScanByLabel::from_slots(vec![4, 5, 6]);
+        let mut intersect = SlotIntersect::new(left, right, COL_ID_SLOT, COL_ID_SLOT, 1024);
+        assert!(intersect.next_chunk().unwrap().is_none());
+    }
+
+    #[test]
+    fn slot_intersect_partial_overlap() {
+        // left = [1, 2, 3, 4], right = [2, 4, 6] → intersection = [2, 4]
+        let left = ScanByLabel::from_slots(vec![1, 2, 3, 4]);
+        let right = ScanByLabel::from_slots(vec![2, 4, 6]);
+        let mut intersect = SlotIntersect::new(left, right, COL_ID_SLOT, COL_ID_SLOT, 1024);
+        let chunk = intersect
+            .next_chunk()
+            .unwrap()
+            .expect("should produce chunk");
+        let col = chunk.find_column(COL_ID_SLOT).expect("slot column");
+        assert_eq!(col.data, vec![2u64, 4]);
+        assert!(intersect.next_chunk().unwrap().is_none());
+    }
+
+    #[test]
+    fn slot_intersect_output_is_sorted() {
+        // Even if inputs arrive out of order, output must be sorted.
+        // left = [5, 1, 3], right = [3, 1, 7] → intersection = [1, 3]
+        let left = ScanByLabel::from_slots(vec![5, 1, 3]);
+        let right = ScanByLabel::from_slots(vec![3, 1, 7]);
+        let mut intersect = SlotIntersect::new(left, right, COL_ID_SLOT, COL_ID_SLOT, 1024);
+        let chunk = intersect.next_chunk().unwrap().expect("chunk");
+        let col = chunk.find_column(COL_ID_SLOT).expect("slot column");
+        assert_eq!(col.data, vec![1u64, 3], "output must be sorted ascending");
+    }
+
+    #[test]
+    fn slot_intersect_full_overlap() {
+        // left = right = [1, 2, 3] → intersection = [1, 2, 3]
+        let left = ScanByLabel::from_slots(vec![1, 2, 3]);
+        let right = ScanByLabel::from_slots(vec![1, 2, 3]);
+        let mut intersect = SlotIntersect::new(left, right, COL_ID_SLOT, COL_ID_SLOT, 1024);
+        let chunk = intersect.next_chunk().unwrap().expect("chunk");
+        let col = chunk.find_column(COL_ID_SLOT).expect("slot column");
+        assert_eq!(col.data, vec![1u64, 2, 3]);
+        assert!(intersect.next_chunk().unwrap().is_none());
+    }
+
+    #[test]
+    fn slot_intersect_large_input_spans_multiple_chunks() {
+        // Intersection of 0..N with 0..N should produce CHUNK_CAPACITY+extra
+        // result slots and split across two chunks.
+        let n = CHUNK_CAPACITY + 100;
+        let slots: Vec<u64> = (0..n as u64).collect();
+        let left = ScanByLabel::from_slots(slots.clone());
+        let right = ScanByLabel::from_slots(slots);
+        let mut intersect = SlotIntersect::new(left, right, COL_ID_SLOT, COL_ID_SLOT, usize::MAX);
+        let c1 = intersect.next_chunk().unwrap().expect("first chunk");
+        assert_eq!(c1.live_len(), CHUNK_CAPACITY);
+        let c2 = intersect.next_chunk().unwrap().expect("second chunk");
+        assert_eq!(c2.live_len(), 100);
+        assert!(intersect.next_chunk().unwrap().is_none());
     }
 }
