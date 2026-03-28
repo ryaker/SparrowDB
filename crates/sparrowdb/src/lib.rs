@@ -39,6 +39,10 @@ use sparrowdb_execution::Engine;
 pub mod export;
 pub use export::{EdgeDump, GraphDump, NodeDump};
 
+// ── Bulk loader ───────────────────────────────────────────────────────────────
+pub mod bulk;
+pub use bulk::BulkLoader;
+
 // ── Public re-exports ─────────────────────────────────────────────────────────
 //
 // Re-export the types that consumers of the top-level `sparrowdb` crate need

@@ -90,6 +90,41 @@ enum Commands {
         #[arg(long)]
         key: Option<String>,
     },
+    /// Bulk-import nodes and/or edges from CSV files using batched WriteTx
+    /// transactions for high-throughput ingestion (SPA-296).
+    ///
+    /// Node CSV format:   id,prop1,prop2,...
+    /// Edge CSV format:   src_id,dst_id
+    ///
+    /// Example:
+    ///   sparrowdb bulk-import --db /path/to/db --nodes nodes.csv --edges edges.csv \
+    ///       --node-label Person --rel-type KNOWS
+    BulkImport {
+        /// Path to the database directory
+        #[arg(long)]
+        db: PathBuf,
+        /// Path to the nodes CSV file (columns: id,prop1,prop2,...)
+        #[arg(long)]
+        nodes: Option<PathBuf>,
+        /// Label to assign to all imported nodes
+        #[arg(long, default_value = "Node")]
+        node_label: String,
+        /// Path to the edges CSV file (columns: src_id,dst_id)
+        #[arg(long)]
+        edges: Option<PathBuf>,
+        /// Relationship type for all imported edges
+        #[arg(long, default_value = "REL")]
+        rel_type: String,
+        /// Label of source nodes (must match node_label used during load_nodes)
+        #[arg(long, default_value = "Node")]
+        src_label: String,
+        /// Label of destination nodes
+        #[arg(long, default_value = "Node")]
+        dst_label: String,
+        /// Rows per WriteTx commit (larger = faster, more memory)
+        #[arg(long, default_value_t = 10_000)]
+        batch_size: usize,
+    },
 }
 
 fn main() {
@@ -102,6 +137,25 @@ fn main() {
         Commands::Import { neo4j_csv, db } => cmd_import(&db, &neo4j_csv),
         Commands::Visualize { db, output } => cmd_visualize(&db, output.as_deref()),
         Commands::Serve { db, key } => cmd_serve(&db, key.as_deref()),
+        Commands::BulkImport {
+            db,
+            nodes,
+            node_label,
+            edges,
+            rel_type,
+            src_label,
+            dst_label,
+            batch_size,
+        } => cmd_bulk_import(
+            &db,
+            nodes.as_deref(),
+            &node_label,
+            edges.as_deref(),
+            &rel_type,
+            &src_label,
+            &dst_label,
+            batch_size,
+        ),
     };
 
     if let Err(e) = result {
@@ -554,5 +608,44 @@ fn cmd_serve(
             }
         }
     }
+    Ok(())
+}
+
+// ── bulk-import ───────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_bulk_import(
+    db_path: &std::path::Path,
+    nodes_path: Option<&std::path::Path>,
+    node_label: &str,
+    edges_path: Option<&std::path::Path>,
+    rel_type: &str,
+    src_label: &str,
+    dst_label: &str,
+    batch_size: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use sparrowdb::bulk::{BulkLoader, BulkOptions};
+
+    if nodes_path.is_none() && edges_path.is_none() {
+        return Err("bulk-import: at least one of --nodes or --edges must be provided".into());
+    }
+
+    let db = sparrowdb::GraphDb::open(db_path)?;
+    let opts = BulkOptions {
+        batch_size,
+        ..BulkOptions::default()
+    };
+    let loader = BulkLoader::new(&db, opts);
+
+    if let Some(p) = nodes_path {
+        let n = loader.load_nodes(p, node_label)?;
+        println!("nodes: {n} imported");
+    }
+
+    if let Some(p) = edges_path {
+        let e = loader.load_edges(p, rel_type, src_label, dst_label)?;
+        println!("edges: {e} imported");
+    }
+
     Ok(())
 }
