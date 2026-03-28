@@ -285,6 +285,11 @@ impl GraphDb {
         Ok(())
     }
 
+    pub(crate) fn refresh_caches(&self) {
+        self.invalidate_catalog();
+        self.invalidate_csr_map();
+    }
+
     fn invalidate_csr_map(&self) {
         if let Ok(fresh) = try_open_csr_map(&self.inner.path) {
             *self.inner.csr_map.write().expect("csr_map RwLock poisoned") = fresh;
