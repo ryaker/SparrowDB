@@ -5,10 +5,11 @@
 //! sync. This is the Phase 1 implementation; the full paged implementation
 //! (with catalog payload pages, superblock, metapages) comes in Phase 2.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use sparrowdb_common::{Error, Result};
+use sparrowdb_common::{Error, NodeId, Result};
 
 use crate::tlv::{encode_entries, LabelEntry, RelTableEntry, TlvEntry};
 
@@ -19,6 +20,30 @@ pub type LabelId = u16;
 pub type RelTableId = u64;
 
 /// The catalog, loaded from (and persisted to) a TLV file.
+///
+/// ## Multi-label support (SPA-200)
+///
+/// Every node has exactly one *primary* label that determines its `NodeId`
+/// encoding and physical storage directory.  Additional ("secondary") labels
+/// are tracked here in two in-memory indexes:
+///
+/// - `node_label_sets`: `NodeId → HashSet<LabelId>` — secondary labels for a
+///   node (primary label is **not** stored here; it is encoded in the NodeId).
+///   Used by `get_node_labels()` and MATCH intersection logic.
+/// - `secondary_label_index`: `LabelId → HashSet<NodeId>` — reverse index
+///   mapping a secondary label to all nodes that carry it.  Used by MATCH to
+///   find nodes where the queried label is a *secondary* label without a full
+///   primary-label store scan.
+///
+/// Both indexes are rebuilt from `NodeLabelSet` TLV entries on `open()` and
+/// updated in-memory on every `record_secondary_labels()` call.
+///
+/// ## Property index limitation (Phase 1)
+///
+/// Property indexes are keyed by `(primary_label_id, col_id)`.  A node
+/// created as `(:A:B {name: "x"})` stores its columns under label A.
+/// `CREATE INDEX ON :B(name)` will **not** cover this node in Phase 1.
+/// Cross-label index support is planned for Phase 2 (issue #289).
 #[derive(Clone)]
 pub struct Catalog {
     /// Path to the TLV catalog file.
@@ -31,6 +56,16 @@ pub struct Catalog {
     next_label_id: u16,
     /// Next rel_table_id to assign.
     next_rel_table_id: u64,
+    /// Secondary label sets per node: NodeId → set of secondary LabelIds.
+    ///
+    /// Only nodes with at least one secondary label appear here.  Single-label
+    /// nodes have no entry (absence means "primary label only").
+    node_label_sets: HashMap<NodeId, HashSet<LabelId>>,
+    /// Reverse index: secondary LabelId → set of NodeIds that carry that label.
+    ///
+    /// Used by MATCH resolution to find nodes by secondary label without
+    /// performing a full scan of every primary-label store.
+    secondary_label_index: HashMap<LabelId, HashSet<NodeId>>,
 }
 
 impl Catalog {
@@ -46,6 +81,8 @@ impl Catalog {
             rel_tables: Vec::new(),
             next_label_id: 0,
             next_rel_table_id: 0,
+            node_label_sets: HashMap::new(),
+            secondary_label_index: HashMap::new(),
         };
         catalog.load()?;
         Ok(catalog)
@@ -147,6 +184,89 @@ impl Catalog {
             .iter()
             .map(|e| (e.label_id, e.name.clone()))
             .collect())
+    }
+
+    // --- Multi-label side table (SPA-200) ---
+
+    /// Record that `node_id` carries `secondary_label_ids` in addition to its
+    /// primary label (which is encoded in the `NodeId` itself).
+    ///
+    /// Persists a `NodeLabelSet` TLV entry to `catalog.tlv` and updates the
+    /// in-memory forward and reverse indexes.
+    ///
+    /// Calling this for a node with no secondary labels (empty slice) is a no-op.
+    ///
+    /// # WAL note (Phase 1)
+    ///
+    /// WAL replay for `NodeLabelSet` entries is not yet implemented (see issue
+    /// #303).  This method persists directly to the catalog side table, which
+    /// is correct for Phase 1 since the catalog is always written synchronously.
+    pub fn record_secondary_labels(
+        &mut self,
+        node_id: NodeId,
+        secondary_label_ids: &[LabelId],
+    ) -> Result<()> {
+        if secondary_label_ids.is_empty() {
+            return Ok(());
+        }
+
+        let primary_label_id = (node_id.0 >> 32) as u16;
+        let slot = (node_id.0 & 0xFFFF_FFFF) as u32;
+
+        let entry = crate::tlv::NodeLabelSetEntry {
+            primary_label_id,
+            slot,
+            secondary_label_ids: secondary_label_ids.to_vec(),
+        };
+        // Persist first; only update in-memory state if write+fsync succeeds.
+        self.append_entry(TlvEntry::NodeLabelSet(entry))?;
+
+        // Update forward index.
+        let set = self.node_label_sets.entry(node_id).or_default();
+        set.extend(secondary_label_ids.iter().copied());
+
+        // Update reverse index.
+        for &label_id in secondary_label_ids {
+            self.secondary_label_index
+                .entry(label_id)
+                .or_default()
+                .insert(node_id);
+        }
+
+        Ok(())
+    }
+
+    /// Return all labels for `node_id` (primary first, then secondary labels
+    /// in insertion order).
+    ///
+    /// The primary label is derived from the `NodeId` encoding; secondary
+    /// labels come from the `node_label_sets` side table.  Returns an empty
+    /// `Vec` if the node's primary label is not registered in the catalog.
+    pub fn get_node_labels(&self, node_id: NodeId) -> Vec<LabelId> {
+        let primary_label_id = (node_id.0 >> 32) as LabelId;
+        let mut labels = vec![primary_label_id];
+        if let Some(secondary) = self.node_label_sets.get(&node_id) {
+            // Stable ordering: sort secondary labels by ID for determinism.
+            let mut sorted: Vec<LabelId> = secondary.iter().copied().collect();
+            sorted.sort_unstable();
+            labels.extend(sorted);
+        }
+        labels
+    }
+
+    /// Return all `NodeId`s that carry `label_id` as a **secondary** label.
+    ///
+    /// Used by MATCH resolution to union primary-label scan results with
+    /// secondary-label hits.  Returns an empty iterator for labels that have
+    /// never been assigned as a secondary label.
+    pub fn nodes_with_secondary_label(
+        &self,
+        label_id: LabelId,
+    ) -> impl Iterator<Item = NodeId> + '_ {
+        self.secondary_label_index
+            .get(&label_id)
+            .into_iter()
+            .flat_map(|set| set.iter().copied())
     }
 
     // --- Relationship table CRUD ---
@@ -367,6 +487,19 @@ impl Catalog {
                         self.next_rel_table_id = e.rel_table_id + 1;
                     }
                     self.rel_tables.push(e);
+                }
+                TlvEntry::NodeLabelSet(e) => {
+                    // Reconstruct node_label_sets and secondary_label_index
+                    // from persisted NodeLabelSet entries (SPA-200).
+                    let node_id = NodeId(((e.primary_label_id as u64) << 32) | (e.slot as u64));
+                    let set = self.node_label_sets.entry(node_id).or_default();
+                    for &sid in &e.secondary_label_ids {
+                        set.insert(sid);
+                        self.secondary_label_index
+                            .entry(sid)
+                            .or_default()
+                            .insert(node_id);
+                    }
                 }
                 _ => {} // other entry types are not processed in Phase 1
             }
