@@ -4,11 +4,11 @@
 // submodules.  Nothing here is `pub` outside the crate.
 
 use sparrowdb_catalog::catalog::{Catalog, LabelId};
+use sparrowdb_common::{EdgeId, NodeId};
 use sparrowdb_storage::csr::CsrForward;
-use sparrowdb_storage::wal::writer::WalWriter;
 use sparrowdb_storage::edge_store::RelTableId;
-use sparrowdb_common::{NodeId, EdgeId};
 use sparrowdb_storage::node_store::Value;
+use sparrowdb_storage::wal::writer::WalWriter;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};

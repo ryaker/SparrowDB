@@ -2,8 +2,7 @@
 
 use crate::helpers::fnv1a_col_id;
 use crate::types::{
-    DbInner, GC_COMMIT_INTERVAL, PendingOp, StagedUpdate,
-    WalMutation, WriteBuffer, WriteGuard,
+    DbInner, PendingOp, StagedUpdate, WalMutation, WriteBuffer, WriteGuard, GC_COMMIT_INTERVAL,
 };
 use crate::wal_codec::write_mutation_wal;
 use sparrowdb_catalog::catalog::{Catalog, LabelId, RelTableId as CatalogRelTableId};
@@ -51,8 +50,7 @@ pub struct WriteTx {
     ///
     /// Caching open indexes here avoids one open+flush per `add_to_fulltext_index`
     /// call; instead we batch all additions and flush each index exactly once.
-    pub(crate) fulltext_pending:
-        HashMap<String, sparrowdb_storage::fulltext_index::FulltextIndex>,
+    pub(crate) fulltext_pending: HashMap<String, sparrowdb_storage::fulltext_index::FulltextIndex>,
     /// Buffered structural mutations (create_node, delete_node, create_edge,
     /// create_label) not yet written to disk.  Flushed atomically on commit.
     pub(crate) pending_ops: Vec<PendingOp>,
@@ -476,9 +474,7 @@ impl WriteTx {
             if let Ok(ref s) = store {
                 let delta = s.read_delta().unwrap_or_default();
                 if delta.iter().any(|r| r.src == node_id || r.dst == node_id) {
-                    return Err(sparrowdb_common::Error::NodeHasEdges {
-                        node_id: node_id.0,
-                    });
+                    return Err(sparrowdb_common::Error::NodeHasEdges { node_id: node_id.0 });
                 }
             }
 
@@ -487,9 +483,7 @@ impl WriteTx {
             if let Ok(ref s) = store {
                 if let Ok(csr) = s.open_fwd() {
                     if !csr.neighbors(node_id.0).is_empty() {
-                        return Err(sparrowdb_common::Error::NodeHasEdges {
-                            node_id: node_id.0,
-                        });
+                        return Err(sparrowdb_common::Error::NodeHasEdges { node_id: node_id.0 });
                     }
                 }
             }
@@ -499,9 +493,7 @@ impl WriteTx {
             if let Ok(ref s) = store {
                 if let Ok(csr) = s.open_bwd() {
                     if !csr.predecessors(node_id.0).is_empty() {
-                        return Err(sparrowdb_common::Error::NodeHasEdges {
-                            node_id: node_id.0,
-                        });
+                        return Err(sparrowdb_common::Error::NodeHasEdges { node_id: node_id.0 });
                     }
                 }
             }
@@ -514,9 +506,7 @@ impl WriteTx {
             matches!(op, PendingOp::EdgeCreate { src, dst, .. } if *src == node_id || *dst == node_id)
         });
         if has_buffered_edge {
-            return Err(sparrowdb_common::Error::NodeHasEdges {
-                node_id: node_id.0,
-            });
+            return Err(sparrowdb_common::Error::NodeHasEdges { node_id: node_id.0 });
         }
 
         // Buffer the tombstone — do NOT write to disk yet.
@@ -625,12 +615,7 @@ impl WriteTx {
     /// existing edges before re-seeding the ontology graph.
     ///
     /// [`commit`]: WriteTx::commit
-    pub fn delete_edge(
-        &mut self,
-        src: NodeId,
-        dst: NodeId,
-        rel_type: &str,
-    ) -> crate::Result<()> {
+    pub fn delete_edge(&mut self, src: NodeId, dst: NodeId, rel_type: &str) -> crate::Result<()> {
         let src_label_id = (src.0 >> 32) as u16;
         let dst_label_id = (dst.0 >> 32) as u16;
 

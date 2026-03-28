@@ -6,10 +6,10 @@
 
 use crate::batch::augment_rows_with_pending;
 use crate::helpers::{
-    build_label_row_counts_from_disk, collect_maintenance_params, dir_size_bytes,
-    eval_expr_merge, expr_to_value, expr_to_value_with_params,
-    fnv1a_col_id, is_edge_delete_mutation, is_reserved_label, literal_to_value,
-    load_constraints, open_csr_map, save_constraints, storage_value_to_exec, try_open_csr_map,
+    build_label_row_counts_from_disk, collect_maintenance_params, dir_size_bytes, eval_expr_merge,
+    expr_to_value, expr_to_value_with_params, fnv1a_col_id, is_edge_delete_mutation,
+    is_reserved_label, literal_to_value, load_constraints, open_csr_map, save_constraints,
+    storage_value_to_exec, try_open_csr_map,
 };
 use crate::read_tx::ReadTx;
 use crate::types::{DbInner, NodeVersions, PendingOp, VersionStore, WriteBuffer, WriteGuard};
@@ -2480,8 +2480,6 @@ fn reserved_label_error(label: &str) -> sparrowdb_common::Error {
         "invalid argument: label \"{label}\" is reserved — the __SO_ prefix is for internal use only"
     ))
 }
-
-
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

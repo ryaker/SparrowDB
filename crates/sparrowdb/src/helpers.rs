@@ -236,8 +236,7 @@ pub(crate) fn load_constraints(db_root: &Path) -> HashSet<(u32, u32)> {
     let mut set = HashSet::with_capacity(count);
     for i in 0..count {
         let off = 4 + i * 8;
-        let label_id =
-            u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let label_id = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
         let col_id =
             u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
         set.insert((label_id, col_id));
