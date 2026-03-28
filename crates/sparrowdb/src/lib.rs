@@ -418,7 +418,8 @@ impl GraphDb {
         // (crash between Step 4 WAL-fsync and Step 5 disk-write in commit).
         // This must run before we build the in-memory caches (label_row_counts,
         // csr_map) so those are constructed from the post-recovery state.
-        replay_wal_mutations(path, None)?;
+        // Returns the maximum txn_id observed so we can restore current_txn_id.
+        let max_replayed_txn_id = replay_wal_mutations(path, None)?;
         // Open the catalog after replay: replay may have called
         // get_or_create_rel_type_id which updates catalog on disk.
         let catalog = Catalog::open(path)?;
@@ -436,10 +437,19 @@ impl GraphDb {
         }
         let prop_index = sparrowdb_storage::property_index::PropertyIndex::load_from_dir(path)
             .unwrap_or_default();
+        // Restore current_txn_id to one past the highest txn_id observed in the
+        // replayed WAL so new transactions never reuse IDs from before the crash.
+        // When no WAL activity exists (max == 0), keep the initial counter at 0
+        // so snapshot semantics are unchanged for fresh databases.
+        let initial_txn_id = if max_replayed_txn_id > 0 {
+            max_replayed_txn_id + 1
+        } else {
+            0
+        };
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
-                current_txn_id: AtomicU64::new(0),
+                current_txn_id: AtomicU64::new(initial_txn_id),
                 write_locked: AtomicBool::new(false),
                 versions: RwLock::new(VersionStore::default()),
                 node_versions: RwLock::new(NodeVersions::default()),
@@ -469,7 +479,8 @@ impl GraphDb {
         let wal_dir = path.join("wal");
         let wal_writer = WalWriter::open_encrypted(&wal_dir, key)?;
         // Replay any WAL records that were fsync'd but not yet written to disk.
-        replay_wal_mutations(path, Some(key))?;
+        // Returns the maximum txn_id observed so we can restore current_txn_id.
+        let max_replayed_txn_id = replay_wal_mutations(path, Some(key))?;
         // Open the catalog after replay (may have been mutated by EdgeCreate replay).
         let catalog = Catalog::open(path)?;
         let label_row_counts = RwLock::new(build_label_row_counts_from_disk(&catalog, path));
@@ -486,10 +497,18 @@ impl GraphDb {
         }
         let prop_index = sparrowdb_storage::property_index::PropertyIndex::load_from_dir(path)
             .unwrap_or_default();
+        // Restore current_txn_id to one past the highest txn_id observed in the
+        // replayed WAL so new transactions never reuse IDs from before the crash.
+        // When no WAL activity exists (max == 0), keep the initial counter at 0.
+        let initial_txn_id = if max_replayed_txn_id > 0 {
+            max_replayed_txn_id + 1
+        } else {
+            0
+        };
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
-                current_txn_id: AtomicU64::new(0),
+                current_txn_id: AtomicU64::new(initial_txn_id),
                 write_locked: AtomicBool::new(false),
                 versions: RwLock::new(VersionStore::default()),
                 node_versions: RwLock::new(NodeVersions::default()),
@@ -3902,21 +3921,6 @@ fn exec_value_to_storage(v: &sparrowdb_execution::Value) -> Value {
     }
 }
 
-/// Encode a storage [`Value`] to a raw little-endian byte vector for WAL
-/// logging.  Unlike [`Value::to_u64`], this never panics for `Float` values —
-/// it emits the full 8 IEEE-754 bytes so the WAL payload is lossless.
-///
-/// The bytes are for observability only (schema introspection uses only the
-/// property *name*, not the value); correctness of on-disk storage is
-/// handled separately via [`NodeStore::encode_value`].
-fn value_to_wal_bytes(v: &Value) -> Vec<u8> {
-    match v {
-        Value::Float(f) => f.to_bits().to_le_bytes().to_vec(),
-        // For Int64 and Bytes the existing to_u64() encoding is fine.
-        other => other.to_u64().to_le_bytes().to_vec(),
-    }
-}
-
 /// Convert a storage-layer `Value` (Int64 / Bytes / Float) to the execution-layer
 /// `Value` (Int64 / String / Float64 / Null / …) used in `QueryResult` rows.
 fn storage_value_to_exec(val: &Value) -> sparrowdb_execution::Value {
@@ -4193,47 +4197,128 @@ fn is_reserved_label(label: &str) -> bool {
 // Return an [`Error::InvalidArgument`] for a reserved label/type.
 // ── WAL crash recovery ────────────────────────────────────────────────────────
 
+// Type tags for the explicit WAL value encoding.
+// Byte 0 of every new-format WAL value payload is one of these tags.
+const WAL_TAG_INT64: u8 = 0x01;
+const WAL_TAG_BYTES_INLINE: u8 = 0x02;
+const WAL_TAG_BYTES_OVERFLOW: u8 = 0x03;
+const WAL_TAG_FLOAT: u8 = 0x04;
+
+/// Encode a `Value` as a WAL property byte slice.
+///
+/// New format (tagged, written for all new records):
+/// - `Int64`  → `[TAG_INT64(0x01), i64_le_bytes(8)]`  — 9 bytes total
+/// - `Bytes` inline (≤ 255 bytes) → `[TAG_BYTES_INLINE(0x02), len(1), data...]`
+/// - `Bytes` overflow (> 255 bytes) → `[TAG_BYTES_OVERFLOW(0x03), len_le(4), data...]`
+/// - `Float`  → `[TAG_FLOAT(0x04), f64_bits_le(8)]`   — 9 bytes total
+fn value_to_wal_bytes(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Int64(n) => {
+            let mut buf = vec![WAL_TAG_INT64];
+            buf.extend_from_slice(&n.to_le_bytes());
+            buf
+        }
+        Value::Bytes(b) => {
+            if b.len() <= 255 {
+                let mut buf = vec![WAL_TAG_BYTES_INLINE, b.len() as u8];
+                buf.extend_from_slice(b);
+                buf
+            } else {
+                let mut buf = vec![WAL_TAG_BYTES_OVERFLOW];
+                buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                buf.extend_from_slice(b);
+                buf
+            }
+        }
+        Value::Float(f) => {
+            let mut buf = vec![WAL_TAG_FLOAT];
+            buf.extend_from_slice(&f.to_bits().to_le_bytes());
+            buf
+        }
+    }
+}
+
 /// Decode a WAL property value byte slice back to a `Value`.
 ///
-/// WAL prop bytes are produced by `value_to_wal_bytes`:
-/// - `Int64`  → `v.to_u64().to_le_bytes()` — top byte = 0x00 (TAG_INT64)
-/// - `Bytes`  → `v.to_u64().to_le_bytes()` — top byte = 0x01 (TAG_BYTES), inline ≤7 bytes
-/// - `Float`  → `f.to_bits().to_le_bytes()` — raw IEEE-754, no tag
+/// Supports two formats:
 ///
-/// For inline Int64 and Bytes this is a lossless round-trip via `Value::from_u64`.
-/// Float values are distinguished by the absence of a known tag byte: any top
-/// byte that is neither 0x00 (Int64) nor 0x01 (inline Bytes) is treated as a
-/// raw float bit pattern and decoded via `f64::from_bits`.
+/// **New tagged format** (byte 0 is a known tag):
+/// - `TAG_INT64 (0x01)`           → 8-byte little-endian i64 at bytes[1..9]
+/// - `TAG_BYTES_INLINE (0x02)`    → length byte at [1], data at [2..2+len]
+/// - `TAG_BYTES_OVERFLOW (0x03)`  → 4-byte LE length at [1..5], data at [5..]
+/// - `TAG_FLOAT (0x04)`           → 8-byte IEEE-754 bits at bytes[1..9]
 ///
-/// Known limitation: `Value::Bytes` longer than 7 characters requires a heap
-/// pointer (`TAG_BYTES_OVERFLOW = 0x02`) that cannot be recovered from WAL
-/// alone.  Such values are decoded as `Int64(heap_ptr)` which is wrong; a
-/// future enhancement should store overflow bytes inline in WAL records.
+/// **Legacy 8-byte format** (backward compat for records written before the
+/// tagged format was introduced; detected by byte 0 not being a known tag):
+/// - Top byte (raw >> 56) == 0x00 → `Int64` (sign-extended from 56 bits)
+/// - Top byte == 0x01             → `Bytes` inline (≤7 bytes, trailing-zero trimmed)
+/// - Any other top byte           → `Float` (raw IEEE-754 bits)
 fn wal_bytes_to_value(bytes: &[u8]) -> Value {
-    if bytes.len() < 8 {
+    if bytes.is_empty() {
         return Value::Int64(0);
     }
-    let raw = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
-    let tag = (raw >> 56) as u8;
-    match tag {
-        0x00 => {
-            // TAG_INT64: sign-extend from 56 bits
-            let shifted = (raw << 8) as i64;
-            Value::Int64(shifted >> 8)
+    match bytes[0] {
+        WAL_TAG_INT64 => {
+            if bytes.len() < 9 {
+                return Value::Int64(0);
+            }
+            let n = i64::from_le_bytes(bytes[1..9].try_into().unwrap_or([0u8; 8]));
+            Value::Int64(n)
         }
-        0x01 => {
-            // TAG_BYTES inline: bytes[0..7] hold data, strip trailing zeros
-            let arr = raw.to_le_bytes();
-            let data: Vec<u8> = arr[..7].iter().copied().take_while(|&b| b != 0).collect();
-            Value::Bytes(data)
+        WAL_TAG_BYTES_INLINE => {
+            if bytes.len() < 2 {
+                return Value::Bytes(vec![]);
+            }
+            let len = bytes[1] as usize;
+            let end = 2 + len;
+            if bytes.len() < end {
+                return Value::Bytes(bytes[2..].to_vec());
+            }
+            Value::Bytes(bytes[2..end].to_vec())
+        }
+        WAL_TAG_BYTES_OVERFLOW => {
+            if bytes.len() < 5 {
+                return Value::Bytes(vec![]);
+            }
+            let len = u32::from_le_bytes(bytes[1..5].try_into().unwrap_or([0u8; 4])) as usize;
+            let end = 5 + len;
+            if bytes.len() < end {
+                return Value::Bytes(bytes[5..].to_vec());
+            }
+            Value::Bytes(bytes[5..end].to_vec())
+        }
+        WAL_TAG_FLOAT => {
+            if bytes.len() < 9 {
+                return Value::Float(0.0);
+            }
+            let bits = u64::from_le_bytes(bytes[1..9].try_into().unwrap_or([0u8; 8]));
+            Value::Float(f64::from_bits(bits))
         }
         _ => {
-            // Float (or overflow pointer) — treat as raw f64 bits.
-            // TAG_FLOAT (0x03) heap pointers would produce a wrong value, but
-            // TAG_BYTES_OVERFLOW (0x02) heap pointers and actual floats both
-            // land here.  Floats with top byte ≠ 0x00/0x01 are correctly
-            // recovered; overflow heap pointers cannot be recovered from WAL.
-            Value::Float(f64::from_bits(raw))
+            // Legacy 8-byte format: no explicit tag.  Detect by examining the
+            // top byte of the 8-byte little-endian word.
+            if bytes.len() < 8 {
+                return Value::Int64(0);
+            }
+            let raw = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+            let top = (raw >> 56) as u8;
+            match top {
+                0x00 => {
+                    // Legacy TAG_INT64: sign-extend from 56 bits.
+                    let shifted = (raw << 8) as i64;
+                    Value::Int64(shifted >> 8)
+                }
+                0x01 => {
+                    // Legacy TAG_BYTES inline (≤7 bytes, trailing-zero trimmed).
+                    let arr = raw.to_le_bytes();
+                    let data: Vec<u8> = arr[..7].iter().copied().take_while(|&b| b != 0).collect();
+                    Value::Bytes(data)
+                }
+                _ => {
+                    // Legacy float — raw IEEE-754 bits.
+                    Value::Float(f64::from_bits(raw))
+                }
+            }
         }
     }
 }
@@ -4244,19 +4329,23 @@ fn wal_bytes_to_value(bytes: &[u8]) -> Value {
 /// Scans committed structural WAL records and applies those whose effects are
 /// not yet visible in the on-disk data files.
 ///
+/// Returns the maximum `txn_id` observed across all committed mutations so
+/// that the caller can restore `current_txn_id` to `max_txn_id + 1` and
+/// avoid reusing transaction IDs from before the crash.
+///
 /// ## Idempotency
 ///
 /// * `NodeCreate`: skip if `disk_hwm_for_label(label_id) > slot`.
-/// * `NodeUpdate`: skip if the column file already contains a non-zero value
-///   at the target slot.
+/// * `NodeUpdate`: skip if slot is at or beyond the persisted HWM (not yet
+///   on disk — covered by NodeCreate replay).
 /// * `EdgeCreate`: skip if the on-disk delta log already has `>= edge_id + 1`
 ///   entries for the relation table.
 /// * `NodeDelete` / `EdgeDelete`: applied unconditionally (tombstoning is
 ///   idempotent; a missing entry is treated as already deleted).
-fn replay_wal_mutations(db_path: &Path, encryption_key: Option<[u8; 32]>) -> Result<()> {
+fn replay_wal_mutations(db_path: &Path, encryption_key: Option<[u8; 32]>) -> Result<u64> {
     let wal_dir = db_path.join("wal");
     if !wal_dir.exists() {
-        return Ok(());
+        return Ok(0);
     }
 
     let mutations = match encryption_key {
@@ -4265,8 +4354,12 @@ fn replay_wal_mutations(db_path: &Path, encryption_key: Option<[u8; 32]>) -> Res
     };
 
     if mutations.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+
+    // Compute the maximum txn_id seen across all committed mutations so the
+    // caller can set current_txn_id = max_txn_id + 1 after open.
+    let max_txn_id = mutations.iter().map(|m| m.txn_id).max().unwrap_or(0);
 
     let mut node_store = NodeStore::open(db_path)?;
     let mut catalog = Catalog::open(db_path)?;
@@ -4286,10 +4379,17 @@ fn replay_wal_mutations(db_path: &Path, encryption_key: Option<[u8; 32]>) -> Res
                     continue; // already on disk
                 }
                 // Decode properties from WAL bytes and apply.
+                // Property names may be "col_{id}" placeholders emitted by the
+                // low-level write path in write_mutation_wal.  Detect the prefix
+                // and parse the numeric col_id directly instead of hashing the
+                // placeholder string (which would yield the wrong column).
                 let decoded_props: Vec<(u32, Value)> = props
                     .iter()
                     .map(|(name, val_bytes)| {
-                        let col_id = col_id_of(name);
+                        let col_id = name
+                            .strip_prefix("col_")
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .unwrap_or_else(|| col_id_of(name));
                         let value = wal_bytes_to_value(val_bytes);
                         (col_id, value)
                     })
@@ -4306,11 +4406,13 @@ fn replay_wal_mutations(db_path: &Path, encryption_key: Option<[u8; 32]>) -> Res
             } => {
                 let label_id = (*node_id >> 32) as u32;
                 let slot = (*node_id & 0xFFFF_FFFF) as u32;
-                // Skip if the node slot is not yet on disk (would have been
-                // replayed by the NodeCreate path above).
-                let disk_hwm = node_store.disk_hwm_for_label(label_id).unwrap_or(0);
-                if disk_hwm <= slot as u64 {
-                    continue; // node itself not on disk
+                // Gate replay on the persisted HWM: only apply updates for
+                // slots that are already on disk (slot < hwm).  Slots at or
+                // beyond the HWM have not been persisted yet — they will be
+                // covered by the NodeCreate replay path above.
+                let hwm = node_store.hwm_for_label(label_id).unwrap_or(0);
+                if slot as u64 >= hwm {
+                    continue; // node not yet persisted; NodeCreate path handles it
                 }
                 let value = wal_bytes_to_value(after);
                 let node_id_typed = sparrowdb_common::NodeId(*node_id);
@@ -4387,7 +4489,7 @@ fn replay_wal_mutations(db_path: &Path, encryption_key: Option<[u8; 32]>) -> Res
         }
     }
 
-    Ok(())
+    Ok(max_txn_id)
 }
 
 fn reserved_label_error(label: &str) -> sparrowdb_common::Error {
