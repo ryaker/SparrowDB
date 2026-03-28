@@ -2550,10 +2550,20 @@ impl GraphDb {
 
             if let Ok(store) = sparrowdb_storage::edge_store::EdgeStore::open(path, storage_rel_id)
             {
+                // Deduplicate within this rel_type: delta log edges may also
+                // appear in CSR after checkpoint.  Keying on (src, dst) is
+                // sufficient because rel_type is constant for this iteration.
+                let mut seen: std::collections::HashSet<(i64, i64)> =
+                    std::collections::HashSet::new();
+
                 // Delta log: stores full NodeId pairs directly.
                 if let Ok(records) = store.read_delta() {
                     for rec in records {
-                        edge_triples.push((rec.src.0 as i64, rel_type.clone(), rec.dst.0 as i64));
+                        let src = rec.src.0 as i64;
+                        let dst = rec.dst.0 as i64;
+                        if seen.insert((src, dst)) {
+                            edge_triples.push((src, rel_type.clone(), dst));
+                        }
                     }
                 }
 
@@ -2564,7 +2574,9 @@ impl GraphDb {
                         let src_id = ((*src_label_id as u64) << 32 | src_slot) as i64;
                         for &dst_slot in csr.neighbors(src_slot) {
                             let dst_id = ((*dst_label_id as u64) << 32 | dst_slot) as i64;
-                            edge_triples.push((src_id, rel_type.clone(), dst_id));
+                            if seen.insert((src_id, dst_id)) {
+                                edge_triples.push((src_id, rel_type.clone(), dst_id));
+                            }
                         }
                     }
                 }
