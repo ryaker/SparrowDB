@@ -257,8 +257,31 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
             let set_prop = args["set_prop"].as_str().ok_or("Missing set_prop")?;
             let set_val = &args["set_val"];
 
-            let set_query =
-                build_add_property_query(label, match_prop, match_val, set_prop, set_val)?;
+            validate_cypher_identifier(label, "add_property: label")?;
+            validate_cypher_identifier(match_prop, "add_property: match_prop")?;
+            validate_cypher_identifier(set_prop, "add_property: set_prop")?;
+            let cypher_set_val = json_scalar_to_cypher(set_val).ok_or_else(|| match set_val {
+                Value::Null => {
+                    "add_property: set_val is null; use a concrete scalar value".to_string()
+                }
+                Value::Array(_) => {
+                    "add_property: set_val is an array; only scalar values are supported"
+                        .to_string()
+                }
+                Value::Object(_) => {
+                    "add_property: set_val is a nested object; only scalar values are supported"
+                        .to_string()
+                }
+                _ => "add_property: unsupported set_val type".to_string(),
+            })?;
+            let set_query = format!(
+                "MATCH (n:{label} {{{match_prop}: '{match_val_escaped}'}}) SET n.{set_prop} = {cypher_set_val}",
+                label = label,
+                match_prop = match_prop,
+                match_val_escaped = escape_cypher_string(match_val),
+                set_prop = set_prop,
+                cypher_set_val = cypher_set_val,
+            );
 
             let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path)).map_err(|e| {
                 format!(
@@ -267,7 +290,12 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 )
             })?;
 
-            let count_query = build_count_query(label, match_prop, match_val);
+            let count_query = format!(
+                "MATCH (n:{label} {{{match_prop}: '{match_val_escaped}'}}) RETURN count(n) AS cnt",
+                label = label,
+                match_prop = match_prop,
+                match_val_escaped = escape_cypher_string(match_val),
+            );
             let count_result = db.execute(&count_query).map_err(|e| {
                 format!(
                     "add_property: count query failed for label '{}': {}",
@@ -324,7 +352,26 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
             let class_name = args["class_name"].as_str().ok_or("Missing class_name")?;
             let props = &args["properties"];
 
-            let query = build_create_query(class_name, props)?;
+            validate_cypher_identifier(class_name, "create_entity: class_name")?;
+            let mut prop_parts: Vec<String> = Vec::new();
+            if let Some(obj) = props.as_object() {
+                for (key, val) in obj {
+                    validate_cypher_identifier(key, "create_entity: property key")?;
+                    let cypher_val = json_scalar_to_cypher(val).ok_or_else(|| match val {
+                        Value::Null => format!("create_entity: property '{}' is null; use a concrete value", key),
+                        Value::Array(_) => format!("create_entity: property '{}' is an array; only scalar values are supported", key),
+                        Value::Object(_) => format!("create_entity: property '{}' is a nested object; only scalar values are supported", key),
+                        _ => format!("create_entity: unsupported value for property '{}'", key),
+                    })?;
+                    prop_parts.push(format!("{}: {}", key, cypher_val));
+                }
+            }
+            let props_clause = if prop_parts.is_empty() {
+                String::new()
+            } else {
+                format!(" {{{}}}", prop_parts.join(", "))
+            };
+            let query = format!("CREATE (n:{}{})", class_name, props_clause);
 
             let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path)).map_err(|e| {
                 format!(
@@ -499,78 +546,6 @@ fn json_scalar_to_cypher(v: &Value) -> Option<String> {
     }
 }
 
-/// Build a Cypher CREATE query from a class name and a JSON properties object.
-fn build_create_query(class_name: &str, props: &Value) -> Result<String, String> {
-    validate_cypher_identifier(class_name, "create_entity: class_name")?;
-
-    let mut prop_parts: Vec<String> = Vec::new();
-
-    if let Some(obj) = props.as_object() {
-        for (key, val) in obj {
-            validate_cypher_identifier(key, "create_entity: property key")?;
-            let cypher_val = json_scalar_to_cypher(val).ok_or_else(|| match val {
-                Value::Null => format!("create_entity: property '{}' is null; use a concrete value", key),
-                Value::Array(_) => format!("create_entity: property '{}' is an array; only scalar values are supported", key),
-                Value::Object(_) => format!("create_entity: property '{}' is a nested object; only scalar values are supported", key),
-                _ => format!("create_entity: unsupported value for property '{}'", key),
-            })?;
-            prop_parts.push(format!("{}: {}", key, cypher_val));
-        }
-    }
-
-    let props_clause = if prop_parts.is_empty() {
-        String::new()
-    } else {
-        format!(" {{{}}}", prop_parts.join(", "))
-    };
-
-    Ok(format!("CREATE (n:{}{})", class_name, props_clause))
-}
-
-/// Build a Cypher MATCH … SET query for the add_property tool.
-fn build_add_property_query(
-    label: &str,
-    match_prop: &str,
-    match_val: &str,
-    set_prop: &str,
-    set_val: &Value,
-) -> Result<String, String> {
-    validate_cypher_identifier(label, "add_property: label")?;
-    validate_cypher_identifier(match_prop, "add_property: match_prop")?;
-    validate_cypher_identifier(set_prop, "add_property: set_prop")?;
-
-    let cypher_set_val = json_scalar_to_cypher(set_val).ok_or_else(|| match set_val {
-        Value::Null => "add_property: set_val is null; use a concrete scalar value".to_string(),
-        Value::Array(_) => {
-            "add_property: set_val is an array; only scalar values are supported".to_string()
-        }
-        Value::Object(_) => {
-            "add_property: set_val is a nested object; only scalar values are supported".to_string()
-        }
-        _ => "add_property: unsupported set_val type".to_string(),
-    })?;
-
-    Ok(format!(
-        "MATCH (n:{label} {{{match_prop}: '{match_val_escaped}'}}) SET n.{set_prop} = {cypher_set_val}",
-        label = label,
-        match_prop = match_prop,
-        match_val_escaped = escape_cypher_string(match_val),
-        set_prop = set_prop,
-        cypher_set_val = cypher_set_val,
-    ))
-}
-
-/// Build a Cypher MATCH count query to check how many nodes match.
-/// Callers must have already validated `label` and `match_prop` as safe identifiers.
-fn build_count_query(label: &str, match_prop: &str, match_val: &str) -> String {
-    format!(
-        "MATCH (n:{label} {{{match_prop}: '{match_val_escaped}'}}) RETURN count(n) AS cnt",
-        label = label,
-        match_prop = match_prop,
-        match_val_escaped = escape_cypher_string(match_val),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,15 +577,6 @@ mod tests {
         let result = handle_tool_call(None);
         assert!(result["isError"].as_bool().unwrap_or(false));
         assert!(result["content"].is_array());
-    }
-
-    #[test]
-    fn test_build_create_query_basic() {
-        let props = serde_json::json!({"name": "Alice", "age": 30});
-        let q = build_create_query("Person", &props).unwrap();
-        assert!(q.starts_with("CREATE (n:Person {"));
-        assert!(q.contains("name: 'Alice'"));
-        assert!(q.contains("age: 30"));
     }
 
     #[test]
