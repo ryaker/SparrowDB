@@ -115,17 +115,17 @@ impl PipelineOperator for ScanByLabel {
 /// When one input chunk expands to more than `CHUNK_CAPACITY` pairs, the output
 /// is buffered and split across successive `next_chunk()` calls.
 ///
-/// # Delta Index Key Convention (Phase 1)
+/// # Delta Index Key Convention
 ///
-/// The delta index is keyed by `(src_label_id, src_slot)`. In Phase 1 we build
-/// the delta index from the per-rel-table delta records; because all records in
-/// a single-rel-table delta log share the same `src_label_id`, we use
-/// `src_label_id = 0` as a placeholder key for the lookup — see `build_delta_index`.
-/// Phase 2 will supply the real `src_label_id` extracted from the NodeId encoding.
+/// The delta index is keyed by `(src_label_id, src_slot)` matching the encoding
+/// produced by `build_delta_index`. `GetNeighbors` is constructed with the
+/// `src_label_id` of the scanned label so lookups use the correct key.
 pub struct GetNeighbors<C: PipelineOperator> {
     child: C,
     csr: CsrForward,
     delta_index: DeltaIndex,
+    /// Label ID of the source nodes — used as the high key in delta-index lookups.
+    src_label_id: u32,
     avg_degree_hint: usize,
     /// Buffered (src_slot, dst_slot) pairs waiting to be chunked and returned.
     buf_src: Vec<u64>,
@@ -140,11 +140,13 @@ impl<C: PipelineOperator> GetNeighbors<C> {
     /// - `child` — upstream operator yielding src-slot chunks.
     /// - `csr` — forward CSR file for the relationship type.
     /// - `delta_records` — per-rel-table delta log (built into a hash index once).
+    /// - `src_label_id` — label ID of the source nodes (high bits of NodeId).
     /// - `avg_degree_hint` — estimated average out-degree for buffer pre-allocation.
     pub fn new(
         child: C,
         csr: CsrForward,
         delta_records: &[DeltaRecord],
+        src_label_id: u32,
         avg_degree_hint: usize,
     ) -> Self {
         let delta_index = build_delta_index(delta_records);
@@ -152,6 +154,7 @@ impl<C: PipelineOperator> GetNeighbors<C> {
             child,
             csr,
             delta_index,
+            src_label_id,
             avg_degree_hint: avg_degree_hint.max(1),
             buf_src: Vec::new(),
             buf_dst: Vec::new(),
@@ -209,9 +212,8 @@ impl<C: PipelineOperator> GetNeighbors<C> {
                     self.buf_dst.push(dst_slot);
                 }
 
-                // Delta neighbors — O(1) hash lookup.
-                // Phase 1: key uses src_label_id = 0 (single-rel-table convention).
-                if let Some(delta_recs) = self.delta_index.get(&(0u32, src_slot)) {
+                // Delta neighbors — O(1) hash lookup keyed by (src_label_id, src_slot).
+                if let Some(delta_recs) = self.delta_index.get(&(self.src_label_id, src_slot)) {
                     for r in delta_recs {
                         let dst_slot = node_id_parts(r.dst.0).1;
                         self.buf_src.push(src_slot);
@@ -383,7 +385,7 @@ mod tests {
         // Build a CsrForward with no edges (n_nodes=5, no edges).
         let csr = CsrForward::build(5, &[]);
         let scan = ScanByLabel::new(5);
-        let mut gn = GetNeighbors::new(scan, csr, &[], 1);
+        let mut gn = GetNeighbors::new(scan, csr, &[], 0, 1);
         assert!(gn.next_chunk().unwrap().is_none());
     }
 
@@ -395,7 +397,7 @@ mod tests {
 
         // Scan all 4 slots (nodes 0, 1, 2, 3).
         let scan = ScanByLabel::new(4);
-        let mut gn = GetNeighbors::new(scan, csr, &[], 2);
+        let mut gn = GetNeighbors::new(scan, csr, &[], 0, 2);
 
         let chunk = gn.next_chunk().unwrap().expect("chunk");
         // Expected pairs: (0,1), (0,2), (1,3) = 3 pairs.
@@ -417,7 +419,7 @@ mod tests {
         let csr = CsrForward::build(n + 1, &edges);
 
         let scan = ScanByLabel::from_slots(vec![0u64]);
-        let mut gn = GetNeighbors::new(scan, csr, &[], 10);
+        let mut gn = GetNeighbors::new(scan, csr, &[], 0, 10);
 
         let c1 = gn.next_chunk().unwrap().expect("first output chunk");
         assert_eq!(c1.live_len(), CHUNK_CAPACITY);

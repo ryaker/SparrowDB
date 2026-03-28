@@ -374,7 +374,7 @@ mod tests {
         // Filter: keep only even rows (indices 0, 2, 4, 6, 8).
         // Pre-compute keep vec to avoid simultaneous &chunk / &mut chunk borrow.
         let keep: Vec<bool> = (0..chunk.len())
-            .map(|i| chunk.column(0).data[i] % 2 == 0)
+            .map(|i| chunk.column(0).data[i].is_multiple_of(2))
             .collect();
         chunk.filter_sel(|i| keep[i]);
 

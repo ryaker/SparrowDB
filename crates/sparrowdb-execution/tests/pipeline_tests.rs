@@ -86,7 +86,7 @@ fn data_chunk_filter_reduces_sel_vector() {
 
     // Pre-compute the keep mask to avoid simultaneous &chunk / &mut chunk borrows.
     let keep: Vec<bool> = (0..chunk.len())
-        .map(|i| chunk.column(0).data[i] % 2 == 0)
+        .map(|i| chunk.column(0).data[i].is_multiple_of(2))
         .collect();
     chunk.filter_sel(|i| keep[i]);
 
@@ -103,7 +103,7 @@ fn data_chunk_successive_filters_narrow_sel() {
 
     // First filter: keep even rows. Pre-compute mask.
     let keep1: Vec<bool> = (0..chunk.len())
-        .map(|i| chunk.column(0).data[i] % 2 == 0)
+        .map(|i| chunk.column(0).data[i].is_multiple_of(2))
         .collect();
     chunk.filter_sel(|i| keep1[i]);
     assert_eq!(chunk.live_len(), 10);
@@ -221,7 +221,7 @@ fn get_neighbors_chunked_matches_hop_results() {
 
     // Use GetNeighbors pipeline: scan all 4 slots, expand neighbors.
     let scan = ScanByLabel::from_slots(vec![0u64, 1, 2, 3]);
-    let mut gn = GetNeighbors::new(scan, csr, &[], 2);
+    let mut gn = GetNeighbors::new(scan, csr, &[], 0, 2);
 
     // Collect all (src, dst) pairs.
     let mut pairs: Vec<(u64, u64)> = Vec::new();
@@ -246,7 +246,7 @@ fn get_neighbors_large_expansion_is_complete() {
     let csr = CsrForward::build(n + 1, &edges);
 
     let scan = ScanByLabel::from_slots(vec![0u64]);
-    let mut gn = GetNeighbors::new(scan, csr, &[], 10);
+    let mut gn = GetNeighbors::new(scan, csr, &[], 0, 10);
 
     let mut total_pairs: usize = 0;
     while let Some(chunk) = gn.next_chunk().unwrap() {
