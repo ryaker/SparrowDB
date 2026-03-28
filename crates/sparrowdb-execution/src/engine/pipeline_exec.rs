@@ -704,17 +704,19 @@ impl Engine {
                 }
             }
         }
-        // WHERE must consist only of id(var)=$param conjuncts — no subqueries,
-        // CONTAINS, or other expressions unsupported by the mutual-neighbors fast-path.
-        // We validate this by requiring exactly 2 bound id() param filters and
-        // checking that the WHERE expression contains ONLY id()=$param expressions
-        // (no other predicates that would need the full evaluator).
+        // WHERE must contain ONLY id(a)=$x AND id(b)=$y — nothing else.
+        // Use a strict purity check so that OR-connected expressions or any
+        // other predicate shapes (property access, CONTAINS, etc.) do not
+        // accidentally pass the fast-path guard.
         let a_var = pat.nodes[0].var.as_str();
         let b_var = pat.nodes[2].var.as_str();
-        let a_bound = where_has_id_param_filter(m.where_clause.as_ref(), a_var);
-        let b_bound = where_has_id_param_filter(m.where_clause.as_ref(), b_var);
-        if !a_bound || !b_bound {
-            return false;
+        match m.where_clause.as_ref() {
+            None => return false,
+            Some(wexpr) => {
+                if !where_is_only_id_param_conjuncts(wexpr, a_var, b_var) {
+                    return false;
+                }
+            }
         }
         // Rel table must exist.
         let label = pat.nodes[0].labels[0].clone();
@@ -802,6 +804,16 @@ impl Engine {
                 });
             }
         };
+
+        // Cypher requires distinct node bindings; a node cannot be its own mutual
+        // neighbor.  When both id() params resolve to the same slot the intersection
+        // would include `a` itself, which is semantically wrong — return empty.
+        if a_slot == b_slot {
+            return Ok(QueryResult {
+                columns: column_names.to_vec(),
+                rows: vec![],
+            });
+        }
 
         tracing::debug!(
             engine = "chunked",
@@ -1989,39 +2001,6 @@ impl<C: PipelineOperator> PipelineOperator for DstSlotProjector<C> {
 
 // ── MutualNeighbors helpers ───────────────────────────────────────────────────
 
-/// Return `true` when the WHERE clause contains `id(var) = $param` for `var_name`.
-///
-/// This is used by `can_use_mutual_neighbors_chunked` to verify that both
-/// endpoint nodes have bound parameter id() filters.
-fn where_has_id_param_filter(where_clause: Option<&Expr>, var_name: &str) -> bool {
-    let wexpr = match where_clause {
-        Some(e) => e,
-        None => return false,
-    };
-    expr_has_id_param_eq(wexpr, var_name)
-}
-
-/// Recursively search `expr` for `id(var_name) = $param` or `$param = id(var_name)`.
-fn expr_has_id_param_eq(expr: &Expr, var_name: &str) -> bool {
-    match expr {
-        Expr::BinOp { left, op, right } => {
-            if *op == BinOpKind::Eq {
-                // id(var) = $param
-                if is_id_call(left, var_name) && is_param_literal(right) {
-                    return true;
-                }
-                // $param = id(var)
-                if is_param_literal(left) && is_id_call(right, var_name) {
-                    return true;
-                }
-            }
-            expr_has_id_param_eq(left, var_name) || expr_has_id_param_eq(right, var_name)
-        }
-        Expr::And(a, b) => expr_has_id_param_eq(a, var_name) || expr_has_id_param_eq(b, var_name),
-        _ => false,
-    }
-}
-
 /// Return `true` if `expr` is `id(var_name)`.
 fn is_id_call(expr: &Expr, var_name: &str) -> bool {
     match expr {
@@ -2037,6 +2016,31 @@ fn is_id_call(expr: &Expr, var_name: &str) -> bool {
 /// Return `true` if `expr` is a `$param` literal.
 fn is_param_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(Literal::Param(_)))
+}
+
+/// Return `true` ONLY if `expr` is a pure conjunction of `id(var)=$param`
+/// equalities for the two given variable names.
+///
+/// Any OR, property access, function call other than `id()`, or other expression
+/// shape returns `false` — this is the strict purity check that prevents
+/// `WHERE id(a)=$aid OR id(b)=$bid` from incorrectly passing the fast-path guard.
+fn where_is_only_id_param_conjuncts(expr: &Expr, a_var: &str, b_var: &str) -> bool {
+    match expr {
+        Expr::And(left, right) => {
+            where_is_only_id_param_conjuncts(left, a_var, b_var)
+                && where_is_only_id_param_conjuncts(right, a_var, b_var)
+        }
+        Expr::BinOp {
+            left,
+            op: BinOpKind::Eq,
+            right,
+        } => {
+            // Must be id(a_var)=$param, id(b_var)=$param, or either commuted.
+            (is_id_call(left, a_var) || is_id_call(left, b_var)) && is_param_literal(right)
+                || is_param_literal(left) && (is_id_call(right, a_var) || is_id_call(right, b_var))
+        }
+        _ => false,
+    }
 }
 
 /// Extract the slot number for `var_name` from `id(var_name) = $param` in WHERE.

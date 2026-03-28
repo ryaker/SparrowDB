@@ -17,6 +17,7 @@
 //! - `try_plan_mutual_neighbors_selected`    — MutualNeighbors selected for fork pattern
 //! - `try_plan_none_for_complex`             — None returned for unsupported shapes
 //! - `chunked_plan_selector_fallback`        — unsupported query falls back cleanly
+//! - `mutual_neighbors_self_intersection_returns_empty` — same node on both sides returns empty
 //! - `existing_tests_still_pass`             — phase 1-3 scan/one-hop/two-hop still work
 
 use sparrowdb::open;
@@ -523,7 +524,35 @@ fn chunked_plan_selector_fallback() {
     assert_eq!(rows.len(), 2, "both persons must appear");
 }
 
-// ── 12. Phase 1-3 plans still produce correct results after Phase 4 refactor ──
+// ── 12. Self-intersection guard — a and b resolve to the same node ────────────
+//
+// When id(a) and id(b) both refer to the same node the chunked fast-path must
+// return an empty result set.  A node cannot be its own mutual neighbor and
+// Cypher requires distinct node bindings.
+
+#[test]
+fn mutual_neighbors_self_intersection_returns_empty() {
+    let (dir, db) = make_db();
+
+    db.execute("CREATE (:Person {name: 'Alice'})").unwrap();
+    db.execute("CREATE (:Person {name: 'Bob'})").unwrap();
+
+    db.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    )
+    .unwrap();
+
+    let alice_id = node_id_for(dir.path(), "Alice");
+
+    // Query with id(a) = id(b) = alice — same node on both sides.
+    let rows = chunked_mutual_neighbors(dir.path(), alice_id, alice_id, "", None);
+    assert!(
+        rows.is_empty(),
+        "self-intersection must return empty; got {rows:?}"
+    );
+}
+
+// ── 13. Phase 1-3 plans still produce correct results after Phase 4 refactor ──
 
 #[test]
 fn existing_tests_still_pass_after_selector_refactor() {
