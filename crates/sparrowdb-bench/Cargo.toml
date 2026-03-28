@@ -39,3 +39,11 @@ harness = false
 [[bench]]
 name = "mlm_benchmark"
 harness = false
+
+[[bench]]
+name = "reactome_bench"
+harness = false
+
+[[bench]]
+name = "pole_bench"
+harness = false
