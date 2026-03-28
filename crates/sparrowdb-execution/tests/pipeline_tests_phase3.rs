@@ -4,7 +4,7 @@
 //! - T1: `FrontierScratch::new` — initial state is empty.
 //! - T2: `FrontierScratch::advance` — swaps current ↔ next and clears next.
 //! - T3: `FrontierScratch::advance` multiple times — reuse without re-alloc.
-//! - T4: `FrontierScratch::bytes_allocated` — reflects capacity of both buffers.
+//! - T4: `FrontierScratch::bytes_allocated` — reflects live data (len) of both buffers.
 //! - T5: `FrontierScratch::clear` — resets both buffers to empty.
 
 use sparrowdb_execution::FrontierScratch;
@@ -18,8 +18,9 @@ fn frontier_scratch_initial_state() {
         fs.current().is_empty(),
         "current must be empty on construction"
     );
-    // With capacity=64 for both buffers: 64*8 + 64*8 = 1024 bytes.
-    assert_eq!(fs.bytes_allocated(), 64 * 8 + 64 * 8);
+    // bytes_allocated is based on len(), not capacity(), so an empty frontier
+    // reports 0 bytes even though backing storage was pre-allocated.
+    assert_eq!(fs.bytes_allocated(), 0, "empty frontier must report 0 bytes");
 }
 
 // ── T2: FrontierScratch::advance swaps and clears ─────────────────────────────
@@ -65,17 +66,24 @@ fn frontier_scratch_multiple_advances() {
     assert!(fs.current().is_empty());
 }
 
-// ── T4: bytes_allocated reflects capacity ─────────────────────────────────────
+// ── T4: bytes_allocated reflects live data (len) ──────────────────────────────
 
 #[test]
 fn frontier_scratch_bytes_allocated() {
     let mut fs = FrontierScratch::new(0);
-    assert_eq!(fs.bytes_allocated(), 0);
+    assert_eq!(fs.bytes_allocated(), 0, "empty frontier must report 0 bytes");
 
-    // After pushing (may cause realloc, but capacity ≥ len).
+    // After pushing 1 element: len=1, bytes = 1 * size_of::<u64>() = 8.
     fs.current_mut().push(1u64);
-    // bytes_allocated = capacity_current * 8 + capacity_next * 8; must be ≥ 8.
-    assert!(fs.bytes_allocated() >= 8);
+    assert_eq!(
+        fs.bytes_allocated(),
+        8,
+        "one element in current = 8 bytes of live data"
+    );
+
+    // Add one element to next as well: total live = 2 * 8 = 16 bytes.
+    fs.next_mut().push(2u64);
+    assert_eq!(fs.bytes_allocated(), 16);
 }
 
 // ── T5: FrontierScratch::clear resets both buffers ────────────────────────────

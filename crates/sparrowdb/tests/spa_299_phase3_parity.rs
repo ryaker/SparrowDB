@@ -548,12 +548,21 @@ fn two_hop_no_path_returns_empty() {
 // ── 10. Memory-limit enforcement ─────────────────────────────────────────────
 //
 // When the memory limit is breached, `QueryMemoryExceeded` is returned.
-// The row engine is not bounded and should succeed.
+// The test verifies the *mechanism*: after hop-1 expands at least one mid-slot
+// into FrontierScratch.current (len >= 1, so bytes_allocated() >= 8 bytes),
+// the 1-byte limit is exceeded and the error is returned.
+//
+// `bytes_allocated()` is intentionally based on `len()` not `capacity()`, so
+// the limit only fires once real data is loaded — not on empty pre-allocated
+// capacity.
 
 #[test]
 fn two_hop_memory_limit_enforced() {
     let (dir, db) = make_db();
 
+    // Graph: Alice -[:KNOWS]-> Bob -[:KNOWS]-> Carol
+    // Hop-1 produces 1 mid-slot (Bob) into FrontierScratch.current.
+    // bytes_allocated() = 1 * 8 = 8 bytes, which exceeds the 1-byte limit.
     db.execute("CREATE (:Person {name: 'Alice'})").unwrap();
     db.execute("CREATE (:Person {name: 'Bob'})").unwrap();
     db.execute("CREATE (:Person {name: 'Carol'})").unwrap();
@@ -572,7 +581,8 @@ fn two_hop_memory_limit_enforced() {
     let cat = Catalog::open(dir.path()).unwrap();
     let csrs = open_csr_map(dir.path());
 
-    // 1-byte limit will be exceeded by any 2-hop expansion.
+    // 1-byte limit is exceeded once the first mid-slot is placed into the
+    // frontier (8 bytes of actual data > 1 byte limit).
     let mut tight_engine = EngineBuilder::new(store, cat, csrs, dir.path())
         .with_chunked_pipeline(true)
         .with_memory_limit(1)
@@ -583,7 +593,8 @@ fn two_hop_memory_limit_enforced() {
 
     match result {
         Err(sparrowdb_common::Error::QueryMemoryExceeded) => {
-            // Correct — memory limit enforced.
+            // Correct — memory limit fired after actual data was loaded into the
+            // frontier, not on pre-allocated capacity.
         }
         Err(e) => panic!("expected QueryMemoryExceeded, got {e}"),
         Ok(qr) => panic!("expected Err, got {} rows", qr.rows.len()),

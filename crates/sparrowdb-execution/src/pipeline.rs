@@ -680,11 +680,12 @@ impl FrontierScratch {
         self.next.clear();
     }
 
-    /// Total byte footprint of both buffers (for memory-limit checks).
+    /// Byte footprint of live data in both buffers (for memory-limit checks).
     ///
-    /// Returns `current.capacity() * 8 + next.capacity() * 8`.
+    /// Uses `len()` rather than `capacity()` so that pre-allocated but unused
+    /// capacity does not trigger the memory limit before any edges are traversed.
     pub fn bytes_allocated(&self) -> usize {
-        (self.current.capacity() + self.next.capacity()) * std::mem::size_of::<u64>()
+        (self.current.len() + self.next.len()) * std::mem::size_of::<u64>()
     }
 }
 

@@ -624,11 +624,13 @@ impl Engine {
         let src_label = pat.nodes[0].labels.first().cloned().unwrap_or_default();
         let mid_label = pat.nodes[1].labels.first().cloned().unwrap_or_default();
         let dst_label = pat.nodes[2].labels.first().cloned().unwrap_or_default();
-        let rel_type1 = pat.rels[0].rel_type.clone();
-        let rel_type2 = pat.rels[1].rel_type.clone();
+        let rel_type1 = &pat.rels[0].rel_type;
+        let rel_type2 = &pat.rels[1].rel_type;
 
-        // Both rel types must be the same (or both unspecified).
-        if !rel_type1.is_empty() && !rel_type2.is_empty() && rel_type1 != rel_type2 {
+        // Both rel types must be identical (including both-empty).
+        // Allowing one empty + one non-empty would silently ignore the typed hop
+        // in execute_two_hop_chunked which only uses rels[0].rel_type.
+        if rel_type1 != rel_type2 {
             return false;
         }
 
@@ -636,24 +638,34 @@ impl Engine {
         let catalog = &self.snapshot.catalog;
         let tables = catalog.list_rel_tables_with_ids();
 
-        let hop1_id = tables.iter().find(|(_, sid, did, rt)| {
-            let type_ok = rel_type1.is_empty() || rt == &rel_type1;
-            let src_ok = catalog
-                .get_label(&src_label)
-                .ok()
-                .flatten()
-                .map(|id| id as u32 == *sid as u32)
-                .unwrap_or(false);
-            let mid_ok = catalog
-                .get_label(&mid_label)
-                .ok()
-                .flatten()
-                .map(|id| id as u32 == *did as u32)
-                .unwrap_or(false);
-            type_ok && src_ok && mid_ok
-        });
+        let hop1_matches: Vec<_> = tables
+            .iter()
+            .filter(|(_, sid, did, rt)| {
+                let type_ok = rel_type1.is_empty() || rt == rel_type1;
+                let src_ok = catalog
+                    .get_label(&src_label)
+                    .ok()
+                    .flatten()
+                    .map(|id| id as u32 == *sid as u32)
+                    .unwrap_or(false);
+                let mid_ok = catalog
+                    .get_label(&mid_label)
+                    .ok()
+                    .flatten()
+                    .map(|id| id as u32 == *did as u32)
+                    .unwrap_or(false);
+                type_ok && src_ok && mid_ok
+            })
+            .collect();
+
+        // Only enter chunked path if there is exactly one matching rel table.
+        let n_tables = hop1_matches.len();
+        if n_tables != 1 {
+            return false;
+        }
+
         let hop2_id = tables.iter().find(|(_, sid, did, rt)| {
-            let type_ok = rel_type2.is_empty() || rt == &rel_type2;
+            let type_ok = rel_type2.is_empty() || rt == rel_type2;
             let mid_ok = catalog
                 .get_label(&mid_label)
                 .ok()
@@ -670,7 +682,7 @@ impl Engine {
         });
 
         // Both hops must resolve, and to the same table.
-        match (hop1_id, hop2_id) {
+        match (hop1_matches.first(), hop2_id) {
             (Some((id1, _, _, _)), Some((id2, _, _, _))) => id1 == id2,
             _ => false,
         }
@@ -993,8 +1005,14 @@ impl Engine {
                 // Path multiplicity is preserved by iterating ALL live_pairs at
                 // materialization time — we emit one row per distinct (src, mid, dst)
                 // triple, which is the correct semantics.
-                for &(_, mid_slot) in &live_pairs {
-                    if !frontier.current().contains(&mid_slot) {
+                //
+                // Use a HashSet for O(1) membership checks to avoid the O(N²)
+                // cost of Vec::contains when live_pairs grows large (up to 2048
+                // entries per chunk).
+                {
+                    use std::collections::HashSet;
+                    let dedup_set: HashSet<u64> = live_pairs.iter().map(|&(_, m)| m).collect();
+                    for mid_slot in dedup_set {
                         frontier.current_mut().push(mid_slot);
                     }
                 }
@@ -1061,6 +1079,19 @@ impl Engine {
 
                     let src_slot_col_in_scan = src_chunk.find_column(crate::chunk::COL_ID_SLOT);
 
+                    // Build slot→row-index maps once before the triple loop to
+                    // avoid O(N) linear scans per output row (WARNING 2).
+                    let src_index: std::collections::HashMap<u64, usize> = src_slot_col_in_scan
+                        .map(|sc| (0..sc.data.len()).map(|i| (sc.data[i], i)).collect())
+                        .unwrap_or_default();
+
+                    let mid_index: std::collections::HashMap<u64, usize> = {
+                        let mid_slot_col_in_mid = mid_chunk.find_column(COL_ID_DST_SLOT);
+                        mid_slot_col_in_mid
+                            .map(|mc| (0..mc.data.len()).map(|i| (mc.data[i], i)).collect())
+                            .unwrap_or_default()
+                    };
+
                     for row_idx in dst_chunk.live_rows() {
                         let dst_slot = dst_slot_col.map(|c| c.data[row_idx]).unwrap_or(0);
                         let via_mid_slot = hop2_src_col.map(|c| c.data[row_idx]).unwrap_or(0);
@@ -1085,10 +1116,9 @@ impl Engine {
                                 continue;
                             }
 
-                            // Read src props (from scan chunk).
-                            let src_props = if let Some(sc) = src_slot_col_in_scan {
-                                let src_row = (0..sc.data.len()).find(|&i| sc.data[i] == src_slot);
-                                if let Some(src_ri) = src_row {
+                            // Read src props (from scan chunk, using pre-built index).
+                            let src_props = if src_slot_col_in_scan.is_some() {
+                                if let Some(&src_ri) = src_index.get(&src_slot) {
                                     build_props_from_chunk(&src_chunk, src_ri, &col_ids_src)
                                 } else {
                                     let nullable = self
@@ -1104,26 +1134,19 @@ impl Engine {
                                 vec![]
                             };
 
-                            // Read mid props (from mid_chunk).
+                            // Read mid props (from mid_chunk, using pre-built index).
                             let mid_props: Vec<(u32, u64)> = if !col_ids_mid.is_empty() {
-                                let mid_slot_col_in_mid = mid_chunk.find_column(COL_ID_DST_SLOT);
-                                if let Some(mc) = mid_slot_col_in_mid {
-                                    let mid_ri =
-                                        (0..mc.data.len()).find(|&i| mc.data[i] == mid_slot);
-                                    if let Some(mid_ri) = mid_ri {
-                                        build_props_from_chunk(&mid_chunk, mid_ri, &col_ids_mid)
-                                    } else {
-                                        let nullable = self
-                                            .snapshot
-                                            .store
-                                            .get_node_raw_nullable(mid_node, &col_ids_mid)?;
-                                        nullable
-                                            .into_iter()
-                                            .filter_map(|(cid, opt)| opt.map(|v| (cid, v)))
-                                            .collect()
-                                    }
+                                if let Some(&mid_ri) = mid_index.get(&mid_slot) {
+                                    build_props_from_chunk(&mid_chunk, mid_ri, &col_ids_mid)
                                 } else {
-                                    vec![]
+                                    let nullable = self
+                                        .snapshot
+                                        .store
+                                        .get_node_raw_nullable(mid_node, &col_ids_mid)?;
+                                    nullable
+                                        .into_iter()
+                                        .filter_map(|(cid, opt)| opt.map(|v| (cid, v)))
+                                        .collect()
                                 }
                             } else {
                                 vec![]
