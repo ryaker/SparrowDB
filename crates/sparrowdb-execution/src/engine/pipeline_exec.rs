@@ -31,7 +31,8 @@ use sparrowdb_storage::edge_store::EdgeStore;
 use super::*;
 use crate::chunk::{DataChunk, COL_ID_DST_SLOT, COL_ID_SLOT, COL_ID_SRC_SLOT};
 use crate::pipeline::{
-    ChunkPredicate, GetNeighbors, PipelineOperator, ReadNodeProps, ScanByLabel, SlotIntersect,
+    BfsArena, ChunkPredicate, GetNeighbors, PipelineOperator, ReadNodeProps, ScanByLabel,
+    SlotIntersect,
 };
 
 // ── ChunkedPlan ───────────────────────────────────────────────────────────────
@@ -1289,14 +1290,14 @@ impl Engine {
         let memory_limit = self.memory_limit_bytes;
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
-        // ── FrontierScratch: reused across both hops ──────────────────────────
+        // ── BfsArena: reused across both hops ────────────────────────────────
         //
-        // We use FrontierScratch to hold source-node slots for the current
-        // scan chunk, then expand to mid-node slots, then to dst-node slots.
-        // This avoids re-allocating Vec<u64> at every scan chunk boundary.
-        let mut frontier = crate::pipeline::FrontierScratch::new(
-            avg_degree_hint * (crate::chunk::CHUNK_CAPACITY / 2),
-        );
+        // BfsArena replaces the old FrontierScratch + per-chunk HashSet dedup
+        // pattern. It pairs a double-buffer frontier with a RoaringBitmap for
+        // O(1) visited-set membership testing — no per-chunk HashSet allocation.
+        // arena.clear() resets both buffers and the bitmap in O(1) amortized
+        // time without deallocating backing memory.
+        let mut frontier = BfsArena::new(avg_degree_hint * (crate::chunk::CHUNK_CAPACITY / 2));
 
         // ── Memory-limit tracking ─────────────────────────────────────────────
         // We track accumulated output rows as a proxy for memory usage.
@@ -1351,7 +1352,7 @@ impl Engine {
             // For each hop-1 output chunk: (src_slot, mid_slot) pairs.
             while let Some(hop1_chunk) = gn1.next_chunk()? {
                 // Memory-limit check: check after each hop-1 chunk.
-                let accum_bytes = rows.len() * row_size_estimate + frontier.bytes_allocated();
+                let accum_bytes = rows.len() * row_size_estimate + frontier.bytes_used();
                 if accum_bytes > memory_limit {
                     return Err(DbError::QueryMemoryExceeded);
                 }
@@ -1390,7 +1391,8 @@ impl Engine {
                 };
 
                 // ── Hop 2: GetNeighbors(mid → dst) ────────────────────────────
-                // Populate FrontierScratch.current with live mid-slots.
+                // Reset the BfsArena for this hop-1 chunk. clear() is O(1)
+                // amortized — no allocations, just length resets + bitmap clear.
                 frontier.clear();
                 let mid_slot_col = mid_chunk.find_column(COL_ID_DST_SLOT);
                 let hop1_src_col = mid_chunk.find_column(COL_ID_SRC_SLOT);
@@ -1405,26 +1407,23 @@ impl Engine {
                     })
                     .collect();
 
-                // Populate FrontierScratch with DEDUPLICATED mid slots for hop-2.
-                // Deduplication here prevents GetNeighbors from expanding the same
-                // mid node multiple times (once per source path through it), which
-                // would produce N^2 output rows instead of N.
+                // Populate BfsArena.current with DEDUPLICATED mid slots for hop-2.
+                // Deduplication prevents GetNeighbors from expanding the same mid
+                // node multiple times (once per source path through it), which would
+                // produce N^2 output rows instead of N.
                 // Path multiplicity is preserved by iterating ALL live_pairs at
                 // materialization time — we emit one row per distinct (src, mid, dst)
                 // triple, which is the correct semantics.
                 //
-                // Use a HashSet for O(1) membership checks to avoid the O(N²)
-                // cost of Vec::contains when live_pairs grows large (up to 2048
-                // entries per chunk).
-                {
-                    use std::collections::HashSet;
-                    let dedup_set: HashSet<u64> = live_pairs.iter().map(|&(_, m)| m).collect();
-                    for mid_slot in dedup_set {
+                // arena.visit() uses a RoaringBitmap for O(1) membership checks,
+                // eliminating the per-chunk HashSet allocation of the old approach.
+                for &(_, mid_slot) in &live_pairs {
+                    if frontier.visit(mid_slot) {
                         frontier.current_mut().push(mid_slot);
                     }
                 }
 
-                // Reuse FrontierScratch as input to GetNeighbors.
+                // Use BfsArena.current as input to GetNeighbors.
                 // Build a ScanByLabel-equivalent from deduplicated mid slots.
                 let mid_slots_chunk = {
                     let data: Vec<u64> = frontier.current().to_vec();
