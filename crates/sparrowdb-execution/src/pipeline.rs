@@ -689,6 +689,145 @@ impl FrontierScratch {
     }
 }
 
+// ── BfsArena ──────────────────────────────────────────────────────────────────
+
+/// Pre-allocated arena for BFS/multi-hop traversal.
+///
+/// Eliminates per-hop `HashSet` allocations by pairing a double-buffer
+/// frontier (like [`FrontierScratch`]) with a compact [`roaring::RoaringBitmap`]
+/// for O(1) visited-set membership testing.
+///
+/// # Design
+///
+/// - Two `Vec<u64>` scratch buffers (A and B) alternate as current/next frontier.
+///   A `flip` flag selects the active buffer without any copying.
+/// - The `visited` bitmap tracks which slots have been seen across all BFS levels.
+///   `RoaringBitmap::clear()` resets it in O(1) amortized time without deallocating.
+///
+/// # Slot ID constraint
+///
+/// Slot IDs must fit in `u32` (max ~4 billion nodes). The implementation casts
+/// `slot as u32` before inserting into the bitmap — callers must not use this
+/// arena for systems where slot IDs exceed `u32::MAX`.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut arena = BfsArena::new(256);
+/// arena.clear();
+///
+/// // Seed the initial frontier:
+/// for slot in start_slots {
+///     arena.current_mut().push(slot);
+///     arena.visit(slot);
+/// }
+///
+/// while !arena.current().is_empty() {
+///     for &slot in arena.current().iter() {
+///         for neighbor in neighbors(slot) {
+///             if arena.visit(neighbor) {           // newly visited?
+///                 arena.next_mut().push(neighbor);
+///             }
+///         }
+///     }
+///     arena.advance(); // swap: next → current, clear next
+/// }
+/// ```
+pub struct BfsArena {
+    /// Scratch buffer A (alternates as current/next frontier).
+    buf_a: Vec<u64>,
+    /// Scratch buffer B (alternates as current/next frontier).
+    buf_b: Vec<u64>,
+    /// Compact bitmap for visited-set membership testing.
+    /// Slot IDs fit in u32 (max ~4B nodes).
+    visited: roaring::RoaringBitmap,
+    /// Which buffer is currently the "current" frontier (false=A, true=B).
+    flip: bool,
+}
+
+impl BfsArena {
+    /// Allocate a `BfsArena`, pre-reserving `capacity` slots in each scratch buffer.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buf_a: Vec::with_capacity(capacity),
+            buf_b: Vec::with_capacity(capacity),
+            visited: roaring::RoaringBitmap::new(),
+            flip: false,
+        }
+    }
+
+    /// Reset the arena for reuse across queries.
+    ///
+    /// Clears both frontier buffers and the visited bitmap without deallocating
+    /// their backing memory. Amortized O(1).
+    pub fn clear(&mut self) {
+        self.buf_a.clear();
+        self.buf_b.clear();
+        self.visited.clear();
+        self.flip = false;
+    }
+
+    /// Read-only view of the current frontier.
+    pub fn current(&self) -> &[u64] {
+        if !self.flip {
+            &self.buf_a
+        } else {
+            &self.buf_b
+        }
+    }
+
+    /// Mutable reference to the current frontier (for initial population).
+    pub fn current_mut(&mut self) -> &mut Vec<u64> {
+        if !self.flip {
+            &mut self.buf_a
+        } else {
+            &mut self.buf_b
+        }
+    }
+
+    /// Mutable reference to the next frontier (populated during expansion).
+    pub fn next_mut(&mut self) -> &mut Vec<u64> {
+        if !self.flip {
+            &mut self.buf_b
+        } else {
+            &mut self.buf_a
+        }
+    }
+
+    /// Swap current/next and clear the new next buffer.
+    ///
+    /// Call this after populating `next_mut()` to advance to the next BFS level.
+    pub fn advance(&mut self) {
+        self.flip = !self.flip;
+        self.next_mut().clear();
+    }
+
+    /// Mark `slot` as visited. Returns `true` if it was newly inserted.
+    ///
+    /// Uses a `RoaringBitmap` for compact, cache-friendly membership tracking.
+    pub fn visit(&mut self, slot: u64) -> bool {
+        self.visited.insert(slot as u32)
+    }
+
+    /// Test whether `slot` has already been visited.
+    pub fn is_visited(&self, slot: u64) -> bool {
+        self.visited.contains(slot as u32)
+    }
+
+    /// Byte footprint of live frontier entries plus the visited bitmap heap.
+    ///
+    /// Uses `len()` on the frontier vecs so pre-allocated but unused capacity
+    /// does not skew memory-limit accounting. Adds the RoaringBitmap's
+    /// serialized size via `serialized_size()` (O(1)) to capture actual bitmap
+    /// heap overhead, which would otherwise allow large bitmaps to bypass the
+    /// QueryMemoryExceeded guard.
+    pub fn bytes_used(&self) -> usize {
+        let frontier_bytes = (self.buf_a.len() + self.buf_b.len()) * std::mem::size_of::<u64>();
+        let bitmap_bytes = self.visited.serialized_size() as usize;
+        frontier_bytes + bitmap_bytes
+    }
+}
+
 // ── SlotIntersect ─────────────────────────────────────────────────────────────
 
 /// Intersects two slot-column pipeline streams on a shared key column.
@@ -720,7 +859,8 @@ impl FrontierScratch {
 ///
 /// For large build-side sets (above `spill_threshold` entries), the caller
 /// should use `join_spill.rs` instead. The current implementation holds the
-/// build side in a `HashSet<u64>` which is correct for moderate-sized graphs.
+/// build side in a [`roaring::RoaringBitmap`] which is both memory-efficient
+/// and avoids per-query `HashSet` allocation overhead.
 pub struct SlotIntersect<L: PipelineOperator, R: PipelineOperator> {
     left: L,
     right: R,
@@ -767,33 +907,35 @@ impl<L: PipelineOperator, R: PipelineOperator> SlotIntersect<L, R> {
 
     /// Consume both sides and materialise sorted intersection into `self.results`.
     fn build(&mut self) -> Result<()> {
-        use std::collections::HashSet;
-
-        // Phase 1: drain right (build) side into a HashSet.
-        let mut build_set: HashSet<u64> = HashSet::new();
+        // Phase 1: drain right (build) side into a RoaringBitmap.
+        // RoaringBitmap avoids per-query HashSet allocation and provides
+        // compact, cache-friendly membership testing for u32-range slot IDs.
+        let mut build_bitmap = roaring::RoaringBitmap::new();
         while let Some(chunk) = self.right.next_chunk()? {
             if let Some(col) = chunk.find_column(self.right_key_col) {
                 for row_idx in chunk.live_rows() {
-                    build_set.insert(col.data[row_idx]);
+                    build_bitmap.insert(col.data[row_idx] as u32);
                 }
             }
         }
 
-        if build_set.len() > self.spill_threshold {
+        // Use build_bitmap.len() (distinct inserted slots) rather than a raw
+        // row counter so duplicates do not inflate the spill-threshold check.
+        if build_bitmap.len() > self.spill_threshold as u64 {
             tracing::warn!(
-                build_side_len = build_set.len(),
+                build_side_len = build_bitmap.len(),
                 spill_threshold = self.spill_threshold,
                 "SlotIntersect: build side exceeds spill threshold — consider join_spill"
             );
         }
 
-        // Phase 2: probe left side against the build set.
+        // Phase 2: probe left side against the build bitmap.
         let mut intersection: Vec<u64> = Vec::new();
         while let Some(chunk) = self.left.next_chunk()? {
             if let Some(col) = chunk.find_column(self.left_key_col) {
                 for row_idx in chunk.live_rows() {
                     let slot = col.data[row_idx];
-                    if build_set.contains(&slot) {
+                    if build_bitmap.contains(slot as u32) {
                         intersection.push(slot);
                     }
                 }
