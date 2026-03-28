@@ -294,6 +294,12 @@ impl Engine {
     /// parameter expressions, or `build_for` I/O error) the method falls back
     /// to iterating all `0..hwm` slots — the same behaviour as before this fix.
     ///
+    /// ## Multi-label support (SPA-200)
+    ///
+    /// After the primary-label scan, nodes where `label_id` is a **secondary**
+    /// label are also added from the catalog reverse index.  This ensures
+    /// `MATCH (n:A)` finds nodes where `:A` is secondary (e.g. `CREATE (n:B:A)`).
+    ///
     /// ## Integration
     ///
     /// This replaces the inline `for slot in 0..hwm` blocks in
@@ -344,6 +350,9 @@ impl Engine {
                 }
                 result.push(node_id);
             }
+            // SPA-200: also check secondary-label hits (not in the property index,
+            // which is keyed on primary label only).
+            self.append_secondary_label_hits(label_id, &filter_col_ids, node_props, &mut result);
             return Ok(result);
         }
 
@@ -359,7 +368,44 @@ impl Engine {
             }
             result.push(node_id);
         }
+
+        // SPA-200: union nodes where label_id is a *secondary* label.
+        self.append_secondary_label_hits(label_id, &filter_col_ids, node_props, &mut result);
+
         Ok(result)
+    }
+
+    /// Append nodes that have `label_id` as a **secondary** label to `result`,
+    /// applying property filters.  Used by `scan_nodes_for_label_with_index`
+    /// to implement SPA-200 multi-label MATCH semantics.
+    ///
+    /// Nodes already in `result` (primary-label hits) are not duplicated.
+    fn append_secondary_label_hits(
+        &self,
+        label_id: u32,
+        filter_col_ids: &[u32],
+        node_props: &[sparrowdb_cypher::ast::PropEntry],
+        result: &mut Vec<NodeId>,
+    ) {
+        // Build a quick-lookup set of already-found nodes to avoid duplicates.
+        let already_found: HashSet<NodeId> = result.iter().copied().collect();
+
+        let lid = label_id as sparrowdb_catalog::LabelId;
+        for node_id in self.snapshot.catalog.nodes_with_secondary_label(lid) {
+            if already_found.contains(&node_id) {
+                continue;
+            }
+            if self.is_node_tombstoned(node_id) {
+                continue;
+            }
+            // For secondary-label nodes, properties are stored under the
+            // primary-label directory (encoded in node_id).  The col_ids are
+            // the same — we read the stored columns and apply the filter.
+            if !self.node_matches_prop_filter(node_id, filter_col_ids, node_props) {
+                continue;
+            }
+            result.push(node_id);
+        }
     }
 
     /// Scan nodes matching the MATCH patterns in a `MatchCreateStatement` and
@@ -750,10 +796,14 @@ impl Engine {
     /// Execute a `CREATE` statement, auto-registering labels as needed (SPA-156).
     ///
     /// For each node in the CREATE clause:
-    /// 1. Look up (or create) its primary label in the catalog.
-    /// 2. Convert inline properties to `(col_id, StoreValue)` pairs using the
+    /// 1. Look up (or create) its **primary** label (first label in the
+    ///    pattern) in the catalog.  The primary label determines the `NodeId`
+    ///    encoding and storage directory.
+    /// 2. Resolve all secondary labels (labels[1..]) and record them in the
+    ///    catalog side table after the node is created (SPA-200).
+    /// 3. Convert inline properties to `(col_id, StoreValue)` pairs using the
     ///    same FNV-1a hash used by `WriteTx::merge_node`.
-    /// 3. Write the node to the node store.
+    /// 4. Write the node to the node store.
     pub(crate) fn execute_create(&mut self, create: &CreateStatement) -> Result<QueryResult> {
         for node in &create.nodes {
             // Resolve the primary label, creating it if absent.
@@ -764,6 +814,15 @@ impl Engine {
                 return Err(sparrowdb_common::Error::InvalidArgument(format!(
                     "invalid argument: label \"{label}\" is reserved — the __SO_ prefix is for internal use only"
                 )));
+            }
+
+            // SPA-200: reject reserved __SO_ prefix on secondary labels too.
+            for secondary_label_name in node.labels.iter().skip(1) {
+                if is_reserved_label(secondary_label_name) {
+                    return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                        "invalid argument: label \"{secondary_label_name}\" is reserved — the __SO_ prefix is for internal use only"
+                    )));
+                }
             }
 
             let label_id: u32 = match self.snapshot.catalog.get_label(&label)? {
@@ -849,6 +908,24 @@ impl Engine {
                     }
                 }
             }
+            // SPA-200: record secondary labels in the catalog side table.
+            // The primary label is already encoded in `node_id`; secondary
+            // labels are persisted here so that MATCH on secondary labels
+            // (and labels(n)) return the full label set.
+            if node.labels.len() > 1 {
+                let mut secondary_label_ids: Vec<sparrowdb_catalog::LabelId> = Vec::new();
+                for secondary_name in node.labels.iter().skip(1) {
+                    let sid = match self.snapshot.catalog.get_label(secondary_name)? {
+                        Some(id) => id,
+                        None => self.snapshot.catalog.create_label(secondary_name)?,
+                    };
+                    secondary_label_ids.push(sid);
+                }
+                self.snapshot
+                    .catalog
+                    .record_secondary_labels(node_id, &secondary_label_ids)?;
+            }
+
             // Update cached row count for the planner (SPA-new).
             *self
                 .snapshot

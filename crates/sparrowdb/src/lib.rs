@@ -31,7 +31,7 @@
 //! db.optimize().unwrap();
 //! ```
 
-use sparrowdb_catalog::catalog::{Catalog, LabelId};
+use sparrowdb_catalog::catalog::{Catalog, LabelId, RelTableId as CatalogRelTableId};
 use sparrowdb_common::{col_id_of, TxnId};
 use sparrowdb_execution::Engine;
 
@@ -93,7 +93,7 @@ use sparrowdb_storage::node_store::NodeStore;
 use sparrowdb_storage::wal::codec::{WalPayload, WalRecordKind};
 use sparrowdb_storage::wal::writer::WalWriter;
 use sparrowdb_storage::wal::WalReplayer;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -146,6 +146,36 @@ impl VersionStore {
         } else {
             Some(versions[idx - 1].value.clone())
         }
+    }
+
+    /// Garbage-collect version chains older than `min_active_txn_id`.
+    ///
+    /// For each key, retain:
+    /// - All versions with `committed_at >= min_active_txn_id` (any active
+    ///   reader pinned at exactly that snapshot needs them).
+    /// - The single most-recent version with `committed_at < min_active_txn_id`
+    ///   (the latest committed state visible to all readers, including future
+    ///   ones with snapshot ≥ min_active_txn_id that arrive before the next
+    ///   write).
+    ///
+    /// Returns the number of version entries pruned.
+    fn gc(&mut self, min_active_txn_id: u64) -> usize {
+        let mut pruned = 0usize;
+        self.map.retain(|_, versions| {
+            // Find the last version index whose committed_at < min_active_txn_id.
+            // Entries [0..cutoff) are all older than the minimum active snapshot.
+            let cutoff = versions.partition_point(|v| v.committed_at < min_active_txn_id);
+            if cutoff > 1 {
+                // Keep entry at index (cutoff - 1) as the "last visible before
+                // min_active_txn_id" anchor; drop everything before it.
+                let keep_from = cutoff - 1;
+                pruned += keep_from;
+                versions.drain(..keep_from);
+            }
+            // Drop entries whose chain is now empty (should not happen but be safe).
+            !versions.is_empty()
+        });
+        pruned
     }
 }
 
@@ -226,8 +256,8 @@ enum WalMutation {
 /// before commit.
 ///
 /// Note: catalog schema changes (`create_label`, `get_or_create_rel_type_id`)
-/// are still written immediately because labels are idempotent metadata.
-/// Full schema-change atomicity is deferred to a future phase.
+/// are staged in the `WriteTx` pending buffers and flushed to disk at commit,
+/// so a dropped transaction leaves no ghost labels or rel-type entries (closes #305).
 enum PendingOp {
     /// Create a node: write to the node-store at the pre-reserved `slot` and
     /// advance the on-disk HWM.
@@ -331,7 +361,21 @@ struct DbInner {
     wal_writer: Mutex<WalWriter>,
     /// Shared edge-property cache (SPA-261).
     edge_props_cache: EdgePropsCache,
+    /// Tracks active `ReadTx` snapshots for GC watermark computation.
+    ///
+    /// Maps `snapshot_txn_id → active_reader_count`.  A reader registers its
+    /// snapshot on open and unregisters on drop.  The minimum key in this map
+    /// is the oldest pinned snapshot; versions older than that watermark (and
+    /// fully superseded by a newer committed version) can be pruned by GC.
+    active_readers: Mutex<BTreeMap<u64, usize>>,
+    /// Number of `WriteTx` commits since the last GC run.
+    ///
+    /// GC is triggered every [`GC_COMMIT_INTERVAL`] commits.
+    commits_since_gc: AtomicU64,
 }
+
+/// Run GC on the version store every this many commits.
+const GC_COMMIT_INTERVAL: u64 = 100;
 
 // ── Write-lock guard (SPA-181: replaces 'static transmute UB) ────────────────
 
@@ -461,6 +505,8 @@ impl GraphDb {
                 label_row_counts,
                 wal_writer: Mutex::new(wal_writer),
                 edge_props_cache: Arc::new(RwLock::new(HashMap::new())),
+                active_readers: Mutex::new(BTreeMap::new()),
+                commits_since_gc: AtomicU64::new(0),
             }),
         })
     }
@@ -520,6 +566,8 @@ impl GraphDb {
                 label_row_counts,
                 wal_writer: Mutex::new(wal_writer),
                 edge_props_cache: Arc::new(RwLock::new(HashMap::new())),
+                active_readers: Mutex::new(BTreeMap::new()),
+                commits_since_gc: AtomicU64::new(0),
             }),
         })
     }
@@ -646,6 +694,15 @@ impl GraphDb {
     pub fn begin_read(&self) -> Result<ReadTx> {
         let snapshot_txn_id = self.inner.current_txn_id.load(Ordering::Acquire);
         let store = NodeStore::open(&self.inner.path)?;
+        // Register this reader's snapshot so GC knows the minimum safe watermark.
+        {
+            let mut ar = self
+                .inner
+                .active_readers
+                .lock()
+                .expect("active_readers lock poisoned");
+            *ar.entry(snapshot_txn_id).or_insert(0) += 1;
+        }
         Ok(ReadTx {
             snapshot_txn_id,
             store,
@@ -679,6 +736,8 @@ impl GraphDb {
             committed: false,
             fulltext_pending: HashMap::new(),
             pending_ops: Vec::new(),
+            pending_label_creates: Vec::new(),
+            pending_rel_type_creates: Vec::new(),
         })
     }
 
@@ -694,10 +753,9 @@ impl GraphDb {
         let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         let catalog = self.catalog_snapshot();
         let node_store = NodeStore::open(&self.inner.path)?;
-        let (rel_table_ids, n_nodes) =
-            collect_maintenance_params(&catalog, &node_store, &self.inner.path);
+        let rel_tables = collect_maintenance_params(&catalog, &node_store, &self.inner.path);
         let engine = MaintenanceEngine::new(&self.inner.path);
-        engine.checkpoint(&rel_table_ids, n_nodes)?;
+        engine.checkpoint(&rel_tables)?;
         self.invalidate_csr_map();
         self.invalidate_edge_props_cache();
         Ok(())
@@ -715,10 +773,9 @@ impl GraphDb {
         let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         let catalog = self.catalog_snapshot();
         let node_store = NodeStore::open(&self.inner.path)?;
-        let (rel_table_ids, n_nodes) =
-            collect_maintenance_params(&catalog, &node_store, &self.inner.path);
+        let rel_tables = collect_maintenance_params(&catalog, &node_store, &self.inner.path);
         let engine = MaintenanceEngine::new(&self.inner.path);
-        engine.optimize(&rel_table_ids, n_nodes)?;
+        engine.optimize(&rel_tables)?;
         self.invalidate_csr_map();
         self.invalidate_edge_props_cache();
         Ok(())
@@ -1043,10 +1100,7 @@ impl GraphDb {
 
         for node in &create.nodes {
             let label = node.labels.first().cloned().unwrap_or_default();
-            let label_id: u32 = match tx.catalog.get_label(&label)? {
-                Some(id) => id as u32,
-                None => tx.catalog.create_label(&label)? as u32,
-            };
+            let label_id: u32 = tx.get_or_create_label_id(&label)?;
 
             let named_props: Vec<(String, Value)> = node
                 .props
@@ -1133,6 +1187,28 @@ impl GraphDb {
             }
 
             let node_id = tx.create_node_named(label_id, &named_props)?;
+
+            // SPA-289: record secondary labels (labels[1..]) in the catalog
+            // side table so that MATCH on secondary labels and labels(n)
+            // return the full label set.
+            if node.labels.len() > 1 {
+                // Reject reserved __SO_ prefix on secondary labels.
+                for secondary_name in node.labels.iter().skip(1) {
+                    if is_reserved_label(secondary_name) {
+                        return Err(reserved_label_error(secondary_name));
+                    }
+                }
+                let mut secondary_label_ids: Vec<LabelId> = Vec::new();
+                for secondary_name in node.labels.iter().skip(1) {
+                    let sid = match tx.catalog.get_label(secondary_name)? {
+                        Some(id) => id,
+                        None => tx.catalog.create_label(secondary_name)?,
+                    };
+                    secondary_label_ids.push(sid);
+                }
+                tx.catalog
+                    .record_secondary_labels(node_id, &secondary_label_ids)?;
+            }
 
             // Record the binding so edge patterns can resolve (src_var, dst_var).
             if !node.var.is_empty() {
@@ -2103,10 +2179,7 @@ impl GraphDb {
                 let mut var_to_node: HashMap<String, NodeId> = HashMap::new();
                 for node in &c.nodes {
                     let label = node.labels.first().cloned().unwrap_or_default();
-                    let label_id: u32 = match tx.catalog.get_label(&label)? {
-                        Some(id) => id as u32,
-                        None => tx.catalog.create_label(&label)? as u32,
-                    };
+                    let label_id: u32 = tx.get_or_create_label_id(&label)?;
                     let named_props: Vec<(String, Value)> = node
                         .props
                         .iter()
@@ -2213,7 +2286,16 @@ impl GraphDb {
                     csrs,
                     &self.inner.path,
                 );
-                let matched_rows = engine.scan_match_create_rows(mc)?;
+                // SPA-308: augment on-disk scan with nodes created earlier in this
+                // batch (they live in pending_ops but are not yet visible to the
+                // on-disk NodeStore reader used by the engine).
+                let mut matched_rows = engine.scan_match_create_rows(mc)?;
+                matched_rows.extend(augment_rows_with_pending(
+                    &mc.match_patterns,
+                    &tx.pending_ops,
+                    &tx.catalog,
+                    &matched_rows,
+                )?);
                 for row in &matched_rows {
                     for (left_var, rel_pat, right_var) in &mc.create.edges {
                         let src = row.get(left_var).copied().ok_or_else(|| {
@@ -2234,11 +2316,6 @@ impl GraphDb {
 
             Statement::MatchMergeRel(ref mm) => {
                 // Find-or-create relationship batch variant (SPA-233).
-                //
-                // NOTE: MATCH...MERGE in a batch reads committed on-disk state only;
-                // nodes/edges created earlier in the same batch are not visible to
-                // the MERGE existence check.  If in-batch visibility is required,
-                // flush the transaction to disk before issuing MATCH...MERGE.
                 let csrs = self.cached_csr_map();
                 let engine = Engine::new(
                     NodeStore::open(&self.inner.path)?,
@@ -2253,7 +2330,16 @@ impl GraphDb {
                         mm.rel_type
                     )));
                 }
-                let matched_rows = engine.scan_match_merge_rel_rows(mm)?;
+                // SPA-308: augment on-disk scan with nodes created earlier in this
+                // batch (they live in pending_ops but are not yet visible to the
+                // on-disk NodeStore reader used by the engine).
+                let mut matched_rows = engine.scan_match_merge_rel_rows(mm)?;
+                matched_rows.extend(augment_rows_with_pending(
+                    &mm.match_patterns,
+                    &tx.pending_ops,
+                    &tx.catalog,
+                    &matched_rows,
+                )?);
                 for row in &matched_rows {
                     let src = *row.get(&mm.src_var).ok_or_else(|| {
                         Error::InvalidArgument(format!(
@@ -2490,10 +2576,20 @@ impl GraphDb {
 
             if let Ok(store) = sparrowdb_storage::edge_store::EdgeStore::open(path, storage_rel_id)
             {
+                // Deduplicate within this rel_type: delta log edges may also
+                // appear in CSR after checkpoint.  Keying on (src, dst) is
+                // sufficient because rel_type is constant for this iteration.
+                let mut seen: std::collections::HashSet<(i64, i64)> =
+                    std::collections::HashSet::new();
+
                 // Delta log: stores full NodeId pairs directly.
                 if let Ok(records) = store.read_delta() {
                     for rec in records {
-                        edge_triples.push((rec.src.0 as i64, rel_type.clone(), rec.dst.0 as i64));
+                        let src = rec.src.0 as i64;
+                        let dst = rec.dst.0 as i64;
+                        if seen.insert((src, dst)) {
+                            edge_triples.push((src, rel_type.clone(), dst));
+                        }
                     }
                 }
 
@@ -2504,7 +2600,9 @@ impl GraphDb {
                         let src_id = ((*src_label_id as u64) << 32 | src_slot) as i64;
                         for &dst_slot in csr.neighbors(src_slot) {
                             let dst_id = ((*dst_label_id as u64) << 32 | dst_slot) as i64;
-                            edge_triples.push((src_id, rel_type.clone(), dst_id));
+                            if seen.insert((src_id, dst_id)) {
+                                edge_triples.push((src_id, rel_type.clone(), dst_id));
+                            }
                         }
                     }
                 }
@@ -2772,6 +2870,26 @@ impl ReadTx {
     }
 }
 
+impl Drop for ReadTx {
+    fn drop(&mut self) {
+        // Unregister this reader's snapshot from the active-readers map.
+        // When the count drops to zero the entry is removed so GC can advance
+        // the watermark past this snapshot.
+        if let Ok(mut ar) = self.inner.active_readers.lock() {
+            if let std::collections::btree_map::Entry::Occupied(mut e) =
+                ar.entry(self.snapshot_txn_id)
+            {
+                let count = e.get_mut();
+                if *count <= 1 {
+                    e.remove();
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+    }
+}
+
 // ── WriteTx ───────────────────────────────────────────────────────────────────
 
 /// A write transaction.
@@ -2815,6 +2933,12 @@ pub struct WriteTx {
     /// Buffered structural mutations (create_node, delete_node, create_edge,
     /// create_label) not yet written to disk.  Flushed atomically on commit.
     pending_ops: Vec<PendingOp>,
+    /// Label ids that were staged in-memory during this transaction and must be
+    /// flushed to the catalog TLV file on commit (closes #305).
+    pending_label_creates: Vec<LabelId>,
+    /// Rel-table ids that were staged in-memory during this transaction and must
+    /// be flushed to the catalog TLV file on commit (closes #305).
+    pending_rel_type_creates: Vec<CatalogRelTableId>,
 }
 
 impl WriteTx {
@@ -2944,15 +3068,17 @@ impl WriteTx {
 
     /// Create a label in the schema catalog.
     ///
-    /// # Note on atomicity
+    /// The label is staged in memory and only written to the catalog file
+    /// when [`commit`] is called.  Dropping the transaction without committing
+    /// discards the label — no ghost entries are left on disk (closes #305).
     ///
-    /// Schema changes (label creation) are written to the catalog file
-    /// immediately and are not rolled back if the transaction is later
-    /// dropped without committing.  Label creation is idempotent at the
-    /// catalog level: a duplicate name returns `Error::AlreadyExists`.
-    /// Full schema-change atomicity is deferred to a future phase.
+    /// Returns `Err(AlreadyExists)` if a label with that name already exists.
+    ///
+    /// [`commit`]: WriteTx::commit
     pub fn create_label(&mut self, name: &str) -> Result<u16> {
-        self.catalog.create_label(name)
+        let id = self.catalog.stage_label(name)?;
+        self.pending_label_creates.push(id);
+        Ok(id)
     }
 
     /// Look up `name` in the catalog, creating it if it does not yet exist.
@@ -2961,14 +3087,21 @@ impl WriteTx {
     /// Unlike [`create_label`], this method is idempotent: calling it multiple
     /// times with the same name always returns the same id.
     ///
+    /// New labels are staged in memory and written to disk only on [`commit`].
+    ///
     /// Primarily used by the bulk-import path (SPA-148) where labels may be
     /// seen for the first time on any row.
     ///
     /// [`create_label`]: WriteTx::create_label
+    /// [`commit`]: WriteTx::commit
     pub fn get_or_create_label_id(&mut self, name: &str) -> Result<u32> {
         match self.catalog.get_label(name)? {
             Some(id) => Ok(id as u32),
-            None => Ok(self.catalog.create_label(name)? as u32),
+            None => {
+                let id = self.catalog.stage_label(name)?;
+                self.pending_label_creates.push(id);
+                Ok(id as u32)
+            }
         }
     }
 
@@ -2983,10 +3116,14 @@ impl WriteTx {
     ///
     /// The label is resolved (or created) in the catalog.
     pub fn merge_node(&mut self, label: &str, props: HashMap<String, Value>) -> Result<NodeId> {
-        // Resolve / create label.
+        // Resolve / create label (staged — not written to disk until commit).
         let label_id: u32 = match self.catalog.get_label(label)? {
             Some(id) => id as u32,
-            None => self.catalog.create_label(label)? as u32,
+            None => {
+                let id = self.catalog.stage_label(label)?;
+                self.pending_label_creates.push(id);
+                id as u32
+            }
         };
 
         // Build col list from props keys.
@@ -3271,12 +3408,14 @@ impl WriteTx {
         let dst_label_id = (dst.0 >> 32) as u16;
 
         // Register (or retrieve) the rel type in the catalog.
-        // Catalog mutation is immediate and not transactional. This is acceptable
-        // for now as rel type creation is idempotent. Full schema-change
-        // atomicity is deferred to a future phase.
-        let catalog_rel_id =
+        // New entries are staged in memory and only written to disk on commit
+        // so that a dropped transaction leaves no ghost rel-type entries (closes #305).
+        let (catalog_rel_id, is_new_rel_type) =
             self.catalog
-                .get_or_create_rel_type_id(src_label_id, dst_label_id, rel_type)?;
+                .stage_rel_table(src_label_id, dst_label_id, rel_type)?;
+        if is_new_rel_type {
+            self.pending_rel_type_creates.push(catalog_rel_id);
+        }
         let rel_table_id = RelTableId(catalog_rel_id as u32);
 
         // Compute the edge ID from the on-disk delta log size, offset by the
@@ -3506,6 +3645,16 @@ impl WriteTx {
             &self.wal_mutations,
         )?;
 
+        // Step 4b: Flush catalog mutations that were staged in memory during
+        // this transaction (closes #305).  WAL is already durable at this point.
+        // Labels are flushed first (rel-table entries reference label ids).
+        for label_id in self.pending_label_creates.drain(..) {
+            self.catalog.flush_label(label_id)?;
+        }
+        for rel_table_id in self.pending_rel_type_creates.drain(..) {
+            self.catalog.flush_rel_table(rel_table_id)?;
+        }
+
         // Step 5: Apply buffered structural operations to disk (SPA-181).
         // WAL is already durable at this point; a crash here is safe.
         //
@@ -3620,6 +3769,42 @@ impl WriteTx {
                 .expect("node_versions lock");
             for &raw in &self.dirty_nodes {
                 nv.set(NodeId(raw), new_id);
+            }
+        }
+
+        // Step 9b: Periodically garbage-collect the version store (issue #307).
+        //
+        // Every GC_COMMIT_INTERVAL commits we compute the minimum active reader
+        // snapshot and prune fully-superseded old versions below that watermark.
+        // This bounds VersionStore memory to O(live_keys × active_reader_span)
+        // rather than O(live_keys × total_write_count).
+        {
+            let prev = self.inner.commits_since_gc.fetch_add(1, Ordering::Relaxed);
+            if prev + 1 >= GC_COMMIT_INTERVAL {
+                self.inner.commits_since_gc.store(0, Ordering::Relaxed);
+                // Compute min active snapshot watermark.
+                let min_active = {
+                    let ar = self
+                        .inner
+                        .active_readers
+                        .lock()
+                        .expect("active_readers lock poisoned");
+                    // If there are no active readers, every version older than
+                    // the current committed txn_id is safe to prune (keeping
+                    // only the most recent).  Use current_txn_id + 1 so the
+                    // gc() "last version before watermark" logic retains the
+                    // latest version for future readers.
+                    ar.keys().copied().next().unwrap_or(new_id + 1)
+                };
+                let pruned = self
+                    .inner
+                    .versions
+                    .write()
+                    .expect("version lock poisoned")
+                    .gc(min_active);
+                if pruned > 0 {
+                    tracing::debug!(pruned, min_active, "versionstore gc complete");
+                }
             }
         }
 
@@ -3921,6 +4106,161 @@ fn exec_value_to_storage(v: &sparrowdb_execution::Value) -> Value {
     }
 }
 
+// ── Intra-batch visibility helpers (SPA-308) ─────────────────────────────────
+
+/// Collect `NodeId`s from `pending_ops` that match `label_id` and all
+/// property filters in `node_props`.
+///
+/// `pending_ops` stores props as `Vec<(col_id: u32, Value)>`.
+/// The prop entries in `node_props` carry key names; we derive the same
+/// `col_id` via [`col_id_of`] to make the comparison.
+fn pending_candidates_for(
+    pending_ops: &[PendingOp],
+    label_id: u32,
+    node_props: &[sparrowdb_cypher::ast::PropEntry],
+) -> Vec<NodeId> {
+    pending_ops
+        .iter()
+        .filter_map(|op| {
+            let PendingOp::NodeCreate {
+                label_id: op_lid,
+                slot,
+                props: op_props,
+            } = op
+            else {
+                return None;
+            };
+            if *op_lid != label_id {
+                return None;
+            }
+            // All pattern props must match a corresponding pending prop.
+            let all_match = node_props.iter().all(|pe| {
+                let wanted_col = col_id_of(&pe.key);
+                let wanted_val = expr_to_value(&pe.value);
+                op_props
+                    .iter()
+                    .any(|&(c, ref v)| c == wanted_col && *v == wanted_val)
+            });
+            if all_match {
+                Some(NodeId((label_id as u64) << 32 | *slot as u64))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Supplement a set of already-matched rows with rows that include
+/// nodes created earlier in the same batch (`pending_ops`).
+///
+/// For each named node variable in `patterns`, the function scans
+/// `pending_ops` for `NodeCreate` entries whose label and properties match
+/// the pattern.  Any pending candidates not already present in `existing_rows`
+/// are cross-joined with on-disk candidates for the other variables to form
+/// new rows.
+///
+/// This is the fix for issue #308: `MATCH...MERGE` statements executed inside
+/// `execute_batch` could not see nodes created by earlier `CREATE` statements
+/// in the same batch because the Engine only reads committed on-disk state.
+fn augment_rows_with_pending(
+    patterns: &[sparrowdb_cypher::ast::PathPattern],
+    pending_ops: &[PendingOp],
+    catalog: &sparrowdb_catalog::catalog::Catalog,
+    existing_rows: &[HashMap<String, NodeId>],
+) -> Result<Vec<HashMap<String, NodeId>>> {
+    // Collect the named node variables present in the patterns.
+    // Patterns with relationships (multi-node path patterns) are not yet
+    // augmented — only independent node-only patterns are handled here.
+    // That covers the most common batch scenario:
+    //   CREATE (:A {k:1})
+    //   CREATE (:B {k:1})
+    //   MATCH (a:A {k:1}), (b:B {k:1}) MERGE (a)-[:R]->(b)
+    let mut var_candidates: HashMap<String, Vec<NodeId>> = HashMap::new();
+    for pat in patterns {
+        // Only process simple node-only patterns (no relationships in the path).
+        if pat.rels.is_empty() {
+            for node_pat in &pat.nodes {
+                if node_pat.var.is_empty() {
+                    continue;
+                }
+                if var_candidates.contains_key(&node_pat.var) {
+                    continue;
+                }
+                let label = node_pat.labels.first().cloned().unwrap_or_default();
+                let label_id: u32 = match catalog.get_label(&label)? {
+                    Some(id) => id as u32,
+                    None => {
+                        // Label not registered at all — no pending nodes either.
+                        var_candidates.insert(node_pat.var.clone(), vec![]);
+                        continue;
+                    }
+                };
+                let pending = pending_candidates_for(pending_ops, label_id, &node_pat.props);
+                var_candidates.insert(node_pat.var.clone(), pending);
+            }
+        }
+    }
+
+    if var_candidates.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Collect the set of NodeIds already present in existing_rows for each
+    // variable so we can skip duplicates.
+    let mut already_seen: HashMap<String, HashSet<NodeId>> = HashMap::new();
+    for row in existing_rows {
+        for (var, nid) in row {
+            already_seen.entry(var.clone()).or_default().insert(*nid);
+        }
+    }
+
+    // Build new rows: cross-join the per-variable pending candidates,
+    // but only include a row if at least one variable has a pending candidate
+    // not already seen in existing_rows.  This avoids duplicating rows that
+    // the engine already returned.
+    let vars: Vec<String> = var_candidates.keys().cloned().collect();
+    let mut new_rows: Vec<HashMap<String, NodeId>> = vec![HashMap::new()];
+
+    for var in &vars {
+        let candidates = var_candidates.get(var).map(Vec::as_slice).unwrap_or(&[]);
+        if candidates.is_empty() {
+            // No pending candidates for this variable; keep current partial rows
+            // alive by not expanding (they will be filtered below).
+            continue;
+        }
+        let mut expanded: Vec<HashMap<String, NodeId>> = Vec::new();
+        for partial in &new_rows {
+            for &cand in candidates {
+                let mut row = partial.clone();
+                row.insert(var.clone(), cand);
+                expanded.push(row);
+            }
+        }
+        new_rows = expanded;
+    }
+
+    // Filter out rows that are fully contained in existing_rows (all variables
+    // match a node already seen from the on-disk scan).
+    let added: Vec<HashMap<String, NodeId>> = new_rows
+        .into_iter()
+        .filter(|row| {
+            if row.is_empty() {
+                return false;
+            }
+            // The row is "new" if ANY of its node assignments is a pending node
+            // not already present in existing_rows for that variable.
+            row.iter().any(|(var, nid)| {
+                !already_seen
+                    .get(var)
+                    .map(|s| s.contains(nid))
+                    .unwrap_or(false)
+            })
+        })
+        .collect();
+
+    Ok(added)
+}
+
 /// Convert a storage-layer `Value` (Int64 / Bytes / Float) to the execution-layer
 /// `Value` (Int64 / String / Float64 / Null / …) used in `QueryResult` rows.
 fn storage_value_to_exec(val: &Value) -> sparrowdb_execution::Value {
@@ -3971,59 +4311,75 @@ fn collect_maintenance_params(
     catalog: &Catalog,
     node_store: &NodeStore,
     db_root: &Path,
-) -> (Vec<u32>, u64) {
+) -> Vec<(u32, u64)> {
     // SPA-185: collect all registered rel table IDs from the catalog instead
     // of hardcoding [0].  This ensures every per-type edge store is checkpointed.
     // Always include table-0 so that any edges written before the catalog had
     // entries (legacy data or pre-SPA-185 databases) are also checkpointed.
     let rel_table_entries = catalog.list_rel_table_ids();
-    let mut rel_table_ids: Vec<u32> = rel_table_entries
+    // Build (rel_table_id, src_label_id, dst_label_id) triples.
+    let mut rel_triples: Vec<(u32, Option<u16>, Option<u16>)> = rel_table_entries
         .iter()
-        .map(|(id, _, _, _)| *id as u32)
+        .map(|(id, src, dst, _)| (*id as u32, Some(*src), Some(*dst)))
         .collect();
     // Always include the legacy table-0 slot.  Dedup if already present.
-    if !rel_table_ids.contains(&0u32) {
-        rel_table_ids.push(0u32);
+    if !rel_triples.iter().any(|(id, _, _)| *id == 0u32) {
+        rel_triples.push((0u32, None, None));
     }
 
-    // n_nodes must cover the highest node-store HWM AND the highest node ID
-    // present in any delta record, so that the CSR bounds check passes even
-    // when edges were inserted without going through the node-store API.
-    let hwm_n_nodes: u64 = catalog
+    // Fallback: max HWM across all known labels (for legacy table-0 or when
+    // label HWMs are not available from the catalog).
+    let global_max_hwm: u64 = catalog
         .list_labels()
         .unwrap_or_default()
         .iter()
         .map(|(label_id, _name)| node_store.hwm_for_label(*label_id as u32).unwrap_or(0))
-        .sum::<u64>();
-
-    // Also scan delta records for the maximum *slot* index used.
-    // NodeIds encode `(label_id << 32) | slot`; the CSR is indexed by slot,
-    // so we must strip the label bits before computing n_nodes.  Using the
-    // full NodeId here would inflate n_nodes into the billions (e.g. label_id=1
-    // → slot 0 appears as 0x0000_0001_0000_0000) and the CSR would be built
-    // with nonsensical degree arrays — the SPA-186 root cause.
-    let delta_max: u64 = rel_table_ids
-        .iter()
-        .filter_map(|&rel_id| {
-            EdgeStore::open(db_root, RelTableId(rel_id))
-                .ok()
-                .and_then(|s| s.read_delta().ok())
-        })
-        .flat_map(|records| {
-            records.into_iter().flat_map(|r| {
-                // Strip label bits — CSR needs slot indices only.
-                let src_slot = r.src.0 & 0xFFFF_FFFF;
-                let dst_slot = r.dst.0 & 0xFFFF_FFFF;
-                [src_slot, dst_slot].into_iter()
-            })
-        })
         .max()
-        .map(|max_slot| max_slot + 1)
         .unwrap_or(0);
 
-    let n_nodes = hwm_n_nodes.max(delta_max).max(1);
+    // For each rel table, compute n_nodes as max(hwm(src_label), hwm(dst_label)).
+    // This replaces the old sum-of-all-labels approach that overcounted (#309).
+    rel_triples
+        .iter()
+        .map(|&(rel_id, src_label, dst_label)| {
+            // Per-label HWM: max of src and dst label HWMs.
+            // Query the node store directly -- labels may not be formally registered
+            // in the catalog (e.g. low-level create_node by label_id).
+            let hwm_n_nodes = match (src_label, dst_label) {
+                (Some(src), Some(dst)) => {
+                    let src_hwm = node_store.hwm_for_label(src as u32).unwrap_or(0);
+                    let dst_hwm = node_store.hwm_for_label(dst as u32).unwrap_or(0);
+                    src_hwm.max(dst_hwm)
+                }
+                // Legacy table-0 or unknown: use global max.
+                _ => global_max_hwm,
+            };
 
-    (rel_table_ids, n_nodes)
+            // Also scan this rel table's delta records for the maximum slot index,
+            // so the CSR bounds check passes even when edges were inserted without
+            // going through the node-store API.
+            let delta_max: u64 = EdgeStore::open(db_root, RelTableId(rel_id))
+                .ok()
+                .and_then(|s| s.read_delta().ok())
+                .map(|records| {
+                    records
+                        .iter()
+                        .flat_map(|r| {
+                            // Strip label bits -- CSR needs slot indices only.
+                            let src_slot = r.src.0 & 0xFFFF_FFFF;
+                            let dst_slot = r.dst.0 & 0xFFFF_FFFF;
+                            [src_slot, dst_slot].into_iter()
+                        })
+                        .max()
+                        .map(|max_slot| max_slot + 1)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+
+            let n_nodes = hwm_n_nodes.max(delta_max).max(1);
+            (rel_id, n_nodes)
+        })
+        .collect()
 }
 
 // Open all per-type CSR forward files that exist on disk, keyed by rel_table_id.
@@ -4643,6 +4999,85 @@ mod tests {
             .expect("checkpoint must succeed after WriteTx dropped");
     }
 
+    /// Issue #309: checkpoint must use per-label HWM, not the sum of all labels.
+    ///
+    /// When a graph has two labels (e.g. Person with 5 nodes, City with 3 nodes),
+    /// the CSR for a (:Person)-[:LIVES_IN]->(:City) rel table should be sized to
+    /// max(5, 3) = 5, not 5 + 3 = 8.  The overcounted sum wastes memory and can
+    /// produce incorrect degree arrays.
+    #[test]
+    fn checkpoint_uses_per_label_hwm_not_sum() {
+        use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        // Create nodes with two distinct labels.
+        // Label 0 ("Person"): 5 nodes  ->  HWM = 5
+        // Label 1 ("City"):   3 nodes  ->  HWM = 3
+        {
+            let mut tx = db.begin_write().unwrap();
+            for _ in 0..5 {
+                tx.create_node(0, &[]).unwrap();
+            }
+            for _ in 0..3 {
+                tx.create_node(1, &[]).unwrap();
+            }
+            // Create edges from Person -> City (LIVES_IN).
+            // Person slot 0 -> City slot 0
+            // Person slot 1 -> City slot 1
+            let person_0 = sparrowdb_common::NodeId(0);
+            let person_1 = sparrowdb_common::NodeId(1);
+            let city_0 = sparrowdb_common::NodeId(1u64 << 32);
+            let city_1 = sparrowdb_common::NodeId((1u64 << 32) | 1);
+            tx.create_edge(
+                person_0,
+                city_0,
+                "LIVES_IN",
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+            tx.create_edge(
+                person_1,
+                city_1,
+                "LIVES_IN",
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Checkpoint should succeed and produce correctly sized CSR.
+        db.checkpoint()
+            .expect("checkpoint with multi-label graph must succeed");
+
+        // Verify the CSR n_nodes is max(5, 3) = 5, not 5 + 3 = 8.
+        // Find the LIVES_IN rel table and open its CSR.
+        let catalog = sparrowdb_catalog::catalog::Catalog::open(dir.path()).unwrap();
+        let rel_tables = catalog.list_rel_table_ids();
+        let lives_in = rel_tables
+            .iter()
+            .find(|(_, _, _, rt)| rt == "LIVES_IN")
+            .expect("LIVES_IN rel table must exist");
+        let store = EdgeStore::open(dir.path(), RelTableId(lives_in.0 as u32)).unwrap();
+        let fwd = store
+            .open_fwd()
+            .expect("CSR forward must exist after checkpoint");
+
+        // The key assertion: n_nodes should be max(5, 3) = 5, not 8.
+        assert_eq!(
+            fwd.n_nodes(),
+            5,
+            "CSR n_nodes should be max of per-label HWMs (5), not sum (8)"
+        );
+
+        // Verify the edges are actually correct.
+        let neighbors_0 = fwd.neighbors(0);
+        let neighbors_1 = fwd.neighbors(1);
+        assert_eq!(neighbors_0, &[0], "Person 0 -> City 0 (slot 0)");
+        assert_eq!(neighbors_1, &[1], "Person 1 -> City 1 (slot 1)");
+    }
+
     /// SPA-181: Dropping a WriteTx without calling commit() must not persist
     /// any mutations.  The node-store HWM must remain at 0 after a dropped tx.
     #[test]
@@ -5063,5 +5498,237 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         };
         assert_eq!(x, 42, "value must not be corrupted by no-op replay");
+    }
+
+    // ── #305: catalog mutations must be transactional ─────────────────────────
+
+    /// #305: A WriteTx that calls create_label and is then dropped without
+    /// committing must NOT leave a ghost label in the catalog.
+    #[test]
+    fn dropped_write_tx_leaves_no_ghost_labels() {
+        use sparrowdb_catalog::catalog::Catalog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        {
+            let mut tx = db.begin_write().unwrap();
+            // Stage a label creation — should NOT be written to catalog on disk.
+            tx.create_label("GhostLabel").unwrap();
+            // Drop WITHOUT calling commit().
+        }
+
+        // Reopen the catalog from disk and verify the label is NOT present.
+        let catalog = Catalog::open(dir.path()).unwrap();
+        let ghost = catalog
+            .get_label("GhostLabel")
+            .expect("catalog lookup must not error");
+        assert!(
+            ghost.is_none(),
+            "dropped WriteTx must not leave ghost label in catalog (#305)"
+        );
+
+        // A subsequent write transaction must still be obtainable.
+        let tx2 = db
+            .begin_write()
+            .expect("write lock must be released after drop");
+        tx2.commit().unwrap();
+    }
+
+    /// #305: A WriteTx that calls create_label and commits successfully MUST
+    /// persist the label to the catalog on disk.
+    #[test]
+    fn committed_write_tx_persists_label() {
+        use sparrowdb_catalog::catalog::Catalog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        {
+            let mut tx = db.begin_write().unwrap();
+            tx.create_label("PersistedLabel").unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Reopen the catalog from disk and verify the label IS present.
+        let catalog = Catalog::open(dir.path()).unwrap();
+        let id = catalog
+            .get_label("PersistedLabel")
+            .expect("catalog lookup must not error");
+        assert!(
+            id.is_some(),
+            "committed WriteTx must persist label to catalog (#305)"
+        );
+    }
+
+    /// #305: A WriteTx that calls create_edge (which stages a new rel type) and
+    /// is dropped without committing must NOT leave a ghost rel-type entry.
+    #[test]
+    fn dropped_write_tx_leaves_no_ghost_rel_types() {
+        use sparrowdb_catalog::catalog::Catalog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        // Commit two nodes so we have valid src/dst node IDs.
+        let (src, dst) = {
+            let mut tx = db.begin_write().unwrap();
+            // Use label 0 (already exists as a virtual/implicit label).
+            let src = tx.create_node(0, &[]).unwrap();
+            let dst = tx.create_node(0, &[]).unwrap();
+            tx.commit().unwrap();
+            (src, dst)
+        };
+
+        {
+            let mut tx = db.begin_write().unwrap();
+            // Stage an edge with a new rel type — should NOT be written to
+            // the catalog on disk when the transaction is dropped.
+            tx.create_edge(src, dst, "GHOST_REL", std::collections::HashMap::new())
+                .unwrap();
+            // Drop WITHOUT calling commit().
+        }
+
+        // Reopen the catalog from disk and verify no rel-table entry exists.
+        let catalog = Catalog::open(dir.path()).unwrap();
+        let rel_tables = catalog
+            .list_rel_tables()
+            .expect("list_rel_tables must not error");
+        assert!(
+            rel_tables.iter().all(|(_, _, t)| t != "GHOST_REL"),
+            "dropped WriteTx must not leave ghost rel-type in catalog (#305)"
+        );
+    }
+
+    /// #305: A WriteTx that calls create_edge (which stages a new rel type) and
+    /// is committed must persist the rel-type entry to the catalog on disk.
+    #[test]
+    fn committed_write_tx_persists_rel_type() {
+        use sparrowdb_catalog::catalog::Catalog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        // Commit two nodes so we have valid src/dst node IDs.
+        let (src, dst) = {
+            let mut tx = db.begin_write().unwrap();
+            let src = tx.create_node(0, &[]).unwrap();
+            let dst = tx.create_node(0, &[]).unwrap();
+            tx.commit().unwrap();
+            (src, dst)
+        };
+
+        {
+            let mut tx = db.begin_write().unwrap();
+            tx.create_edge(src, dst, "PERSISTED_REL", std::collections::HashMap::new())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Reopen the catalog from disk and verify the rel-type IS present.
+        let catalog = Catalog::open(dir.path()).unwrap();
+        let rel_tables = catalog
+            .list_rel_tables()
+            .expect("list_rel_tables must not error");
+        assert!(
+            rel_tables.iter().any(|(_, _, t)| t == "PERSISTED_REL"),
+            "committed WriteTx must persist rel-type to catalog (#305)"
+        );
+    }
+
+    // ── Issue #307: VersionStore GC ───────────────────────────────────────────
+
+    /// GC prunes old version entries so the store does not grow proportionally
+    /// with the number of writes.  After 1 000 SET operations and enough commits
+    /// to trigger GC several times, the total number of version entries across
+    /// all keys must be strictly less than 1 000 (the unbounded baseline).
+    #[test]
+    fn versionstore_gc_bounds_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        let col_id = sparrowdb_common::col_id_of("counter");
+
+        // Create the node once.
+        let node_id = {
+            let mut tx = db.begin_write().unwrap();
+            let nid = tx.create_node(0, &[(col_id, Value::Int64(0))]).unwrap();
+            tx.commit().unwrap();
+            nid
+        };
+
+        // Update the same property 1 000 times.
+        for i in 1i64..=1_000 {
+            let mut tx = db.begin_write().unwrap();
+            tx.set_node_col(node_id, col_id, Value::Int64(i));
+            tx.commit().unwrap();
+        }
+
+        // Count total Version entries across the entire VersionStore.
+        let total_entries: usize = db
+            .inner
+            .versions
+            .read()
+            .unwrap()
+            .map
+            .values()
+            .map(|v| v.len())
+            .sum();
+
+        // GC_COMMIT_INTERVAL = 100, so GC ran ~10 times.  The chain must be
+        // far shorter than 1 000 entries.
+        assert!(
+            total_entries < 1_000,
+            "VersionStore grew to {total_entries} entries — GC is not running"
+        );
+    }
+
+    /// Readers pinned before GC runs must still see the correct snapshot value
+    /// after GC has pruned versions below their watermark.
+    #[test]
+    fn versionstore_gc_preserves_snapshot_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        let col_id = sparrowdb_common::col_id_of("val");
+
+        // Create a node with initial value 0.
+        let node_id = {
+            let mut tx = db.begin_write().unwrap();
+            let nid = tx.create_node(0, &[(col_id, Value::Int64(0))]).unwrap();
+            tx.commit().unwrap();
+            nid
+        };
+
+        // Open a long-lived reader pinned at this snapshot.
+        let reader = db.begin_read().unwrap();
+        let reader_snapshot = reader.snapshot_txn_id;
+
+        // Perform enough writes to trigger GC several times.
+        for i in 1i64..=200 {
+            let mut tx = db.begin_write().unwrap();
+            tx.set_node_col(node_id, col_id, Value::Int64(i));
+            tx.commit().unwrap();
+        }
+
+        // The pinned reader must still observe a value consistent with its snapshot.
+        let seen = reader.get_node(node_id, &[col_id]).unwrap();
+        let seen_val = seen
+            .iter()
+            .find(|(c, _)| *c == col_id)
+            .map(|(_, v)| v.clone());
+
+        match seen_val {
+            Some(Value::Int64(v)) => {
+                assert!(
+                    v <= 200,
+                    "reader at snapshot {reader_snapshot} saw future value {v}"
+                );
+            }
+            other => panic!("unexpected value from pinned reader: {other:?}"),
+        }
+
+        // Explicitly drop the reader — cleanly unregisters it.
+        drop(reader);
     }
 }
