@@ -392,8 +392,9 @@ impl Engine {
         // SPA-284: pre-resolve rel-type IDs so the BFS/DFS uses filtered CSR lookups.
         let rel_ids = self.resolve_rel_ids_for_type(&rel_pat.rel_type);
         // If a rel type was specified but doesn't exist in the catalog, no edges of
-        // that type can exist — return empty rather than falling back to "all neighbors".
-        if !rel_pat.rel_type.is_empty() && rel_ids.is_empty() {
+        // that type can exist. When min_hops > 0 that means no matches — return empty.
+        // When min_hops == 0 the source node must still be emitted, so fall through.
+        if !rel_pat.rel_type.is_empty() && rel_ids.is_empty() && min_hops > 0 {
             return Ok(QueryResult {
                 columns: column_names.to_vec(),
                 rows: vec![],
