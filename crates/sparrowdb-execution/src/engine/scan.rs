@@ -1605,6 +1605,13 @@ impl Engine {
         m: &MatchStatement,
         column_names: &[String],
     ) -> Result<QueryResult> {
+        // ── Opt-in chunked pipeline (#299) ────────────────────────────────────
+        // When enabled and the query qualifies, route through the Phase 1
+        // vectorized pipeline. The row-at-a-time path below is unchanged.
+        if self.can_use_chunked_pipeline(m) {
+            return self.execute_scan_chunked(m, column_names);
+        }
+
         let pat = &m.pattern[0];
         let node = &pat.nodes[0];
 
