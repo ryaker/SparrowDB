@@ -4674,4 +4674,45 @@ mod tests {
             "dropped WriteTx must not leave ghost rel-type in catalog (#305)"
         );
     }
+
+    /// #305: A WriteTx that calls create_edge (which stages a new rel type) and
+    /// is committed must persist the rel-type entry to the catalog on disk.
+    #[test]
+    fn committed_write_tx_persists_rel_type() {
+        use sparrowdb_catalog::catalog::Catalog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = GraphDb::open(dir.path()).unwrap();
+
+        // Commit two nodes so we have valid src/dst node IDs.
+        let (src, dst) = {
+            let mut tx = db.begin_write().unwrap();
+            let src = tx.create_node(0, &[]).unwrap();
+            let dst = tx.create_node(0, &[]).unwrap();
+            tx.commit().unwrap();
+            (src, dst)
+        };
+
+        {
+            let mut tx = db.begin_write().unwrap();
+            tx.create_edge(
+                src,
+                dst,
+                "PERSISTED_REL",
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Reopen the catalog from disk and verify the rel-type IS present.
+        let catalog = Catalog::open(dir.path()).unwrap();
+        let rel_tables = catalog
+            .list_rel_tables()
+            .expect("list_rel_tables must not error");
+        assert!(
+            rel_tables.iter().any(|(_, _, t)| t == "PERSISTED_REL"),
+            "committed WriteTx must persist rel-type to catalog (#305)"
+        );
+    }
 }
