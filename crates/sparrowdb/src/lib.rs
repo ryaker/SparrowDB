@@ -5332,7 +5332,7 @@ mod tests {
             db.execute("CREATE (n:CrashNode {val: 1})").expect("create");
 
             // Discover the label_id assigned by the catalog.
-            let mut cat = RawCatalog::open(&db_path).expect("catalog");
+            let cat = RawCatalog::open(&db_path).expect("catalog");
             label_id = cat
                 .get_label("CrashNode")
                 .expect("get_label")
