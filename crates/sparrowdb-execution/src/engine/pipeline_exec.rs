@@ -1187,6 +1187,7 @@ impl Engine {
             })?;
 
         let hwm_src = self.snapshot.store.hwm_for_label(src_label_id).unwrap_or(0);
+        let hwm_dst = self.snapshot.store.hwm_for_label(dst_label_id).unwrap_or(0);
         tracing::debug!(
             engine = "chunked",
             src_label = %src_label,
@@ -1194,6 +1195,7 @@ impl Engine {
             dst_label = %dst_label,
             rel_type = %rel_type,
             hwm_src,
+            hwm_dst,
             "executing via chunked pipeline (2-hop)"
         );
 
@@ -1293,11 +1295,15 @@ impl Engine {
         // ── BfsArena: reused across both hops ────────────────────────────────
         //
         // BfsArena replaces the old FrontierScratch + per-chunk HashSet dedup
-        // pattern. It pairs a double-buffer frontier with a RoaringBitmap for
+        // pattern. It pairs a double-buffer frontier with a flat bitvector for
         // O(1) visited-set membership testing — no per-chunk HashSet allocation.
-        // arena.clear() resets both buffers and the bitmap in O(1) amortized
-        // time without deallocating backing memory.
-        let mut frontier = BfsArena::new(avg_degree_hint * (crate::chunk::CHUNK_CAPACITY / 2));
+        // arena.clear() only zeroes modified bitvector words (O(dirty)), not
+        // the full pre-allocated bitvector.
+        let node_capacity = (hwm_src.max(hwm_dst) as usize).max(64);
+        let mut frontier = BfsArena::new(
+            avg_degree_hint * (crate::chunk::CHUNK_CAPACITY / 2),
+            node_capacity,
+        );
 
         // ── Memory-limit tracking ─────────────────────────────────────────────
         // We track accumulated output rows as a proxy for memory usage.
