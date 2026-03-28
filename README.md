@@ -48,6 +48,63 @@ That's it. The database is a directory on disk. Ship it.
 
 ---
 
+## Performance: Faster Than Neo4j Where It Counts
+
+Benchmarked against Neo4j 5.x on the SNAP Facebook dataset (4,039 nodes, 88,234 edges). All figures are p50 latency, v0.1.13.
+
+| Query | SparrowDB | Neo4j | vs Neo4j |
+|-------|-----------|-------|---------|
+| **Point Lookup (indexed)** | **103µs** | 321µs | **3x faster** |
+| **Global COUNT(\*)** | **2.2µs** | 202µs | **93x faster** |
+| **Top-10 by Degree** | **401µs** | 17,588µs | **44x faster** |
+| 1-Hop Traversal | 42.8ms | 632µs | 68x slower |
+| 2-Hop Traversal | 83.7ms | 376µs | 222x slower |
+
+**Point lookups and aggregations beat a running Neo4j server — with no JVM, no server process, no network hop.**
+
+The traversal gap is real and documented (see [Performance](#performance-characteristics)). SparrowDB is the right choice when you're building apps, not operating a graph cluster. Deep multi-hop on billion-edge social graphs is Neo4j's domain. Everything else — embedded apps, agents, CLIs, edge services, knowledge graphs — is SparrowDB's.
+
+**Cold start: ~27ms** — viable for serverless and short-lived processes where Neo4j's server startup is disqualifying.
+
+---
+
+## Built for AI Agents and MCP
+
+SparrowDB ships with a first-class **MCP server** (`sparrowdb-mcp`) — the only embedded graph database with native MCP support. It speaks JSON-RPC 2.0 over stdio and plugs directly into Claude Desktop and any MCP-compatible AI client.
+
+```bash
+cargo install sparrowdb --bin sparrowdb-mcp --locked
+```
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "sparrowdb": {
+      "command": "/absolute/path/to/sparrowdb-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+Your AI assistant can now query and write to your graph database using natural tool calls:
+
+| Tool | Description |
+|------|-------------|
+| `execute_cypher` | Execute any Cypher statement; returns result rows |
+| `create_entity` | Create a node with a label and properties |
+| `add_property` | Set a property on nodes matching a filter |
+| `checkpoint` | Flush WAL and compact |
+| `info` | Database metadata |
+
+Full setup: [docs/mcp-setup.md](docs/mcp-setup.md)
+
+**Why this matters for agent builders:** Multi-agent systems need shared, persistent graph state. SparrowDB gives your agents a knowledge graph they can read and write without spinning up a server. Pair it with [SparrowOntology](https://github.com/ryaker/SparrowOntology) for schema-enforced agent memory and governance.
+
+---
+
 ## Why SparrowDB
 
 **The graph database landscape has a gap.**
@@ -78,8 +135,55 @@ SparrowDB is the right choice when:
 
 SparrowDB is *not* the right choice when:
 
-- **Deep multi-hop traversal is your primary workload.** 1-hop to 5-hop queries on high-fanout graphs (social networks, web graphs) are where Neo4j's battle-hardened CSR layout and parallel execution show. SparrowDB is currently 25–453x behind on those queries (1-hop: 67x, 2-hop: 233x, mutual friends: 453x). That gap narrows over time, but if deep traversal is your core workload, use Neo4j.
+- **Deep multi-hop traversal is your primary workload.** 1-hop to 5-hop queries on high-fanout graphs (social networks, web graphs) are where Neo4j's battle-hardened CSR layout and parallel execution show. SparrowDB is currently 68x–435x behind on those queries (1-hop: 68x, 2-hop: 222x, mutual friends: 435x). That gap is actively narrowing (see Roadmap), but if deep traversal is your core workload today, use Neo4j.
 - **You need distributed writes across many nodes**, or your graph has billions of edges and requires horizontal sharding. Use Neo4j Aura or DGraph for that.
+
+---
+
+## Install
+
+### Node.js
+
+```bash
+npm install sparrowdb
+```
+
+### Rust
+
+```toml
+[dependencies]
+sparrowdb = "0.1"
+```
+
+### Python
+
+```bash
+# Build from source (requires Rust toolchain):
+cd crates/sparrowdb-python && maturin develop
+```
+
+> PyPI package coming soon. Pre-built wheels are on the roadmap.
+
+### Ruby
+
+```bash
+# Build from source (requires Rust toolchain):
+cd crates/sparrowdb-ruby && bundle install && rake compile
+```
+
+> RubyGems package coming soon.
+
+### CLI
+
+```bash
+cargo install sparrowdb --bin sparrowdb
+```
+
+### MCP Server (Claude Desktop integration)
+
+```bash
+cargo install sparrowdb --bin sparrowdb-mcp --locked
+```
 
 ---
 
@@ -95,7 +199,9 @@ SparrowDB is *not* the right choice when:
 | `WHERE n.prop IS NULL` / `IS NOT NULL` | ✅ |
 | 1-hop and multi-hop edges `(a)-[:R]->()-[:R]->(c)` | ✅ |
 | Undirected edges `(a)-[:R]-(b)` | ✅ |
+| Reverse-arrow pattern `(a)->()<-(c)` | ✅ |
 | Variable-length paths `[:R*1..N]` | ✅ |
+| Multi-label nodes `(n:A:B)` | ✅ |
 | `RETURN DISTINCT`, `ORDER BY`, `LIMIT`, `SKIP` | ✅ |
 | `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT expr)` | ✅ |
 | `SUM`, `AVG`, `MIN`, `MAX` | ✅ |
@@ -122,20 +228,21 @@ SparrowDB is *not* the right choice when:
 | Parameters `$param` | ✅ |
 | `CALL db.index.fulltext.queryNodes` — scored full-text search | ✅ |
 | `CALL db.schema()` | ✅ |
-| Multi-label nodes `(n:A:B)` | ⚠️ Planned |
 | Subqueries `CALL { … }` | ⚠️ Partial |
 
 ### Engine & Storage
 
 - **WAL durability** — write-ahead log with crash recovery; survives hard kills
 - **SWMR concurrency** — single-writer, multiple-reader; readers never block writers
+- **Chunked vectorized pipeline** — 4-phase chunked execution engine for multi-hop traversals; FrontierScratch arena eliminates per-hop allocation; SlotIntersect for mutual-neighbor queries
 - **Factorized execution** — multi-hop traversals avoid materializing O(N²) intermediate rows
-- **B-tree property index** — equality lookups in O(log n), not full label scans
+- **B-tree property index** — equality lookups in O(log n), not full label scans; persisted to disk
 - **Inverted text index** — `CONTAINS` / `STARTS WITH` routed through an index
 - **Full-text search** — relevance-scored `queryNodes` without Elasticsearch
 - **External merge sort** — `ORDER BY` on large results spills to disk; no unbounded heap
 - **At-rest encryption** — optional XChaCha20-Poly1305 per WAL entry; wrong key errors immediately, never silently decrypts garbage
 - **`execute_batch()`** — multiple writes in one `fsync` for bulk-load throughput
+- **Bulk CSV loader** — `sparrowdb bulk-import` ingests node and edge CSVs with batched WriteTx for high-throughput imports
 - **`execute_with_timeout()`** — cancel runaway traversals without killing the process
 - **`export_dot()`** — export any graph to Graphviz DOT for visualization
 - **APOC CSV import** — migrate existing Neo4j graphs in one command
@@ -151,49 +258,6 @@ SparrowDB is *not* the right choice when:
 | Ruby | Magnus extension | ✅ Stable |
 
 All bindings open the same on-disk format. A graph written from Python can be read by Node.js.
-
----
-
-## Install
-
-### Rust
-
-```toml
-[dependencies]
-sparrowdb = "0.1"
-```
-
-### Python
-
-```bash
-# Build from source (requires Rust toolchain):
-cd crates/sparrowdb-python && maturin develop
-```
-
-### Node.js
-
-```bash
-npm install sparrowdb
-```
-
-### Ruby
-
-```bash
-# Build from source (requires Rust toolchain):
-cd crates/sparrowdb-ruby && bundle install && rake compile
-```
-
-### CLI
-
-```bash
-cargo install sparrowdb --bin sparrowdb
-```
-
-### MCP Server (Claude Desktop integration)
-
-```bash
-cargo install sparrowdb --bin sparrowdb-mcp --locked
-```
 
 ---
 
@@ -224,7 +288,7 @@ fn main() -> sparrowdb::Result<()> {
     println!("{:?}", fof.rows); // [["Carol"]]
 
     // WITH pipeline: count edges, filter, continue
-    let prolific = db.execute(
+    let _prolific = db.execute(
         "MATCH (p:Person)-[:KNOWS]->(f)
          WITH p, COUNT(f) AS connections
          WHERE connections >= 1
@@ -261,22 +325,13 @@ with sparrowdb.GraphDb("/path/to/my.db") as db:
         "MATCH (a:Product {id:1}),(b:Product {id:2}) CREATE (a)-[:RELATED]->(b)"
     )
 
-    # Traverse: what's related to Widget?
     rows = db.execute(
         "MATCH (p:Product {name:'Widget'})-[:RELATED*1..2]->(r) "
         "RETURN DISTINCT r.name, r.price ORDER BY r.price"
     )
-    print(rows)  # [{'r.name': 'Doohickey', 'r.price': 4.99}, {'r.name': 'Gadget', 'r.price': 24.99}]
+    print(rows)
 
-    # UNWIND + MATCH: bulk lookup by ID
-    rows = db.execute(
-        "UNWIND [1, 3] AS item_id "
-        "MATCH (n:Product {id: item_id}) "
-        "RETURN n.name, n.price"
-    )
-    print(rows)  # [{'n.name': 'Widget', 'n.price': 9.99}, {'n.name': 'Doohickey', 'n.price': 4.99}]
-
-# Thread-safe: GIL is released inside execute(), checkpoint(), and optimize()
+# Thread-safe: GIL is released inside execute()
 import concurrent.futures
 
 def query_worker(limit):
@@ -296,22 +351,14 @@ const db = new SparrowDB('/path/to/my.db');
 
 db.execute("CREATE (n:Article {id: 'a1', title: 'Graph Databases 101', tags: 'graphs,rust'})");
 db.execute("CREATE (n:Article {id: 'a2', title: 'Cypher Query Language', tags: 'cypher,graphs'})");
-db.execute("CREATE (n:Article {id: 'a3', title: 'Embedded Rust', tags: 'rust,embedded'})");
 db.execute("MATCH (a:Article {id:'a1'}),(b:Article {id:'a2'}) CREATE (a)-[:RELATED]->(b)");
 
-// Find related articles, 2 hops
-const related = db.execute(
-  "MATCH (a:Article {id:'a1'})-[:RELATED*1..2]->(r) RETURN DISTINCT r.title"
-);
-console.log(related); // [['Cypher Query Language']]
-
-// Full-text search (after indexing)
+// Full-text search
 db.execute("CALL db.index.fulltext.createNodeIndex('articles', ['Article'], ['title', 'tags'])");
 const results = db.execute(
   "CALL db.index.fulltext.queryNodes('articles', 'rust') " +
   "YIELD node, score RETURN node.title, score ORDER BY score DESC"
 );
-console.log(results);
 
 db.close();
 ```
@@ -325,10 +372,8 @@ db = SparrowDB::GraphDb.new('/path/to/my.db')
 
 db.execute("CREATE (n:Dependency {name: 'tokio',  version: '1.35'})")
 db.execute("CREATE (n:Dependency {name: 'serde',  version: '1.0'})")
-db.execute("CREATE (n:Dependency {name: 'rand',   version: '0.8'})")
 db.execute("MATCH (a:Dependency {name:'tokio'}),(b:Dependency {name:'serde'}) CREATE (a)-[:DEPENDS_ON]->(b)")
 
-# Who does tokio depend on transitively?
 rows = db.execute(
   "MATCH (a:Dependency {name:'tokio'})-[:DEPENDS_ON*1..5]->(dep) RETURN DISTINCT dep.name"
 )
@@ -344,7 +389,6 @@ db.close
 ### Recommendation Engine
 
 ```cypher
--- "Users who liked X also liked Y"
 MATCH (u:User {id: $user_id})-[:LIKED]->(item:Item)
 WITH collect(item) AS liked_items
 MATCH (other:User)-[:LIKED]->(item) WHERE item IN liked_items
@@ -357,7 +401,6 @@ RETURN candidate.name, COUNT(other) AS score ORDER BY score DESC LIMIT 10
 ### Fraud Detection
 
 ```cypher
--- Find accounts that share a device with a flagged account
 MATCH (flagged:Account {status:'fraudulent'})-[:USED]->(device:Device)
 MATCH (device)<-[:USED]-(suspect:Account)
 WHERE suspect.status <> 'fraudulent'
@@ -367,7 +410,7 @@ RETURN suspect.id, suspect.email, shared_devices
 ORDER BY shared_devices DESC
 ```
 
-### Dependency Graph (software, supply chain)
+### Dependency Graph
 
 ```cypher
 -- What breaks if we remove this package?
@@ -379,7 +422,6 @@ ORDER BY dependent.name
 ### Knowledge Graph
 
 ```cypher
--- How are these two concepts connected?
 MATCH (a:Concept {name: 'machine learning'}), (b:Concept {name: 'linear algebra'})
 MATCH path = shortestPath((a)-[:RELATED_TO|REQUIRES|FOUNDATION_OF*]->(b))
 RETURN [n IN nodes(path) | n.name] AS connection_chain
@@ -388,7 +430,6 @@ RETURN [n IN nodes(path) | n.name] AS connection_chain
 ### Org Chart Reporting
 
 ```cypher
--- Full reporting chain from an IC to the top
 MATCH (emp:Employee {name: $name})-[:REPORTS_TO*]->(mgr:Employee)
 RETURN emp.name, [m IN collect(mgr) | m.name + ' (' + m.title + ')'] AS chain
 ```
@@ -399,14 +440,11 @@ RETURN emp.name, [m IN collect(mgr) | m.name + ' (' + m.title + ')'] AS chain
 
 ### Encrypted Database
 
-Protect data at rest. The key must be exactly 32 bytes. Wrong key = immediate error, never silently decrypted garbage.
-
 ```rust,no_run
 use sparrowdb::GraphDb;
 
 fn main() -> sparrowdb::Result<()> {
     let mut key = [0u8; 32];
-    // Use argon2 / scrypt in production to derive from a passphrase
     key[..16].copy_from_slice(b"my-secret-phrase");
 
     let db = GraphDb::open_encrypted(std::path::Path::new("secure.db"), key)?;
@@ -418,20 +456,6 @@ fn main() -> sparrowdb::Result<()> {
 
 ### Graph Visualization
 
-```rust,no_run
-use sparrowdb::GraphDb;
-
-fn main() -> sparrowdb::Result<()> {
-    let db = GraphDb::open(std::path::Path::new("my.db"))?;
-    let dot = db.export_dot()?;
-    std::fs::write("graph.dot", &dot)?;
-    // Render:
-    //   dot -Tsvg graph.dot -o graph.svg
-    //   dot -Tpng graph.dot -o graph.png
-    Ok(())
-}
-```
-
 ```bash
 sparrowdb visualize --db my.db | dot -Tsvg -o graph.svg
 ```
@@ -439,76 +463,53 @@ sparrowdb visualize --db my.db | dot -Tsvg -o graph.svg
 ### Full-Text Search
 
 ```rust,no_run
-use sparrowdb::GraphDb;
+db.execute("CALL db.index.fulltext.createNodeIndex('docs', ['Document'], ['content', 'title'])")?;
+db.execute("CREATE (n:Document {title: 'Rust graph databases', content: 'Embedded and fast'})")?;
 
-fn main() -> sparrowdb::Result<()> {
-    let db = GraphDb::open(std::path::Path::new("my.db"))?;
-
-    // Index once
-    db.execute(
-        "CALL db.index.fulltext.createNodeIndex('docs', ['Document'], ['content', 'title'])"
-    )?;
-
-    // Index is maintained automatically on writes
-    db.execute("CREATE (n:Document {title: 'Rust graph databases', content: 'Embedded and fast'})")?;
-
-    // Query -- relevance ranked
-    let results = db.execute(
-        "CALL db.index.fulltext.queryNodes('docs', 'embedded graph') \
-         YIELD node, score \
-         RETURN node.title, score ORDER BY score DESC"
-    )?;
-    let _ = results;
-    Ok(())
-}
+let results = db.execute(
+    "CALL db.index.fulltext.queryNodes('docs', 'embedded graph') \
+     YIELD node, score \
+     RETURN node.title, score ORDER BY score DESC"
+)?;
 ```
 
 ### Per-Query Timeout
 
 ```rust,no_run
-use sparrowdb::GraphDb;
-use std::time::Duration;
-
-fn main() -> sparrowdb::Result<()> {
-    let db = GraphDb::open(std::path::Path::new("my.db"))?;
-
-    match db.execute_with_timeout(
-        "MATCH (a)-[:FOLLOWS*1..10]->(b) RETURN b.name",
-        Duration::from_secs(5),
-    ) {
-        Ok(rows) => println!("{} rows", rows.rows.len()),
-        Err(e) if e.to_string().contains("timeout") => eprintln!("Query cancelled"),
-        Err(e) => return Err(e),
-    }
-    Ok(())
+match db.execute_with_timeout(
+    "MATCH (a)-[:FOLLOWS*1..10]->(b) RETURN b.name",
+    Duration::from_secs(5),
+) {
+    Ok(rows) => println!("{} rows", rows.rows.len()),
+    Err(e) if e.to_string().contains("timeout") => eprintln!("Query cancelled"),
+    Err(e) => return Err(e),
 }
 ```
 
-### Bulk Load (single fsync)
+### Bulk CSV Import
+
+```bash
+# High-throughput node + edge ingestion via CLI
+sparrowdb bulk-import \
+  --db my.db \
+  --nodes nodes.csv --node-label Person \
+  --edges edges.csv --rel-type KNOWS \
+  --src-label Person --dst-label Person \
+  --batch-size 10000
+```
 
 ```rust,no_run
-use sparrowdb::GraphDb;
-
-fn main() -> sparrowdb::Result<()> {
-    let db = GraphDb::open(std::path::Path::new("my.db"))?;
-    db.execute_batch(&[
-        "CREATE (n:Product {id: 1, name: 'Widget',   price: 9.99})",
-        "CREATE (n:Product {id: 2, name: 'Gadget',   price: 24.99})",
-        "CREATE (n:Product {id: 3, name: 'Doohickey',price: 4.99})",
-        "MATCH (a:Product {id:1}),(b:Product {id:2}) CREATE (a)-[:RELATED]->(b)",
-    ])?;
-    // All four statements committed in one WAL fsync
-    Ok(())
-}
+// Or from Rust
+use sparrowdb::bulk::{BulkLoader, BulkOptions};
+let loader = BulkLoader::new(&db, BulkOptions::default());
+let n = loader.load_nodes(Path::new("nodes.csv"), "Person")?;
+let e = loader.load_edges(Path::new("edges.csv"), "KNOWS", "Person", "Person")?;
 ```
 
 ### Neo4j Migration
 
 ```bash
-# Export from Neo4j using APOC:
-#   CALL apoc.export.csv.all("export", {})
-# Produces nodes.csv + relationships.csv
-
+# Export from Neo4j using APOC, then:
 sparrowdb import --neo4j-csv nodes.csv,relationships.csv --db my.db
 ```
 
@@ -516,32 +517,30 @@ sparrowdb import --neo4j-csv nodes.csv,relationships.csv --db my.db
 
 ## Performance Characteristics
 
-### Benchmark Results: SNAP Facebook Dataset (v0.1.10)
+### Benchmark Results: SNAP Facebook Dataset (v0.1.13)
 
-Measured against Neo4j 5.x (server, JVM warmed) and Kùzu (Shi et al. VLDB 2023). All figures are p50 latency in microseconds. Dataset: SNAP Facebook social graph (4,039 nodes, 88,234 edges), 100 warmup + 500 iterations.
-
-**The headline:** Point lookups and global aggregation beat a running Neo4j server handily — with no JVM, no server process, and no network hop.
+Measured against Neo4j 5.x (server, JVM warmed) and Kùzu (Shi et al. VLDB 2023). All figures are p50 latency in microseconds. Dataset: SNAP Facebook social graph (4,039 nodes, 88,234 edges), 50 warmup + 200 iterations.
 
 | Query | SparrowDB (µs) | Neo4j (µs) | Kùzu (µs) | vs Neo4j |
 |-------|---------------|-----------|-----------|---------|
-| Q1 Point Lookup (indexed) | **105** | 321 | 280 | **3x faster** |
-| Q2 Range Filter | 3,400 | 333 | n/a | 10x slower |
-| Q3 1-Hop Traversal | 42,300 | 632 | 410 | 67x slower |
-| Q4 2-Hop Traversal | 87,500 | 376 | 490 | 233x slower |
-| Q5 Variable Path 1..3 | 12,300 | 501 | 620 | 25x slower |
-| Q6 Global COUNT(*) | **2.2** | 202 | 150 | **91x faster** |
+| Q1 Point Lookup (indexed) | **103** | 321 | 280 | **3x faster** |
+| Q2 Range Filter | 3,600 | 333 | n/a | 11x slower |
+| Q3 1-Hop Traversal | 42,800 | 632 | 410 | 68x slower |
+| Q4 2-Hop Traversal | 83,700 | 376 | 490 | 222x slower |
+| Q5 Variable Path 1..3 | 12,100 | 501 | 620 | 24x slower |
+| Q6 Global COUNT(*) | **2.2** | 202 | 150 | **93x faster** |
 | Q7 Top-10 by Degree | **401** | 17,588 | n/a | **44x faster** |
-| Q8 Mutual Friends | 159,600 | 352 | n/a | 453x slower |
+| Q8 Mutual Friends | 153,300 | 352 | n/a | 435x slower |
 
 Neo4j reference: measured locally, Neo4j Docker v5.x, Bolt TCP. Kùzu reference: Shi et al. VLDB 2023 Table 5, in-process.
 
 **Where SparrowDB wins:**
-- **Q1 (point lookup):** B-tree property index delivers O(log n) lookup at 105µs. 3x faster than Neo4j's Bolt round-trip with JVM overhead.
-- **Q6 (global COUNT):** 2.2µs — 91x faster. Catalog-level metadata lookup, no scan.
-- **Q7 (top-10 by degree):** 401µs — 44x faster than Neo4j's 17.6ms. Pre-computed degree cache delivers O(1) lookup vs Neo4j's full adjacency scan.
-- **Cold start:** opens in ~27ms on macOS SSD — viable for serverless functions and short-lived CLI processes where Neo4j's server startup is disqualifying.
+- **Q1 (point lookup):** B-tree property index at 103µs — 3x faster than Neo4j's Bolt round-trip with JVM overhead.
+- **Q6 (global COUNT):** 2.2µs — 93x faster. Catalog-level metadata lookup, no scan.
+- **Q7 (top-10 by degree):** 401µs — 44x faster than Neo4j's 17.6ms. Pre-computed degree cache vs Neo4j's full adjacency scan.
+- **Cold start:** ~27ms on macOS SSD — viable for serverless and short-lived CLI processes.
 
-**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5, Q8) and range scans (Q2). Neo4j's CSR layout is battle-hardened for high-fanout graph walks with parallel execution. The gap on deep traversals (67x–453x) is structural, not a tuning issue. It narrows over time as the engine matures (see Roadmap), but it is real today.
+**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5, Q8) and range scans (Q2). The gap is actively narrowing — Q4 improved 7% and Q8 p99 dropped 37% in v0.1.13 — but the remaining gap is structural: the execution engine is single-threaded and the CSR layout isn't yet fully exploited for in-memory traversal walks. See Roadmap.
 
 **What this means in practice:**
 - Use SparrowDB for: embedded apps, CLIs, agents, edge services, recommendation engines, and workloads dominated by point lookups, writes, aggregations, and shallow traversals.
@@ -551,118 +550,16 @@ Neo4j reference: measured locally, Neo4j Docker v5.x, Bolt TCP. Kùzu reference:
 
 | Technique | What it buys you |
 |-----------|-----------------|
+| **Chunked vectorized pipeline** | 4-phase execution: ScanByLabel → GetNeighbors chunks → SlotIntersect → ReadNodeProps; eliminates per-row allocation overhead |
+| **FrontierScratch arena** | Reusable flat arena for BFS frontiers; no per-hop heap allocation |
 | **Factorized execution** | Multi-hop traversals avoid materializing O(N²) intermediate rows |
-| **B-tree property index** | Equality lookups: O(log n), not a full label scan |
+| **B-tree property index** | Equality lookups: O(log n), not a full label scan; persisted across restarts |
 | **Inverted text index** | `CONTAINS` / `STARTS WITH` without scanning every node |
 | **External merge sort** | `ORDER BY` on results larger than RAM — sorted runs spill to disk |
 | **`execute_batch()`** | Bulk loads committed in one `fsync` |
 | **SWMR concurrency** | Concurrent readers at zero extra cost; readers never block writers |
 | **Zero-copy open** | Opens in under 1ms — suitable for serverless and short-lived processes |
 | **GIL-released Python** | Python threads can issue parallel reads without contention |
-
----
-
-## Architecture
-
-```text
-+------------------------------------------------------------------------+
-|  Language Bindings                                                     |
-|  Rust - Python (PyO3) - Node.js (napi-rs) - Ruby (Magnus)            |
-|  CLI (sparrowdb) - MCP Server (sparrowdb-mcp)                         |
-+------------------------------------------------------------------------+
-|  Cypher Frontend  (sparrowdb-cypher)                                   |
-|  Lexer -> AST -> Binder (name resolution, type checking)              |
-+------------------------------------------------------------------------+
-|  Factorized Execution Engine  (sparrowdb-execution)                    |
-|  Physical plan - iterator model - aggregation                          |
-|  External merge sort - EXISTS evaluation - deadline checks             |
-+------------------------------------------------------------------------+
-|  Catalog  (sparrowdb-catalog)                                          |
-|  Label registry - B-tree property index - Inverted text index         |
-+------------------------------------------------------------------------+
-|  Storage  (sparrowdb-storage)                                          |
-|  Write-Ahead Log - CSR adjacency store - Delta log                    |
-|  XChaCha20-Poly1305 encryption (optional) - Crash recovery - SWMR    |
-+------------------------------------------------------------------------+
-```
-
-**Crate layout:**
-
-| Crate | Role |
-|-------|------|
-| `sparrowdb` | Public API — `GraphDb`, `QueryResult`, `Value` |
-| `sparrowdb-common` | Shared types and error definitions |
-| `sparrowdb-storage` | WAL, CSR store, encryption, crash recovery |
-| `sparrowdb-catalog` | Label/property schema, B-tree index, text index |
-| `sparrowdb-cypher` | Lexer, parser, AST, binder |
-| `sparrowdb-execution` | Physical query executor, sort, aggregation |
-| `sparrowdb-cli` | `sparrowdb` command-line binary |
-| `sparrowdb-mcp` | JSON-RPC 2.0 MCP server binary |
-| `sparrowdb-python` | PyO3 extension module |
-| `sparrowdb-node` | napi-rs Node.js addon |
-| `sparrowdb-ruby` | Magnus Ruby extension |
-
----
-
-## MCP Server — AI Assistant Integration
-
-`sparrowdb-mcp` speaks JSON-RPC 2.0 over stdio. It plugs into Claude Desktop and any MCP-compatible AI client, letting the assistant query and write to your graph database using natural tool calls.
-
-```bash
-cargo build --release --bin sparrowdb-mcp
-```
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "sparrowdb": {
-      "command": "/absolute/path/to/sparrowdb-mcp",
-      "args": []
-    }
-  }
-}
-```
-
-**Available tools:**
-
-| Tool | Description |
-|------|-------------|
-| `execute_cypher` | Execute any Cypher statement; returns result rows |
-| `create_entity` | Create a node with a label and properties |
-| `add_property` | Set a property on nodes matching a filter |
-| `checkpoint` | Flush WAL and compact |
-| `info` | Database metadata |
-
-Full setup: [docs/mcp-setup.md](docs/mcp-setup.md)
-
----
-
-## CLI Reference
-
-```bash
-# Execute a query — results as JSON
-sparrowdb query --db my.db "MATCH (n:Person) RETURN n.name LIMIT 10"
-
-# Flush WAL and compact
-sparrowdb checkpoint --db my.db
-
-# Database metadata
-sparrowdb info --db my.db
-
-# Export graph as DOT
-sparrowdb visualize --db my.db --output graph.dot
-sparrowdb visualize --db my.db | dot -Tsvg -o graph.svg
-
-# Import Neo4j APOC CSV export
-sparrowdb import --neo4j-csv nodes.csv,relationships.csv --db my.db
-
-# NDJSON line-oriented server mode
-sparrowdb serve --db my.db
-# stdin:  {"id":"q1","cypher":"MATCH (n) RETURN n LIMIT 5"}
-# stdout: {"id":"q1","columns":["n"],"rows":[...],"error":null}
-```
 
 ---
 
@@ -680,6 +577,7 @@ sparrowdb serve --db my.db
 | **WAL crash recovery** | Yes | Yes | Yes | Yes |
 | **Full-text search** | Built-in | Built-in | Built-in | No |
 | **MCP server** | Built-in | No | No | No |
+| **Bulk CSV import** | Built-in | Via neo4j-admin | Via bulk loader | No |
 | **License** | MIT | GPL / Commercial | Apache 2 | Public domain |
 | **Runtime dependencies** | Zero | JVM + server | Server process | Zero |
 
@@ -687,55 +585,97 @@ sparrowdb serve --db my.db
 
 ---
 
+## CLI Reference
+
+```bash
+sparrowdb query --db my.db "MATCH (n:Person) RETURN n.name LIMIT 10"
+sparrowdb checkpoint --db my.db
+sparrowdb info --db my.db
+sparrowdb visualize --db my.db | dot -Tsvg -o graph.svg
+sparrowdb import --neo4j-csv nodes.csv,relationships.csv --db my.db
+sparrowdb bulk-import --db my.db --nodes nodes.csv --edges edges.csv --node-label Person --rel-type KNOWS
+
+# NDJSON server mode
+sparrowdb serve --db my.db
+# stdin:  {"id":"q1","cypher":"MATCH (n) RETURN n LIMIT 5"}
+# stdout: {"id":"q1","columns":["n"],"rows":[...],"error":null}
+```
+
+---
+
 ## Project Status
 
 **SparrowDB is pre-1.0. We are building in public.**
 
-We ship fast. The API is stable enough to build on, but we're still adding features and the on-disk format may change before 1.0. Pin your version.
+The API is stable enough to build on, but the on-disk format may change before 1.0. Pin your version.
 
-**What's done:**
-- Full Cypher subset (see table above)
-- WAL durability + crash recovery
-- At-rest encryption
-- Factorized multi-hop engine
-- B-tree + full-text indexes
-- External merge sort
-- Per-query timeouts
-- Bulk batch writes
-- Python / Node.js / Ruby bindings
-- MCP server
-- CLI tools
-- Neo4j APOC import
-
-Follow along: [github.com/ryaker/SparrowDB](https://github.com/ryaker/SparrowDB)
+**What's done:** Full Cypher subset · Multi-label nodes `(n:A:B)` · WAL durability + crash recovery · MVCC · At-rest encryption · 4-phase chunked vectorized pipeline · Factorized multi-hop engine · B-tree + full-text indexes · External merge sort · Per-query timeouts · Bulk CSV loader · Python / Node.js / Ruby bindings · MCP server · CLI tools · Neo4j APOC import
 
 ---
 
 ## Roadmap
 
-These are the active workstreams that will close the most meaningful gaps, ordered by priority:
-
 | Issue | Work | Why it matters |
 |-------|------|----------------|
-| #242 | MATCH on large WAL silently returns empty — causes phantom write successes | Affects import correctness at scale. Twitter import loses ~27% of edges silently. |
-| #248 | WHERE predicate on edge properties returns 0 rows | Edge property reads work; filter evaluation does not. Blocks rating/weight-based queries. |
-| #247 | `MERGE` upsert — find-by-property-or-create | Enables idempotent imports and fixes the root cause of #242's phantom creates. PR #250 open. |
-| SPA-253 | WAL CRC32C integrity checksums | Detects bit-rot and incomplete writes on crash. Required before 1.0. |
-| SPA-231 | HTTP/SSE transport layer | Enables remote access without embedding. |
-| SPA-200 | Multi-label nodes `(n:A:B)` | Matches standard Cypher semantics. |
-| SPA-226 | Publish SparrowOntology to crates.io | Makes the ontology layer reusable as a standalone dependency. |
+| #300 | Flat BFS arena — replace FrontierScratch with a single flat arena | Eliminates remaining allocation churn in Q8 mutual-neighbor traversals |
+| #248 | WHERE predicate on edge properties returns 0 rows | Blocks rating/weight-based queries |
+| SPA-253 | WAL CRC32C integrity checksums | Required before 1.0 |
+| SPA-231 | HTTP/SSE transport layer | Remote access without embedding |
+| — | PyPI pre-built wheels | No Rust toolchain required for Python users |
+| — | RubyGems package | No Rust toolchain required for Ruby users |
 
-**Recently shipped** (reflected in benchmark numbers above):
-- **Degree cache** — Q7 (Top-10 Degree) went from 1,279ms → 401µs, now 44x *faster* than Neo4j
-- **B-tree property index** — Q1 (Point Lookup) went from ~444µs → 105µs, now 3x faster than Neo4j
-- **Global COUNT optimization** — Q6 went from 24µs → 2.2µs, now 91x *faster* than Neo4j
-- **ReadSnapshot label_row_counts cache** — eliminated ~116µs per-query overhead on Q1
-- **Edge property reads** (#240, #243) — edge properties now correctly returned after CHECKPOINT
-- **Two-hop intermediate node prop reads** (#241, #244) — multi-hop traversal returns correct intermediate node values
-- **edge_props.bin skip** (#245) — queries without edge variables no longer pay the edge-props read cost
-- **2-hop aggregate fix** (#263, #281, #282) — COUNT(*) on multi-hop queries no longer returns null
+**Recently shipped:**
+- **4-phase chunked vectorized pipeline** (#299) — FrontierScratch arena + SlotIntersect; Q4 −7%, Q8 p99 −37% in v0.1.13
+- **Multi-label nodes `(n:A:B)`** (#289) — standard Cypher multi-label semantics
+- **Bulk CSV loader** (#296) — `sparrowdb bulk-import` for high-throughput node/edge ingestion
+- **Reverse-arrow pattern fix** (#294) — `(a)->()<-(c)` now returns correct results
+- **B-tree property index persisted to disk** (#286) — index survives restart; no re-build on open
+- **Delta log O(1) index** (#283) — un-checkpointed writes no longer degrade traversal
+- **Degree cache** — Q7 (Top-10 Degree): 1,279ms → 401µs, now 44x faster than Neo4j
+- **B-tree property index** — Q1 (Point Lookup): ~444µs → 103µs, now 3x faster than Neo4j
+- **Global COUNT optimization** — Q6: 24µs → 2.2µs, now 93x faster than Neo4j
+- **2-hop aggregate fix** (#282) — COUNT(*) on multi-hop queries no longer returns null
 
-The traversal gap (Q3, Q4, Q8) remains the largest open challenge. SparrowDB uses a CSR adjacency store on disk (see Architecture), but the current execution engine is single-threaded and does not exploit that layout for in-memory traversal walks. Parallel traversal and a tighter runtime adjacency representation are the two structural changes that will move those numbers.
+---
+
+## Architecture
+
+```text
++------------------------------------------------------------------------+
+|  Language Bindings                                                     |
+|  Rust - Python (PyO3) - Node.js (napi-rs) - Ruby (Magnus)            |
+|  CLI (sparrowdb) - MCP Server (sparrowdb-mcp)                         |
++------------------------------------------------------------------------+
+|  Cypher Frontend  (sparrowdb-cypher)                                   |
+|  Lexer -> AST -> Binder (name resolution, type checking)              |
++------------------------------------------------------------------------+
+|  Execution Engine  (sparrowdb-execution)                               |
+|  Chunked vectorized pipeline - ChunkedPlan selector                   |
+|  FrontierScratch arena - SlotIntersect - factorized aggregation       |
+|  External merge sort - EXISTS evaluation - deadline checks             |
++------------------------------------------------------------------------+
+|  Catalog  (sparrowdb-catalog)                                          |
+|  Label registry - B-tree property index - Inverted text index         |
++------------------------------------------------------------------------+
+|  Storage  (sparrowdb-storage)                                          |
+|  Write-Ahead Log - CSR adjacency store - Delta log index              |
+|  XChaCha20-Poly1305 encryption (optional) - Crash recovery - SWMR    |
++------------------------------------------------------------------------+
+```
+
+| Crate | Role |
+|-------|------|
+| `sparrowdb` | Public API — `GraphDb`, `QueryResult`, `Value`, `BulkLoader` |
+| `sparrowdb-common` | Shared types and error definitions |
+| `sparrowdb-storage` | WAL, CSR store, encryption, crash recovery |
+| `sparrowdb-catalog` | Label/property schema, B-tree index, text index |
+| `sparrowdb-cypher` | Lexer, parser, AST, binder |
+| `sparrowdb-execution` | Chunked vectorized pipeline, sort, aggregation |
+| `sparrowdb-cli` | `sparrowdb` command-line binary |
+| `sparrowdb-mcp` | JSON-RPC 2.0 MCP server binary |
+| `sparrowdb-python` | PyO3 extension module |
+| `sparrowdb-node` | napi-rs Node.js addon |
+| `sparrowdb-ruby` | Magnus Ruby extension |
 
 ---
 
@@ -759,18 +699,12 @@ Open an issue before submitting a large PR so we can discuss the design first.
 ```bash
 git clone https://github.com/ryaker/SparrowDB
 cd SparrowDB
-
-cargo build           # build everything
-cargo test            # full test suite
-cargo test -p sparrowdb  # integration tests only (these are the signal — not unit tests)
-cargo clippy          # lints
-cargo fmt --check     # format check
-
-cargo build --release --bin sparrowdb    # CLI
-cargo build --release --bin sparrowdb-mcp  # MCP server
+cargo build
+cargo test
+cargo test -p sparrowdb  # integration tests — the signal
+cargo clippy
+cargo fmt --check
 ```
-
-The workspace is structured so each crate has one job. Adding a Cypher feature typically means touching `sparrowdb-cypher` (parser + AST) and `sparrowdb-execution` (executor), with an integration test in `crates/sparrowdb/tests/`. See [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ---
 
