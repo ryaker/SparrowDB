@@ -750,7 +750,7 @@ impl BfsArena {
     /// `node_capacity`: upper bound on slot values (typically label's max slot).
     /// Pass `8_000_000` as a safe default for most graphs.
     pub fn new(frontier_capacity: usize, node_capacity: usize) -> Self {
-        let words = (node_capacity + 63) / 64;
+        let words = node_capacity.div_ceil(64);
         Self {
             buf_a: Vec::with_capacity(frontier_capacity),
             buf_b: Vec::with_capacity(frontier_capacity),
