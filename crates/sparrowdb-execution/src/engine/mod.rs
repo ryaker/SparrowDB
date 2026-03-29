@@ -1765,6 +1765,38 @@ fn collect_col_ids_for_var(var: &str, column_names: &[String], _label_id: u32) -
     ids
 }
 
+/// Collect the set of column IDs referenced by `var` in a `ReturnItem` slice.
+///
+/// Unlike `collect_col_ids_for_var` (which operates on column name strings and
+/// breaks when AS aliases are present), this function inspects `item.expr`
+/// directly so aliased items like `RETURN n.name AS from` still contribute the
+/// correct column ID for `n`.
+///
+/// This is the preferred call site for all hop/traversal projection paths (#369).
+fn collect_col_ids_for_var_from_items(var: &str, items: &[ReturnItem]) -> Vec<u32> {
+    let mut id_set = std::collections::HashSet::new();
+    for item in items {
+        match &item.expr {
+            Expr::PropAccess { var: v, prop } => {
+                if v.as_str() == var {
+                    id_set.insert(prop_name_to_col_id(prop));
+                }
+            }
+            // FnCall expressions (type, labels, id, etc.) don't reference stored
+            // node property columns; they are handled in project_hop_row at
+            // projection time.
+            _ => {}
+        }
+    }
+    // Also include WHERE-clause referenced columns — callers extend the list
+    // from the WHERE expression separately, so we don't duplicate that here.
+    if id_set.is_empty() {
+        // Default: read col_0 so tombstone / existence checks work.
+        return vec![0];
+    }
+    id_set.into_iter().collect()
+}
+
 /// Read node properties using the nullable store path (SPA-197).
 ///
 /// Calls `get_node_raw_nullable` so that columns that were never written for
@@ -2296,7 +2328,7 @@ fn project_row(
 fn project_hop_row(
     src_props: &[(u32, u64)],
     dst_props: &[(u32, u64)],
-    column_names: &[String],
+    return_items: &[ReturnItem],
     src_var: &str,
     _dst_var: &str,
     // Optional (rel_var, rel_type) for resolving `type(rel_var)` columns.
@@ -2310,59 +2342,78 @@ fn project_hop_row(
     // Keyed by rel_var name; the slice contains (col_id, raw_u64) pairs.
     edge_props: Option<(&str, &[(u32, u64)])>,
 ) -> Vec<Value> {
-    column_names
+    return_items
         .iter()
-        .map(|col_name| {
-            // Handle metadata function calls: type(r) → "type(r)" column name.
-            if let Some(inner) = col_name
-                .strip_prefix("type(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                // inner is the variable name, e.g. "r"
-                if let Some((rel_var, rel_type)) = rel_var_type {
-                    if inner == rel_var {
-                        return Value::String(rel_type.to_string());
+        .map(|item| {
+            // Dispatch on the AST expression, not on the (possibly aliased) column name.
+            // This fixes #369: `RETURN n.name AS from` must resolve `n.name`, not `"from"`.
+            match &item.expr {
+                Expr::FnCall { name, args } => {
+                    let name_lc = name.to_lowercase();
+                    let arg_var = args.first().and_then(|a| {
+                        if let Expr::Var(v) = a {
+                            Some(v.as_str())
+                        } else {
+                            None
+                        }
+                    });
+                    match name_lc.as_str() {
+                        "type" => {
+                            if let (Some(var), Some((rel_var, rel_type))) =
+                                (arg_var, rel_var_type)
+                            {
+                                if var == rel_var {
+                                    return Value::String(rel_type.to_string());
+                                }
+                            }
+                            Value::Null
+                        }
+                        "labels" => {
+                            if let Some(var) = arg_var {
+                                if let Some((meta_var, label)) = src_label_meta {
+                                    if var == meta_var {
+                                        return Value::List(vec![Value::String(
+                                            label.to_string(),
+                                        )]);
+                                    }
+                                }
+                                if let Some((meta_var, label)) = dst_label_meta {
+                                    if var == meta_var {
+                                        return Value::List(vec![Value::String(
+                                            label.to_string(),
+                                        )]);
+                                    }
+                                }
+                            }
+                            Value::Null
+                        }
+                        _ => Value::Null,
                     }
                 }
-                return Value::Null;
-            }
-            // Handle labels(n) → "labels(n)" column name.
-            if let Some(inner) = col_name
-                .strip_prefix("labels(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                if let Some((meta_var, label)) = src_label_meta {
-                    if inner == meta_var {
-                        return Value::List(vec![Value::String(label.to_string())]);
+                Expr::PropAccess { var, prop } => {
+                    let col_id = prop_name_to_col_id(prop);
+                    // Check if this is a relationship variable property access (SPA-178).
+                    if let Some((evar, eprops)) = edge_props {
+                        if var.as_str() == evar {
+                            return eprops
+                                .iter()
+                                .find(|(c, _)| *c == col_id)
+                                .map(|(_, val)| decode_raw_val(*val, store))
+                                .unwrap_or(Value::Null);
+                        }
                     }
+                    let props = if var.as_str() == src_var {
+                        src_props
+                    } else {
+                        dst_props
+                    };
+                    props
+                        .iter()
+                        .find(|(c, _)| *c == col_id)
+                        .map(|(_, val)| decode_raw_val(*val, store))
+                        .unwrap_or(Value::Null)
                 }
-                if let Some((meta_var, label)) = dst_label_meta {
-                    if inner == meta_var {
-                        return Value::List(vec![Value::String(label.to_string())]);
-                    }
-                }
-                return Value::Null;
-            }
-            if let Some((v, prop)) = col_name.split_once('.') {
-                let col_id = prop_name_to_col_id(prop);
-                // Check if this is a relationship variable property access (SPA-178).
-                if let Some((evar, eprops)) = edge_props {
-                    if v == evar {
-                        return eprops
-                            .iter()
-                            .find(|(c, _)| *c == col_id)
-                            .map(|(_, val)| decode_raw_val(*val, store))
-                            .unwrap_or(Value::Null);
-                    }
-                }
-                let props = if v == src_var { src_props } else { dst_props };
-                props
-                    .iter()
-                    .find(|(c, _)| *c == col_id)
-                    .map(|(_, val)| decode_raw_val(*val, store))
-                    .unwrap_or(Value::Null)
-            } else {
-                Value::Null
+                _ => Value::Null,
             }
         })
         .collect()
@@ -2413,23 +2464,27 @@ fn project_fof_row(
 ///
 /// Resolves column references to src (a), mid (m), or fof (b) props based on
 /// variable name matching.  Any unrecognised variable falls back to fof_props.
+///
+/// Accepts `ReturnItem` slices so that AS aliases are handled correctly (#369):
+/// the expression (`item.expr`) is used for value resolution, not the column
+/// name string which reflects the alias.
 fn project_three_var_row(
     src_props: &[(u32, u64)],
     mid_props: &[(u32, u64)],
     fof_props: &[(u32, u64)],
-    column_names: &[String],
+    return_items: &[ReturnItem],
     src_var: &str,
     mid_var: &str,
     store: &NodeStore,
 ) -> Vec<Value> {
-    column_names
+    return_items
         .iter()
-        .map(|col_name| {
-            if let Some((var, prop)) = col_name.split_once('.') {
+        .map(|item| {
+            if let Expr::PropAccess { var, prop } = &item.expr {
                 let col_id = prop_name_to_col_id(prop);
-                let props: &[(u32, u64)] = if !src_var.is_empty() && var == src_var {
+                let props: &[(u32, u64)] = if !src_var.is_empty() && var.as_str() == src_var {
                     src_props
-                } else if !mid_var.is_empty() && var == mid_var {
+                } else if !mid_var.is_empty() && var.as_str() == mid_var {
                     mid_props
                 } else {
                     fof_props

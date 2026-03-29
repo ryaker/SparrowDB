@@ -135,10 +135,14 @@ impl Engine {
                 "one-hop traversal start"
             );
 
-            let mut col_ids_src =
-                collect_col_ids_for_var(&src_node_pat.var, column_names, effective_src_label_id);
-            let mut col_ids_dst =
-                collect_col_ids_for_var(&dst_node_pat.var, column_names, effective_dst_label_id);
+            let mut col_ids_src = collect_col_ids_for_var_from_items(
+                &src_node_pat.var,
+                &m.return_clause.items,
+            );
+            let mut col_ids_dst = collect_col_ids_for_var_from_items(
+                &dst_node_pat.var,
+                &m.return_clause.items,
+            );
             if use_agg {
                 for item in &m.return_clause.items {
                     collect_col_ids_from_expr(&item.expr, &mut col_ids_src);
@@ -486,7 +490,7 @@ impl Engine {
                         let row = project_hop_row(
                             &src_props,
                             &dst_props,
-                            column_names,
+                            &m.return_clause.items,
                             &src_node_pat.var,
                             &dst_node_pat.var,
                             rel_var_type,
@@ -539,10 +543,14 @@ impl Engine {
                     Err(_) => continue,
                 };
 
-                let mut col_ids_src =
-                    collect_col_ids_for_var(&src_node_pat.var, column_names, bwd_scan_label_id);
-                let mut col_ids_dst =
-                    collect_col_ids_for_var(&dst_node_pat.var, column_names, bwd_dst_label_id);
+                let mut col_ids_src = collect_col_ids_for_var_from_items(
+                    &src_node_pat.var,
+                    &m.return_clause.items,
+                );
+                let mut col_ids_dst = collect_col_ids_for_var_from_items(
+                    &dst_node_pat.var,
+                    &m.return_clause.items,
+                );
                 if use_agg {
                     for item in &m.return_clause.items {
                         collect_col_ids_from_expr(&item.expr, &mut col_ids_src);
@@ -766,7 +774,7 @@ impl Engine {
                             let row = project_hop_row(
                                 &b_props,
                                 &a_props,
-                                column_names,
+                                &m.return_clause.items,
                                 &src_node_pat.var,
                                 &dst_node_pat.var,
                                 rel_var_type,
@@ -846,7 +854,8 @@ impl Engine {
         // Also include any columns referenced by the WHERE clause, scoped to the fof variable so
         // that src-only predicates do not cause spurious column fetches from fof nodes.
         let col_ids_fof = {
-            let mut ids = collect_col_ids_for_var(&fof_node_pat.var, column_names, fof_label_id);
+            let mut ids =
+                collect_col_ids_for_var_from_items(&fof_node_pat.var, &m.return_clause.items);
             for p in &fof_node_pat.props {
                 let col_id = prop_name_to_col_id(&p.key);
                 if !ids.contains(&col_id) {
@@ -864,7 +873,8 @@ impl Engine {
         // SPA-252: projection columns must be included so that project_three_var_row
         // can resolve src-variable columns (e.g. `RETURN a.name` when src_var = "a").
         let col_ids_src_where: Vec<u32> = {
-            let mut ids = collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
+            let mut ids =
+                collect_col_ids_for_var_from_items(&src_node_pat.var, &m.return_clause.items);
             if let Some(ref where_expr) = m.where_clause {
                 collect_col_ids_from_expr_for_var(where_expr, &src_node_pat.var, &mut ids);
             }
@@ -902,7 +912,8 @@ impl Engine {
         // incoming case, leaving mid node properties unresolvable in the
         // forward-forward path (a)-[:R]->(m)-[:R]->(b).
         let col_ids_mid: Vec<u32> = if !mid_node_pat.var.is_empty() {
-            let mut ids = collect_col_ids_for_var(&mid_node_pat.var, column_names, mid_label_id);
+            let mut ids =
+                collect_col_ids_for_var_from_items(&mid_node_pat.var, &m.return_clause.items);
             for p in &mid_node_pat.props {
                 let col_id = prop_name_to_col_id(&p.key);
                 if !ids.contains(&col_id) {
@@ -1297,7 +1308,7 @@ impl Engine {
                                     &src_props,
                                     &mid_props,
                                     b_props,
-                                    column_names,
+                                    &m.return_clause.items,
                                     &src_node_pat.var,
                                     &mid_node_pat.var,
                                     &self.snapshot.store,
@@ -1459,7 +1470,7 @@ impl Engine {
                                 &src_props,
                                 &mid_props,
                                 &b_props,
-                                column_names,
+                                &m.return_clause.items,
                                 &src_node_pat.var,
                                 &mid_node_pat.var,
                                 &self.snapshot.store,
@@ -1673,7 +1684,7 @@ impl Engine {
                             &src_props,
                             &mid_props,
                             &fof_props,
-                            column_names,
+                            &m.return_clause.items,
                             &src_node_pat.var,
                             &mid_node_pat.var,
                             &self.snapshot.store,

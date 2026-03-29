@@ -331,8 +331,10 @@ impl Engine {
             (src_var, dst_var)
         };
 
-        let mut col_ids_src = collect_col_ids_for_var(query_src_var, column_names, src_label_id);
-        let mut col_ids_dst = collect_col_ids_for_var(query_dst_var, column_names, dst_label_id);
+        let mut col_ids_src =
+            collect_col_ids_for_var_from_items(query_src_var, &m.return_clause.items);
+        let mut col_ids_dst =
+            collect_col_ids_for_var_from_items(query_dst_var, &m.return_clause.items);
 
         // Ensure WHERE-referenced columns are fetched.
         if let Some(ref wexpr) = m.where_clause {
@@ -584,13 +586,19 @@ impl Engine {
                         )
                     };
 
+                    // Supply rel_var_type so that `type(r) AS alias` resolves correctly.
+                    let rel_var_type_arg = if !rel_pat.var.is_empty() && !rel_type.is_empty() {
+                        Some((rel_pat.var.as_str(), rel_type.as_str()))
+                    } else {
+                        None
+                    };
                     let row = project_hop_row(
                         proj_src_props,
                         proj_dst_props,
-                        column_names,
+                        &m.return_clause.items,
                         proj_src_var,
                         proj_dst_var,
-                        None, // no rel_var_type for Phase 2
+                        rel_var_type_arg,
                         Some((proj_src_var, proj_src_label)),
                         Some((proj_dst_var, proj_dst_label)),
                         &self.snapshot.store,
@@ -1277,8 +1285,10 @@ impl Engine {
 
         // Collect property col_ids needed for each node.
         // Late materialization: only read what WHERE or RETURN references.
-        let mut col_ids_src = collect_col_ids_for_var(src_var, column_names, src_label_id);
-        let mut col_ids_dst = collect_col_ids_for_var(dst_var, column_names, dst_label_id);
+        let mut col_ids_src =
+            collect_col_ids_for_var_from_items(src_var, &m.return_clause.items);
+        let mut col_ids_dst =
+            collect_col_ids_for_var_from_items(dst_var, &m.return_clause.items);
 
         // Mid node properties: only needed if WHERE references them.
         let mut col_ids_mid: Vec<u32> = vec![];
@@ -1309,7 +1319,8 @@ impl Engine {
         }
         // If mid var is referenced in RETURN, read those props too.
         if !mid_var.is_empty() {
-            let mid_return_ids = collect_col_ids_for_var(mid_var, column_names, mid_label_id);
+            let mid_return_ids =
+                collect_col_ids_for_var_from_items(mid_var, &m.return_clause.items);
             for cid in mid_return_ids {
                 if !col_ids_mid.contains(&cid) {
                     col_ids_mid.push(cid);
@@ -1675,7 +1686,7 @@ impl Engine {
                                 &src_props,
                                 &mid_props,
                                 &dst_props,
-                                column_names,
+                                &m.return_clause.items,
                                 src_var,
                                 mid_var,
                                 &self.snapshot.store,
