@@ -540,7 +540,7 @@ Neo4j reference: measured locally, Neo4j Docker v5.x, Bolt TCP. Kùzu reference:
 - **Q7 (top-10 by degree):** 401µs — 44x faster than Neo4j's 17.6ms. Pre-computed degree cache vs Neo4j's full adjacency scan.
 - **Cold start:** ~27ms on macOS SSD — viable for serverless and short-lived CLI processes.
 
-**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5, Q8) and range scans (Q2). The gap is actively narrowing — Q4 improved 7% and Q8 p99 dropped 37% in v0.1.13 — but the remaining gap is structural: the execution engine is single-threaded and the CSR layout isn't yet fully exploited for in-memory traversal walks. See Roadmap.
+**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5, Q8) and range scans (Q2). The gap is actively narrowing — Q4 improved 7% and Q8 p99 dropped 37% in v0.1.13, with further structural fixes in progress for v0.1.15 (see below) — but the remaining gap is structural: the execution engine is single-threaded and the CSR layout isn't yet fully exploited for in-memory traversal walks. See Roadmap.
 
 **What this means in practice:**
 - Use SparrowDB for: embedded apps, CLIs, agents, edge services, recommendation engines, and workloads dominated by point lookups, writes, aggregations, and shallow traversals.
@@ -623,6 +623,13 @@ The API is stable enough to build on, but the on-disk format may change before 1
 | SPA-231 | HTTP/SSE transport layer | Remote access without embedding |
 | — | PyPI pre-built wheels | No Rust toolchain required for Python users |
 | — | RubyGems package | No Rust toolchain required for Ruby users |
+
+**In progress (pending benchmark re-run after merge):**
+- **Q8 anchor-node bulk read** (#357) — `find_slot_by_props` replaced per-slot `fs::read` (O(N × file_reads)) with a single bulk column read + in-memory scan; eliminates ~8K syscalls for two-anchor mutual-neighbor queries on 4K-node graphs
+- **Q4 DISTINCT dedup O(N)** (#358) — `deduplicate_rows` replaced O(N²) linear scan with O(N) bincode-keyed HashSet; benefits all 11 DISTINCT/dedup call sites
+- **Q5 variable-path source fast path** (#359) — `execute_variable_length` resolves single-source inline-prop queries via property index before iterating; eliminates O(hwm_src) scan for indexed single-node source patterns
+
+> Benchmark numbers for Q4, Q5, Q8 will be updated to v0.1.15 figures once these PRs merge and the suite re-runs on the SNAP Facebook dataset.
 
 **Recently shipped:**
 - **4-phase chunked vectorized pipeline** (#299) — FrontierScratch arena + SlotIntersect; Q4 −7%, Q8 p99 −37% in v0.1.13
