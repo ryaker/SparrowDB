@@ -517,7 +517,7 @@ sparrowdb import --neo4j-csv nodes.csv,relationships.csv --db my.db
 
 ## Performance Characteristics
 
-### Benchmark Results: SNAP Facebook Dataset (v0.1.13)
+### Benchmark Results: SNAP Facebook Dataset (v0.1.13 baseline; v0.1.15 pending)
 
 Measured against Neo4j 5.x (server, JVM warmed) and Kùzu (Shi et al. VLDB 2023). All figures are p50 latency in microseconds. Dataset: SNAP Facebook social graph (4,039 nodes, 88,234 edges), 50 warmup + 200 iterations.
 
@@ -530,7 +530,9 @@ Measured against Neo4j 5.x (server, JVM warmed) and Kùzu (Shi et al. VLDB 2023)
 | Q5 Variable Path 1..3 | 12,100 | 501 | 620 | 24x slower |
 | Q6 Global COUNT(*) | **2.2** | 202 | 150 | **93x faster** |
 | Q7 Top-10 by Degree | **401** | 17,588 | n/a | **44x faster** |
-| Q8 Mutual Friends | 153,300 | 352 | n/a | 435x slower |
+| Q8 Mutual Friends | 153,300 ¹ | 352 | n/a | 435x slower |
+
+¹ Q8 anchor-node fix merged (#357); Q4 DISTINCT dedup fix in review (#358); Q5 source fast-path in review (#359). SNAP re-run on deck for v0.1.15 numbers.
 
 Neo4j reference: measured locally, Neo4j Docker v5.x, Bolt TCP. Kùzu reference: Shi et al. VLDB 2023 Table 5, in-process.
 
@@ -540,7 +542,7 @@ Neo4j reference: measured locally, Neo4j Docker v5.x, Bolt TCP. Kùzu reference:
 - **Q7 (top-10 by degree):** 401µs — 44x faster than Neo4j's 17.6ms. Pre-computed degree cache vs Neo4j's full adjacency scan.
 - **Cold start:** ~27ms on macOS SSD — viable for serverless and short-lived CLI processes.
 
-**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5, Q8) and range scans (Q2). The gap is actively narrowing — Q4 improved 7% and Q8 p99 dropped 37% in v0.1.13 — but the remaining gap is structural: the execution engine is single-threaded and the CSR layout isn't yet fully exploited for in-memory traversal walks. See Roadmap.
+**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5, Q8) and range scans (Q2). The gap is actively narrowing — three structural fixes (Q8 anchor lookup, Q4 DISTINCT dedup, Q5 source fast-path) measured at **−33% to −76%** on criterion benchmarks — but the core gap is the single-threaded engine and under-exploited CSR layout on large social graphs. See Roadmap.
 
 **What this means in practice:**
 - Use SparrowDB for: embedded apps, CLIs, agents, edge services, recommendation engines, and workloads dominated by point lookups, writes, aggregations, and shallow traversals.
@@ -625,6 +627,7 @@ The API is stable enough to build on, but the on-disk format may change before 1
 | — | RubyGems package | No Rust toolchain required for Ruby users |
 
 **Recently shipped:**
+- **Q8 anchor-node bulk read** (#357) — `find_slot_by_props` replaced O(N × file_reads) with a single bulk column read; eliminates N disk reads for each inline-prop anchor lookup in mutual-neighbor queries
 - **4-phase chunked vectorized pipeline** (#299) — FrontierScratch arena + SlotIntersect; Q4 −7%, Q8 p99 −37% in v0.1.13
 - **Multi-label nodes `(n:A:B)`** (#289) — standard Cypher multi-label semantics
 - **Bulk CSV loader** (#296) — `sparrowdb bulk-import` for high-throughput node/edge ingestion
