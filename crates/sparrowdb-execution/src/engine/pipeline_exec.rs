@@ -91,6 +91,11 @@ impl Engine {
         if !m.order_by.is_empty() || m.skip.is_some() || m.limit.is_some() {
             return false;
         }
+        // DISTINCT deduplication is not implemented in the chunked scan path —
+        // fall back to the row engine which applies deduplicate_rows.
+        if m.distinct {
+            return false;
+        }
         // Inline prop filters on the node pattern are not evaluated by the
         // chunked scan path — fall back to the row engine so they are applied.
         // (Tracked as #362 for native support in the chunked path.)
