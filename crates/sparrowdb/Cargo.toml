@@ -55,3 +55,7 @@ harness = false
 [[bench]]
 name    = "pipeline_phase2_benchmarks"
 harness = false
+
+[[bench]]
+name    = "snap_benchmarks"
+harness = false
