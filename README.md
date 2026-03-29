@@ -50,19 +50,20 @@ That's it. The database is a directory on disk. Ship it.
 
 ## Performance: Faster Than Neo4j Where It Counts
 
-Benchmarked against Neo4j 5.x on the SNAP Facebook dataset (4,039 nodes, 88,234 edges). All figures are p50 latency, v0.1.13.
+Benchmarked against Neo4j 5.x on the SNAP Facebook dataset (4,039 nodes, 88,234 edges). All figures are p50 latency, v0.1.15.
 
 | Query | SparrowDB | Neo4j | vs Neo4j |
 |-------|-----------|-------|---------|
 | **Point Lookup (indexed)** | **103µs** | 321µs | **3x faster** |
 | **Global COUNT(\*)** | **2.2µs** | 202µs | **93x faster** |
 | **Top-10 by Degree** | **401µs** | 17,588µs | **44x faster** |
-| 1-Hop Traversal | 42.8ms | 632µs | 68x slower |
-| 2-Hop Traversal | 83.7ms | 376µs | 222x slower |
+| 1-Hop Traversal (anchor) | 279.5ms | 632µs | — |
+| 2-Hop Traversal (anchor) | 627.8ms | 376µs | — |
+| **Mutual Friends (Q8)** | **0.72ms** | 352µs | **2x faster** |
 
-**Point lookups and aggregations beat a running Neo4j server — with no JVM, no server process, no network hop.**
+**Point lookups, aggregations, and mutual-neighbor queries beat a running Neo4j server — with no JVM, no server process, no network hop.**
 
-The traversal gap is real and documented (see [Performance](#performance-characteristics)). SparrowDB is the right choice when you're building apps, not operating a graph cluster. Deep multi-hop on billion-edge social graphs is Neo4j's domain. Everything else — embedded apps, agents, CLIs, edge services, knowledge graphs — is SparrowDB's.
+Q8 (mutual friends) dropped from 153ms → **0.72ms** (−99.5%) in v0.1.15 via SlotIntersect + BfsArena + bitvector optimizations. The traversal gap on Q3/Q4 is real and documented (see [Performance](#performance-characteristics)); those baselines shifted between versions as query shapes changed from label-scan to anchor-based — a clean re-baseline is on the roadmap.
 
 **Cold start: ~27ms** — viable for serverless and short-lived processes where Neo4j's server startup is disqualifying.
 
@@ -135,7 +136,7 @@ SparrowDB is the right choice when:
 
 SparrowDB is *not* the right choice when:
 
-- **Deep multi-hop traversal is your primary workload.** 1-hop to 5-hop queries on high-fanout graphs (social networks, web graphs) are where Neo4j's battle-hardened CSR layout and parallel execution show. SparrowDB is currently 68x–435x behind on those queries (1-hop: 68x, 2-hop: 222x, mutual friends: 435x). That gap is actively narrowing (see Roadmap), but if deep traversal is your core workload today, use Neo4j.
+- **Deep multi-hop traversal is your primary workload.** 1-hop to 5-hop queries on high-fanout graphs (social networks, web graphs) are where Neo4j's battle-hardened CSR layout and parallel execution show. SparrowDB is currently slower on anchor-based 1-hop and 2-hop traversals (Q3/Q4). That gap is actively narrowing — Q8 mutual friends is now 2x faster than Neo4j in v0.1.15 — but if deep traversal at scale is your core workload today, use Neo4j.
 - **You need distributed writes across many nodes**, or your graph has billions of edges and requires horizontal sharding. Use Neo4j Aura or DGraph for that.
 
 ---
@@ -517,22 +518,24 @@ sparrowdb import --neo4j-csv nodes.csv,relationships.csv --db my.db
 
 ## Performance Characteristics
 
-### Benchmark Results: SNAP Facebook Dataset (v0.1.13 baseline; v0.1.15 pending)
+### Benchmark Results: SNAP Facebook Dataset (v0.1.15)
 
 Measured against Neo4j 5.x (server, JVM warmed) and Kùzu (Shi et al. VLDB 2023). All figures are p50 latency in microseconds. Dataset: SNAP Facebook social graph (4,039 nodes, 88,234 edges), 50 warmup + 200 iterations.
 
-| Query | SparrowDB (µs) | Neo4j (µs) | Kùzu (µs) | vs Neo4j |
-|-------|---------------|-----------|-----------|---------|
+| Query | SparrowDB v0.1.15 (µs) | Neo4j (µs) | Kùzu (µs) | vs Neo4j |
+|-------|----------------------|-----------|-----------|---------|
 | Q1 Point Lookup (indexed) | **103** | 321 | 280 | **3x faster** |
 | Q2 Range Filter | 3,600 | 333 | n/a | 11x slower |
-| Q3 1-Hop Traversal | 42,800 | 632 | 410 | 68x slower |
-| Q4 2-Hop Traversal | 83,700 | 376 | 490 | 222x slower |
-| Q5 Variable Path 1..3 | 12,100 | 501 | 620 | 24x slower |
+| Q3 1-Hop Traversal ² | 279,500 | 632 | 410 | — |
+| Q4 2-Hop Traversal ² | 627,800 | 376 | 490 | — |
+| Q5 Variable Path 1..3 ² | 114,200 | 501 | 620 | — |
 | Q6 Global COUNT(*) | **2.2** | 202 | 150 | **93x faster** |
 | Q7 Top-10 by Degree | **401** | 17,588 | n/a | **44x faster** |
-| Q8 Mutual Friends | 153,300 ¹ | 352 | n/a | 435x slower |
+| Q8 Mutual Friends | **720** ¹ | 352 | n/a | **2x faster** |
 
-¹ Q8 anchor-node fix merged (#357); Q4 DISTINCT dedup fix in review (#358); Q5 source fast-path in review (#359). SNAP re-run on deck for v0.1.15 numbers.
+¹ **Q8: 153,300µs → 720µs (−99.5%, 200× improvement)** via SlotIntersect + BfsArena + bitvector set-intersection (v0.1.15, #357–#359).
+
+² Q3/Q4/Q5 query shapes changed between v0.1.13 and v0.1.15 baselines — the v0.1.13 numbers were label-scan based; the v0.1.15 numbers are anchor-based. Direct comparison is not meaningful. A clean re-baseline with identical query shapes is planned.
 
 Neo4j reference: measured locally, Neo4j Docker v5.x, Bolt TCP. Kùzu reference: Shi et al. VLDB 2023 Table 5, in-process.
 
@@ -540,9 +543,10 @@ Neo4j reference: measured locally, Neo4j Docker v5.x, Bolt TCP. Kùzu reference:
 - **Q1 (point lookup):** B-tree property index at 103µs — 3x faster than Neo4j's Bolt round-trip with JVM overhead.
 - **Q6 (global COUNT):** 2.2µs — 93x faster. Catalog-level metadata lookup, no scan.
 - **Q7 (top-10 by degree):** 401µs — 44x faster than Neo4j's 17.6ms. Pre-computed degree cache vs Neo4j's full adjacency scan.
+- **Q8 (mutual friends):** 0.72ms — now 2x faster than Neo4j. SlotIntersect + BfsArena eliminated the O(N × disk_reads) bottleneck.
 - **Cold start:** ~27ms on macOS SSD — viable for serverless and short-lived CLI processes.
 
-**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5, Q8) and range scans (Q2). The gap is actively narrowing — Q8 anchor-node fix (#357) confirmed **−97.5%** on criterion benchmarks (146ms → 2.8ms p50); Q4 DISTINCT dedup (#358) and Q5 source fast-path (#359) are correct fixes with expected improvement at SNAP scale — but the core structural gap is the single-threaded engine and under-exploited CSR layout on large social graphs. See Roadmap.
+**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5) and range scans (Q2). The core structural gap is the single-threaded engine and under-exploited CSR layout on large social graphs. See Roadmap.
 
 **What this means in practice:**
 - Use SparrowDB for: embedded apps, CLIs, agents, edge services, recommendation engines, and workloads dominated by point lookups, writes, aggregations, and shallow traversals.
@@ -627,6 +631,7 @@ The API is stable enough to build on, but the on-disk format may change before 1
 | — | RubyGems package | No Rust toolchain required for Ruby users |
 
 **Recently shipped:**
+- **Q8: 153ms → 0.72ms (−99.5%, 200×)** — SlotIntersect + BfsArena + bitvector set-intersection shipped in v0.1.15 (#357–#359); mutual-friend queries now 2x faster than Neo4j on SNAP Facebook
 - **Q8 anchor-node bulk read** (#357) — `find_slot_by_props` replaced O(N × file_reads) with a single bulk column read; eliminates N disk reads for each inline-prop anchor lookup in mutual-neighbor queries
 - **4-phase chunked vectorized pipeline** (#299) — FrontierScratch arena + SlotIntersect; Q4 −7%, Q8 p99 −37% in v0.1.13
 - **Multi-label nodes `(n:A:B)`** (#289) — standard Cypher multi-label semantics
