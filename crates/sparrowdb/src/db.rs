@@ -236,6 +236,7 @@ impl GraphDb {
             Some(self.cached_label_row_counts()),
             Some(Arc::clone(&self.inner.edge_props_cache)),
         )
+        .with_chunked_pipeline()
     }
 
     /// Return a clone of the cached label row counts (SPA-190).
