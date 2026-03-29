@@ -605,9 +605,11 @@ fn existing_tests_still_pass_after_selector_refactor() {
 /// Common neighbors of Alice and Bob: Carol, Dave.
 fn make_inline_prop_mn_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
     let (dir, db) = make_db();
-    db.execute("CREATE (:User {uid: 0, name: 'Alice'})").unwrap();
+    db.execute("CREATE (:User {uid: 0, name: 'Alice'})")
+        .unwrap();
     db.execute("CREATE (:User {uid: 1, name: 'Bob'})").unwrap();
-    db.execute("CREATE (:User {uid: 2, name: 'Carol'})").unwrap();
+    db.execute("CREATE (:User {uid: 2, name: 'Carol'})")
+        .unwrap();
     db.execute("CREATE (:User {uid: 3, name: 'Dave'})").unwrap();
     db.execute("CREATE (:User {uid: 4, name: 'Eve'})").unwrap();
     for (src_uid, dst_uid) in [(0, 2), (0, 3), (1, 2), (1, 3), (1, 4)] {
@@ -745,5 +747,9 @@ fn mutual_neighbors_inline_props_at_scale() {
         })
         .collect();
     uids.sort();
-    assert_eq!(uids, vec![2i64, 3i64], "common neighbors are uid=2 and uid=3");
+    assert_eq!(
+        uids,
+        vec![2i64, 3i64],
+        "common neighbors are uid=2 and uid=3"
+    );
 }

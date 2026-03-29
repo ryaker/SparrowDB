@@ -815,8 +815,22 @@ impl Engine {
             let dollar_params = self.dollar_params();
             let prop_idx = self.prop_index.borrow();
             (
-                find_slot_by_props(&self.snapshot.store, label_id, hwm, &a_node_pat.props, &dollar_params, &prop_idx),
-                find_slot_by_props(&self.snapshot.store, label_id, hwm, &b_node_pat.props, &dollar_params, &prop_idx),
+                find_slot_by_props(
+                    &self.snapshot.store,
+                    label_id,
+                    hwm,
+                    &a_node_pat.props,
+                    &dollar_params,
+                    &prop_idx,
+                ),
+                find_slot_by_props(
+                    &self.snapshot.store,
+                    label_id,
+                    hwm,
+                    &b_node_pat.props,
+                    &dollar_params,
+                    &prop_idx,
+                ),
             )
         };
 
@@ -968,6 +982,7 @@ impl Engine {
                 x_var,
                 &label,
                 &self.snapshot.store,
+                Some(x_node_id),
             );
             rows.push(row);
 
@@ -1769,6 +1784,7 @@ impl Engine {
                     var_name,
                     &label,
                     &self.snapshot.store,
+                    Some(node_id),
                 );
                 rows.push(row);
             }
@@ -2188,18 +2204,22 @@ fn find_slot_by_props(
             let null_bitmap = store.read_null_bitmap_all(label_id, col_id).ok().flatten();
 
             for (slot, &raw) in col_data.iter().enumerate().take(hwm as usize) {
-                if raw != target_raw {
-                    continue;
-                }
+                // Check presence before equality: in pre-SPA-207 data, raw == 0
+                // means absent (not the integer zero), so a search for uid:0
+                // must not match an absent slot.
                 let is_present = match &null_bitmap {
                     // No bitmap (pre-SPA-207 data): use `raw != 0` sentinel.
                     None => raw != 0,
                     // Bitmap present: check the explicit null bit.
                     Some(bits) => bits.get(slot).copied().unwrap_or(false),
                 };
-                if is_present {
-                    return Some(slot as u64);
+                if !is_present {
+                    continue;
                 }
+                if raw != target_raw {
+                    continue;
+                }
+                return Some(slot as u64);
             }
             return None;
         }

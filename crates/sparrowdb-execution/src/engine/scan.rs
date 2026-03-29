@@ -2024,6 +2024,7 @@ impl Engine {
                     var_name,
                     &label,
                     &self.snapshot.store,
+                    Some(node_id),
                 );
                 rows.push(row);
                 // SPA-198: early exit when we have enough rows for SKIP+LIMIT.
@@ -2161,6 +2162,7 @@ impl Engine {
                         sec_var_name,
                         &sec_primary_label,
                         &self.snapshot.store,
+                        Some(sec_node_id),
                     );
                     rows.push(row);
                 }
@@ -2348,6 +2350,7 @@ impl Engine {
                     var_name,
                     &prim_label_name,
                     &self.snapshot.store,
+                    Some(node_id),
                 );
                 rows.push(row);
             }
@@ -2524,6 +2527,7 @@ impl Engine {
                         var_name,
                         label_name,
                         &self.snapshot.store,
+                        Some(node_id),
                     );
                     rows.push(row);
                 }

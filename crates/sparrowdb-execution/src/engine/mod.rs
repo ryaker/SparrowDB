@@ -2253,10 +2253,24 @@ fn project_row(
     // Primary label for the scanned node, used for labels(n) columns.
     node_label: &str,
     store: &NodeStore,
+    // NodeId of the scanned node, used for id(var) columns.
+    node_id: Option<NodeId>,
 ) -> Vec<Value> {
     column_names
         .iter()
         .map(|col_name| {
+            // Handle id(var) column — returns the node's integer id.
+            if let Some(inner) = col_name
+                .strip_prefix("id(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                if inner == var_name {
+                    if let Some(nid) = node_id {
+                        return Value::Int64(nid.0 as i64);
+                    }
+                }
+                return Value::Null;
+            }
             // Handle labels(var) column.
             if let Some(inner) = col_name
                 .strip_prefix("labels(")
