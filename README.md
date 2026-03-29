@@ -542,7 +542,7 @@ Neo4j reference: measured locally, Neo4j Docker v5.x, Bolt TCP. Kùzu reference:
 - **Q7 (top-10 by degree):** 401µs — 44x faster than Neo4j's 17.6ms. Pre-computed degree cache vs Neo4j's full adjacency scan.
 - **Cold start:** ~27ms on macOS SSD — viable for serverless and short-lived CLI processes.
 
-**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5, Q8) and range scans (Q2). The gap is actively narrowing — three structural fixes (Q8 anchor lookup, Q4 DISTINCT dedup, Q5 source fast-path) measured at **−33% to −76%** on criterion benchmarks — but the core gap is the single-threaded engine and under-exploited CSR layout on large social graphs. See Roadmap.
+**Where SparrowDB trails:** Multi-hop traversal (Q3, Q4, Q5, Q8) and range scans (Q2). The gap is actively narrowing — Q8 anchor-node fix (#357) confirmed **−97.5%** on criterion benchmarks (146ms → 2.8ms p50); Q4 DISTINCT dedup (#358) and Q5 source fast-path (#359) are correct fixes with expected improvement at SNAP scale — but the core structural gap is the single-threaded engine and under-exploited CSR layout on large social graphs. See Roadmap.
 
 **What this means in practice:**
 - Use SparrowDB for: embedded apps, CLIs, agents, edge services, recommendation engines, and workloads dominated by point lookups, writes, aggregations, and shallow traversals.
