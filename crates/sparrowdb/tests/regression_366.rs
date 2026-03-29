@@ -59,17 +59,20 @@ fn create_with_return_whole_node() {
 }
 
 #[test]
-fn create_multiple_nodes_with_return() {
+fn create_multi_pattern_with_return() {
     let dir = tempdir().unwrap();
     let db = GraphDb::open(dir.path()).unwrap();
 
-    // CREATE two nodes, RETURN both
-    db.execute("CREATE (:Person {name: \"Alice\"})").unwrap();
-    db.execute("CREATE (:Person {name: \"Bob\"})").unwrap();
-
-    // Now verify they exist
+    // CREATE two nodes in one statement and RETURN both their properties.
+    // Standard Cypher semantics: one row containing both projected values.
     let result = db
-        .execute("MATCH (n:Person) RETURN n.name ORDER BY n.name")
+        .execute(
+            "CREATE (a:Person {name: \"Alice\"}), (b:Person {name: \"Bob\"}) RETURN a.name, b.name",
+        )
         .unwrap();
-    assert_eq!(result.rows.len(), 2);
+
+    assert_eq!(result.columns, vec!["a.name", "b.name"]);
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::String("Alice".into()));
+    assert_eq!(result.rows[0][1], Value::String("Bob".into()));
 }

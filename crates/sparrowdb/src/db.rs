@@ -972,6 +972,9 @@ impl GraphDb {
                 .collect();
 
             // Evaluate each RETURN item against the in-memory prop stash.
+            // Open the fallback store once outside the loop to avoid
+            // repeated open() calls inside the iterator.
+            let fallback_store = NodeStore::open(&self.inner.path).ok();
             let row: Vec<ExecValue> = rc
                 .items
                 .iter()
@@ -986,9 +989,8 @@ impl GraphDb {
                                 .unwrap_or(ExecValue::Null)
                         } else {
                             // Fallback: re-read from disk.
-                            let store = NodeStore::open(&self.inner.path).ok();
-                            if let (Some(store), Some(&node_id)) =
-                                (store, var_to_node.get(var.as_str()))
+                            if let (Some(ref store), Some(&node_id)) =
+                                (&fallback_store, var_to_node.get(var.as_str()))
                             {
                                 let col_id = fnv1a_col_id(prop);
                                 store
