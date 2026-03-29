@@ -62,7 +62,9 @@ fn regression_364_bare_var_return_yields_map_not_null() {
     match &row[1] {
         Value::List(labels) => {
             assert!(
-                labels.iter().any(|v| matches!(v, Value::String(s) if s == "Person")),
+                labels
+                    .iter()
+                    .any(|v| matches!(v, Value::String(s) if s == "Person")),
                 "labels(n) must contain 'Person', got {:?}",
                 labels
             );
@@ -78,14 +80,8 @@ fn regression_364_bare_var_return_yields_map_not_null() {
             let has_name = props
                 .iter()
                 .any(|(_, v)| matches!(v, Value::String(s) if s == "Alice"));
-            let has_age = props
-                .iter()
-                .any(|(_, v)| matches!(v, Value::Int64(30)));
-            assert!(
-                has_name,
-                "map must contain name='Alice', got {:?}",
-                props
-            );
+            let has_age = props.iter().any(|(_, v)| matches!(v, Value::Int64(30)));
+            assert!(has_name, "map must contain name='Alice', got {:?}", props);
             assert!(has_age, "map must contain age=30, got {:?}", props);
         }
         Value::Null => panic!(
