@@ -97,6 +97,12 @@ impl Engine {
         if !m.pattern[0].nodes[0].props.is_empty() {
             return false;
         }
+        // Bare variable projection (RETURN n) requires the row engine eval path
+        // to build a full property map (SPA-213). project_row returns Null for
+        // bare vars. Fall back until the chunked path implements SPA-213.
+        if m.return_clause.items.iter().any(|item| matches!(&item.expr, Expr::Var(_))) {
+            return false;
+        }
         !m.pattern[0].nodes[0].labels.is_empty()
     }
 
