@@ -213,6 +213,8 @@ pub struct CreateStatement {
     pub nodes: Vec<NodePattern>,
     /// Edges to create (each is (left_var, rel, right_var)).
     pub edges: Vec<(String, RelPattern, String)>,
+    /// Optional RETURN clause (issue #366).
+    pub return_clause: Option<ReturnClause>,
 }
 
 /// MATCH+CREATE statement (MATCH ... CREATE edge).

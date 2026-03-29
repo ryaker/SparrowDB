@@ -726,6 +726,7 @@ impl Engine {
             create: CreateStatement {
                 nodes: vec![],
                 edges: vec![],
+                return_clause: None,
             },
         };
         self.scan_match_create_rows(&proxy)
