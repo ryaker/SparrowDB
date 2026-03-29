@@ -1245,7 +1245,13 @@ impl Parser {
             self.advance();
             return self.parse_create_constraint();
         }
-        let body = self.parse_create_body()?;
+        let mut body = self.parse_create_body()?;
+        // Check for optional RETURN clause (issue #366).
+        if matches!(self.peek(), Token::Return) {
+            self.advance(); // consume RETURN
+            let items = self.parse_return_items()?;
+            body.return_clause = Some(ReturnClause { items });
+        }
         Ok(Statement::Create(body))
     }
     fn parse_create_index(&mut self) -> Result<Statement> {
@@ -1404,7 +1410,11 @@ impl Parser {
             ));
         }
 
-        Ok(CreateStatement { nodes, edges })
+        Ok(CreateStatement {
+            nodes,
+            edges,
+            return_clause: None,
+        })
     }
 
     // ── Pattern list ──────────────────────────────────────────────────────────

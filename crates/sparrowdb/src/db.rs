@@ -780,6 +780,9 @@ impl GraphDb {
 
         // Map variable name → NodeId for all newly created nodes.
         let mut var_to_node: HashMap<String, NodeId> = HashMap::new();
+        // Map variable name → named props written (for RETURN projection).
+        let mut var_to_props: HashMap<String, Vec<(String, sparrowdb_execution::Value)>> =
+            HashMap::new();
 
         for node in &create.nodes {
             let label = node.labels.first().cloned().unwrap_or_default();
@@ -896,6 +899,12 @@ impl GraphDb {
             // Record the binding so edge patterns can resolve (src_var, dst_var).
             if !node.var.is_empty() {
                 var_to_node.insert(node.var.clone(), node_id);
+                // Stash props for RETURN projection (issue #366).
+                let exec_props: Vec<(String, sparrowdb_execution::Value)> = named_props
+                    .iter()
+                    .map(|(k, v)| (k.clone(), storage_value_to_exec(v)))
+                    .collect();
+                var_to_props.insert(node.var.clone(), exec_props);
             }
         }
 
@@ -933,6 +942,95 @@ impl GraphDb {
 
         tx.commit()?;
         self.invalidate_catalog();
+
+        // If a RETURN clause was provided, project the created nodes (issue #366).
+        if let Some(ref rc) = create.return_clause {
+            use sparrowdb_cypher::ast::Expr;
+            type ExecValue = sparrowdb_execution::Value;
+
+            // Derive column names from the RETURN items.
+            let columns: Vec<String> = rc
+                .items
+                .iter()
+                .map(|item| {
+                    item.alias.clone().unwrap_or_else(|| match &item.expr {
+                        Expr::PropAccess { var, prop } => format!("{var}.{prop}"),
+                        Expr::Var(v) => v.clone(),
+                        Expr::FnCall { name, args } => {
+                            let arg_str = args
+                                .first()
+                                .map(|a| match a {
+                                    Expr::Var(v) => v.clone(),
+                                    _ => "*".to_string(),
+                                })
+                                .unwrap_or_else(|| "*".to_string());
+                            format!("{}({})", name.to_lowercase(), arg_str)
+                        }
+                        _ => "?".to_string(),
+                    })
+                })
+                .collect();
+
+            // Evaluate each RETURN item against the in-memory prop stash.
+            let row: Vec<ExecValue> = rc
+                .items
+                .iter()
+                .map(|item| match &item.expr {
+                    Expr::PropAccess { var, prop } => {
+                        // Look up from in-memory prop stash first.
+                        if let Some(props) = var_to_props.get(var.as_str()) {
+                            props
+                                .iter()
+                                .find(|(k, _)| k == prop)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(ExecValue::Null)
+                        } else {
+                            // Fallback: re-read from disk.
+                            let store = NodeStore::open(&self.inner.path).ok();
+                            if let (Some(store), Some(&node_id)) =
+                                (store, var_to_node.get(var.as_str()))
+                            {
+                                let col_id = fnv1a_col_id(prop);
+                                store
+                                    .get_node(node_id, &[col_id])
+                                    .ok()
+                                    .and_then(|v| v.into_iter().next())
+                                    .map(|(_, val)| storage_value_to_exec(&val))
+                                    .unwrap_or(ExecValue::Null)
+                            } else {
+                                ExecValue::Null
+                            }
+                        }
+                    }
+                    Expr::Var(v) => {
+                        // Bare variable: return a Map of all properties.
+                        if let Some(props) = var_to_props.get(v.as_str()) {
+                            ExecValue::Map(props.clone())
+                        } else {
+                            ExecValue::Null
+                        }
+                    }
+                    Expr::FnCall { name, args } if name.eq_ignore_ascii_case("id") => {
+                        if let Some(Expr::Var(v)) = args.first() {
+                            if let Some(&node_id) = var_to_node.get(v.as_str()) {
+                                ExecValue::Int64(node_id.0 as i64)
+                            } else {
+                                ExecValue::Null
+                            }
+                        } else {
+                            ExecValue::Null
+                        }
+                    }
+                    _ => ExecValue::Null,
+                })
+                .collect();
+
+            return Ok(QueryResult {
+                columns,
+                rows: vec![row],
+            });
+        }
+
         Ok(QueryResult::empty(vec![]))
     }
 
