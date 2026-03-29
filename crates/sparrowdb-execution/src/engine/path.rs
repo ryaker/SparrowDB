@@ -331,9 +331,10 @@ impl Engine {
 
         let hwm_src = self.snapshot.store.hwm_for_label(src_label_id)?;
 
-        let col_ids_src = collect_col_ids_for_var(&src_node_pat.var, column_names, src_label_id);
+        let col_ids_src =
+            collect_col_ids_for_var_from_items(&src_node_pat.var, &m.return_clause.items);
         let col_ids_dst =
-            collect_col_ids_for_var(&dst_node_pat.var, column_names, dst_label_id.unwrap_or(0));
+            collect_col_ids_for_var_from_items(&dst_node_pat.var, &m.return_clause.items);
 
         // Build dst read set: projection columns + dst inline-prop filter columns +
         // WHERE-clause columns on the dst variable.  Mirrors the 1-hop code (SPA-224).
@@ -643,7 +644,7 @@ impl Engine {
                 let row = project_hop_row(
                     &src_props,
                     &dst_props,
-                    column_names,
+                    &m.return_clause.items,
                     &src_node_pat.var,
                     &dst_node_pat.var,
                     rel_var_type,
