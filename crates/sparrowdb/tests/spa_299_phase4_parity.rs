@@ -19,6 +19,10 @@
 //! - `chunked_plan_selector_fallback`        — unsupported query falls back cleanly
 //! - `mutual_neighbors_self_intersection_returns_empty` — same node on both sides returns empty
 //! - `existing_tests_still_pass`             — phase 1-3 scan/one-hop/two-hop still work
+//! - `mutual_neighbors_inline_props_basic`   — MN fast-path with {uid: X} inline props
+//! - `mutual_neighbors_inline_props_no_common` — inline props, no common neighbor
+//! - `try_plan_mutual_neighbors_inline_props` — guard selects MutualNeighbors for inline props
+//! - `mutual_neighbors_inline_props_at_scale` — correctness with 500-node graph (exercises bulk-read path)
 
 use sparrowdb::open;
 use sparrowdb_catalog::catalog::Catalog;
@@ -587,4 +591,165 @@ fn existing_tests_still_pass_after_selector_refactor() {
         "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN a.name, c.name",
     );
     assert_eq!(rows.len(), 1, "exactly 1 two-hop path");
+}
+
+// ── 14. MutualNeighbors fast-path with inline prop endpoint binding ────────────
+
+/// Graph for inline-prop MN tests:
+///   Alice (uid=0) -KNOWS-> Carol (uid=2)
+///   Alice (uid=0) -KNOWS-> Dave  (uid=3)
+///   Bob   (uid=1) -KNOWS-> Carol (uid=2)
+///   Bob   (uid=1) -KNOWS-> Dave  (uid=3)
+///   Bob   (uid=1) -KNOWS-> Eve   (uid=4)  ← NOT a common neighbor of Alice
+///
+/// Common neighbors of Alice and Bob: Carol, Dave.
+fn make_inline_prop_mn_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
+    let (dir, db) = make_db();
+    db.execute("CREATE (:User {uid: 0, name: 'Alice'})")
+        .unwrap();
+    db.execute("CREATE (:User {uid: 1, name: 'Bob'})").unwrap();
+    db.execute("CREATE (:User {uid: 2, name: 'Carol'})")
+        .unwrap();
+    db.execute("CREATE (:User {uid: 3, name: 'Dave'})").unwrap();
+    db.execute("CREATE (:User {uid: 4, name: 'Eve'})").unwrap();
+    for (src_uid, dst_uid) in [(0, 2), (0, 3), (1, 2), (1, 3), (1, 4)] {
+        db.execute(&format!(
+            "MATCH (a:User {{uid: {src_uid}}}), (b:User {{uid: {dst_uid}}}) CREATE (a)-[:KNOWS]->(b)"
+        ))
+        .unwrap();
+    }
+    (dir, db)
+}
+
+#[test]
+fn mutual_neighbors_inline_props_basic() {
+    let (dir, _db) = make_inline_prop_mn_db();
+
+    // Chunked engine: inline-prop form — should hit MutualNeighbors fast-path.
+    let cypher =
+        "MATCH (a:User {uid: 0})-[:KNOWS]->(m:User)<-[:KNOWS]-(b:User {uid: 1}) RETURN m.name";
+    let chunked_result = chunked_engine(dir.path())
+        .execute(cypher)
+        .expect("chunked engine failed");
+    let row_result = row_engine(dir.path())
+        .execute(cypher)
+        .expect("row engine failed");
+
+    let mut chunked_names: Vec<String> = chunked_result
+        .rows
+        .iter()
+        .filter_map(|r| match r.first() {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    chunked_names.sort();
+
+    let mut row_names: Vec<String> = row_result
+        .rows
+        .iter()
+        .filter_map(|r| match r.first() {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    row_names.sort();
+
+    assert_eq!(
+        chunked_names, row_names,
+        "chunked and row engines must agree on mutual neighbors"
+    );
+    assert_eq!(
+        chunked_names,
+        vec!["Carol".to_string(), "Dave".to_string()],
+        "common neighbors of uid=0 and uid=1 are Carol and Dave"
+    );
+}
+
+#[test]
+fn mutual_neighbors_inline_props_no_common() {
+    let (dir, _db) = make_inline_prop_mn_db();
+
+    // uid=2 (Carol) and uid=4 (Eve) share no common outgoing neighbors.
+    let cypher =
+        "MATCH (a:User {uid: 2})-[:KNOWS]->(m:User)<-[:KNOWS]-(b:User {uid: 4}) RETURN m.name";
+    let chunked_result = chunked_engine(dir.path())
+        .execute(cypher)
+        .expect("chunked engine failed");
+    let row_result = row_engine(dir.path())
+        .execute(cypher)
+        .expect("row engine failed");
+
+    assert_eq!(chunked_result.rows.len(), 0, "chunked: no common neighbors");
+    assert_eq!(row_result.rows.len(), 0, "row: no common neighbors");
+}
+
+#[test]
+fn try_plan_mutual_neighbors_inline_props_selected() {
+    // Verify the ChunkedPlan selector picks MutualNeighbors for the inline-prop form.
+    let (dir, _db) = make_inline_prop_mn_db();
+
+    // The query must route to MutualNeighbors, not fall back to row-at-a-time.
+    // We verify indirectly: chunked and row engines produce identical results,
+    // and the chunked engine is faster (assertion via correctness parity only —
+    // timing is verified by the Facebook Q8 benchmark).
+    let cypher =
+        "MATCH (a:User {uid: 0})-[:KNOWS]->(m:User)<-[:KNOWS]-(b:User {uid: 1}) RETURN m.uid";
+    let (_cols, rows) = assert_engines_agree(dir.path(), cypher);
+    assert_eq!(rows.len(), 2, "uid=0 and uid=1 have 2 common neighbors");
+}
+
+// ── 17. MutualNeighbors inline props — 500-node graph ─────────────────────────
+//
+// Exercises the bulk-read path in find_slot_by_props (reads column file once,
+// not once-per-slot).  A 500-node graph would take ~500 × fs::read with the
+// old O(N) per-slot approach; the new bulk-read path does 2 fs::reads total.
+//
+// Graph: 500 User nodes (uid 0-499).
+//   node 0 -KNOWS-> node 2,  node 0 -KNOWS-> node 3
+//   node 1 -KNOWS-> node 2,  node 1 -KNOWS-> node 3,  node 1 -KNOWS-> node 4
+// Common neighbors of uid=0 and uid=1: uid=2 and uid=3.
+#[test]
+fn mutual_neighbors_inline_props_at_scale() {
+    let (dir, db) = make_db();
+
+    // Create 500 User nodes.
+    for uid in 0i64..500 {
+        db.execute(&format!("CREATE (:User {{uid: {uid}}})"))
+            .unwrap();
+    }
+
+    // Create KNOWS edges: uid=0→2, uid=0→3, uid=1→2, uid=1→3, uid=1→4.
+    for (a, b) in [(0i64, 2i64), (0, 3), (1, 2), (1, 3), (1, 4)] {
+        db.execute(&format!(
+            "MATCH (a:User {{uid: {a}}}), (b:User {{uid: {b}}}) CREATE (a)-[:KNOWS]->(b)"
+        ))
+        .unwrap();
+    }
+
+    let cypher =
+        "MATCH (a:User {uid: 0})-[:KNOWS]->(m:User)<-[:KNOWS]-(b:User {uid: 1}) RETURN m.uid";
+
+    // Both engines must agree on uid=2 and uid=3 as common neighbors.
+    let (_cols, rows) = assert_engines_agree(dir.path(), cypher);
+    assert_eq!(
+        rows.len(),
+        2,
+        "uid=0 and uid=1 have 2 common neighbors in 500-node graph"
+    );
+
+    // Verify the actual values are 2 and 3.
+    let mut uids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match r.first() {
+            Some(sparrowdb_execution::Value::Int64(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    uids.sort();
+    assert_eq!(
+        uids,
+        vec![2i64, 3i64],
+        "common neighbors are uid=2 and uid=3"
+    );
 }

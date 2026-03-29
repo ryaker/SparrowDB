@@ -705,14 +705,22 @@ impl Engine {
                 }
             }
         }
-        // WHERE must contain ONLY id(a)=$x AND id(b)=$y — nothing else.
-        // Use a strict purity check so that OR-connected expressions or any
-        // other predicate shapes (property access, CONTAINS, etc.) do not
-        // accidentally pass the fast-path guard.
+        // Endpoint binding: either WHERE id(a)=$x AND id(b)=$y, or both
+        // endpoint nodes carry exactly one inline prop filter (e.g. {uid: 0}).
+        // The inline-prop form is the shape used by the Facebook benchmark Q8:
+        //   MATCH (a:User {uid: X})-[:R]->(m)<-[:R]-(b:User {uid: Y}) RETURN m.uid
         let a_var = pat.nodes[0].var.as_str();
         let b_var = pat.nodes[2].var.as_str();
         match m.where_clause.as_ref() {
-            None => return false,
+            None => {
+                // Accept inline-prop binding: each endpoint must carry exactly
+                // one prop filter so execute can scan for the matching slot.
+                let a_bound = pat.nodes[0].props.len() == 1;
+                let b_bound = pat.nodes[2].props.len() == 1;
+                if !a_bound || !b_bound {
+                    return false;
+                }
+            }
             Some(wexpr) => {
                 if !where_is_only_id_param_conjuncts(wexpr, a_var, b_var) {
                     return false;
@@ -789,16 +797,47 @@ impl Engine {
                 )
             })?;
 
-        // Extract bound slots for a and b from params.
+        // Extract bound slots for a and b.
+        // Two supported forms:
+        //   1. WHERE id(a) = $x AND id(b) = $y  — param-bound NodeId
+        //   2. Inline props on endpoint nodes    — scan label for matching slot
         let a_var = a_node_pat.var.as_str();
         let b_var = b_node_pat.var.as_str();
-        let a_slot = extract_id_param_slot(m.where_clause.as_ref(), a_var, &self.params, label_id);
-        let b_slot = extract_id_param_slot(m.where_clause.as_ref(), b_var, &self.params, label_id);
+        let (a_slot_opt, b_slot_opt) = if m.where_clause.is_some() {
+            // Form 1: id() params.
+            (
+                extract_id_param_slot(m.where_clause.as_ref(), a_var, &self.params, label_id),
+                extract_id_param_slot(m.where_clause.as_ref(), b_var, &self.params, label_id),
+            )
+        } else {
+            // Form 2: inline props — scan the label to find matching slots.
+            let hwm = self.snapshot.store.hwm_for_label(label_id).unwrap_or(0);
+            let dollar_params = self.dollar_params();
+            let prop_idx = self.prop_index.borrow();
+            (
+                find_slot_by_props(
+                    &self.snapshot.store,
+                    label_id,
+                    hwm,
+                    &a_node_pat.props,
+                    &dollar_params,
+                    &prop_idx,
+                ),
+                find_slot_by_props(
+                    &self.snapshot.store,
+                    label_id,
+                    hwm,
+                    &b_node_pat.props,
+                    &dollar_params,
+                    &prop_idx,
+                ),
+            )
+        };
 
-        let (a_slot, b_slot) = match (a_slot, b_slot) {
+        let (a_slot, b_slot) = match (a_slot_opt, b_slot_opt) {
             (Some(a), Some(b)) => (a, b),
             _ => {
-                // Params not resolved — return empty.
+                // Endpoint not resolved — return empty.
                 return Ok(QueryResult {
                     columns: column_names.to_vec(),
                     rows: vec![],
@@ -943,6 +982,7 @@ impl Engine {
                 x_var,
                 &label,
                 &self.snapshot.store,
+                Some(x_node_id),
             );
             rows.push(row);
 
@@ -1744,6 +1784,7 @@ impl Engine {
                     var_name,
                     &label,
                     &self.snapshot.store,
+                    Some(node_id),
                 );
                 rows.push(row);
             }
@@ -2106,4 +2147,98 @@ fn find_id_param_name(expr: &Expr, var_name: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Scan a label's slots to find the first node that matches all `props` filters.
+///
+/// Used by `execute_mutual_neighbors_chunked` when endpoints are bound via
+/// inline props (`{uid: 0}`) rather than `WHERE id(a) = $param`.
+///
+/// # Performance
+///
+/// 1. Property index (O(1)) — checked first when an index exists for `(label_id, prop)`.
+/// 2. Single-column bulk read — reads the column file **once**, scans in memory.
+///    O(N) in memory instead of O(N) × `fs::read` calls (the per-slot path
+///    re-reads the entire column file on every slot, causing 4000+ disk reads
+///    for a typical social-graph dataset).
+/// 3. Per-slot fallback — used only for complex/multi-prop filters.
+fn find_slot_by_props(
+    store: &NodeStore,
+    label_id: u32,
+    hwm: u64,
+    props: &[sparrowdb_cypher::ast::PropEntry],
+    params: &std::collections::HashMap<String, crate::types::Value>,
+    prop_index: &PropertyIndex,
+) -> Option<u64> {
+    if props.is_empty() || hwm == 0 {
+        return None;
+    }
+
+    // Fast path: property index (O(1) when an index exists for this label+prop).
+    if let Some(slots) = try_index_lookup_for_props(props, label_id, prop_index) {
+        return slots.into_iter().next().map(|s| s as u64);
+    }
+
+    // Single-prop bulk-read path: read the column file once, scan in memory.
+    // This replaces O(N) per-slot `fs::read` calls (each re-reads the whole file)
+    // with O(1) file reads + O(N) in-memory iteration.
+    if props.len() == 1 {
+        let filter = &props[0];
+        let col_id = prop_name_to_col_id(&filter.key);
+
+        // Encode the filter value to its raw u64 storage representation.
+        let target_raw_opt: Option<u64> = match &filter.value {
+            Expr::Literal(Literal::Int(n)) => Some(StoreValue::Int64(*n).to_u64()),
+            Expr::Literal(Literal::String(s)) if s.len() <= 7 => {
+                Some(StoreValue::Bytes(s.as_bytes().to_vec()).to_u64())
+            }
+            // Params, floats, long strings: fall through to per-slot path.
+            _ => None,
+        };
+
+        if let Some(target_raw) = target_raw_opt {
+            let col_data = match store.read_col_all(label_id, col_id) {
+                Ok(d) => d,
+                Err(_) => return None,
+            };
+            let null_bitmap = store.read_null_bitmap_all(label_id, col_id).ok().flatten();
+
+            for (slot, &raw) in col_data.iter().enumerate().take(hwm as usize) {
+                // Check presence before equality: in pre-SPA-207 data, raw == 0
+                // means absent (not the integer zero), so a search for uid:0
+                // must not match an absent slot.
+                let is_present = match &null_bitmap {
+                    // No bitmap (pre-SPA-207 data): use `raw != 0` sentinel.
+                    None => raw != 0,
+                    // Bitmap present: check the explicit null bit.
+                    Some(bits) => bits.get(slot).copied().unwrap_or(false),
+                };
+                if !is_present {
+                    continue;
+                }
+                if raw != target_raw {
+                    continue;
+                }
+                return Some(slot as u64);
+            }
+            return None;
+        }
+    }
+
+    // Fallback: per-slot read for complex/multi-prop filters.
+    let col_ids: Vec<u32> = props.iter().map(|p| prop_name_to_col_id(&p.key)).collect();
+    for slot in 0..hwm {
+        let node_id = NodeId(((label_id as u64) << 32) | slot);
+        let Ok(raw_props) = store.get_node_raw_nullable(node_id, &col_ids) else {
+            continue;
+        };
+        let stored: Vec<(u32, u64)> = raw_props
+            .into_iter()
+            .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+            .collect();
+        if matches_prop_filter_static(&stored, props, params, store) {
+            return Some(slot);
+        }
+    }
+    None
 }
