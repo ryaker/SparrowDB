@@ -423,14 +423,13 @@ impl Engine {
         // calls inside the loop (check_deadline, execute_variable_hops, etc.).
         let resolved_slots: Option<Vec<u64>> = {
             let prop_idx = self.prop_index.borrow();
-            try_index_lookup_for_props(&src_node_pat.props, src_label_id, &prop_idx)
-                .map(|slots| {
-                    slots
-                        .into_iter()
-                        .map(|s| s as u64)
-                        .filter(|&s| s < hwm_src)
-                        .collect()
-                })
+            try_index_lookup_for_props(&src_node_pat.props, src_label_id, &prop_idx).map(|slots| {
+                slots
+                    .into_iter()
+                    .map(|s| s as u64)
+                    .filter(|&s| s < hwm_src)
+                    .collect()
+            })
         };
         let src_iter: Box<dyn Iterator<Item = u64>> = match resolved_slots {
             Some(slots) => Box::new(slots.into_iter()),
@@ -447,6 +446,11 @@ impl Engine {
             }
 
             let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
+
+            // Skip tombstoned (deleted) source nodes — property_index callers must filter these.
+            if self.is_node_tombstoned(src_node) {
+                continue;
+            }
 
             // Fetch source props (for filter + projection).
             let src_all_col_ids: Vec<u32> = {
