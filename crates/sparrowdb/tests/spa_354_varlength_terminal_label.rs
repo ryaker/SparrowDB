@@ -16,6 +16,17 @@ fn make_db() -> (tempfile::TempDir, sparrowdb::GraphDb) {
     (dir, db)
 }
 
+fn extract_strings(result: &sparrowdb::QueryResult, col_idx: usize) -> Vec<String> {
+    result
+        .rows
+        .iter()
+        .filter_map(|row| match &row[col_idx] {
+            sparrowdb_execution::types::Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 // ── Test 1: labeled source → different-label destination ───────────────────────
 
 /// `(a:Person)-[:WORKS_AT*1..2]->(b:Company)` must return the reachable Company node.
@@ -77,14 +88,7 @@ fn varpath_terminal_label_multi_hop() {
         result.rows
     );
 
-    let names: Vec<String> = result
-        .rows
-        .iter()
-        .filter_map(|row| match &row[0] {
-            sparrowdb_execution::types::Value::String(s) => Some(s.clone()),
-            _ => None,
-        })
-        .collect();
+    let names = extract_strings(&result, 0);
     assert!(
         names.contains(&"Widget".to_string()),
         "expected Widget in results, got {:?}",
@@ -128,14 +132,7 @@ fn varpath_terminal_label_excludes_wrong_label() {
         result.rows
     );
 
-    let names: Vec<String> = result
-        .rows
-        .iter()
-        .filter_map(|row| match &row[0] {
-            sparrowdb_execution::types::Value::String(s) => Some(s.clone()),
-            _ => None,
-        })
-        .collect();
+    let names = extract_strings(&result, 0);
     assert!(
         names.contains(&"Acme".to_string()),
         "expected Acme in results, got {:?}",
@@ -178,14 +175,7 @@ fn varpath_unlabeled_source_labeled_destination() {
         result.rows
     );
 
-    let names: Vec<String> = result
-        .rows
-        .iter()
-        .filter_map(|row| match &row[0] {
-            sparrowdb_execution::types::Value::String(s) => Some(s.clone()),
-            _ => None,
-        })
-        .collect();
+    let names = extract_strings(&result, 0);
     assert!(
         names.contains(&"Bob".to_string()),
         "expected Bob in results, got {:?}",
