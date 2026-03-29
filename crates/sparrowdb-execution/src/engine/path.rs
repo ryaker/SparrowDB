@@ -416,7 +416,28 @@ impl Engine {
             m.limit.map(|l| l as usize).unwrap_or(usize::MAX)
         };
 
-        for src_slot in 0..hwm_src {
+        // SPA-299 Q5: Fast source resolution via property index.
+        // When the source node has inline props and the label is indexed, resolve
+        // to the matching slots directly instead of scanning all 0..hwm_src.
+        // The prop_idx borrow is scoped so it is dropped before the mutable self
+        // calls inside the loop (check_deadline, execute_variable_hops, etc.).
+        let resolved_slots: Option<Vec<u64>> = {
+            let prop_idx = self.prop_index.borrow();
+            try_index_lookup_for_props(&src_node_pat.props, src_label_id, &prop_idx)
+                .map(|slots| {
+                    slots
+                        .into_iter()
+                        .map(|s| s as u64)
+                        .filter(|&s| s < hwm_src)
+                        .collect()
+                })
+        };
+        let src_iter: Box<dyn Iterator<Item = u64>> = match resolved_slots {
+            Some(slots) => Box::new(slots.into_iter()),
+            None => Box::new(0..hwm_src),
+        };
+
+        for src_slot in src_iter {
             // SPA-254: check per-query deadline at every slot boundary.
             self.check_deadline()?;
 
