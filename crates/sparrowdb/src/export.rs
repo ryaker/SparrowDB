@@ -263,10 +263,8 @@ fn json_val_to_store_value(val: &serde_json::Value) -> Option<StoreValue> {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Some(StoreValue::Int64(i))
-            } else if let Some(f) = n.as_f64() {
-                Some(StoreValue::Float(f))
             } else {
-                None
+                n.as_f64().map(StoreValue::Float)
             }
         }
         serde_json::Value::String(s) => Some(StoreValue::Bytes(s.as_bytes().to_vec())),

@@ -91,10 +91,25 @@ impl Engine {
         if !m.order_by.is_empty() || m.skip.is_some() || m.limit.is_some() {
             return false;
         }
+        // DISTINCT deduplication is not implemented in the chunked scan path —
+        // fall back to the row engine which applies deduplicate_rows.
+        if m.distinct {
+            return false;
+        }
         // Inline prop filters on the node pattern are not evaluated by the
         // chunked scan path — fall back to the row engine so they are applied.
         // (Tracked as #362 for native support in the chunked path.)
         if !m.pattern[0].nodes[0].props.is_empty() {
+            return false;
+        }
+        // Bare variable projection (RETURN n) requires the row engine eval path
+        // to build a full property map (SPA-213). project_row returns Null for
+        // bare vars. Fall back until the chunked path implements SPA-213.
+        if m.return_clause
+            .items
+            .iter()
+            .any(|item| matches!(&item.expr, Expr::Var(_)))
+        {
             return false;
         }
         !m.pattern[0].nodes[0].labels.is_empty()
