@@ -2433,15 +2433,18 @@ fn project_three_var_row(
 }
 
 fn deduplicate_rows(rows: &mut Vec<Vec<Value>>) {
-    // Deduplicate using structural row equality to avoid false collisions from
-    // string-key approaches (e.g. ["a|", "b"] vs ["a", "|b"] would hash equal).
-    let mut unique: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
-    for row in rows.drain(..) {
-        if !unique.iter().any(|existing| existing == &row) {
-            unique.push(row);
-        }
-    }
-    *rows = unique;
+    // O(N) deduplication: encode each row via bincode (type-tagged, deterministic)
+    // and use a HashSet of byte keys.  The original O(N²) `any()` scan became a
+    // bottleneck for DISTINCT queries on large result sets (SPA-299 Q4).
+    //
+    // Bincode avoids the false-collision risk that string concatenation carries
+    // (e.g. ["a|", "b"] vs ["a", "|b"] would hash equal as strings).
+    use std::collections::HashSet;
+    let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(rows.len());
+    rows.retain(|row| {
+        let key = bincode::serialize(row).unwrap_or_default();
+        seen.insert(key)
+    });
 }
 
 /// Maximum rows to sort in-memory before spilling to disk (SPA-100).
