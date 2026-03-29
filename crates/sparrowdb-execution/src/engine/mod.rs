@@ -2439,10 +2439,22 @@ fn deduplicate_rows(rows: &mut Vec<Vec<Value>>) {
     //
     // Bincode avoids the false-collision risk that string concatenation carries
     // (e.g. ["a|", "b"] vs ["a", "|b"] would hash equal as strings).
+    //
+    // NaN preservation: bincode serializes Float64 bit-for-bit, which would
+    // collapse multiple NaN rows into one (all NaN bit-patterns serialize
+    // identically).  The original O(N²) path used PartialEq, where NaN != NaN
+    // (IEEE 754), so every NaN row was always kept.  We preserve that semantic
+    // here by bypassing the HashSet for any row that contains a NaN value.
     use std::collections::HashSet;
     let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(rows.len());
     rows.retain(|row| {
-        let key = bincode::serialize(row).unwrap_or_default();
+        let has_nan = row
+            .iter()
+            .any(|v| matches!(v, Value::Float64(f) if f.is_nan()));
+        if has_nan {
+            return true;
+        }
+        let key = bincode::serialize(row).expect("Value must be bincode-serializable");
         seen.insert(key)
     });
 }
