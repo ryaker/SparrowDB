@@ -26,11 +26,11 @@
 //!   SNAP_DATASET=/path/to/facebook_combined.txt cargo bench --bench snap_benchmarks
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use sparrowdb::{GraphDb, Value};
 use sparrowdb::NodeId;
+use sparrowdb::{GraphDb, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
 use std::fs::File;
+use std::io::{BufRead, BufReader};
 
 // ── graph constants ─────────────────────────────────────────────────────────
 
@@ -69,8 +69,12 @@ fn build_snap_graph_from_file(path: &str) -> (tempfile::TempDir, GraphDb, NodeId
         let mut parts = line.split_whitespace();
         let src: u64 = parts.next().expect("src").parse().expect("parse src");
         let dst: u64 = parts.next().expect("dst").parse().expect("parse dst");
-        if src > max_uid { max_uid = src; }
-        if dst > max_uid { max_uid = dst; }
+        if src > max_uid {
+            max_uid = src;
+        }
+        if dst > max_uid {
+            max_uid = dst;
+        }
         edges.push((src, dst));
     }
 
@@ -95,10 +99,13 @@ fn build_snap_graph_from_file(path: &str) -> (tempfile::TempDir, GraphDb, NodeId
     // Insert edges in batches of 500.
     let edge_chunk = 500;
     let flush = |db: &GraphDb, batch: &mut Vec<(NodeId, NodeId)>| {
-        if batch.is_empty() { return; }
+        if batch.is_empty() {
+            return;
+        }
         let mut tx = db.begin_write().expect("begin_write edges");
         for (src, dst) in batch.drain(..) {
-            tx.create_edge(src, dst, "KNOWS", HashMap::new()).expect("create edge");
+            tx.create_edge(src, dst, "KNOWS", HashMap::new())
+                .expect("create edge");
         }
         tx.commit().expect("commit edges");
     };
@@ -144,10 +151,7 @@ fn build_snap_graph() -> (tempfile::TempDir, GraphDb) {
             let label_id = tx.get_or_create_label_id("User").expect("label");
             for i in start..end {
                 let nid = tx
-                    .create_node_named(
-                        label_id,
-                        &[("uid".to_string(), Value::Int64(i as i64))],
-                    )
+                    .create_node_named(label_id, &[("uid".to_string(), Value::Int64(i as i64))])
                     .expect("create_node");
                 node_ids.push(nid);
             }
