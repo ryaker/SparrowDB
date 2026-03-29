@@ -1774,15 +1774,12 @@ fn collect_col_ids_for_var(var: &str, column_names: &[String], _label_id: u32) -
 ///
 /// This is the preferred call site for all hop/traversal projection paths (#369).
 fn collect_col_ids_for_var_from_items(var: &str, items: &[ReturnItem]) -> Vec<u32> {
-    let mut ids = Vec::new();
+    let mut id_set = std::collections::HashSet::new();
     for item in items {
         match &item.expr {
             Expr::PropAccess { var: v, prop } => {
                 if v.as_str() == var {
-                    let col_id = prop_name_to_col_id(prop);
-                    if !ids.contains(&col_id) {
-                        ids.push(col_id);
-                    }
+                    id_set.insert(prop_name_to_col_id(prop));
                 }
             }
             // FnCall expressions (type, labels, id, etc.) don't reference stored
@@ -1793,11 +1790,11 @@ fn collect_col_ids_for_var_from_items(var: &str, items: &[ReturnItem]) -> Vec<u3
     }
     // Also include WHERE-clause referenced columns — callers extend the list
     // from the WHERE expression separately, so we don't duplicate that here.
-    if ids.is_empty() {
+    if id_set.is_empty() {
         // Default: read col_0 so tombstone / existence checks work.
-        ids.push(0);
+        return vec![0];
     }
-    ids
+    id_set.into_iter().collect()
 }
 
 /// Read node properties using the nullable store path (SPA-197).
