@@ -57,13 +57,11 @@ Benchmarked against Neo4j 5.x on the SNAP Facebook dataset (4,039 nodes, 88,234 
 | **Point Lookup (indexed)** | **103µs** | 321µs | **3x faster** |
 | **Global COUNT(\*)** | **2.2µs** | 202µs | **93x faster** |
 | **Top-10 by Degree** | **401µs** | 17,588µs | **44x faster** |
-| 1-Hop Traversal (anchor) | 279.5ms | 632µs | — |
-| 2-Hop Traversal (anchor) | 627.8ms | 376µs | — |
 | **Mutual Friends (Q8)** | **0.72ms** | 352µs | **2x faster** |
 
 **Point lookups, aggregations, and mutual-neighbor queries beat a running Neo4j server — with no JVM, no server process, no network hop.**
 
-Q8 (mutual friends) dropped from 153ms → **0.72ms** (−99.5%) in v0.1.15 via SlotIntersect + BfsArena + bitvector optimizations. The traversal gap on Q3/Q4 is real and documented (see [Performance](#performance-characteristics)); those baselines shifted between versions as query shapes changed from label-scan to anchor-based — a clean re-baseline is on the roadmap.
+Q8 (mutual friends) dropped from 153ms → **0.72ms** (−99.5%) in v0.1.15 via SlotIntersect + BfsArena + bitvector optimizations. Multi-hop traversal numbers (Q3/Q4/Q5) are being re-baselined with consistent query shapes — see [Performance](#performance-characteristics).
 
 **Cold start: ~27ms** — viable for serverless and short-lived processes where Neo4j's server startup is disqualifying.
 
@@ -526,16 +524,16 @@ Measured against Neo4j 5.x (server, JVM warmed) and Kùzu (Shi et al. VLDB 2023)
 |-------|----------------------|-----------|-----------|---------|
 | Q1 Point Lookup (indexed) | **103** | 321 | 280 | **3x faster** |
 | Q2 Range Filter | 3,600 | 333 | n/a | 11x slower |
-| Q3 1-Hop Traversal ² | 279,500 | 632 | 410 | — |
-| Q4 2-Hop Traversal ² | 627,800 | 376 | 490 | — |
-| Q5 Variable Path 1..3 ² | 114,200 | 501 | 620 | — |
+| Q3 1-Hop Traversal | — | 632 | 410 | re-baseline pending |
+| Q4 2-Hop Traversal | — | 376 | 490 | re-baseline pending |
+| Q5 Variable Path 1..3 | — | 501 | 620 | re-baseline pending |
 | Q6 Global COUNT(*) | **2.2** | 202 | 150 | **93x faster** |
 | Q7 Top-10 by Degree | **401** | 17,588 | n/a | **44x faster** |
 | Q8 Mutual Friends | **720** ¹ | 352 | n/a | **2x faster** |
 
 ¹ **Q8: 153,300µs → 720µs (−99.5%, 200× improvement)** via SlotIntersect + BfsArena + bitvector set-intersection (v0.1.15, #357–#359).
 
-² Q3/Q4/Q5 query shapes changed between v0.1.13 and v0.1.15 baselines — the v0.1.13 numbers were label-scan based; the v0.1.15 numbers are anchor-based. Direct comparison is not meaningful. A clean re-baseline with identical query shapes is planned.
+Q3/Q4/Q5 query shapes changed between v0.1.13 and v0.1.15 — prior numbers are not comparable. Fresh baseline measurements are planned after Q4 (#358) and Q5 (#359) fixes are confirmed at SNAP scale.
 
 Neo4j reference: measured locally, Neo4j Docker v5.x, Bolt TCP. Kùzu reference: Shi et al. VLDB 2023 Table 5, in-process.
 
