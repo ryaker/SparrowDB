@@ -91,6 +91,12 @@ impl Engine {
         if !m.order_by.is_empty() || m.skip.is_some() || m.limit.is_some() {
             return false;
         }
+        // Inline prop filters on the node pattern are not evaluated by the
+        // chunked scan path — fall back to the row engine so they are applied.
+        // (Tracked as #362 for native support in the chunked path.)
+        if !m.pattern[0].nodes[0].props.is_empty() {
+            return false;
+        }
         !m.pattern[0].nodes[0].labels.is_empty()
     }
 
@@ -171,6 +177,11 @@ impl Engine {
             if !is_simple_where_for_chunked(wexpr) {
                 return false;
             }
+        }
+        // Inline prop filters on node patterns are not evaluated by the chunked
+        // one-hop path — fall back to the row engine.  (See #362.)
+        if pat.nodes.iter().any(|n| !n.props.is_empty()) {
+            return false;
         }
         // Resolve to exactly one rel table.
         let src_label = pat.nodes[0].labels.first().cloned().unwrap_or_default();
@@ -1067,6 +1078,11 @@ impl Engine {
             if !is_simple_where_for_chunked(wexpr) {
                 return false;
             }
+        }
+        // Inline prop filters on node patterns are not evaluated by the chunked
+        // two-hop path — fall back to the row engine.  (See #362.)
+        if pat.nodes.iter().any(|n| !n.props.is_empty()) {
+            return false;
         }
         // Both hops must resolve to the same relationship table.
         let src_label = pat.nodes[0].labels.first().cloned().unwrap_or_default();

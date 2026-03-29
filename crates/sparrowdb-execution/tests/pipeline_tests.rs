@@ -276,3 +276,53 @@ fn pipeline_filter_reduces_live_count() {
     let live: Vec<usize> = chunk.live_rows().collect();
     assert_eq!(live, vec![1, 3, 5, 7, 9]);
 }
+
+// ── Regression #356: inline prop filter must not be ignored by chunked pipeline ─
+
+/// Regression test for #356: `MATCH (n:Label {prop: val})` was returning ALL
+/// nodes of that label when `use_chunked_pipeline` was enabled, because the
+/// chunked scan path did not evaluate inline `{prop: val}` filters.
+///
+/// Fix (Option B, #356): the eligibility guard `can_use_chunked_pipeline` now
+/// returns `false` when any node pattern has non-empty inline props, causing
+/// the query to fall back to the row engine which correctly applies the filter.
+#[test]
+fn inline_prop_filter_not_ignored_by_chunked_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, _) = setup_person_db(dir.path());
+
+    // With chunked pipeline enabled, MATCH (n:Person {age: 30}) must return
+    // exactly 1 row (Alice), NOT all 3 nodes.
+    let chunked_result = {
+        let mut eng = make_engine_pipeline(dir.path());
+        eng.execute("MATCH (n:Person {age: 30}) RETURN n.age")
+            .unwrap()
+    };
+
+    assert_eq!(
+        chunked_result.rows.len(),
+        1,
+        "chunked pipeline must apply inline prop filter — expected 1 row (age=30), got {}",
+        chunked_result.rows.len()
+    );
+
+    // Confirm the returned value is actually 30.
+    let age_val = chunked_result.rows[0].first().unwrap();
+    assert_eq!(
+        *age_val,
+        sparrowdb_execution::Value::Int64(30),
+        "returned age must be 30"
+    );
+
+    // Also verify the row engine agrees (sanity check the test setup).
+    let row_result = {
+        let mut eng = make_engine(dir.path());
+        eng.execute("MATCH (n:Person {age: 30}) RETURN n.age")
+            .unwrap()
+    };
+    assert_eq!(
+        row_result.rows.len(),
+        1,
+        "row engine must also return 1 row for inline prop filter"
+    );
+}
