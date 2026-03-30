@@ -742,12 +742,27 @@ impl Parser {
         // Consume WITH token.
         self.expect_tok(&Token::With)?;
 
-        // Parse one or more `expr AS alias` items separated by commas.
+        // Parse one or more `expr [AS alias]` items separated by commas.
+        // `AS alias` is optional: `WITH n` is equivalent to `WITH n AS n`.
         let mut items: Vec<WithItem> = Vec::new();
         loop {
             let expr = self.parse_expr()?;
-            self.expect_tok(&Token::As)?;
-            let alias = self.expect_ident()?;
+            let alias = if matches!(self.peek(), Token::As) {
+                self.advance(); // consume AS
+                self.expect_ident()?
+            } else {
+                // No AS — derive alias from the expression.
+                // Only bare variable references have an obvious implicit alias.
+                match &expr {
+                    crate::ast::Expr::Var(name) => name.clone(),
+                    _ => {
+                        return Err(Error::InvalidArgument(
+                            "WITH item without AS alias must be a bare variable (e.g. WITH n)"
+                                .into(),
+                        ))
+                    }
+                }
+            };
             items.push(WithItem { expr, alias });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();

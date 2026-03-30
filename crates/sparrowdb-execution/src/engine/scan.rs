@@ -374,23 +374,13 @@ impl Engine {
         let dst_pat = &pat.nodes[1];
         let rel_pat = &pat.rels[0];
 
-        let src_label = src_pat.labels.first().cloned().unwrap_or_default();
         let dst_label = dst_pat.labels.first().cloned().unwrap_or_default();
 
-        let src_label_id = match self.snapshot.catalog.get_label(&src_label)? {
-            Some(id) => id as u32,
-            None => return Ok(vec![]),
-        };
         let dst_label_id = match self.snapshot.catalog.get_label(&dst_label)? {
             Some(id) => id as u32,
             None => return Ok(vec![]),
         };
 
-        let src_col_ids: Vec<u32> = self
-            .snapshot
-            .store
-            .col_ids_for_label(src_label_id)
-            .unwrap_or_default();
         let dst_col_ids: Vec<u32> = self
             .snapshot
             .store
@@ -399,34 +389,76 @@ impl Engine {
         let params = self.dollar_params();
 
         // Find candidate src nodes.
-        let src_candidates: Vec<NodeId> = {
-            // If the src var is already bound as a NodeRef, use that directly.
-            let bound_src = binding
-                .get(&src_pat.var)
-                .or_else(|| binding.get(&format!("{}.__node_id__", src_pat.var)));
-            if let Some(Value::NodeRef(nid)) = bound_src {
-                vec![*nid]
-            } else {
-                let hwm = self.snapshot.store.hwm_for_label(src_label_id)?;
-                let mut cands = Vec::new();
-                for slot in 0..hwm {
-                    let node_id = NodeId(((src_label_id as u64) << 32) | slot);
-                    if self.is_node_tombstoned(node_id) {
-                        continue;
+        // Check binding BEFORE resolving the src label: when the src variable is
+        // already bound as a NodeRef (from a preceding WITH stage), we derive the
+        // src_label_id directly from the NodeId encoding and skip the label scan
+        // entirely.  This is the critical fix for issue #355: `WITH a MATCH (a)-…`
+        // where `a` has no label annotation on the second MATCH pattern.
+        let bound_src_nid: Option<NodeId> = binding
+            .get(&src_pat.var)
+            .or_else(|| binding.get(&format!("{}.__node_id__", src_pat.var)))
+            .and_then(|v| {
+                if let Value::NodeRef(nid) = v {
+                    Some(*nid)
+                } else {
+                    None
+                }
+            });
+
+        let src_label = src_pat.labels.first().cloned().unwrap_or_default();
+        let src_label_id: u32 = if let Some(nid) = bound_src_nid {
+            let bound_label_id = (nid.0 >> 32) as u32;
+            // When the src node is already bound, a label in the pattern acts as a
+            // filter: if the bound node's label doesn't match, return no results.
+            if !src_label.is_empty() {
+                match self.snapshot.catalog.get_label(&src_label)? {
+                    Some(pat_label_id) if (pat_label_id as u32) != bound_label_id => {
+                        return Ok(vec![]);
                     }
-                    if let Ok(props) = self.snapshot.store.get_node_raw(node_id, &src_col_ids) {
-                        if self.matches_prop_filter_with_binding(
-                            &props,
-                            &src_pat.props,
-                            binding,
-                            &params,
-                        ) {
-                            cands.push(node_id);
-                        }
+                    None => return Ok(vec![]),
+                    _ => {}
+                }
+            }
+            bound_label_id
+        } else if src_label.is_empty() {
+            // No label and not bound — cannot resolve src; return empty.
+            return Ok(vec![]);
+        } else {
+            match self.snapshot.catalog.get_label(&src_label)? {
+                Some(id) => id as u32,
+                None => return Ok(vec![]),
+            }
+        };
+
+        let src_col_ids: Vec<u32> = self
+            .snapshot
+            .store
+            .col_ids_for_label(src_label_id)
+            .unwrap_or_default();
+
+        // Find candidate src nodes.
+        let src_candidates: Vec<NodeId> = if let Some(nid) = bound_src_nid {
+            vec![nid]
+        } else {
+            let hwm = self.snapshot.store.hwm_for_label(src_label_id)?;
+            let mut cands = Vec::new();
+            for slot in 0..hwm {
+                let node_id = NodeId(((src_label_id as u64) << 32) | slot);
+                if self.is_node_tombstoned(node_id) {
+                    continue;
+                }
+                if let Ok(props) = self.snapshot.store.get_node_raw(node_id, &src_col_ids) {
+                    if self.matches_prop_filter_with_binding(
+                        &props,
+                        &src_pat.props,
+                        binding,
+                        &params,
+                    ) {
+                        cands.push(node_id);
                     }
                 }
-                cands
             }
+            cands
         };
 
         let rel_table_id = self.resolve_rel_table_id(src_label_id, dst_label_id, &rel_pat.rel_type);
