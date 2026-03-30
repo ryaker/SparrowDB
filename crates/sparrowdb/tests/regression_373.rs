@@ -115,10 +115,55 @@ fn set_with_where_clause() {
     let alice_result = db
         .execute("MATCH (n:Person {name: 'Alice'}) RETURN n.age")
         .expect("RETURN Alice age");
-    assert_eq!(alice_result.rows[0][0], Value::Int64(99), "Alice age must be 99");
+    assert_eq!(
+        alice_result.rows[0][0],
+        Value::Int64(99),
+        "Alice age must be 99"
+    );
 
     let dave_result = db
         .execute("MATCH (n:Person {name: 'Dave'}) RETURN n.age")
         .expect("RETURN Dave age");
-    assert_eq!(dave_result.rows[0][0], Value::Int64(40), "Dave age must be unchanged");
+    assert_eq!(
+        dave_result.rows[0][0],
+        Value::Int64(40),
+        "Dave age must be unchanged"
+    );
+}
+
+// ── Multi-row + multi-SET: two matching nodes both receive multiple properties ─
+
+#[test]
+fn set_multiple_properties_updates_all_matching_nodes() {
+    let (_dir, db) = make_db();
+
+    db.execute("CREATE (:Person {name: 'Carol', age: 20})")
+        .expect("CREATE Carol");
+    db.execute("CREATE (:Person {name: 'Dana', age: 22})")
+        .expect("CREATE Dana");
+
+    db.execute("MATCH (n:Person) SET n.age = 35, n.city = 'LA'")
+        .expect("multi-row multi-property SET must succeed");
+
+    for name in ["Carol", "Dana"] {
+        let age_result = db
+            .execute(&format!("MATCH (n:Person {{name: '{name}'}}) RETURN n.age"))
+            .expect("RETURN n.age");
+        assert_eq!(
+            age_result.rows[0][0],
+            Value::Int64(35),
+            "{name} age must be 35"
+        );
+
+        let city_result = db
+            .execute(&format!(
+                "MATCH (n:Person {{name: '{name}'}}) RETURN n.city"
+            ))
+            .expect("RETURN n.city");
+        assert_eq!(
+            city_result.rows[0][0],
+            Value::String("LA".to_string()),
+            "{name} city must be 'LA'"
+        );
+    }
 }
