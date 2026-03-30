@@ -2607,6 +2607,26 @@ fn apply_order_by(rows: &mut Vec<Vec<Value>>, m: &MatchStatement, column_names: 
     }
 }
 
+/// Apply DISTINCT, ORDER BY, SKIP, and LIMIT to a result row set.
+///
+/// This is the single authoritative post-processing step shared by every scan
+/// path (single-label, multi-label, label-less, and multi-pattern).  It must
+/// be called **after** aggregation / eval-path projection so that ORDER BY and
+/// LIMIT see the final projected values.
+fn apply_post_processing(rows: &mut Vec<Vec<Value>>, m: &MatchStatement, column_names: &[String]) {
+    if m.distinct {
+        deduplicate_rows(rows);
+    }
+    apply_order_by(rows, m, column_names);
+    if let Some(skip) = m.skip {
+        let skip = (skip as usize).min(rows.len());
+        rows.drain(0..skip);
+    }
+    if let Some(lim) = m.limit {
+        rows.truncate(lim as usize);
+    }
+}
+
 fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Int64(x), Value::Int64(y)) => x.cmp(y),

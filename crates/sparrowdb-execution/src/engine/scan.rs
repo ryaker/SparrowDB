@@ -1606,15 +1606,7 @@ impl Engine {
 
         let mut rows = self.aggregate_rows_graph(&accumulated, &m.return_clause.items);
 
-        // ORDER BY / LIMIT / SKIP.
-        apply_order_by(&mut rows, m, column_names);
-        if let Some(skip) = m.skip {
-            let skip = (skip as usize).min(rows.len());
-            rows.drain(0..skip);
-        }
-        if let Some(limit) = m.limit {
-            rows.truncate(limit as usize);
-        }
+        apply_post_processing(&mut rows, m, column_names);
 
         Ok(QueryResult {
             columns: column_names.to_vec(),
@@ -2171,25 +2163,12 @@ impl Engine {
 
         if use_eval_path {
             rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
-        } else {
-            if m.distinct {
-                deduplicate_rows(&mut rows);
-            }
-
-            // ORDER BY
-            apply_order_by(&mut rows, m, column_names);
-
-            // SKIP
-            if let Some(skip) = m.skip {
-                let skip = (skip as usize).min(rows.len());
-                rows.drain(0..skip);
-            }
-
-            // LIMIT
-            if let Some(lim) = m.limit {
-                rows.truncate(lim as usize);
-            }
         }
+
+        // DISTINCT / ORDER BY / SKIP / LIMIT apply to both the eval path and the
+        // fast project_row path (fixes #363: CASE WHEN with ORDER BY / LIMIT was
+        // skipped when use_eval_path=true).
+        apply_post_processing(&mut rows, m, column_names);
 
         tracing::debug!(rows = rows.len(), "node scan complete");
         Ok(QueryResult {
@@ -2358,19 +2337,10 @@ impl Engine {
 
         if use_eval_path {
             rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
-        } else {
-            if m.distinct {
-                deduplicate_rows(&mut rows);
-            }
-            apply_order_by(&mut rows, m, column_names);
-            if let Some(skip) = m.skip {
-                let skip = (skip as usize).min(rows.len());
-                rows.drain(0..skip);
-            }
-            if let Some(lim) = m.limit {
-                rows.truncate(lim as usize);
-            }
         }
+
+        // DISTINCT / ORDER BY / SKIP / LIMIT apply to both paths (fixes #363).
+        apply_post_processing(&mut rows, m, column_names);
 
         tracing::debug!(
             labels = ?labels,
@@ -2540,17 +2510,7 @@ impl Engine {
 
         // DISTINCT / ORDER BY / SKIP / LIMIT apply regardless of which path
         // built the rows (eval or fast path).
-        if m.distinct {
-            deduplicate_rows(&mut rows);
-        }
-        apply_order_by(&mut rows, m, column_names);
-        if let Some(skip) = m.skip {
-            let skip = (skip as usize).min(rows.len());
-            rows.drain(0..skip);
-        }
-        if let Some(lim) = m.limit {
-            rows.truncate(lim as usize);
-        }
+        apply_post_processing(&mut rows, m, column_names);
 
         tracing::debug!(rows = rows.len(), "label-less full scan complete");
         Ok(QueryResult {
