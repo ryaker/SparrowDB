@@ -311,7 +311,9 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                     sparrowdb_execution::types::Value::Int64(n) => Some(*n),
                     _ => None,
                 })
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    "add_property: count query returned unexpected result".to_string()
+                })?;
 
             if matched == 0 {
                 return Ok(json!({
@@ -478,7 +480,9 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                     sparrowdb_execution::types::Value::Int64(n) => Some(*n),
                     _ => None,
                 })
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    "merge_node_by_property: count query returned unexpected result".to_string()
+                })?;
 
             // Use two-path logic (MATCH+SET or CREATE) since MERGE is not yet
             // supported by the Cypher parser.
@@ -532,10 +536,10 @@ fn validate_cypher_identifier(ident: &str, context: &str) -> Result<(), String> 
         return Err(format!("{context}: identifier must not be empty"));
     }
     let mut chars = ident.chars();
-    let first_ok = chars
+    let first_char = chars
         .next()
-        .map(|c| c.is_ascii_alphabetic() || c == '_')
-        .unwrap_or(false);
+        .ok_or_else(|| format!("{context}: identifier must not be empty"))?;
+    let first_ok = first_char.is_ascii_alphabetic() || first_char == '_';
     if !first_ok || chars.any(|c| !c.is_ascii_alphanumeric() && c != '_') {
         return Err(format!(
             "{context}: identifier '{ident}' contains unsafe characters; \
