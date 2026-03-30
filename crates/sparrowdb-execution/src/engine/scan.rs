@@ -407,8 +407,19 @@ impl Engine {
 
         let src_label = src_pat.labels.first().cloned().unwrap_or_default();
         let src_label_id: u32 = if let Some(nid) = bound_src_nid {
-            // Label id is the high 32 bits of the NodeId.
-            (nid.0 >> 32) as u32
+            let bound_label_id = (nid.0 >> 32) as u32;
+            // When the src node is already bound, a label in the pattern acts as a
+            // filter: if the bound node's label doesn't match, return no results.
+            if !src_label.is_empty() {
+                match self.snapshot.catalog.get_label(&src_label)? {
+                    Some(pat_label_id) if (pat_label_id as u32) != bound_label_id => {
+                        return Ok(vec![]);
+                    }
+                    None => return Ok(vec![]),
+                    _ => {}
+                }
+            }
+            bound_label_id
         } else if src_label.is_empty() {
             // No label and not bound — cannot resolve src; return empty.
             return Ok(vec![]);
