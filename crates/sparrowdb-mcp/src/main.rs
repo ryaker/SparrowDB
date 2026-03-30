@@ -448,7 +448,7 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
             if let Some(obj) = properties.as_object() {
                 for (k, v) in obj {
                     if k == match_key {
-                        continue; // match key already in MERGE clause
+                        continue; // match key handled separately
                     }
                     validate_cypher_identifier(k, "merge_node_by_property: property key")?;
                     let cypher_v = json_scalar_to_cypher(v).ok_or_else(|| {
@@ -458,13 +458,7 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 }
             }
 
-            let set_clause = if set_parts.is_empty() {
-                String::new()
-            } else {
-                format!(" SET {}", set_parts.join(", "))
-            };
-
-            // Check whether the node already exists before MERGE so we can accurately
+            // Check whether the node already exists before the upsert so we can accurately
             // report whether it was created or matched.
             let count_query =
                 format!("MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) RETURN count(n)",);
@@ -481,14 +475,46 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 })
                 .unwrap_or(0);
 
-            // Use MERGE (find-or-create) semantics.
-            let query = format!(
-                "MERGE (n:{label} {{{match_key}: {cypher_match_val}}}){set_clause} RETURN n",
-            );
-
-            let result = db
-                .execute(&query)
-                .map_err(|e| format!("merge_node_by_property: MERGE failed: {}", e))?;
+            // Use two-path logic (MATCH+SET or CREATE) since MERGE is not yet
+            // supported by the Cypher parser.
+            let result = if pre_existing > 0 {
+                // Node exists — match it and optionally set extra properties.
+                let query = if set_parts.is_empty() {
+                    format!(
+                        "MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) RETURN n",
+                    )
+                } else {
+                    format!(
+                        "MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) SET {set_clause_inner} RETURN n",
+                        set_clause_inner = set_parts.join(", "),
+                    )
+                };
+                db.execute(&query)
+                    .map_err(|e| format!("merge_node_by_property: MATCH failed: {}", e))?
+            } else {
+                // Node does not exist — create it with all properties.
+                let mut all_props: Vec<String> = vec![
+                    format!("{match_key}: {cypher_match_val}"),
+                ];
+                if let Some(obj) = properties.as_object() {
+                    for (k, v) in obj {
+                        if k == match_key {
+                            continue;
+                        }
+                        validate_cypher_identifier(k, "merge_node_by_property: property key")?;
+                        let cypher_v = json_scalar_to_cypher(v).ok_or_else(|| {
+                            format!("merge_node_by_property: property '{}' must be a scalar", k)
+                        })?;
+                        all_props.push(format!("{k}: {cypher_v}"));
+                    }
+                }
+                let props_str = all_props.join(", ");
+                let query = format!(
+                    "CREATE (n:{label} {{{props_str}}}) RETURN n",
+                );
+                db.execute(&query)
+                    .map_err(|e| format!("merge_node_by_property: CREATE failed: {}", e))?
+            };
 
             let created = pre_existing == 0;
             Ok(json!({
