@@ -167,7 +167,11 @@ pub(crate) fn eval_expr_merge(
 /// Used to route `MATCH (a)-[r:REL]->(b) DELETE r` to the edge-delete path
 /// instead of the node-delete path.
 pub(crate) fn is_edge_delete_mutation(mm: &sparrowdb_cypher::ast::MatchMutateStatement) -> bool {
-    let sparrowdb_cypher::ast::Mutation::Delete { var } = &mm.mutation else {
+    // DELETE is always stored as a single-element mutations vec.
+    if mm.mutations.len() != 1 {
+        return false;
+    }
+    let sparrowdb_cypher::ast::Mutation::Delete { var } = &mm.mutations[0] else {
         return false;
     };
     mm.match_patterns
