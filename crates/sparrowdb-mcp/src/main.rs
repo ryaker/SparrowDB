@@ -482,40 +482,41 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
 
             // Use two-path logic (MATCH+SET or CREATE) since MERGE is not yet
             // supported by the Cypher parser.
-            let result = if pre_existing > 0 {
+            if pre_existing > 0 {
                 // Node exists — match it and optionally set extra properties.
                 let query = if set_parts.is_empty() {
-                    format!("MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) RETURN n",)
+                    format!("MATCH (n:{label} {{{match_key}: {cypher_match_val}}})",)
                 } else {
                     format!(
-                        "MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) SET {set_clause_inner} RETURN n",
+                        "MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) SET {set_clause_inner}",
                         set_clause_inner = set_parts.join(", "),
                     )
                 };
-                db.execute(&query)
-                    .map_err(|e| format!("merge_node_by_property: MATCH failed: {}", e))?
+                let _ = db
+                    .execute(&query)
+                    .map_err(|e| format!("merge_node_by_property: MATCH failed: {}", e))?;
             } else {
                 // Node does not exist — create it with all properties.
                 let mut all_props: Vec<String> = vec![format!("{match_key}: {cypher_match_val}")];
                 all_props.extend(prop_parts);
                 let props_str = all_props.join(", ");
-                let query = format!("CREATE (n:{label} {{{props_str}}}) RETURN n",);
-                db.execute(&query)
-                    .map_err(|e| format!("merge_node_by_property: CREATE failed: {}", e))?
-            };
+                let query = format!("CREATE (n:{label} {{{props_str}}})",);
+                let _ = db
+                    .execute(&query)
+                    .map_err(|e| format!("merge_node_by_property: CREATE failed: {}", e))?;
+            }
 
             let created = pre_existing == 0;
             Ok(json!({
                 "content": [{
                     "type": "text",
                     "text": format!(
-                        "merge_node_by_property: node with {}={} on label '{}' {} ({} row(s) returned).",
+                        "merge_node_by_property: node with {}={} on label '{}' {}.",
                         match_key, match_value, label,
-                        if created { "created" } else { "found (existing)" },
-                        result.rows.len()
+                        if created { "created" } else { "found (existing)" }
                     )
                 }],
-                "rows": result.rows.len(),
+                "rows": 1,
                 "created": created
             }))
         }
