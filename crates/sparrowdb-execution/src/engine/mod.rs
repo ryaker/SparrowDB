@@ -1776,16 +1776,13 @@ fn collect_col_ids_for_var(var: &str, column_names: &[String], _label_id: u32) -
 fn collect_col_ids_for_var_from_items(var: &str, items: &[ReturnItem]) -> Vec<u32> {
     let mut id_set = std::collections::HashSet::new();
     for item in items {
-        match &item.expr {
-            Expr::PropAccess { var: v, prop } => {
-                if v.as_str() == var {
-                    id_set.insert(prop_name_to_col_id(prop));
-                }
+        // FnCall expressions (type, labels, id, etc.) don't reference stored
+        // node property columns; they are handled in project_hop_row at
+        // projection time.
+        if let Expr::PropAccess { var: v, prop } = &item.expr {
+            if v.as_str() == var {
+                id_set.insert(prop_name_to_col_id(prop));
             }
-            // FnCall expressions (type, labels, id, etc.) don't reference stored
-            // node property columns; they are handled in project_hop_row at
-            // projection time.
-            _ => {}
         }
     }
     // Also include WHERE-clause referenced columns — callers extend the list
