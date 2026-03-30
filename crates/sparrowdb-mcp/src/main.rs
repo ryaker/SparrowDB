@@ -492,7 +492,8 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                         set_clause_inner = set_parts.join(", "),
                     )
                 };
-                let _ = db.execute(&query)
+                let _ = db
+                    .execute(&query)
                     .map_err(|e| format!("merge_node_by_property: MATCH failed: {}", e))?;
             } else {
                 // Node does not exist — create it with all properties.
@@ -500,7 +501,8 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 all_props.extend(prop_parts);
                 let props_str = all_props.join(", ");
                 let query = format!("CREATE (n:{label} {{{props_str}}})",);
-                let _ = db.execute(&query)
+                let _ = db
+                    .execute(&query)
                     .map_err(|e| format!("merge_node_by_property: CREATE failed: {}", e))?;
             }
 
