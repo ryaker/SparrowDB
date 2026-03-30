@@ -12,10 +12,8 @@ use tempfile::tempdir;
 fn setup_graph() -> (GraphDb, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db = GraphDb::open(dir.path()).unwrap();
-    db.execute(
-        "CREATE (a:Person {name: \"Alice\"})-[:KNOWS]->(b:Person {name: \"Bob\"})",
-    )
-    .expect("CREATE should succeed");
+    db.execute("CREATE (a:Person {name: \"Alice\"})-[:KNOWS]->(b:Person {name: \"Bob\"})")
+        .expect("CREATE should succeed");
     (db, dir)
 }
 

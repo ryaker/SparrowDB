@@ -2359,8 +2359,7 @@ fn project_hop_row(
                     });
                     match name_lc.as_str() {
                         "type" => {
-                            if let (Some(var), Some((rel_var, rel_type))) =
-                                (arg_var, rel_var_type)
+                            if let (Some(var), Some((rel_var, rel_type))) = (arg_var, rel_var_type)
                             {
                                 if var == rel_var {
                                     return Value::String(rel_type.to_string());
@@ -2372,16 +2371,12 @@ fn project_hop_row(
                             if let Some(var) = arg_var {
                                 if let Some((meta_var, label)) = src_label_meta {
                                     if var == meta_var {
-                                        return Value::List(vec![Value::String(
-                                            label.to_string(),
-                                        )]);
+                                        return Value::List(vec![Value::String(label.to_string())]);
                                     }
                                 }
                                 if let Some((meta_var, label)) = dst_label_meta {
                                     if var == meta_var {
-                                        return Value::List(vec![Value::String(
-                                            label.to_string(),
-                                        )]);
+                                        return Value::List(vec![Value::String(label.to_string())]);
                                     }
                                 }
                             }

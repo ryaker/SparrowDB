@@ -485,9 +485,7 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
             let result = if pre_existing > 0 {
                 // Node exists — match it and optionally set extra properties.
                 let query = if set_parts.is_empty() {
-                    format!(
-                        "MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) RETURN n",
-                    )
+                    format!("MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) RETURN n",)
                 } else {
                     format!(
                         "MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) SET {set_clause_inner} RETURN n",
