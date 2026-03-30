@@ -202,6 +202,12 @@ impl Engine {
         if pat.nodes.iter().any(|n| !n.props.is_empty()) {
             return false;
         }
+        // Inline prop filters on the relationship pattern (e.g. [r:KNOWS {since:2020}])
+        // are not evaluated by the chunked one-hop path — it has no edge-props read
+        // stage.  Fall back to the row engine so filters are applied correctly (#367).
+        if !pat.rels[0].props.is_empty() {
+            return false;
+        }
         // id(n) and other NodeRef-dependent functions require the row engine (#372).
         if return_requires_row_engine(&m.return_clause.items) {
             return false;
@@ -747,6 +753,11 @@ impl Engine {
                 }
             }
         }
+        // Inline prop filters on relationship patterns are not evaluated by the
+        // chunked mutual-neighbors path — fall back to the row engine.  (See #367.)
+        if pat.rels.iter().any(|r| !r.props.is_empty()) {
+            return false;
+        }
         // Endpoint binding: either WHERE id(a)=$x AND id(b)=$y, or both
         // endpoint nodes carry exactly one inline prop filter (e.g. {uid: 0}).
         // The inline-prop form is the shape used by the Facebook benchmark Q8:
@@ -1117,6 +1128,11 @@ impl Engine {
         // Inline prop filters on node patterns are not evaluated by the chunked
         // two-hop path — fall back to the row engine.  (See #362.)
         if pat.nodes.iter().any(|n| !n.props.is_empty()) {
+            return false;
+        }
+        // Inline prop filters on relationship patterns are not evaluated by the
+        // chunked two-hop path — fall back to the row engine.  (See #367.)
+        if pat.rels.iter().any(|r| !r.props.is_empty()) {
             return false;
         }
         // id(n) and other NodeRef-dependent functions require the row engine (#372).
