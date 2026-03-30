@@ -72,10 +72,10 @@ impl Engine {
         Ok(matching_ids)
     }
 
-    /// Return the mutation carried by a `MatchMutate` statement, exposing it
-    /// to the caller (GraphDb) so it can apply it inside a write transaction.
-    pub fn mutation_from_match_mutate(mm: &MatchMutateStatement) -> &Mutation {
-        &mm.mutation
+    /// Return the mutations carried by a `MatchMutate` statement, exposing them
+    /// to the caller (GraphDb) so they can be applied inside a write transaction.
+    pub fn mutations_from_match_mutate(mm: &MatchMutateStatement) -> &[Mutation] {
+        &mm.mutations
     }
 
     /// Scan edges matching a MATCH pattern with exactly one hop and return

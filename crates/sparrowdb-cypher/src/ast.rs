@@ -310,8 +310,11 @@ pub struct MatchMutateStatement {
     pub match_patterns: Vec<PathPattern>,
     /// Optional WHERE predicate.
     pub where_clause: Option<Expr>,
-    /// The mutation to apply to matched nodes.
-    pub mutation: Mutation,
+    /// The mutations to apply to matched nodes.
+    ///
+    /// For SET, there may be multiple items (comma-separated).
+    /// For DELETE, this always contains exactly one `Mutation::Delete`.
+    pub mutations: Vec<Mutation>,
 }
 
 /// A single projection in a WITH clause: `expr AS alias`.
