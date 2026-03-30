@@ -112,6 +112,10 @@ impl Engine {
         {
             return false;
         }
+        // id(n) and other NodeRef-dependent functions require the row engine (#372).
+        if return_requires_row_engine(&m.return_clause.items) {
+            return false;
+        }
         !m.pattern[0].nodes[0].labels.is_empty()
     }
 
@@ -196,6 +200,10 @@ impl Engine {
         // Inline prop filters on node patterns are not evaluated by the chunked
         // one-hop path — fall back to the row engine.  (See #362.)
         if pat.nodes.iter().any(|n| !n.props.is_empty()) {
+            return false;
+        }
+        // id(n) and other NodeRef-dependent functions require the row engine (#372).
+        if return_requires_row_engine(&m.return_clause.items) {
             return false;
         }
         // Resolve to exactly one rel table.
@@ -761,6 +769,10 @@ impl Engine {
                 }
             }
         }
+        // id(n) and other NodeRef-dependent functions require the row engine (#372).
+        if return_requires_row_engine(&m.return_clause.items) {
+            return false;
+        }
         // Rel table must exist.
         let label = pat.nodes[0].labels[0].clone();
         let rel_type = &pat.rels[0].rel_type;
@@ -1105,6 +1117,10 @@ impl Engine {
         // Inline prop filters on node patterns are not evaluated by the chunked
         // two-hop path — fall back to the row engine.  (See #362.)
         if pat.nodes.iter().any(|n| !n.props.is_empty()) {
+            return false;
+        }
+        // id(n) and other NodeRef-dependent functions require the row engine (#372).
+        if return_requires_row_engine(&m.return_clause.items) {
             return false;
         }
         // Both hops must resolve to the same relationship table.
@@ -2283,4 +2299,17 @@ fn find_slot_by_props(
         }
     }
     None
+}
+
+/// Returns `true` when the RETURN clause contains expressions that the chunked
+/// pipeline paths cannot handle and the query must fall back to the row engine.
+///
+/// Specifically, `id(n)` and other `NodeRef`-dependent functions require
+/// `Value::NodeRef` to be injected into the row map by the eval path.  The
+/// chunked `project_row` / `project_hop_row` paths match by column-name string;
+/// when an AS alias is present the column name is the alias rather than
+/// `"id(n)"`, so those paths return Null.  The row engine's eval path resolves
+/// `id(n)` correctly via `eval_expr` (#372).
+fn return_requires_row_engine(items: &[ReturnItem]) -> bool {
+    needs_node_ref_in_return(items)
 }

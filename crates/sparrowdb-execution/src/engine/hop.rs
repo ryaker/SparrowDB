@@ -77,7 +77,12 @@ impl Engine {
             .map(|(catalog_id, sid, did, rt)| (catalog_id, sid as u32, did as u32, rt))
             .collect();
 
-        let use_agg = has_aggregate_in_return(&m.return_clause.items);
+        // use_raw_rows_path is true for aggregations OR for id(n)/NodeRef-dependent
+        // RETURN items (#372): the raw-rows + aggregate_rows_graph path correctly
+        // injects NodeRef into the row map, whereas project_hop_row does not handle
+        // id().
+        let use_raw_rows_path = has_aggregate_in_return(&m.return_clause.items)
+            || needs_node_ref_in_return(&m.return_clause.items);
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
         // For undirected (Both), track seen (src_slot, dst_slot) pairs from the
@@ -143,7 +148,7 @@ impl Engine {
                 &dst_node_pat.var,
                 &m.return_clause.items,
             );
-            if use_agg {
+            if use_raw_rows_path {
                 for item in &m.return_clause.items {
                     collect_col_ids_from_expr(&item.expr, &mut col_ids_src);
                     collect_col_ids_from_expr(&item.expr, &mut col_ids_dst);
@@ -405,7 +410,7 @@ impl Engine {
                         }
                     }
 
-                    if use_agg {
+                    if use_raw_rows_path {
                         let mut row_vals = build_row_vals(
                             &src_props,
                             &src_node_pat.var,
@@ -551,7 +556,7 @@ impl Engine {
                     &dst_node_pat.var,
                     &m.return_clause.items,
                 );
-                if use_agg {
+                if use_raw_rows_path {
                     for item in &m.return_clause.items {
                         collect_col_ids_from_expr(&item.expr, &mut col_ids_src);
                         collect_col_ids_from_expr(&item.expr, &mut col_ids_dst);
@@ -704,7 +709,7 @@ impl Engine {
                             }
                         }
 
-                        if use_agg {
+                        if use_raw_rows_path {
                             let mut row_vals = build_row_vals(
                                 &b_props,
                                 &src_node_pat.var,
@@ -790,7 +795,7 @@ impl Engine {
             }
         }
 
-        if use_agg {
+        if use_raw_rows_path {
             rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
         } else {
             // DISTINCT
