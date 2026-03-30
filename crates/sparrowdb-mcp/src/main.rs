@@ -443,8 +443,12 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 )
             })?;
 
-            // Build additional SET clause from properties (excluding the match key).
+            // Build SET and CREATE property fragments from `properties` in a single pass,
+            // excluding the match key (handled separately in both paths).
+            // set_parts  → "n.k = v"   used in the MATCH+SET path
+            // prop_parts → "k: v"      used in the CREATE path
             let mut set_parts: Vec<String> = Vec::new();
+            let mut prop_parts: Vec<String> = Vec::new();
             if let Some(obj) = properties.as_object() {
                 for (k, v) in obj {
                     if k == match_key {
@@ -454,7 +458,8 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                     let cypher_v = json_scalar_to_cypher(v).ok_or_else(|| {
                         format!("merge_node_by_property: property '{}' must be a scalar", k)
                     })?;
-                    set_parts.push(format!("n.{} = {}", k, cypher_v));
+                    set_parts.push(format!("n.{k} = {cypher_v}"));
+                    prop_parts.push(format!("{k}: {cypher_v}"));
                 }
             }
 
@@ -493,25 +498,10 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                     .map_err(|e| format!("merge_node_by_property: MATCH failed: {}", e))?
             } else {
                 // Node does not exist — create it with all properties.
-                let mut all_props: Vec<String> = vec![
-                    format!("{match_key}: {cypher_match_val}"),
-                ];
-                if let Some(obj) = properties.as_object() {
-                    for (k, v) in obj {
-                        if k == match_key {
-                            continue;
-                        }
-                        validate_cypher_identifier(k, "merge_node_by_property: property key")?;
-                        let cypher_v = json_scalar_to_cypher(v).ok_or_else(|| {
-                            format!("merge_node_by_property: property '{}' must be a scalar", k)
-                        })?;
-                        all_props.push(format!("{k}: {cypher_v}"));
-                    }
-                }
+                let mut all_props: Vec<String> = vec![format!("{match_key}: {cypher_match_val}")];
+                all_props.extend(prop_parts);
                 let props_str = all_props.join(", ");
-                let query = format!(
-                    "CREATE (n:{label} {{{props_str}}}) RETURN n",
-                );
+                let query = format!("CREATE (n:{label} {{{props_str}}}) RETURN n",);
                 db.execute(&query)
                     .map_err(|e| format!("merge_node_by_property: CREATE failed: {}", e))?
             };
