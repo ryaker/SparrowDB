@@ -77,7 +77,11 @@ impl Engine {
             .map(|(catalog_id, sid, did, rt)| (catalog_id, sid as u32, did as u32, rt))
             .collect();
 
-        let use_agg = has_aggregate_in_return(&m.return_clause.items);
+        // use_agg is true for aggregations OR for id(n)/NodeRef-dependent RETURN
+        // items (#372): the raw-rows + aggregate_rows_graph path correctly injects
+        // NodeRef into the row map, whereas project_hop_row does not handle id().
+        let use_agg = has_aggregate_in_return(&m.return_clause.items)
+            || needs_node_ref_in_return(&m.return_clause.items);
         let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
         // For undirected (Both), track seen (src_slot, dst_slot) pairs from the

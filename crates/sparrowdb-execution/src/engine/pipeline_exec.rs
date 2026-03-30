@@ -112,6 +112,14 @@ impl Engine {
         {
             return false;
         }
+        // id(n) and other NodeRef-dependent functions require the row engine eval
+        // path (which injects Value::NodeRef into the row map).  The chunked path
+        // uses project_row which matches by column-name string; when an AS alias
+        // is present the column name is the alias (not "id(n)"), so project_row
+        // returns Null.  Fall back to the row engine for all such queries (#372).
+        if needs_node_ref_in_return(&m.return_clause.items) {
+            return false;
+        }
         !m.pattern[0].nodes[0].labels.is_empty()
     }
 
@@ -196,6 +204,11 @@ impl Engine {
         // Inline prop filters on node patterns are not evaluated by the chunked
         // one-hop path — fall back to the row engine.  (See #362.)
         if pat.nodes.iter().any(|n| !n.props.is_empty()) {
+            return false;
+        }
+        // id(n) and other NodeRef-dependent functions are not supported by the
+        // chunked one-hop path (project_hop_row does not handle id() — #372).
+        if needs_node_ref_in_return(&m.return_clause.items) {
             return false;
         }
         // Resolve to exactly one rel table.
@@ -761,6 +774,10 @@ impl Engine {
                 }
             }
         }
+        // id(n) and other NodeRef-dependent functions require the row engine (#372).
+        if needs_node_ref_in_return(&m.return_clause.items) {
+            return false;
+        }
         // Rel table must exist.
         let label = pat.nodes[0].labels[0].clone();
         let rel_type = &pat.rels[0].rel_type;
@@ -1105,6 +1122,10 @@ impl Engine {
         // Inline prop filters on node patterns are not evaluated by the chunked
         // two-hop path — fall back to the row engine.  (See #362.)
         if pat.nodes.iter().any(|n| !n.props.is_empty()) {
+            return false;
+        }
+        // id(n) and other NodeRef-dependent functions require the row engine (#372).
+        if needs_node_ref_in_return(&m.return_clause.items) {
             return false;
         }
         // Both hops must resolve to the same relationship table.
