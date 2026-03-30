@@ -2171,24 +2171,27 @@ impl Engine {
 
         if use_eval_path {
             rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
-        } else {
-            if m.distinct {
-                deduplicate_rows(&mut rows);
-            }
+        }
 
-            // ORDER BY
-            apply_order_by(&mut rows, m, column_names);
+        // DISTINCT / ORDER BY / SKIP / LIMIT apply to both the eval path and the
+        // fast project_row path (fixes #363: CASE WHEN with ORDER BY / LIMIT was
+        // skipped when use_eval_path=true).
+        if m.distinct {
+            deduplicate_rows(&mut rows);
+        }
 
-            // SKIP
-            if let Some(skip) = m.skip {
-                let skip = (skip as usize).min(rows.len());
-                rows.drain(0..skip);
-            }
+        // ORDER BY
+        apply_order_by(&mut rows, m, column_names);
 
-            // LIMIT
-            if let Some(lim) = m.limit {
-                rows.truncate(lim as usize);
-            }
+        // SKIP
+        if let Some(skip) = m.skip {
+            let skip = (skip as usize).min(rows.len());
+            rows.drain(0..skip);
+        }
+
+        // LIMIT
+        if let Some(lim) = m.limit {
+            rows.truncate(lim as usize);
         }
 
         tracing::debug!(rows = rows.len(), "node scan complete");
@@ -2358,18 +2361,19 @@ impl Engine {
 
         if use_eval_path {
             rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
-        } else {
-            if m.distinct {
-                deduplicate_rows(&mut rows);
-            }
-            apply_order_by(&mut rows, m, column_names);
-            if let Some(skip) = m.skip {
-                let skip = (skip as usize).min(rows.len());
-                rows.drain(0..skip);
-            }
-            if let Some(lim) = m.limit {
-                rows.truncate(lim as usize);
-            }
+        }
+
+        // DISTINCT / ORDER BY / SKIP / LIMIT apply to both paths (fixes #363).
+        if m.distinct {
+            deduplicate_rows(&mut rows);
+        }
+        apply_order_by(&mut rows, m, column_names);
+        if let Some(skip) = m.skip {
+            let skip = (skip as usize).min(rows.len());
+            rows.drain(0..skip);
+        }
+        if let Some(lim) = m.limit {
+            rows.truncate(lim as usize);
         }
 
         tracing::debug!(
