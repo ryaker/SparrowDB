@@ -312,11 +312,38 @@ impl Engine {
         let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
         let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
 
-        let src_label_id = self
-            .snapshot
-            .catalog
-            .get_label(&src_label)?
-            .ok_or(sparrowdb_common::Error::NotFound)? as u32;
+        // Resolve source label IDs to scan.
+        //
+        // When the source pattern has a label constraint (`:Person`), resolve to
+        // that single label ID.  When unlabeled (`(a)` or `()`), scan every known
+        // label — this fixes the `MATCH ()-[:R*1..3]->(:Label)` NotFound regression
+        // where `get_label("").ok_or(NotFound)?` errored on an empty label string.
+        let src_label_ids: Vec<(u32, u64)> = if src_label.is_empty() {
+            // Unlabeled source: iterate all known labels.
+            let mut v: Vec<(u32, u64)> = Vec::new();
+            for (lid, _name) in self.snapshot.catalog.list_labels().unwrap_or_default() {
+                let hwm = self.snapshot.store.hwm_for_label(lid as u32).unwrap_or(0);
+                if hwm > 0 {
+                    v.push((lid as u32, hwm));
+                }
+            }
+            v
+        } else {
+            match self.snapshot.catalog.get_label(&src_label)? {
+                None => {
+                    // Label specified but does not exist — return empty.
+                    return Ok(QueryResult {
+                        columns: column_names.to_vec(),
+                        rows: vec![],
+                    });
+                }
+                Some(lid) => {
+                    let hwm = self.snapshot.store.hwm_for_label(lid as u32)?;
+                    vec![(lid as u32, hwm)]
+                }
+            }
+        };
+
         // dst_label_id is None when the destination pattern has no label constraint.
         let dst_label_id: Option<u32> = if dst_label.is_empty() {
             None
@@ -328,8 +355,6 @@ impl Engine {
                     .ok_or(sparrowdb_common::Error::NotFound)? as u32,
             )
         };
-
-        let hwm_src = self.snapshot.store.hwm_for_label(src_label_id)?;
 
         let col_ids_src =
             collect_col_ids_for_var_from_items(&src_node_pat.var, &m.return_clause.items);
@@ -417,149 +442,155 @@ impl Engine {
             m.limit.map(|l| l as usize).unwrap_or(usize::MAX)
         };
 
-        // SPA-299 Q5: Fast source resolution via property index.
-        // When the source node has inline props and the label is indexed, resolve
-        // to the matching slots directly instead of scanning all 0..hwm_src.
-        // The prop_idx borrow is scoped so it is dropped before the mutable self
-        // calls inside the loop (check_deadline, execute_variable_hops, etc.).
-        let resolved_slots: Option<Vec<u64>> = {
-            let prop_idx = self.prop_index.borrow();
-            try_index_lookup_for_props(&src_node_pat.props, src_label_id, &prop_idx).map(|slots| {
-                slots
-                    .into_iter()
-                    .map(|s| s as u64)
-                    .filter(|&s| s < hwm_src)
-                    .collect()
-            })
-        };
-        let src_iter: Box<dyn Iterator<Item = u64>> = match resolved_slots {
-            Some(slots) => Box::new(slots.into_iter()),
-            None => Box::new(0..hwm_src),
-        };
-
-        for src_slot in src_iter {
-            // SPA-254: check per-query deadline at every slot boundary.
-            self.check_deadline()?;
-
-            // Early exit: already have enough rows for the LIMIT.
-            if rows.len() >= row_limit {
-                break;
-            }
-
-            let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
-
-            // Skip tombstoned (deleted) source nodes — property_index callers must filter these.
-            if self.is_node_tombstoned(src_node) {
-                continue;
-            }
-
-            // Fetch source props (for filter + projection).
-            let src_all_col_ids: Vec<u32> = {
-                let mut v = col_ids_src.clone();
-                for p in &src_node_pat.props {
-                    let col_id = prop_name_to_col_id(&p.key);
-                    if !v.contains(&col_id) {
-                        v.push(col_id);
-                    }
-                }
-                if let Some(ref where_expr) = m.where_clause {
-                    collect_col_ids_from_expr(where_expr, &mut v);
-                }
-                v
+        // Outer loop over source label IDs.
+        // Single entry when the source pattern has a label; all labels when unlabeled.
+        'src_labels: for (src_label_id, hwm_src) in src_label_ids {
+            // SPA-299 Q5: Fast source resolution via property index.
+            // When the source node has inline props and the label is indexed, resolve
+            // to the matching slots directly instead of scanning all 0..hwm_src.
+            // The prop_idx borrow is scoped so it is dropped before the mutable self
+            // calls inside the loop (check_deadline, execute_variable_hops, etc.).
+            let resolved_slots: Option<Vec<u64>> = {
+                let prop_idx = self.prop_index.borrow();
+                try_index_lookup_for_props(&src_node_pat.props, src_label_id, &prop_idx).map(
+                    |slots| {
+                        slots
+                            .into_iter()
+                            .map(|s| s as u64)
+                            .filter(|&s| s < hwm_src)
+                            .collect()
+                    },
+                )
             };
-            let src_props = read_node_props(&self.snapshot.store, src_node, &src_all_col_ids)?;
+            let src_iter: Box<dyn Iterator<Item = u64>> = match resolved_slots {
+                Some(slots) => Box::new(slots.into_iter()),
+                None => Box::new(0..hwm_src),
+            };
 
-            if !self.matches_prop_filter(&src_props, &src_node_pat.props) {
-                continue;
-            }
+            for src_slot in src_iter {
+                // SPA-254: check per-query deadline at every slot boundary.
+                self.check_deadline()?;
 
-            // BFS to find all reachable (slot, label_id) pairs within [min_hops, max_hops].
-            // delta_all, node_label, all_label_ids, and neighbors_buf are hoisted out of
-            // this loop (SPA-275) and reused across all source nodes.
-            // Use reachability BFS when RETURN DISTINCT is present and no path variable
-            // is bound (issue #165). Otherwise use enumerative DFS for full path semantics.
-            let use_reachability = m.distinct && rel_pat.var.is_empty();
-            // Pass remaining row budget into the BFS/DFS so it can stop early.
-            let remaining = row_limit.saturating_sub(rows.len());
-            let dst_nodes = self.execute_variable_hops(
-                src_slot,
-                src_label_id,
-                min_hops,
-                max_hops,
-                &delta_idx,
-                &node_label,
-                &all_label_ids,
-                &mut neighbors_buf,
-                use_reachability,
-                remaining,
-                &rel_ids,
-            );
+                // Early exit: already have enough rows for the LIMIT.
+                if rows.len() >= row_limit {
+                    break 'src_labels;
+                }
 
-            // ── SPA-285: batch-read dst properties ────────────────────────
-            // Collect all destination slots grouped by label_id, then read
-            // their properties in one pass per label (matching hop.rs:279-287).
-            // This replaces the per-node read_node_props() call that caused
-            // excessive file seeks on variable-length traversals.
-            let dst_props_map: std::collections::HashMap<(u64, u32), Vec<(u32, u64)>> =
-                if !dst_all_col_ids.is_empty() && !dst_nodes.is_empty() {
-                    // Group dst slots by their resolved label_id.
-                    let mut by_label: std::collections::HashMap<u32, Vec<u32>> =
-                        std::collections::HashMap::new();
-                    for &(slot, actual_label_id) in &dst_nodes {
-                        // Apply the same label filter early to avoid reading props
-                        // for nodes we will skip anyway.
-                        if let Some(required_label) = dst_label_id {
-                            if actual_label_id != required_label {
-                                continue;
+                let src_node = NodeId(((src_label_id as u64) << 32) | src_slot);
+
+                // Skip tombstoned (deleted) source nodes — property_index callers must filter these.
+                if self.is_node_tombstoned(src_node) {
+                    continue;
+                }
+
+                // Fetch source props (for filter + projection).
+                let src_all_col_ids: Vec<u32> = {
+                    let mut v = col_ids_src.clone();
+                    for p in &src_node_pat.props {
+                        let col_id = prop_name_to_col_id(&p.key);
+                        if !v.contains(&col_id) {
+                            v.push(col_id);
+                        }
+                    }
+                    if let Some(ref where_expr) = m.where_clause {
+                        collect_col_ids_from_expr(where_expr, &mut v);
+                    }
+                    v
+                };
+                let src_props = read_node_props(&self.snapshot.store, src_node, &src_all_col_ids)?;
+
+                if !self.matches_prop_filter(&src_props, &src_node_pat.props) {
+                    continue;
+                }
+
+                // BFS to find all reachable (slot, label_id) pairs within [min_hops, max_hops].
+                // delta_all, node_label, all_label_ids, and neighbors_buf are hoisted out of
+                // this loop (SPA-275) and reused across all source nodes.
+                // Use reachability BFS when RETURN DISTINCT is present and no path variable
+                // is bound (issue #165). Otherwise use enumerative DFS for full path semantics.
+                let use_reachability = m.distinct && rel_pat.var.is_empty();
+                // Pass remaining row budget into the BFS/DFS so it can stop early.
+                let remaining = row_limit.saturating_sub(rows.len());
+                let dst_nodes = self.execute_variable_hops(
+                    src_slot,
+                    src_label_id,
+                    min_hops,
+                    max_hops,
+                    &delta_idx,
+                    &node_label,
+                    &all_label_ids,
+                    &mut neighbors_buf,
+                    use_reachability,
+                    remaining,
+                    &rel_ids,
+                );
+
+                // ── SPA-285: batch-read dst properties ────────────────────────
+                // Collect all destination slots grouped by label_id, then read
+                // their properties in one pass per label (matching hop.rs:279-287).
+                // This replaces the per-node read_node_props() call that caused
+                // excessive file seeks on variable-length traversals.
+                let dst_props_map: std::collections::HashMap<(u64, u32), Vec<(u32, u64)>> =
+                    if !dst_all_col_ids.is_empty() && !dst_nodes.is_empty() {
+                        // Group dst slots by their resolved label_id.
+                        let mut by_label: std::collections::HashMap<u32, Vec<u32>> =
+                            std::collections::HashMap::new();
+                        for &(slot, actual_label_id) in &dst_nodes {
+                            // Apply the same label filter early to avoid reading props
+                            // for nodes we will skip anyway.
+                            if let Some(required_label) = dst_label_id {
+                                if actual_label_id != required_label {
+                                    continue;
+                                }
+                            }
+                            let resolved = dst_label_id.unwrap_or(actual_label_id);
+                            by_label.entry(resolved).or_default().push(slot as u32);
+                        }
+
+                        let mut map: std::collections::HashMap<(u64, u32), Vec<(u32, u64)>> =
+                            std::collections::HashMap::new();
+                        for (label_id, mut slots) in by_label {
+                            // Deduplicate slots within each label group.
+                            slots.sort_unstable();
+                            slots.dedup();
+                            let batch = self.snapshot.store.batch_read_node_props(
+                                label_id,
+                                &slots,
+                                &dst_all_col_ids,
+                            )?;
+                            for (i, slot) in slots.iter().enumerate() {
+                                let props: Vec<(u32, u64)> = dst_all_col_ids
+                                    .iter()
+                                    .copied()
+                                    .zip(batch[i].iter().copied())
+                                    .collect();
+                                map.insert((*slot as u64, label_id), props);
                             }
                         }
-                        let resolved = dst_label_id.unwrap_or(actual_label_id);
-                        by_label.entry(resolved).or_default().push(slot as u32);
-                    }
+                        map
+                    } else {
+                        std::collections::HashMap::new()
+                    };
 
-                    let mut map: std::collections::HashMap<(u64, u32), Vec<(u32, u64)>> =
-                        std::collections::HashMap::new();
-                    for (label_id, mut slots) in by_label {
-                        // Deduplicate slots within each label group.
-                        slots.sort_unstable();
-                        slots.dedup();
-                        let batch = self.snapshot.store.batch_read_node_props(
-                            label_id,
-                            &slots,
-                            &dst_all_col_ids,
-                        )?;
-                        for (i, slot) in slots.iter().enumerate() {
-                            let props: Vec<(u32, u64)> = dst_all_col_ids
-                                .iter()
-                                .copied()
-                                .zip(batch[i].iter().copied())
-                                .collect();
-                            map.insert((*slot as u64, label_id), props);
+                for (dst_slot, actual_label_id) in dst_nodes {
+                    // When the destination pattern specifies a label, only include nodes
+                    // whose actual label (recovered from the delta) matches.
+                    if let Some(required_label) = dst_label_id {
+                        if actual_label_id != required_label {
+                            continue;
                         }
                     }
-                    map
-                } else {
-                    std::collections::HashMap::new()
-                };
 
-            for (dst_slot, actual_label_id) in dst_nodes {
-                // When the destination pattern specifies a label, only include nodes
-                // whose actual label (recovered from the delta) matches.
-                if let Some(required_label) = dst_label_id {
-                    if actual_label_id != required_label {
-                        continue;
-                    }
-                }
+                    // Use the actual label_id to construct the NodeId so that
+                    // heterogeneous graph nodes are addressed correctly.
+                    let resolved_dst_label_id = dst_label_id.unwrap_or(actual_label_id);
 
-                // Use the actual label_id to construct the NodeId so that
-                // heterogeneous graph nodes are addressed correctly.
-                let resolved_dst_label_id = dst_label_id.unwrap_or(actual_label_id);
-
-                // SPA-285: look up pre-batched dst properties instead of
-                // reading per-node.  Fall back to individual read for slots
-                // that were not in the batch (e.g. delta-only edge targets).
-                let dst_props =
-                    if let Some(props) = dst_props_map.get(&(dst_slot, resolved_dst_label_id)) {
+                    // SPA-285: look up pre-batched dst properties instead of
+                    // reading per-node.  Fall back to individual read for slots
+                    // that were not in the batch (e.g. delta-only edge targets).
+                    let dst_props = if let Some(props) =
+                        dst_props_map.get(&(dst_slot, resolved_dst_label_id))
+                    {
                         props.clone()
                     } else if !dst_all_col_ids.is_empty() {
                         let dst_node = NodeId(((resolved_dst_label_id as u64) << 32) | dst_slot);
@@ -568,94 +599,95 @@ impl Engine {
                         vec![]
                     };
 
-                if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
-                    continue;
-                }
-
-                // Resolve the actual label name for this destination node so that
-                // labels(x) and label metadata work even when the pattern is unlabeled.
-                // Use the precomputed map to avoid calling list_labels() per node.
-                let resolved_dst_label_name: String = if !dst_label.is_empty() {
-                    dst_label.clone()
-                } else {
-                    labels_by_id
-                        .get(&(actual_label_id as u16))
-                        .cloned()
-                        .unwrap_or_default()
-                };
-
-                // Apply WHERE clause.
-                if let Some(ref where_expr) = m.where_clause {
-                    let mut row_vals = build_row_vals(
-                        &src_props,
-                        &src_node_pat.var,
-                        &col_ids_src,
-                        &self.snapshot.store,
-                    );
-                    row_vals.extend(build_row_vals(
-                        &dst_props,
-                        &dst_node_pat.var,
-                        &col_ids_dst,
-                        &self.snapshot.store,
-                    ));
-                    // Inject relationship metadata so type(r) works in WHERE.
-                    if !rel_pat.var.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__type__", rel_pat.var),
-                            Value::String(rel_pat.rel_type.clone()),
-                        );
-                    }
-                    // SPA-200: inject full label set (primary + secondary).
-                    if !src_node_pat.var.is_empty() {
-                        row_vals.insert(
-                            format!("{}.__labels__", src_node_pat.var),
-                            self.labels_value_for_node(src_node),
-                        );
-                    }
-                    if !dst_node_pat.var.is_empty() {
-                        let dst_nid = NodeId(((resolved_dst_label_id as u64) << 32) | dst_slot);
-                        row_vals.insert(
-                            format!("{}.__labels__", dst_node_pat.var),
-                            self.labels_value_for_node(dst_nid),
-                        );
-                    }
-                    row_vals.extend(self.dollar_params());
-                    if !self.eval_where_graph(where_expr, &row_vals) {
+                    if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
                         continue;
                     }
-                }
 
-                let rel_var_type = if !rel_pat.var.is_empty() {
-                    Some((rel_pat.var.as_str(), rel_pat.rel_type.as_str()))
-                } else {
-                    None
-                };
-                let src_label_meta = if !src_node_pat.var.is_empty() && !src_label.is_empty() {
-                    Some((src_node_pat.var.as_str(), src_label.as_str()))
-                } else {
-                    None
-                };
-                let dst_label_meta =
-                    if !dst_node_pat.var.is_empty() && !resolved_dst_label_name.is_empty() {
-                        Some((dst_node_pat.var.as_str(), resolved_dst_label_name.as_str()))
+                    // Resolve the actual label name for this destination node so that
+                    // labels(x) and label metadata work even when the pattern is unlabeled.
+                    // Use the precomputed map to avoid calling list_labels() per node.
+                    let resolved_dst_label_name: String = if !dst_label.is_empty() {
+                        dst_label.clone()
+                    } else {
+                        labels_by_id
+                            .get(&(actual_label_id as u16))
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+
+                    // Apply WHERE clause.
+                    if let Some(ref where_expr) = m.where_clause {
+                        let mut row_vals = build_row_vals(
+                            &src_props,
+                            &src_node_pat.var,
+                            &col_ids_src,
+                            &self.snapshot.store,
+                        );
+                        row_vals.extend(build_row_vals(
+                            &dst_props,
+                            &dst_node_pat.var,
+                            &col_ids_dst,
+                            &self.snapshot.store,
+                        ));
+                        // Inject relationship metadata so type(r) works in WHERE.
+                        if !rel_pat.var.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__type__", rel_pat.var),
+                                Value::String(rel_pat.rel_type.clone()),
+                            );
+                        }
+                        // SPA-200: inject full label set (primary + secondary).
+                        if !src_node_pat.var.is_empty() {
+                            row_vals.insert(
+                                format!("{}.__labels__", src_node_pat.var),
+                                self.labels_value_for_node(src_node),
+                            );
+                        }
+                        if !dst_node_pat.var.is_empty() {
+                            let dst_nid = NodeId(((resolved_dst_label_id as u64) << 32) | dst_slot);
+                            row_vals.insert(
+                                format!("{}.__labels__", dst_node_pat.var),
+                                self.labels_value_for_node(dst_nid),
+                            );
+                        }
+                        row_vals.extend(self.dollar_params());
+                        if !self.eval_where_graph(where_expr, &row_vals) {
+                            continue;
+                        }
+                    }
+
+                    let rel_var_type = if !rel_pat.var.is_empty() {
+                        Some((rel_pat.var.as_str(), rel_pat.rel_type.as_str()))
                     } else {
                         None
                     };
-                let row = project_hop_row(
-                    &src_props,
-                    &dst_props,
-                    &m.return_clause.items,
-                    &src_node_pat.var,
-                    &dst_node_pat.var,
-                    rel_var_type,
-                    src_label_meta,
-                    dst_label_meta,
-                    &self.snapshot.store,
-                    None, // edge props not available in OPTIONAL MATCH path
-                );
-                rows.push(row);
-            }
-        }
+                    let src_label_meta = if !src_node_pat.var.is_empty() && !src_label.is_empty() {
+                        Some((src_node_pat.var.as_str(), src_label.as_str()))
+                    } else {
+                        None
+                    };
+                    let dst_label_meta =
+                        if !dst_node_pat.var.is_empty() && !resolved_dst_label_name.is_empty() {
+                            Some((dst_node_pat.var.as_str(), resolved_dst_label_name.as_str()))
+                        } else {
+                            None
+                        };
+                    let row = project_hop_row(
+                        &src_props,
+                        &dst_props,
+                        &m.return_clause.items,
+                        &src_node_pat.var,
+                        &dst_node_pat.var,
+                        rel_var_type,
+                        src_label_meta,
+                        dst_label_meta,
+                        &self.snapshot.store,
+                        None, // edge props not available in OPTIONAL MATCH path
+                    );
+                    rows.push(row);
+                } // end for (dst_slot, actual_label_id) in dst_nodes
+            } // end for src_slot in src_iter
+        } // end 'src_labels: for (src_label_id, hwm_src) in src_label_ids
 
         // DISTINCT
         if m.distinct {
