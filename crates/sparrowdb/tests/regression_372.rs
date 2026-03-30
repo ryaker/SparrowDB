@@ -98,11 +98,9 @@ fn id_function_unique_ids() {
         })
         .collect();
 
-    let mut sorted = ids.clone();
-    sorted.sort_unstable();
-    sorted.dedup();
+    let unique_ids: std::collections::HashSet<_> = ids.iter().collect();
     assert_eq!(
-        sorted.len(),
+        unique_ids.len(),
         3,
         "all node IDs must be distinct, got: {:?}",
         ids
