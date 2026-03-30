@@ -1776,16 +1776,13 @@ fn collect_col_ids_for_var(var: &str, column_names: &[String], _label_id: u32) -
 fn collect_col_ids_for_var_from_items(var: &str, items: &[ReturnItem]) -> Vec<u32> {
     let mut id_set = std::collections::HashSet::new();
     for item in items {
-        match &item.expr {
-            Expr::PropAccess { var: v, prop } => {
-                if v.as_str() == var {
-                    id_set.insert(prop_name_to_col_id(prop));
-                }
+        // FnCall expressions (type, labels, id, etc.) don't reference stored
+        // node property columns; they are handled in project_hop_row at
+        // projection time.
+        if let Expr::PropAccess { var: v, prop } = &item.expr {
+            if v.as_str() == var {
+                id_set.insert(prop_name_to_col_id(prop));
             }
-            // FnCall expressions (type, labels, id, etc.) don't reference stored
-            // node property columns; they are handled in project_hop_row at
-            // projection time.
-            _ => {}
         }
     }
     // Also include WHERE-clause referenced columns — callers extend the list
@@ -2359,8 +2356,7 @@ fn project_hop_row(
                     });
                     match name_lc.as_str() {
                         "type" => {
-                            if let (Some(var), Some((rel_var, rel_type))) =
-                                (arg_var, rel_var_type)
+                            if let (Some(var), Some((rel_var, rel_type))) = (arg_var, rel_var_type)
                             {
                                 if var == rel_var {
                                     return Value::String(rel_type.to_string());
@@ -2372,16 +2368,12 @@ fn project_hop_row(
                             if let Some(var) = arg_var {
                                 if let Some((meta_var, label)) = src_label_meta {
                                     if var == meta_var {
-                                        return Value::List(vec![Value::String(
-                                            label.to_string(),
-                                        )]);
+                                        return Value::List(vec![Value::String(label.to_string())]);
                                     }
                                 }
                                 if let Some((meta_var, label)) = dst_label_meta {
                                     if var == meta_var {
-                                        return Value::List(vec![Value::String(
-                                            label.to_string(),
-                                        )]);
+                                        return Value::List(vec![Value::String(label.to_string())]);
                                     }
                                 }
                             }

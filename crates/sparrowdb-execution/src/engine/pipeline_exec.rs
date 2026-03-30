@@ -1301,10 +1301,8 @@ impl Engine {
 
         // Collect property col_ids needed for each node.
         // Late materialization: only read what WHERE or RETURN references.
-        let mut col_ids_src =
-            collect_col_ids_for_var_from_items(src_var, &m.return_clause.items);
-        let mut col_ids_dst =
-            collect_col_ids_for_var_from_items(dst_var, &m.return_clause.items);
+        let mut col_ids_src = collect_col_ids_for_var_from_items(src_var, &m.return_clause.items);
+        let mut col_ids_dst = collect_col_ids_for_var_from_items(dst_var, &m.return_clause.items);
 
         // Mid node properties: only needed if WHERE references them.
         let mut col_ids_mid: Vec<u32> = vec![];

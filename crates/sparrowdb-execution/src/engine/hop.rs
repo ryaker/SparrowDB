@@ -140,14 +140,10 @@ impl Engine {
                 "one-hop traversal start"
             );
 
-            let mut col_ids_src = collect_col_ids_for_var_from_items(
-                &src_node_pat.var,
-                &m.return_clause.items,
-            );
-            let mut col_ids_dst = collect_col_ids_for_var_from_items(
-                &dst_node_pat.var,
-                &m.return_clause.items,
-            );
+            let mut col_ids_src =
+                collect_col_ids_for_var_from_items(&src_node_pat.var, &m.return_clause.items);
+            let mut col_ids_dst =
+                collect_col_ids_for_var_from_items(&dst_node_pat.var, &m.return_clause.items);
             if use_raw_rows_path {
                 for item in &m.return_clause.items {
                     collect_col_ids_from_expr(&item.expr, &mut col_ids_src);
@@ -548,14 +544,10 @@ impl Engine {
                     Err(_) => continue,
                 };
 
-                let mut col_ids_src = collect_col_ids_for_var_from_items(
-                    &src_node_pat.var,
-                    &m.return_clause.items,
-                );
-                let mut col_ids_dst = collect_col_ids_for_var_from_items(
-                    &dst_node_pat.var,
-                    &m.return_clause.items,
-                );
+                let mut col_ids_src =
+                    collect_col_ids_for_var_from_items(&src_node_pat.var, &m.return_clause.items);
+                let mut col_ids_dst =
+                    collect_col_ids_for_var_from_items(&dst_node_pat.var, &m.return_clause.items);
                 if use_raw_rows_path {
                     for item in &m.return_clause.items {
                         collect_col_ids_from_expr(&item.expr, &mut col_ids_src);
