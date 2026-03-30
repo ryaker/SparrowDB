@@ -1294,14 +1294,16 @@ impl GraphDb {
         if matching_ids.is_empty() {
             return Ok(QueryResult::empty(vec![]));
         }
-        for node_id in &matching_ids {
-            for mutation in &mm.mutations {
-                match mutation {
-                    sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
-                        let sv = expr_to_value_with_params(value, params)?;
-                        tx.set_property(*node_id, prop, sv)?;
+        for mutation in &mm.mutations {
+            match mutation {
+                sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
+                    let sv = expr_to_value_with_params(value, params)?;
+                    for node_id in &matching_ids {
+                        tx.set_property(*node_id, prop, sv.clone())?;
                     }
-                    sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                }
+                sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                    for node_id in &matching_ids {
                         tx.delete_node(*node_id)?;
                     }
                 }
@@ -1356,14 +1358,16 @@ impl GraphDb {
             return Ok(QueryResult::empty(vec![]));
         }
 
-        for node_id in &matching_ids {
-            for mutation in &mm.mutations {
-                match mutation {
-                    sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
-                        let sv = expr_to_value(value);
-                        tx.set_property(*node_id, prop, sv)?;
+        for mutation in &mm.mutations {
+            match mutation {
+                sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
+                    let sv = expr_to_value(value);
+                    for node_id in &matching_ids {
+                        tx.set_property(*node_id, prop, sv.clone())?;
                     }
-                    sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                }
+                sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                    for node_id in &matching_ids {
                         tx.delete_node(*node_id)?;
                     }
                 }
@@ -1414,15 +1418,17 @@ impl GraphDb {
             return Ok(QueryResult::empty(vec![]));
         }
 
-        for node_id in &matching_ids {
-            for mutation in &mm.mutations {
-                match mutation {
-                    sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
-                        let sv = expr_to_value(value);
+        for mutation in &mm.mutations {
+            match mutation {
+                sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
+                    let sv = expr_to_value(value);
+                    for node_id in &matching_ids {
                         Self::check_deadline(deadline)?;
-                        tx.set_property(*node_id, prop, sv)?;
+                        tx.set_property(*node_id, prop, sv.clone())?;
                     }
-                    sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                }
+                sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                    for node_id in &matching_ids {
                         Self::check_deadline(deadline)?;
                         tx.delete_node(*node_id)?;
                     }
@@ -2038,14 +2044,16 @@ impl GraphDb {
                     }
                 } else {
                     let matching_ids = engine.scan_match_mutate(mm)?;
-                    for node_id in &matching_ids {
-                        for mutation in &mm.mutations {
-                            match mutation {
-                                sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
-                                    let sv = expr_to_value(value);
-                                    tx.set_property(*node_id, prop, sv)?;
+                    for mutation in &mm.mutations {
+                        match mutation {
+                            sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
+                                let sv = expr_to_value(value);
+                                for node_id in &matching_ids {
+                                    tx.set_property(*node_id, prop, sv.clone())?;
                                 }
-                                sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                            }
+                            sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                                for node_id in &matching_ids {
                                     tx.delete_node(*node_id)?;
                                 }
                             }
