@@ -509,13 +509,12 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 "content": [{
                     "type": "text",
                     "text": format!(
-                        "merge_node_by_property: node with {}={} on label '{}' {} ({} row(s) returned).",
+                        "merge_node_by_property: node with {}={} on label '{}' {}.",
                         match_key, match_value, label,
-                        if created { "created" } else { "found (existing)" },
-                        result.rows.len()
+                        if created { "created" } else { "found (existing)" }
                     )
                 }],
-                "rows": result.rows.len(),
+                "rows": 1,
                 "created": created
             }))
         }
