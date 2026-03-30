@@ -485,10 +485,10 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
             let result = if pre_existing > 0 {
                 // Node exists — match it and optionally set extra properties.
                 let query = if set_parts.is_empty() {
-                    format!("MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) RETURN count(n)",)
+                    format!("MATCH (n:{label} {{{match_key}: {cypher_match_val}}})",)
                 } else {
                     format!(
-                        "MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) SET {set_clause_inner} RETURN count(n)",
+                        "MATCH (n:{label} {{{match_key}: {cypher_match_val}}}) SET {set_clause_inner}",
                         set_clause_inner = set_parts.join(", "),
                     )
                 };
@@ -499,7 +499,7 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 let mut all_props: Vec<String> = vec![format!("{match_key}: {cypher_match_val}")];
                 all_props.extend(prop_parts);
                 let props_str = all_props.join(", ");
-                let query = format!("CREATE (n:{label} {{{props_str}}}) RETURN count(n)",);
+                let query = format!("CREATE (n:{label} {{{props_str}}})",);
                 db.execute(&query)
                     .map_err(|e| format!("merge_node_by_property: CREATE failed: {}", e))?
             };
