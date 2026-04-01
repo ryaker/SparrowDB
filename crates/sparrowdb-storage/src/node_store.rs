@@ -1142,8 +1142,13 @@ impl NodeStore {
             .open(&col0)
             .map_err(Error::Io)?;
 
-        // Zero-pad any slots before `slot` that are not yet in the file.
-        let needed_len = (slot as u64 + 1) * 8;
+        // Pad col_0.bin to cover all existing nodes for this label (the HWM),
+        // not just up to the tombstoned slot.  Without this, a node at slot S+1
+        // would receive Err(NotFound) when reading col_0 after the file is
+        // created here with only (S+1)*8 bytes, because read_col_slot returns
+        // NotFound when the requested slot is beyond the file length.
+        let hwm = self.hwm_for_label(label_id).unwrap_or(slot as u64 + 1);
+        let needed_len = std::cmp::max(hwm, slot as u64 + 1) * 8;
         let existing_len = f.seek(SeekFrom::End(0)).map_err(Error::Io)?;
         if existing_len < needed_len {
             let zeros = vec![0u8; (needed_len - existing_len) as usize];

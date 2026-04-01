@@ -347,6 +347,17 @@ impl Parser {
                     mutations,
                 }))
             }
+            Token::Detach => {
+                // MATCH ... DETACH DELETE var
+                self.advance();
+                self.expect_tok(&Token::Delete)?;
+                let var = self.expect_ident()?;
+                Ok(Statement::MatchMutate(MatchMutateStatement {
+                    match_patterns: patterns,
+                    where_clause: None,
+                    mutations: vec![Mutation::DetachDelete { var }],
+                }))
+            }
             Token::Delete => {
                 // MATCH ... DELETE var
                 self.advance();
@@ -369,6 +380,17 @@ impl Parser {
                             match_patterns: patterns,
                             where_clause: Some(where_expr),
                             mutations,
+                        }))
+                    }
+                    Token::Detach => {
+                        // MATCH ... WHERE expr DETACH DELETE var
+                        self.advance();
+                        self.expect_tok(&Token::Delete)?;
+                        let var = self.expect_ident()?;
+                        Ok(Statement::MatchMutate(MatchMutateStatement {
+                            match_patterns: patterns,
+                            where_clause: Some(where_expr),
+                            mutations: vec![Mutation::DetachDelete { var }],
                         }))
                     }
                     Token::Delete => {

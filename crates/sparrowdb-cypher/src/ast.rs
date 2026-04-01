@@ -301,6 +301,8 @@ pub enum Mutation {
     },
     /// `DELETE var`
     Delete { var: String },
+    /// `DETACH DELETE var` — delete a node and all of its incident edges.
+    DetachDelete { var: String },
 }
 
 /// MATCH … SET/DELETE statement.

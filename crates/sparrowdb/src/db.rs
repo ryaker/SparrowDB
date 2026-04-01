@@ -1307,6 +1307,11 @@ impl GraphDb {
                         tx.delete_node(*node_id)?;
                     }
                 }
+                sparrowdb_cypher::ast::Mutation::DetachDelete { .. } => {
+                    for node_id in &matching_ids {
+                        tx.detach_delete_node(*node_id)?;
+                    }
+                }
             }
         }
         tx.commit()?;
@@ -1371,6 +1376,11 @@ impl GraphDb {
                         tx.delete_node(*node_id)?;
                     }
                 }
+                sparrowdb_cypher::ast::Mutation::DetachDelete { .. } => {
+                    for node_id in &matching_ids {
+                        tx.detach_delete_node(*node_id)?;
+                    }
+                }
             }
         }
 
@@ -1431,6 +1441,12 @@ impl GraphDb {
                     for node_id in &matching_ids {
                         Self::check_deadline(deadline)?;
                         tx.delete_node(*node_id)?;
+                    }
+                }
+                sparrowdb_cypher::ast::Mutation::DetachDelete { .. } => {
+                    for node_id in &matching_ids {
+                        Self::check_deadline(deadline)?;
+                        tx.detach_delete_node(*node_id)?;
                     }
                 }
             }
@@ -2055,6 +2071,11 @@ impl GraphDb {
                             sparrowdb_cypher::ast::Mutation::Delete { .. } => {
                                 for node_id in &matching_ids {
                                     tx.delete_node(*node_id)?;
+                                }
+                            }
+                            sparrowdb_cypher::ast::Mutation::DetachDelete { .. } => {
+                                for node_id in &matching_ids {
+                                    tx.detach_delete_node(*node_id)?;
                                 }
                             }
                         }
