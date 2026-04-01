@@ -1117,7 +1117,7 @@ impl GraphDb {
         let mut tx = self.begin_write()?;
         // Detect create vs match by observing whether merge_node dirtied a new node.
         let dirty_before = tx.dirty_nodes.len();
-        let node_id = tx.merge_node(&m.label, props.clone())?;
+        let node_id = tx.merge_node(&m.label, props)?;
         let was_created = tx.dirty_nodes.len() > dirty_before;
 
         // Apply ON CREATE SET or ON MATCH SET items inside the same transaction.
@@ -1227,10 +1227,11 @@ impl GraphDb {
             .collect::<Result<HashMap<_, _>>>()?;
         let mut tx = self.begin_write()?;
         let dirty_before = tx.dirty_nodes.len();
-        let node_id = tx.merge_node(&m.label, props.clone())?;
+        let node_id = tx.merge_node(&m.label, props)?;
         let was_created = tx.dirty_nodes.len() > dirty_before;
 
         // Apply ON CREATE SET or ON MATCH SET items inside the same transaction.
+        // Use expr_to_value_with_params so $parameter references resolve correctly.
         let on_set_items = if was_created {
             &m.on_create_set
         } else {
@@ -1238,7 +1239,7 @@ impl GraphDb {
         };
         for mutation in on_set_items {
             if let sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } = mutation {
-                let sv = expr_to_value(value);
+                let sv = expr_to_value_with_params(value, params)?;
                 tx.set_property(node_id, prop, sv)?;
             }
         }
