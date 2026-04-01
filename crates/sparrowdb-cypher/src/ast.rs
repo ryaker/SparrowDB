@@ -266,6 +266,10 @@ pub struct MergeStatement {
     pub props: Vec<PropEntry>,
     /// Optional RETURN clause projecting properties of the merged node.
     pub return_clause: Option<ReturnClause>,
+    /// SET items applied only when the node is freshly created.
+    pub on_create_set: Vec<Mutation>,
+    /// SET items applied only when an existing node is matched.
+    pub on_match_set: Vec<Mutation>,
 }
 
 /// MATCH … MERGE (a)-[r:TYPE]->(b) statement: find-or-create a relationship.
@@ -299,8 +303,13 @@ pub enum Mutation {
         prop: String,
         value: Expr,
     },
-    /// `DELETE var`
-    Delete { var: String },
+    /// `DELETE var` or `DETACH DELETE var`
+    Delete {
+        var: String,
+        /// When `true`, all incident edges are removed before the node is
+        /// deleted (equivalent to Cypher's `DETACH DELETE`).
+        detach: bool,
+    },
 }
 
 /// MATCH … SET/DELETE statement.

@@ -1115,7 +1115,23 @@ impl GraphDb {
             .map(|pe| (pe.key.clone(), expr_to_value(&pe.value)))
             .collect();
         let mut tx = self.begin_write()?;
-        let node_id = tx.merge_node(&m.label, props.clone())?;
+        // Detect create vs match by observing whether merge_node dirtied a new node.
+        let dirty_before = tx.dirty_nodes.len();
+        let node_id = tx.merge_node(&m.label, props)?;
+        let was_created = tx.dirty_nodes.len() > dirty_before;
+
+        // Apply ON CREATE SET or ON MATCH SET items inside the same transaction.
+        let on_set_items = if was_created {
+            &m.on_create_set
+        } else {
+            &m.on_match_set
+        };
+        for mutation in on_set_items {
+            if let sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } = mutation {
+                let sv = expr_to_value(value);
+                tx.set_property(node_id, prop, sv)?;
+            }
+        }
         tx.commit()?;
         self.invalidate_catalog();
 
@@ -1210,7 +1226,23 @@ impl GraphDb {
             })
             .collect::<Result<HashMap<_, _>>>()?;
         let mut tx = self.begin_write()?;
-        let node_id = tx.merge_node(&m.label, props.clone())?;
+        let dirty_before = tx.dirty_nodes.len();
+        let node_id = tx.merge_node(&m.label, props)?;
+        let was_created = tx.dirty_nodes.len() > dirty_before;
+
+        // Apply ON CREATE SET or ON MATCH SET items inside the same transaction.
+        // Use expr_to_value_with_params so $parameter references resolve correctly.
+        let on_set_items = if was_created {
+            &m.on_create_set
+        } else {
+            &m.on_match_set
+        };
+        for mutation in on_set_items {
+            if let sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } = mutation {
+                let sv = expr_to_value_with_params(value, params)?;
+                tx.set_property(node_id, prop, sv)?;
+            }
+        }
         tx.commit()?;
         self.invalidate_catalog();
         if let Some(ref ret) = m.return_clause {
@@ -2024,7 +2056,20 @@ impl GraphDb {
                     .iter()
                     .map(|pe| (pe.key.clone(), expr_to_value(&pe.value)))
                     .collect();
-                tx.merge_node(&m.label, props)?;
+                let dirty_before = tx.dirty_nodes.len();
+                let node_id = tx.merge_node(&m.label, props)?;
+                let was_created = tx.dirty_nodes.len() > dirty_before;
+                let on_set_items = if was_created {
+                    &m.on_create_set
+                } else {
+                    &m.on_match_set
+                };
+                for mutation in on_set_items {
+                    if let sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } = mutation {
+                        let sv = expr_to_value(value);
+                        tx.set_property(node_id, prop, sv)?;
+                    }
+                }
                 Ok(QueryResult::empty(vec![]))
             }
 

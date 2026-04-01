@@ -15,6 +15,12 @@ use crate::ast::{
 };
 use crate::lexer::{tokenize, Token};
 
+/// Discriminated result of parsing one `ON CREATE SET …` / `ON MATCH SET …` clause.
+enum OnClause {
+    Create(Vec<Mutation>),
+    Match(Vec<Mutation>),
+}
+
 /// Map a keyword `Token` variant to its canonical string representation.
 ///
 /// Returns `None` for non-keyword tokens (e.g. `Ident`, `Integer`, punctuation).
@@ -354,7 +360,7 @@ impl Parser {
                 Ok(Statement::MatchMutate(MatchMutateStatement {
                     match_patterns: patterns,
                     where_clause: None,
-                    mutations: vec![Mutation::Delete { var }],
+                    mutations: vec![Mutation::Delete { var, detach: false }],
                 }))
             }
             Token::Where => {
@@ -377,7 +383,7 @@ impl Parser {
                         Ok(Statement::MatchMutate(MatchMutateStatement {
                             match_patterns: patterns,
                             where_clause: Some(where_expr),
-                            mutations: vec![Mutation::Delete { var }],
+                            mutations: vec![Mutation::Delete { var, detach: false }],
                         }))
                     }
                     Token::With => {
@@ -1183,6 +1189,18 @@ impl Parser {
 
         self.expect_tok(&Token::RParen)?;
 
+        // Optional `ON CREATE SET …` / `ON MATCH SET …` clauses (in any order).
+        let mut on_create_set: Vec<Mutation> = Vec::new();
+        let mut on_match_set: Vec<Mutation> = Vec::new();
+        while matches!(self.peek(), Token::On) {
+            self.advance(); // consume ON
+            let items = self.parse_on_clause()?;
+            match items {
+                OnClause::Create(mutations) => on_create_set.extend(mutations),
+                OnClause::Match(mutations) => on_match_set.extend(mutations),
+            }
+        }
+
         // Optional RETURN clause.
         let return_clause = if matches!(self.peek(), Token::Return) {
             self.advance(); // consume RETURN
@@ -1197,6 +1215,8 @@ impl Parser {
             label,
             props,
             return_clause,
+            on_create_set,
+            on_match_set,
         }))
     }
 
@@ -1229,10 +1249,12 @@ impl Parser {
         let dst_node = self.parse_node_pattern()?;
         let dst_var = dst_node.var;
 
-        // Optional `ON CREATE SET …` / `ON MATCH SET …` clauses — parse and discard.
+        // Optional `ON CREATE SET …` / `ON MATCH SET …` clauses — parsed and ignored
+        // for MATCH…MERGE relationship statements (relationship-level ON clauses are
+        // not yet supported in the executor, but we parse them to avoid syntax errors).
         while matches!(self.peek(), Token::On) {
             self.advance(); // consume ON
-            self.skip_on_clause()?;
+            self.parse_on_clause()?;
         }
 
         Ok(Statement::MatchMergeRel(MatchMergeRelStatement {
@@ -1245,33 +1267,30 @@ impl Parser {
         }))
     }
 
-    /// Skip an `ON CREATE SET …` or `ON MATCH SET …` clause after a MERGE.
-    fn skip_on_clause(&mut self) -> Result<()> {
-        match self.peek() {
-            Token::Create | Token::Match => {
-                self.advance();
+    /// Parse an `ON CREATE SET …` or `ON MATCH SET …` clause after a MERGE.
+    ///
+    /// Called after the `ON` keyword has already been consumed.
+    /// Returns the discriminated mutations so callers can route them to the
+    /// correct `on_create_set` / `on_match_set` bucket.
+    fn parse_on_clause(&mut self) -> Result<OnClause> {
+        match self.peek().clone() {
+            Token::Create => {
+                self.advance(); // consume CREATE
+                self.expect_tok(&Token::Set)?;
+                let mutations = self.parse_set_items()?;
+                Ok(OnClause::Create(mutations))
             }
-            other => {
-                return Err(Error::InvalidArgument(format!(
-                    "expected CREATE or MATCH after ON, got {:?}",
-                    other
-                )));
+            Token::Match => {
+                self.advance(); // consume MATCH
+                self.expect_tok(&Token::Set)?;
+                let mutations = self.parse_set_items()?;
+                Ok(OnClause::Match(mutations))
             }
+            other => Err(Error::InvalidArgument(format!(
+                "expected CREATE or MATCH after ON, got {:?}",
+                other
+            ))),
         }
-        loop {
-            match self.peek() {
-                Token::Eof
-                | Token::Semicolon
-                | Token::Return
-                | Token::With
-                | Token::Merge
-                | Token::On => break,
-                _ => {
-                    self.advance();
-                }
-            }
-        }
-        Ok(())
     }
 
     // ── CREATE ────────────────────────────────────────────────────────────────

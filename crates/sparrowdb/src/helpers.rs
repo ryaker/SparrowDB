@@ -171,7 +171,7 @@ pub(crate) fn is_edge_delete_mutation(mm: &sparrowdb_cypher::ast::MatchMutateSta
     if mm.mutations.len() != 1 {
         return false;
     }
-    let sparrowdb_cypher::ast::Mutation::Delete { var } = &mm.mutations[0] else {
+    let sparrowdb_cypher::ast::Mutation::Delete { var, .. } = &mm.mutations[0] else {
         return false;
     };
     mm.match_patterns
