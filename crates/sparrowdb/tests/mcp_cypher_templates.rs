@@ -11,7 +11,7 @@
 //! - `add_property`   — MATCH count query + MATCH … SET
 //! - `create_entity`  — CREATE (no props) and CREATE (with props)
 //! - `merge_node_by_property` — pre-merge MATCH count, MATCH-only path,
-//!                              MATCH+SET path, and CREATE path
+//!   MATCH+SET path, and CREATE path
 
 use sparrowdb::open;
 
@@ -264,9 +264,14 @@ fn mcp_template_merge_node_count_query_integer_parses_and_executes() {
 
 /// MATCH-only path (pre_existing > 0, set_parts empty):
 ///
-/// When there are no extra properties to set, the MCP tool skips executing any
-/// Cypher (a bare `MATCH` without `RETURN` is invalid).  This test verifies
-/// that the pre-merge count path still works and the node remains readable.
+/// When `set_parts` is empty the current MCP handler emits a bare
+/// `MATCH (n:{label} {{{match_key}: {cypher_match_val}}})` (no `SET`,
+/// no `RETURN`).  The parser rejects bare `MATCH` without a `RETURN` clause,
+/// so the MCP execute call will return an error at runtime for this path.
+///
+/// This test documents the known constraint by asserting the bare-`MATCH`
+/// form is rejected, and verifies the pre-merge count query (which is always
+/// executed) remains parseable and returns a result.
 #[test]
 fn mcp_template_merge_node_match_only_path_node_unchanged() {
     let (_dir, db) = make_db();
@@ -285,8 +290,19 @@ fn mcp_template_merge_node_match_only_path_node_unchanged() {
         result.rows
     );
 
-    // When set_parts is empty the MCP skips the MATCH execute entirely.
-    // Verify the node is still readable (no silent corruption).
+    // Bare MATCH without RETURN is rejected by the parser — document the
+    // constraint so a future "fix bare-MATCH" change is caught immediately.
+    let label = "Tenant";
+    let match_key = "id";
+    let cypher_match_val = "'tenant-1'";
+    let bare_match_query = format!("MATCH (n:{label} {{{match_key}: {cypher_match_val}}})");
+    let bare_result = db.execute(&bare_match_query);
+    assert!(
+        bare_result.is_err(),
+        "bare MATCH without RETURN must be rejected by the parser; got Ok"
+    );
+
+    // Verify the node is still readable — the failed execute must not corrupt state.
     let verify = db
         .execute("MATCH (n:Tenant {id: 'tenant-1'}) RETURN n.region")
         .expect("verify MATCH must succeed");
