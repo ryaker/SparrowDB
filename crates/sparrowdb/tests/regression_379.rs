@@ -201,6 +201,47 @@ fn detach_delete_with_where_clause() {
     );
 }
 
+// ── Post-CHECKPOINT CSR code path ────────────────────────────────────────────
+
+/// `DETACH DELETE` must also work after CHECKPOINT when edges are in CSR files
+/// rather than the delta log.
+#[test]
+fn detach_delete_after_checkpoint() {
+    let (_dir, db) = make_db();
+
+    db.execute("CREATE (a:Person {name: 'Alice'})").unwrap();
+    db.execute("CREATE (b:Person {name: 'Bob'})").unwrap();
+    db.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    )
+    .unwrap();
+
+    // Move edges from delta log to CSR files.
+    db.execute("CHECKPOINT").unwrap();
+
+    assert_eq!(
+        count_matches(&db, "MATCH (x)-[:KNOWS]->(y) RETURN x, y"),
+        1,
+        "KNOWS edge must exist after CHECKPOINT"
+    );
+
+    db.execute("MATCH (n:Person {name: 'Alice'}) DETACH DELETE n")
+        .expect("DETACH DELETE must succeed on checkpointed edges");
+
+    assert_eq!(
+        count_matches(&db, "MATCH (x)-[:KNOWS]->(y) RETURN x, y"),
+        0,
+        "KNOWS edge must be gone after DETACH DELETE of checkpointed source"
+    );
+
+    // Bob must still be present.
+    assert_eq!(
+        count_matches(&db, "MATCH (n:Person {name: 'Bob'}) RETURN n.name"),
+        1,
+        "Bob must still exist after Alice is DETACH DELETEd"
+    );
+}
+
 // ── Documented behavior: plain DELETE fails on node with edges ────────────────
 
 /// Plain `DELETE` on a node that still has edges must return an error.

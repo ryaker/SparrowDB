@@ -1294,6 +1294,7 @@ impl GraphDb {
         if matching_ids.is_empty() {
             return Ok(QueryResult::empty(vec![]));
         }
+        let mut has_detach_delete = false;
         for mutation in &mm.mutations {
             match mutation {
                 sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
@@ -1308,6 +1309,7 @@ impl GraphDb {
                     }
                 }
                 sparrowdb_cypher::ast::Mutation::DetachDelete { .. } => {
+                    has_detach_delete = true;
                     for node_id in &matching_ids {
                         tx.detach_delete_node(*node_id)?;
                     }
@@ -1316,6 +1318,9 @@ impl GraphDb {
         }
         tx.commit()?;
         self.invalidate_catalog();
+        if has_detach_delete {
+            self.invalidate_csr_map();
+        }
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1363,6 +1368,7 @@ impl GraphDb {
             return Ok(QueryResult::empty(vec![]));
         }
 
+        let mut has_detach_delete = false;
         for mutation in &mm.mutations {
             match mutation {
                 sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
@@ -1377,6 +1383,7 @@ impl GraphDb {
                     }
                 }
                 sparrowdb_cypher::ast::Mutation::DetachDelete { .. } => {
+                    has_detach_delete = true;
                     for node_id in &matching_ids {
                         tx.detach_delete_node(*node_id)?;
                     }
@@ -1386,6 +1393,9 @@ impl GraphDb {
 
         tx.commit()?;
         self.invalidate_catalog();
+        if has_detach_delete {
+            self.invalidate_csr_map();
+        }
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1428,6 +1438,7 @@ impl GraphDb {
             return Ok(QueryResult::empty(vec![]));
         }
 
+        let mut has_detach_delete = false;
         for mutation in &mm.mutations {
             match mutation {
                 sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
@@ -1444,6 +1455,7 @@ impl GraphDb {
                     }
                 }
                 sparrowdb_cypher::ast::Mutation::DetachDelete { .. } => {
+                    has_detach_delete = true;
                     for node_id in &matching_ids {
                         Self::check_deadline(deadline)?;
                         tx.detach_delete_node(*node_id)?;
@@ -1454,6 +1466,9 @@ impl GraphDb {
 
         tx.commit()?;
         self.invalidate_catalog();
+        if has_detach_delete {
+            self.invalidate_csr_map();
+        }
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1895,10 +1910,23 @@ impl GraphDb {
         // Acquire a single WriteTx for all structural + property mutations.
         let mut tx = self.begin_write()?;
         let mut results: Vec<Option<QueryResult>> = vec![None; bound_stmts.len()];
+        let mut has_detach_delete = false;
 
         for (i, bound) in bound_stmts.into_iter().enumerate() {
             if early_results[i].is_some() {
                 continue;
+            }
+
+            // Track whether any DetachDelete mutations are in the batch so we
+            // can invalidate the CSR map after commit (edges are deleted).
+            if let sparrowdb_cypher::ast::Statement::MatchMutate(ref mm) = bound.inner {
+                if mm
+                    .mutations
+                    .iter()
+                    .any(|m| matches!(m, sparrowdb_cypher::ast::Mutation::DetachDelete { .. }))
+                {
+                    has_detach_delete = true;
+                }
             }
 
             let result = if Engine::is_mutation(&bound.inner) {
@@ -1921,6 +1949,11 @@ impl GraphDb {
         // Single fsync commit — all mutations land in one WAL transaction.
         tx.commit()?;
         self.invalidate_catalog();
+        // DetachDelete removes edges, so the cached CSR forward/backward maps
+        // must be invalidated to prevent stale reads on subsequent queries.
+        if has_detach_delete {
+            self.invalidate_csr_map();
+        }
 
         // Merge early (CHECKPOINT/OPTIMIZE) and mutation results in order.
         let final_results = results

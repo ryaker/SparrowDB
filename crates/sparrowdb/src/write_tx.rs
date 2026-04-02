@@ -531,26 +531,27 @@ impl WriteTx {
     pub fn detach_delete_node(&mut self, node_id: NodeId) -> crate::Result<()> {
         // Collect all (src, dst, rel_type) tuples for edges incident to node_id.
         let rel_entries = self.catalog.list_rel_table_ids();
-        let mut rel_ids_to_check: Vec<(u32, String)> = rel_entries
+
+        // Build a HashMap for O(1) rel_type lookups when scanning pending ops.
+        let rel_type_map: std::collections::HashMap<u32, String> = rel_entries
             .iter()
-            .map(|(id, _, _, rel_type)| (*id as u32, rel_type.clone()))
+            .map(|(id, _, _, rt)| (*id as u32, rt.clone()))
             .collect();
-        // Always check the legacy table-0 slot (edges written before catalog entries existed).
-        if !rel_ids_to_check.iter().any(|(id, _)| *id == 0u32) {
-            rel_ids_to_check.push((0u32, String::new()));
-        }
 
         let mut edges_to_delete: Vec<(NodeId, NodeId, String)> = Vec::new();
 
-        for (rel_id, rel_type) in &rel_ids_to_check {
-            if rel_type.is_empty() {
-                // Skip the legacy-0 slot when there is no known type name.
-                continue;
-            }
-            let store = EdgeStore::open(&self.inner.path, RelTableId(*rel_id));
+        // The CSR stores node slots (lower 32 bits of NodeId) as indices.
+        // Strip the label bits before calling neighbors/predecessors, and
+        // reconstruct full NodeIds with the correct label bits on return.
+        let node_slot = node_id.0 & 0xFFFF_FFFF;
+
+        for (rel_table_id, src_label_id, dst_label_id, rel_type) in &rel_entries {
+            let rel_id = *rel_table_id as u32;
+            let store = EdgeStore::open(&self.inner.path, RelTableId(rel_id));
             let Ok(ref s) = store else { continue };
 
             // Collect incident edges from the delta log (un-checkpointed).
+            // Delta records store full NodeIds, so compare directly.
             if let Ok(delta) = s.read_delta() {
                 for rec in &delta {
                     if rec.src == node_id || rec.dst == node_id {
@@ -560,16 +561,22 @@ impl WriteTx {
             }
 
             // Collect outgoing edges from the checkpointed CSR forward file.
+            // CSR is indexed by slot and returns destination slots.
+            // Reconstruct full NodeIds by combining the dst_label_id with the slot.
             if let Ok(csr) = s.open_fwd() {
-                for &dst_raw in csr.neighbors(node_id.0) {
-                    edges_to_delete.push((node_id, NodeId(dst_raw), rel_type.clone()));
+                for &dst_slot in csr.neighbors(node_slot) {
+                    let dst_id = NodeId((*dst_label_id as u64) << 32 | dst_slot);
+                    edges_to_delete.push((node_id, dst_id, rel_type.clone()));
                 }
             }
 
             // Collect incoming edges from the checkpointed CSR backward file.
+            // CSR is indexed by slot and returns source slots.
+            // Reconstruct full NodeIds by combining the src_label_id with the slot.
             if let Ok(csr) = s.open_bwd() {
-                for &src_raw in csr.predecessors(node_id.0) {
-                    edges_to_delete.push((NodeId(src_raw), node_id, rel_type.clone()));
+                for &src_slot in csr.predecessors(node_slot) {
+                    let src_id = NodeId((*src_label_id as u64) << 32 | src_slot);
+                    edges_to_delete.push((src_id, node_id, rel_type.clone()));
                 }
             }
         }
@@ -588,10 +595,9 @@ impl WriteTx {
                 } = op
                 {
                     if *src == node_id || *dst == node_id {
-                        let rt = rel_entries
-                            .iter()
-                            .find(|(id, _, _, _)| *id as u32 == rel_table_id.0)
-                            .map(|(_, _, _, rt)| rt.clone())
+                        let rt = rel_type_map
+                            .get(&rel_table_id.0)
+                            .cloned()
                             .unwrap_or_default();
                         if !rt.is_empty() {
                             return Some((*src, *dst, rt));
