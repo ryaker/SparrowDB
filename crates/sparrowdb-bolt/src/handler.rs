@@ -309,10 +309,7 @@ async fn read_chunked_message(
             break;
         }
         if result.len() + chunk_len > MAX_MESSAGE_SIZE {
-            return Err(format!(
-                "message too large: would exceed {MAX_MESSAGE_SIZE} bytes"
-            )
-            .into());
+            return Err(format!("message too large: would exceed {MAX_MESSAGE_SIZE} bytes").into());
         }
         let mut chunk = vec![0u8; chunk_len];
         stream.read_exact(&mut chunk).await?;
