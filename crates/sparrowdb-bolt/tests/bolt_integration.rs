@@ -234,19 +234,11 @@ async fn start_server(db: GraphDb) -> u16 {
     let port = listener.local_addr().unwrap().port();
 
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let db = db.clone();
-                    tokio::spawn(async move {
-                        // Import the handler module via the binary crate.
-                        // Since we can't import from a bin crate, we'll inline
-                        // the connection handler via the library path.
-                        sparrowdb_bolt::handle_connection(stream, db).await;
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            let db = db.clone();
+            tokio::spawn(async move {
+                sparrowdb_bolt::handle_connection(stream, db).await;
+            });
         }
     });
 
