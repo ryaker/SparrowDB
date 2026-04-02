@@ -1326,6 +1326,7 @@ impl GraphDb {
         if matching_ids.is_empty() {
             return Ok(QueryResult::empty(vec![]));
         }
+        let mut has_detach_delete = false;
         for mutation in &mm.mutations {
             match mutation {
                 sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
@@ -1334,7 +1335,13 @@ impl GraphDb {
                         tx.set_property(*node_id, prop, sv.clone())?;
                     }
                 }
-                sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                sparrowdb_cypher::ast::Mutation::Delete { detach: true, .. } => {
+                    has_detach_delete = true;
+                    for node_id in &matching_ids {
+                        tx.detach_delete_node(*node_id)?;
+                    }
+                }
+                sparrowdb_cypher::ast::Mutation::Delete { detach: false, .. } => {
                     for node_id in &matching_ids {
                         tx.delete_node(*node_id)?;
                     }
@@ -1343,6 +1350,9 @@ impl GraphDb {
         }
         tx.commit()?;
         self.invalidate_catalog();
+        if has_detach_delete {
+            self.invalidate_csr_map();
+        }
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1390,6 +1400,7 @@ impl GraphDb {
             return Ok(QueryResult::empty(vec![]));
         }
 
+        let mut has_detach_delete = false;
         for mutation in &mm.mutations {
             match mutation {
                 sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
@@ -1398,7 +1409,13 @@ impl GraphDb {
                         tx.set_property(*node_id, prop, sv.clone())?;
                     }
                 }
-                sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                sparrowdb_cypher::ast::Mutation::Delete { detach: true, .. } => {
+                    has_detach_delete = true;
+                    for node_id in &matching_ids {
+                        tx.detach_delete_node(*node_id)?;
+                    }
+                }
+                sparrowdb_cypher::ast::Mutation::Delete { detach: false, .. } => {
                     for node_id in &matching_ids {
                         tx.delete_node(*node_id)?;
                     }
@@ -1408,6 +1425,9 @@ impl GraphDb {
 
         tx.commit()?;
         self.invalidate_catalog();
+        if has_detach_delete {
+            self.invalidate_csr_map();
+        }
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1450,6 +1470,7 @@ impl GraphDb {
             return Ok(QueryResult::empty(vec![]));
         }
 
+        let mut has_detach_delete = false;
         for mutation in &mm.mutations {
             match mutation {
                 sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
@@ -1459,7 +1480,14 @@ impl GraphDb {
                         tx.set_property(*node_id, prop, sv.clone())?;
                     }
                 }
-                sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                sparrowdb_cypher::ast::Mutation::Delete { detach: true, .. } => {
+                    has_detach_delete = true;
+                    for node_id in &matching_ids {
+                        Self::check_deadline(deadline)?;
+                        tx.detach_delete_node(*node_id)?;
+                    }
+                }
+                sparrowdb_cypher::ast::Mutation::Delete { detach: false, .. } => {
                     for node_id in &matching_ids {
                         Self::check_deadline(deadline)?;
                         tx.delete_node(*node_id)?;
@@ -1470,6 +1498,9 @@ impl GraphDb {
 
         tx.commit()?;
         self.invalidate_catalog();
+        if has_detach_delete {
+            self.invalidate_csr_map();
+        }
         Ok(QueryResult::empty(vec![]))
     }
 
@@ -1911,10 +1942,24 @@ impl GraphDb {
         // Acquire a single WriteTx for all structural + property mutations.
         let mut tx = self.begin_write()?;
         let mut results: Vec<Option<QueryResult>> = vec![None; bound_stmts.len()];
+        let mut has_detach_delete = false;
 
         for (i, bound) in bound_stmts.into_iter().enumerate() {
             if early_results[i].is_some() {
                 continue;
+            }
+
+            // Track whether any DETACH DELETE mutations are in the batch so we
+            // can invalidate the CSR map after commit (edges are deleted).
+            if let sparrowdb_cypher::ast::Statement::MatchMutate(ref mm) = bound.inner {
+                if mm.mutations.iter().any(|m| {
+                    matches!(
+                        m,
+                        sparrowdb_cypher::ast::Mutation::Delete { detach: true, .. }
+                    )
+                }) {
+                    has_detach_delete = true;
+                }
             }
 
             let result = if Engine::is_mutation(&bound.inner) {
@@ -1937,6 +1982,11 @@ impl GraphDb {
         // Single fsync commit — all mutations land in one WAL transaction.
         tx.commit()?;
         self.invalidate_catalog();
+        // DetachDelete removes edges, so the cached CSR forward/backward maps
+        // must be invalidated to prevent stale reads on subsequent queries.
+        if has_detach_delete {
+            self.invalidate_csr_map();
+        }
 
         // Merge early (CHECKPOINT/OPTIMIZE) and mutation results in order.
         let final_results = results
@@ -2097,7 +2147,12 @@ impl GraphDb {
                                     tx.set_property(*node_id, prop, sv.clone())?;
                                 }
                             }
-                            sparrowdb_cypher::ast::Mutation::Delete { .. } => {
+                            sparrowdb_cypher::ast::Mutation::Delete { detach: true, .. } => {
+                                for node_id in &matching_ids {
+                                    tx.detach_delete_node(*node_id)?;
+                                }
+                            }
+                            sparrowdb_cypher::ast::Mutation::Delete { detach: false, .. } => {
                                 for node_id in &matching_ids {
                                     tx.delete_node(*node_id)?;
                                 }

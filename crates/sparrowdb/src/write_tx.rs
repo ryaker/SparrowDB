@@ -516,6 +516,120 @@ impl WriteTx {
         Ok(())
     }
 
+    /// `DETACH DELETE` variant: first delete all edges incident to `node_id`
+    /// (both outgoing and incoming, across all relationship types), then delete
+    /// the node itself.
+    ///
+    /// This mirrors the semantics of Neo4j's `DETACH DELETE`: the caller does not
+    /// need to explicitly remove edges before removing the node.
+    ///
+    /// Unlike calling `delete_node` directly, this method schedules all
+    /// `EdgeDelete` ops in the same transaction and then queues the
+    /// `NodeDelete` op without re-running the edge-presence safety check
+    /// (which reads on-disk state and would still see the not-yet-committed
+    /// edge deletions).
+    pub fn detach_delete_node(&mut self, node_id: NodeId) -> crate::Result<()> {
+        // Collect all (src, dst, rel_type) tuples for edges incident to node_id.
+        let rel_entries = self.catalog.list_rel_table_ids();
+
+        // Build a HashMap for O(1) rel_type lookups when scanning pending ops.
+        let rel_type_map: std::collections::HashMap<u32, String> = rel_entries
+            .iter()
+            .map(|(id, _, _, rt)| (*id as u32, rt.clone()))
+            .collect();
+
+        let mut edges_to_delete: Vec<(NodeId, NodeId, String)> = Vec::new();
+
+        // The CSR stores node slots (lower 32 bits of NodeId) as indices.
+        // Strip the label bits before calling neighbors/predecessors, and
+        // reconstruct full NodeIds with the correct label bits on return.
+        let node_slot = node_id.0 & 0xFFFF_FFFF;
+
+        for (rel_table_id, src_label_id, dst_label_id, rel_type) in &rel_entries {
+            let rel_id = *rel_table_id as u32;
+            let store = EdgeStore::open(&self.inner.path, RelTableId(rel_id));
+            let Ok(ref s) = store else { continue };
+
+            // Collect incident edges from the delta log (un-checkpointed).
+            // Delta records store full NodeIds, so compare directly.
+            if let Ok(delta) = s.read_delta() {
+                for rec in &delta {
+                    if rec.src == node_id || rec.dst == node_id {
+                        edges_to_delete.push((rec.src, rec.dst, rel_type.clone()));
+                    }
+                }
+            }
+
+            // Collect outgoing edges from the checkpointed CSR forward file.
+            // CSR is indexed by slot and returns destination slots.
+            // Reconstruct full NodeIds by combining the dst_label_id with the slot.
+            if let Ok(csr) = s.open_fwd() {
+                for &dst_slot in csr.neighbors(node_slot) {
+                    let dst_id = NodeId((*dst_label_id as u64) << 32 | dst_slot);
+                    edges_to_delete.push((node_id, dst_id, rel_type.clone()));
+                }
+            }
+
+            // Collect incoming edges from the checkpointed CSR backward file.
+            // CSR is indexed by slot and returns source slots.
+            // Reconstruct full NodeIds by combining the src_label_id with the slot.
+            if let Ok(csr) = s.open_bwd() {
+                for &src_slot in csr.predecessors(node_slot) {
+                    let src_id = NodeId((*src_label_id as u64) << 32 | src_slot);
+                    edges_to_delete.push((src_id, node_id, rel_type.clone()));
+                }
+            }
+        }
+
+        // Also cancel any buffered (not-yet-committed) EdgeCreate ops in this
+        // transaction that touch node_id.
+        let buffered: Vec<(NodeId, NodeId, String)> = self
+            .pending_ops
+            .iter()
+            .filter_map(|op| {
+                if let PendingOp::EdgeCreate {
+                    src,
+                    dst,
+                    rel_table_id,
+                    ..
+                } = op
+                {
+                    if *src == node_id || *dst == node_id {
+                        let rt = rel_type_map
+                            .get(&rel_table_id.0)
+                            .cloned()
+                            .unwrap_or_default();
+                        if !rt.is_empty() {
+                            return Some((*src, *dst, rt));
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+        edges_to_delete.extend(buffered);
+
+        // Deduplicate to avoid scheduling redundant edge deletions.
+        edges_to_delete.sort_unstable();
+        edges_to_delete.dedup();
+
+        // Schedule all edge deletions.  `delete_edge` will either cancel a
+        // buffered EdgeCreate or queue an EdgeDelete op for commit time.
+        for (src, dst, rel_type) in edges_to_delete {
+            self.delete_edge(src, dst, &rel_type)?;
+        }
+
+        // Directly queue the NodeDelete op.  We bypass `delete_node`'s
+        // edge-presence safety check because: (a) we have scheduled EdgeDelete
+        // ops for every incident edge above, and (b) those ops have not been
+        // committed to disk yet — so reading on-disk state would still see the
+        // edges and incorrectly return NodeHasEdges.
+        self.dirty_nodes.insert(node_id.0);
+        self.pending_ops.push(PendingOp::NodeDelete { node_id });
+        self.wal_mutations.push(WalMutation::NodeDelete { node_id });
+        Ok(())
+    }
+
     /// SPA-126: Create a directed edge `src → dst` with the given type.
     ///
     /// Buffers the edge creation; the delta-log append and WAL record are only

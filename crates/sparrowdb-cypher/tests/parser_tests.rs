@@ -198,8 +198,13 @@ fn parse_unwind_param() {
 }
 
 #[test]
-fn parse_detach_delete_rejected() {
-    assert!(parse("MATCH (n) DETACH DELETE n").is_err());
+fn parse_detach_delete_accepted() {
+    // DETACH DELETE is now supported (issue #379).
+    let stmt = parse("MATCH (n) DETACH DELETE n").expect("DETACH DELETE must parse");
+    assert!(matches!(
+        stmt,
+        sparrowdb_cypher::ast::Statement::MatchMutate(_)
+    ));
 }
 
 #[test]
