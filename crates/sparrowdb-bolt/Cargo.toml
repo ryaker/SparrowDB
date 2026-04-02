@@ -1,0 +1,29 @@
+[package]
+name = "sparrowdb-bolt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Bolt protocol TCP server for SparrowDB"
+publish = false
+
+[lib]
+name = "sparrowdb_bolt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sparrowdb-bolt"
+path = "src/main.rs"
+
+[dependencies]
+sparrowdb = { workspace = true }
+sparrowdb-execution = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
