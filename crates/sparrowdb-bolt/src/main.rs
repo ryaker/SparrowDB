@@ -6,7 +6,12 @@
 use clap::Parser;
 use sparrowdb::GraphDb;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+
+/// Maximum number of concurrent Bolt connections.
+const MAX_CONNECTIONS: usize = 256;
 
 #[derive(Parser, Debug)]
 #[command(name = "sparrowdb-bolt", about = "Bolt protocol server for SparrowDB")]
@@ -41,10 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&bind_addr).await?;
     tracing::info!("bolt server listening on {bind_addr}");
 
+    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+
     loop {
         let (stream, _addr) = listener.accept().await?;
         let db = db.clone();
+        let permit = semaphore.clone().acquire_owned().await?;
         tokio::spawn(async move {
+            let _permit = permit; // released when the connection closes
             sparrowdb_bolt::handle_connection(stream, db).await;
         });
     }

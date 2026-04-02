@@ -9,6 +9,16 @@ use sparrowdb_execution::{QueryResult, Value};
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::Duration;
+
+/// Maximum total size of a single chunked message (4 MiB).
+const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
+/// Maximum size of a single outgoing chunk (Bolt protocol limit).
+const MAX_CHUNK_SIZE: usize = 65_535;
+
+/// Timeout for the initial Bolt handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bolt magic preamble (4 bytes).
 const BOLT_MAGIC: [u8; 4] = [0x60, 0x60, 0xB0, 0x17];
@@ -40,7 +50,9 @@ async fn handle_inner(
     // ── 1. Handshake ────────────────────────────────────────────────
 
     let mut preamble = [0u8; 20];
-    stream.read_exact(&mut preamble).await?;
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut preamble))
+        .await
+        .map_err(|_| "handshake timeout")??;
 
     if preamble[..4] != BOLT_MAGIC {
         return Err("invalid bolt magic".into());
@@ -68,12 +80,7 @@ async fn handle_inner(
             selected = Some([0, 0, 4, 0]);
             break;
         }
-        // Check if any version in range matches major 4
-        if major >= 1 && major <= 4 {
-            selected = Some([0, 0, 4, 0]);
-            break;
-        }
-        let _ = range; // suppress unused warning
+        let _ = range; // version range field — reserved for future use
     }
 
     let version_bytes = match selected {
@@ -147,7 +154,12 @@ async fn handle_inner(
 
                 tracing::info!("RUN: {query}");
 
-                match db.execute(&query) {
+                let db2 = db.clone();
+                let exec_result = tokio::task::spawn_blocking(move || db2.execute(&query))
+                    .await
+                    .map_err(|e| format!("task join error: {e}"))?;
+
+                match exec_result {
                     Ok(result) => {
                         let mut meta = HashMap::new();
                         let field_names: Vec<BoltValue> = result
@@ -173,19 +185,59 @@ async fn handle_inner(
                     continue;
                 }
 
+                // Extract `n` (batch size) from PULL metadata map, default -1 = all.
+                let n_requested: i64 = fields
+                    .first()
+                    .and_then(|v| {
+                        if let BoltValue::Map(m) = v {
+                            m.get("n").and_then(|n| {
+                                if let BoltValue::Integer(i) = n {
+                                    Some(*i)
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(-1);
+
                 match &state {
                     State::Streaming { result, cursor } => {
                         let cursor = *cursor;
-                        // Send all remaining records.
-                        for row in &result.rows[cursor..] {
+                        let total = result.rows.len();
+                        let limit = if n_requested < 0 {
+                            total - cursor
+                        } else {
+                            (n_requested as usize).min(total - cursor)
+                        };
+
+                        // Buffer all records into a single write before flushing.
+                        let end = cursor + limit;
+                        let mut combined = BytesMut::new();
+                        for row in &result.rows[cursor..end] {
                             let bolt_row: Vec<BoltValue> =
                                 row.iter().map(sparrow_to_bolt).collect();
-                            send_record(stream, bolt_row).await?;
+                            append_record(&mut combined, bolt_row);
                         }
+
+                        // SUCCESS metadata
+                        let has_more = end < total;
                         let mut meta = HashMap::new();
-                        meta.insert("has_more".into(), BoltValue::Boolean(false));
-                        send_success(stream, meta).await?;
-                        state = State::Ready;
+                        meta.insert("has_more".into(), BoltValue::Boolean(has_more));
+                        append_success(&mut combined, meta);
+
+                        write_chunked_batch(stream, &combined).await?;
+
+                        if has_more {
+                            state = State::Streaming {
+                                result: result.clone(),
+                                cursor: end,
+                            };
+                        } else {
+                            state = State::Ready;
+                        }
                     }
                     _ => {
                         send_success(stream, HashMap::new()).await?;
@@ -200,17 +252,34 @@ async fn handle_inner(
                 send_success(stream, meta).await?;
             }
             packstream::SIG_BEGIN => {
-                // Auto-commit only — accept BEGIN but no real tx management.
-                send_success(stream, HashMap::new()).await?;
-                state = State::Ready;
+                // SparrowDB does not support multi-statement transactions.
+                // Returning SUCCESS here would give clients a false atomicity
+                // guarantee, so we reject BEGIN explicitly.
+                send_failure(
+                    stream,
+                    "SparrowDB.Unsupported",
+                    "explicit transactions are not supported; use auto-commit mode",
+                )
+                .await?;
+                state = State::Failed;
             }
             packstream::SIG_COMMIT => {
-                send_success(stream, HashMap::new()).await?;
-                state = State::Ready;
+                send_failure(
+                    stream,
+                    "SparrowDB.Unsupported",
+                    "explicit transactions are not supported; use auto-commit mode",
+                )
+                .await?;
+                state = State::Failed;
             }
             packstream::SIG_ROLLBACK => {
-                send_success(stream, HashMap::new()).await?;
-                state = State::Ready;
+                send_failure(
+                    stream,
+                    "SparrowDB.Unsupported",
+                    "explicit transactions are not supported; use auto-commit mode",
+                )
+                .await?;
+                state = State::Failed;
             }
             other => {
                 tracing::warn!("unknown message signature: 0x{other:02X}");
@@ -227,6 +296,7 @@ async fn handle_inner(
 ///
 /// Bolt chunking: `[u16 len][data]...  [0x0000]`
 /// Chunks are concatenated until a zero-length chunk is seen.
+/// Returns an error if the accumulated size exceeds `MAX_MESSAGE_SIZE`.
 async fn read_chunked_message(
     stream: &mut TcpStream,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -238,6 +308,12 @@ async fn read_chunked_message(
         if chunk_len == 0 {
             break;
         }
+        if result.len() + chunk_len > MAX_MESSAGE_SIZE {
+            return Err(format!(
+                "message too large: would exceed {MAX_MESSAGE_SIZE} bytes"
+            )
+            .into());
+        }
         let mut chunk = vec![0u8; chunk_len];
         stream.read_exact(&mut chunk).await?;
         result.extend_from_slice(&chunk);
@@ -245,18 +321,33 @@ async fn read_chunked_message(
     Ok(result)
 }
 
-/// Write a message using chunked transport.
+/// Write a message using chunked transport, splitting into ≤65535-byte chunks.
+///
+/// Per the Bolt spec, each chunk is prefixed by its u16 length, and the
+/// message is terminated by a zero-length chunk (`0x00 0x00`).
 async fn write_chunked_message(
     stream: &mut TcpStream,
     data: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Send as a single chunk (messages are typically small).
-    let len = data.len() as u16;
-    let mut out = BytesMut::with_capacity(2 + data.len() + 2);
-    out.put_u16(len);
-    out.extend_from_slice(data);
-    out.put_u16(0); // end marker
-    stream.write_all(&out).await?;
+    for chunk in data.chunks(MAX_CHUNK_SIZE) {
+        let len = chunk.len() as u16;
+        stream.write_all(&len.to_be_bytes()).await?;
+        stream.write_all(chunk).await?;
+    }
+    stream.write_all(&[0, 0]).await?; // end marker
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Write a pre-built buffer of concatenated chunked messages in a single flush.
+///
+/// Used by PULL to batch-write all records before the final SUCCESS, avoiding
+/// a per-record `flush()` call.
+async fn write_chunked_batch(
+    stream: &mut TcpStream,
+    data: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    stream.write_all(data).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -289,14 +380,29 @@ async fn send_failure(
     write_chunked_message(stream, &buf).await
 }
 
-async fn send_record(
-    stream: &mut TcpStream,
-    fields: Vec<BoltValue>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut buf = BytesMut::new();
-    packstream::encode_struct_header(&mut buf, 1, packstream::SIG_RECORD);
-    packstream::encode_value(&mut buf, &BoltValue::List(fields));
-    write_chunked_message(stream, &buf).await
+/// Append a serialized RECORD message (with chunked framing) to `out`, without flushing.
+fn append_record(out: &mut BytesMut, fields: Vec<BoltValue>) {
+    let mut msg = BytesMut::new();
+    packstream::encode_struct_header(&mut msg, 1, packstream::SIG_RECORD);
+    packstream::encode_value(&mut msg, &BoltValue::List(fields));
+    append_chunked(out, &msg);
+}
+
+/// Append a serialized SUCCESS message (with chunked framing) to `out`, without flushing.
+fn append_success(out: &mut BytesMut, metadata: HashMap<String, BoltValue>) {
+    let mut msg = BytesMut::new();
+    packstream::encode_struct_header(&mut msg, 1, packstream::SIG_SUCCESS);
+    packstream::encode_value(&mut msg, &BoltValue::Map(metadata));
+    append_chunked(out, &msg);
+}
+
+/// Serialize `data` into Bolt chunked framing and append to `out`.
+fn append_chunked(out: &mut BytesMut, data: &[u8]) {
+    for chunk in data.chunks(MAX_CHUNK_SIZE) {
+        out.put_u16(chunk.len() as u16);
+        out.extend_from_slice(chunk);
+    }
+    out.put_u16(0); // end marker
 }
 
 async fn send_ignored(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>> {

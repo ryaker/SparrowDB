@@ -359,8 +359,12 @@ fn decode_string_body(buf: &mut &[u8], len: usize) -> Result<BoltValue, DecodeEr
     Ok(BoltValue::String(result))
 }
 
+/// Maximum number of elements pre-allocated from an untrusted network length.
+/// Larger collections grow dynamically via `push`.
+const MAX_PREALLOC: usize = 64;
+
 fn decode_list_body(buf: &mut &[u8], len: usize) -> Result<BoltValue, DecodeError> {
-    let mut items = Vec::with_capacity(len);
+    let mut items = Vec::with_capacity(len.min(MAX_PREALLOC));
     for _ in 0..len {
         items.push(decode_value(buf)?);
     }
@@ -368,7 +372,7 @@ fn decode_list_body(buf: &mut &[u8], len: usize) -> Result<BoltValue, DecodeErro
 }
 
 fn decode_map_body(buf: &mut &[u8], len: usize) -> Result<BoltValue, DecodeError> {
-    let mut map = HashMap::with_capacity(len);
+    let mut map = HashMap::with_capacity(len.min(MAX_PREALLOC));
     for _ in 0..len {
         let key = match decode_value(buf)? {
             BoltValue::String(s) => s,
