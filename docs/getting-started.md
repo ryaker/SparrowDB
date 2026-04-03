@@ -140,8 +140,28 @@ cargo bench -p sparrowdb-storage -- --output-format bencher
 Benchmarks cover WAL append, metapage encode/decode, CSR neighbor lookup, and
 CRC32C throughput.
 
+## Visualizing Your Graph (Bolt Server)
+
+SparrowDB includes a Bolt protocol server compatible with Neo4j clients such as
+[gdotv](https://gdotv.app) and the Neo4j Browser.
+
+```bash
+# Build and start the Bolt server
+cargo build --release -p sparrowdb-bolt
+sparrowdb-bolt --db-path my_graph.db --port 7687
+```
+
+Then open gdotv, set the connection to `bolt://localhost:7687`, and run:
+
+```cypher
+MATCH (n) RETURN n LIMIT 50
+```
+
+See [Bolt Server](bolt-server.md) for the full connection guide.
+
 ## What's Next
 
 - [API Reference](api-reference.md) — full `Engine` API and query result types
 - [Cypher Reference](cypher-reference.md) — all supported Cypher with examples
+- [Bolt Server](bolt-server.md) — connect Neo4j-compatible clients and graph visualization tools
 - [DEVELOPMENT.md](../DEVELOPMENT.md) — contributor workflow and architecture deep-dive

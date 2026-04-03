@@ -72,8 +72,11 @@ pub struct RelPattern {
 }
 
 /// A path pattern: a sequence of alternating nodes and relationships.
+/// `path_var` holds the name of a path variable assignment (`p = (a)-[r]->(b)`);
+/// the variable is accepted by the parser but currently ignored at execution time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathPattern {
+    pub path_var: Option<String>,
     pub nodes: Vec<NodePattern>,
     pub rels: Vec<RelPattern>,
 }

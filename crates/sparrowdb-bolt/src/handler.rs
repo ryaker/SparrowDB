@@ -433,7 +433,9 @@ fn sparrow_to_bolt(val: &Value) -> BoltValue {
 
 fn hello_success_meta() -> HashMap<String, BoltValue> {
     let mut meta = HashMap::new();
-    meta.insert("server".into(), BoltValue::String("SparrowDB/0.1".into()));
+    // Spoof Neo4j identity: gdotv and other Bolt clients validate the server
+    // string against "Neo4j/" prefix and reject unknown vendors.
+    meta.insert("server".into(), BoltValue::String("Neo4j/5.20.0".into()));
     meta.insert(
         "connection_id".into(),
         BoltValue::String("sparrowdb-bolt-0".into()),
