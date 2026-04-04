@@ -8,6 +8,7 @@ use sparrowdb_common::{EdgeId, NodeId};
 use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::RelTableId;
 use sparrowdb_storage::node_store::Value;
+use sparrowdb_storage::vector_index::VectorIndex;
 use sparrowdb_storage::wal::writer::WalWriter;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -16,6 +17,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 /// Per-rel-table edge property cache (SPA-261).
 pub(crate) type EdgePropsCache = Arc<RwLock<HashMap<u32, HashMap<(u64, u64), Vec<(u32, u64)>>>>>;
+
+/// HNSW vector index registry: `(label, property) → index handle` (issue #394).
+pub(crate) type VectorIndexMap = HashMap<(String, String), Arc<RwLock<VectorIndex>>>;
 
 // ── Version chain ─────────────────────────────────────────────────────────────
 
@@ -290,6 +294,11 @@ pub(crate) struct DbInner {
     ///
     /// GC is triggered every [`GC_COMMIT_INTERVAL`] commits.
     pub commits_since_gc: AtomicU64,
+    /// HNSW vector indexes, keyed by `(label, property)` (issue #394).
+    ///
+    /// Each index is wrapped in `Arc<RwLock<VectorIndex>>` for SWMR access
+    /// without holding the outer write-lock.
+    pub vector_indexes: RwLock<VectorIndexMap>,
 }
 
 /// Run GC on the version store every this many commits.

@@ -919,6 +919,16 @@ impl Engine {
                 label,
                 property,
             } => self.execute_create_fulltext_index(name.as_deref(), &label, &property),
+            // Vector DDL is intercepted at the GraphDb layer before the engine
+            // is ever instantiated; these arms are unreachable in normal operation
+            // but must be present for exhaustiveness.
+            Statement::CreateVectorIndex { .. } | Statement::DropIndex { .. } => {
+                Err(sparrowdb_common::Error::InvalidArgument(
+                    "CREATE VECTOR INDEX / DROP INDEX must be executed via GraphDb::execute, \
+                     not the read engine"
+                        .into(),
+                ))
+            }
         }
     }
 
@@ -1377,6 +1387,9 @@ fn value_to_store_value(val: Value) -> StoreValue {
         Value::EdgeRef(id) => StoreValue::Int64(id.0 as i64),
         Value::List(_) => StoreValue::Int64(0),
         Value::Map(_) => StoreValue::Int64(0),
+        // Vector values are not stored via the node property store; they are
+        // indexed separately in the HNSW vector index.  Return a sentinel.
+        Value::Vector(_) => StoreValue::Int64(0),
     }
 }
 

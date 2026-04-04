@@ -253,6 +253,9 @@ fn execution_value_to_json(val: &sparrowdb_execution::types::Value) -> serde_jso
                 .collect();
             serde_json::Value::Object(obj)
         }
+        Value::Vector(floats) => {
+            serde_json::Value::Array(floats.iter().map(|f| serde_json::json!(f)).collect())
+        }
     }
 }
 

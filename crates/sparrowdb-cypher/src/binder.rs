@@ -75,7 +75,9 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
         Statement::Pipeline(_) => {}
         Statement::CreateIndex { .. }
         | Statement::CreateConstraint { .. }
-        | Statement::CreateFulltextIndex { .. } => {}
+        | Statement::CreateFulltextIndex { .. }
+        | Statement::CreateVectorIndex { .. }
+        | Statement::DropIndex { .. } => {}
         // CALL { } subquery: label binding is deferred to the subquery's own
         // execution path, which recurses through bind/execute internally.
         Statement::CallSubquery { .. } => {}

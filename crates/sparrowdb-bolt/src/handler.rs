@@ -428,6 +428,10 @@ fn sparrow_to_bolt(val: &Value) -> BoltValue {
             }
             BoltValue::Map(map)
         }
+        // Serialize vector as a Bolt list of floats so clients can receive it.
+        Value::Vector(floats) => {
+            BoltValue::List(floats.iter().map(|f| BoltValue::Float(*f as f64)).collect())
+        }
     }
 }
 

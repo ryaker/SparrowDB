@@ -61,6 +61,8 @@ pub enum Value {
     /// A property map, returned when a bare node variable is projected (SPA-213).
     /// Keys are `"col_{id}"` strings; values are the decoded property values.
     Map(Vec<(String, Value)>),
+    /// A floating-point vector, used for similarity search (issue #394).
+    Vector(Vec<f32>),
 }
 
 impl Value {
@@ -69,6 +71,28 @@ impl Value {
         match (self, other) {
             (Value::String(s), Value::String(p)) => s.contains(p.as_str()),
             _ => false,
+        }
+    }
+
+    /// Extract a `Vec<f32>` from this value, if possible.
+    ///
+    /// Accepts `Value::Vector` directly, or `Value::List` where every element
+    /// is `Float64` or `Int64` (coerced to f32).  Returns `None` otherwise.
+    pub fn as_vector(&self) -> Option<Vec<f32>> {
+        match self {
+            Value::Vector(v) => Some(v.clone()),
+            Value::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::Float64(f) => out.push(*f as f32),
+                        Value::Int64(i) => out.push(*i as f32),
+                        _ => return None,
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
         }
     }
 }
@@ -104,6 +128,16 @@ impl std::fmt::Display for Value {
                     write!(f, "{k}: {v}")?;
                 }
                 write!(f, "}}")
+            }
+            Value::Vector(v) => {
+                write!(f, "vec[")?;
+                for (i, x) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{x}")?;
+                }
+                write!(f, "]")
             }
         }
     }
