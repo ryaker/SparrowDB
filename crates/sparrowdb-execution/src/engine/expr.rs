@@ -74,15 +74,17 @@ impl Engine {
             }
         };
 
-        match sparrowdb_storage::fts_index::FtsIndex::open(
-            &self.snapshot.db_root,
-            &label,
-            &property,
-        ) {
-            // Use matches_query for a fast O(|terms| * avg_postings) membership
-            // check instead of computing and sorting all BM25 scores.
-            Ok(idx) => Value::Bool(idx.matches_query(node_id, &query)),
-            Err(_) => Value::Bool(false),
+        // Use the per-query FTS cache so the index is loaded from disk at most
+        // once per (label, property) pair regardless of how many rows are scanned.
+        match self.snapshot.fts_index(&label, &property) {
+            Some(cache) => {
+                let key = (label, property);
+                let idx = cache.get(&key).expect("key was just inserted");
+                // Use matches_query for a fast O(|terms|*avg_postings) membership
+                // check instead of computing and sorting all BM25 scores.
+                Value::Bool(idx.matches_query(node_id, &query))
+            }
+            None => Value::Bool(false),
         }
     }
 
@@ -130,16 +132,16 @@ impl Engine {
             Err(_) => return Value::Float64(0.0),
         };
 
-        match sparrowdb_storage::fts_index::FtsIndex::open(
-            &self.snapshot.db_root,
-            &label,
-            &prop_name,
-        ) {
-            Ok(idx) => {
+        // Use the per-query FTS cache so the index is loaded from disk at most
+        // once per (label, property) pair across all rows in the result set.
+        match self.snapshot.fts_index(&label, &prop_name) {
+            Some(cache) => {
+                let key = (label, prop_name);
+                let idx = cache.get(&key).expect("key was just inserted");
                 let score = idx.score(node_id, &query);
                 Value::Float64(score as f64)
             }
-            Err(_) => Value::Float64(0.0),
+            None => Value::Float64(0.0),
         }
     }
 
