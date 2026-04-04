@@ -23,23 +23,34 @@ impl Engine {
     /// MATCH) is not meaningful because there is no outer scope to import from.
     /// In that case the imports are silently ignored and the subquery runs as a
     /// unit subquery.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_call_subquery(
         &self,
         subquery: &Statement,
         _imports: &[String],
         return_clause: Option<&ReturnClause>,
+        return_order_by: &[(sparrowdb_cypher::ast::Expr, SortDir)],
+        return_skip: Option<u64>,
+        return_limit: Option<u64>,
+        return_distinct: bool,
     ) -> Result<QueryResult> {
         // Execute the inner subquery statement.
         let inner = self.execute_read_stmt(subquery)?;
 
         if let Some(ret) = return_clause {
-            // Project the outer RETURN clause over the subquery's result rows.
-            // Build a name → column-index map from the inner result.
-            let col_idx: HashMap<&str, usize> = inner
-                .columns
+            // Build a row-map representation of the inner result so that both
+            // aggregate and scalar expressions can be evaluated uniformly.
+            let inner_row_maps: Vec<HashMap<String, Value>> = inner
+                .rows
                 .iter()
-                .enumerate()
-                .map(|(i, c)| (c.as_str(), i))
+                .map(|row| {
+                    inner
+                        .columns
+                        .iter()
+                        .zip(row.iter())
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                })
                 .collect();
 
             let out_cols: Vec<String> = ret
@@ -52,43 +63,93 @@ impl Engine {
                 })
                 .collect();
 
-            // Only build the env map if at least one RETURN item needs expression eval
-            // (non-Var expressions).  For the common case of bare variable projections
-            // we skip the per-row allocation entirely.
-            let needs_env = ret
-                .items
-                .iter()
-                .any(|item| !matches!(item.expr, sparrowdb_cypher::ast::Expr::Var(_)));
+            // Route aggregate RETURN items through the aggregate engine so that
+            // expressions like `count(*) AS c` collapse correctly (including the
+            // zero-row case which must still produce one output row).
+            let has_agg = has_aggregate_in_return(&ret.items);
+            let mut out_rows: Vec<Vec<Value>> = if has_agg {
+                self.aggregate_rows_graph(&inner_row_maps, &ret.items)
+            } else {
+                // Only build the env map if at least one item needs expression eval
+                // (non-Var expressions).  Bare variable projections skip allocation.
+                let needs_env = ret
+                    .items
+                    .iter()
+                    .any(|item| !matches!(item.expr, sparrowdb_cypher::ast::Expr::Var(_)));
 
-            let out_rows: Vec<Vec<Value>> = inner
-                .rows
-                .iter()
-                .map(|row| {
-                    let env: Option<HashMap<String, Value>> = if needs_env {
-                        Some(
-                            inner
-                                .columns
-                                .iter()
-                                .zip(row.iter())
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect(),
-                        )
-                    } else {
-                        None
-                    };
-                    ret.items
-                        .iter()
-                        .map(|item| match &item.expr {
-                            sparrowdb_cypher::ast::Expr::Var(name) => col_idx
-                                .get(name.as_str())
-                                .and_then(|&i| row.get(i))
-                                .cloned()
-                                .unwrap_or(Value::Null),
-                            other => eval_expr(other, env.as_ref().expect("env present")),
-                        })
-                        .collect()
-                })
-                .collect();
+                // Build a col → index map for fast Var lookups.
+                let col_idx: HashMap<&str, usize> = inner
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.as_str(), i))
+                    .collect();
+
+                inner
+                    .rows
+                    .iter()
+                    .zip(inner_row_maps.iter())
+                    .map(|(row, env_map)| {
+                        let env: Option<&HashMap<String, Value>> =
+                            if needs_env { Some(env_map) } else { None };
+                        ret.items
+                            .iter()
+                            .map(|item| match &item.expr {
+                                sparrowdb_cypher::ast::Expr::Var(name) => col_idx
+                                    .get(name.as_str())
+                                    .and_then(|&i| row.get(i))
+                                    .cloned()
+                                    .unwrap_or(Value::Null),
+                                other => eval_expr(other, env.expect("env built for non-Var expr")),
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+
+            // Apply ORDER BY / SKIP / LIMIT / DISTINCT on the projected rows.
+            // These correspond to modifiers on the outer `RETURN` clause.
+            if !return_order_by.is_empty() {
+                // Build row-maps for ORDER BY evaluation (use the same column names).
+                let row_maps_for_sort: Vec<HashMap<String, Value>> = out_rows
+                    .iter()
+                    .map(|row| {
+                        out_cols
+                            .iter()
+                            .zip(row.iter())
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
+                    .collect();
+                let mut indexed: Vec<(usize, &Vec<Value>)> = out_rows.iter().enumerate().collect();
+                indexed.sort_by(|(ia, _), (ib, _)| {
+                    for (expr, dir) in return_order_by {
+                        let va = eval_expr(expr, &row_maps_for_sort[*ia]);
+                        let vb = eval_expr(expr, &row_maps_for_sort[*ib]);
+                        let cmp = compare_values(&va, &vb);
+                        let cmp = if *dir == SortDir::Desc {
+                            cmp.reverse()
+                        } else {
+                            cmp
+                        };
+                        if cmp != std::cmp::Ordering::Equal {
+                            return cmp;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                out_rows = indexed.into_iter().map(|(_, r)| r.clone()).collect();
+            }
+            if let Some(s) = return_skip {
+                let s = (s as usize).min(out_rows.len());
+                out_rows.drain(0..s);
+            }
+            if let Some(l) = return_limit {
+                out_rows.truncate(l as usize);
+            }
+            if return_distinct {
+                deduplicate_rows(&mut out_rows);
+            }
 
             Ok(QueryResult {
                 columns: out_cols,
@@ -271,7 +332,19 @@ impl Engine {
                 subquery,
                 imports: sub_imports,
                 return_clause,
-            } => self.execute_call_subquery(subquery, sub_imports, return_clause.as_ref()),
+                return_order_by,
+                return_skip,
+                return_limit,
+                return_distinct,
+            } => self.execute_call_subquery(
+                subquery,
+                sub_imports,
+                return_clause.as_ref(),
+                return_order_by,
+                *return_skip,
+                *return_limit,
+                *return_distinct,
+            ),
             other => Err(sparrowdb_common::Error::InvalidArgument(format!(
                 "CALL {{ }}: unsupported or mutating statement kind in subquery: {:?}",
                 std::mem::discriminant(other)

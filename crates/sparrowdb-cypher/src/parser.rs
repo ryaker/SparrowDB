@@ -416,6 +416,17 @@ impl Parser {
                         // MATCH … WHERE … MERGE (a)-[r:TYPE]->(b)
                         self.parse_match_merge_rel_tail(patterns, Some(where_expr))
                     }
+                    Token::Call => {
+                        // MATCH … WHERE … CALL { } … RETURN — pipeline with WHERE guard.
+                        self.advance(); // consume CALL
+                        let call_stage = self.parse_call_subquery_stage()?;
+                        self.parse_pipeline_continuation(
+                            Some(patterns),
+                            Some(where_expr),
+                            None,
+                            vec![call_stage],
+                        )
+                    }
                     _ => {
                         // Fall through to RETURN parsing with the parsed WHERE expr.
                         self.finish_match_return(patterns, Some(where_expr))
@@ -950,8 +961,8 @@ impl Parser {
                     distinct,
                 }))
             }
-            // Continuation clause: MATCH, WITH, or UNWIND → build Pipeline.
-            Token::Match | Token::With | Token::Unwind => {
+            // Continuation clause: MATCH, WITH, UNWIND, or CALL {} → build Pipeline.
+            Token::Match | Token::With | Token::Unwind | Token::Call => {
                 let first_with_stage = PipelineStage::With {
                     clause: with_clause,
                     order_by: with_order_by,
@@ -966,7 +977,7 @@ impl Parser {
                 )
             }
             other => Err(Error::InvalidArgument(format!(
-                "expected RETURN, MATCH, WITH, or UNWIND after WITH clause, got {:?}",
+                "expected RETURN, MATCH, WITH, UNWIND, or CALL after WITH clause, got {:?}",
                 other
             ))),
         }
@@ -2396,24 +2407,69 @@ impl Parser {
         self.expect_tok(&Token::RBrace)?;
 
         // Optional trailing RETURN clause for standalone `CALL { } RETURN ...`.
-        let return_clause = if matches!(self.peek(), Token::Return) {
-            self.advance(); // consume RETURN
-            let _distinct = if matches!(self.peek(), Token::Distinct) {
-                self.advance();
-                true
+        let (return_clause, return_distinct, return_order_by, return_skip, return_limit) =
+            if matches!(self.peek(), Token::Return) {
+                self.advance(); // consume RETURN
+                let distinct = if matches!(self.peek(), Token::Distinct) {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let items = self.parse_return_items()?;
+                // Parse optional ORDER BY / SKIP / LIMIT modifiers.
+                let order_by = if matches!(self.peek(), Token::Order) {
+                    self.advance(); // consume ORDER
+                    self.expect_tok(&Token::By)?;
+                    self.parse_order_by_items()?
+                } else {
+                    vec![]
+                };
+                let skip = if matches!(self.peek(), Token::Skip) {
+                    self.advance();
+                    match self.advance().clone() {
+                        Token::Integer(n) if n >= 0 => Some(n as u64),
+                        _ => {
+                            return Err(Error::InvalidArgument(
+                                "SKIP expects a non-negative integer".into(),
+                            ))
+                        }
+                    }
+                } else {
+                    None
+                };
+                let limit = if matches!(self.peek(), Token::Limit) {
+                    self.advance();
+                    match self.advance().clone() {
+                        Token::Integer(n) if n > 0 => Some(n as u64),
+                        _ => {
+                            return Err(Error::InvalidArgument(
+                                "LIMIT expects a positive integer".into(),
+                            ))
+                        }
+                    }
+                } else {
+                    None
+                };
+                (
+                    Some(ReturnClause { items }),
+                    distinct,
+                    order_by,
+                    skip,
+                    limit,
+                )
             } else {
-                false
+                (None, false, vec![], None, None)
             };
-            let items = self.parse_return_items()?;
-            Some(ReturnClause { items })
-        } else {
-            None
-        };
 
         Ok(Statement::CallSubquery {
             subquery: Box::new(subquery),
             imports,
             return_clause,
+            return_order_by,
+            return_skip,
+            return_limit,
+            return_distinct,
         })
     }
 

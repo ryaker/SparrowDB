@@ -531,5 +531,13 @@ pub enum Statement {
         imports: Vec<String>,
         /// Optional trailing `RETURN` clause projecting subquery columns.
         return_clause: Option<ReturnClause>,
+        /// Optional `ORDER BY` on the outer RETURN (may be empty).
+        return_order_by: Vec<(Expr, SortDir)>,
+        /// Optional `SKIP` on the outer RETURN.
+        return_skip: Option<u64>,
+        /// Optional `LIMIT` on the outer RETURN.
+        return_limit: Option<u64>,
+        /// Whether the outer RETURN is `RETURN DISTINCT …`.
+        return_distinct: bool,
     },
 }
