@@ -874,6 +874,11 @@ impl Engine {
                 return_limit,
                 return_distinct,
             ),
+            Statement::CreateFulltextIndex {
+                name,
+                label,
+                property,
+            } => self.execute_create_fulltext_index(name.as_deref(), &label, &property),
         }
     }
 

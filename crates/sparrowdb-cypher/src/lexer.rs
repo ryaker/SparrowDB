@@ -58,6 +58,8 @@ pub enum Token {
     On,
     Constraint,
     Assert,
+    Fulltext,
+    For,
 
     // Punctuation
     LParen,    // (
@@ -387,6 +389,8 @@ fn keyword_or_ident(word: String) -> Token {
         "ON" => Token::On,
         "CONSTRAINT" => Token::Constraint,
         "ASSERT" => Token::Assert,
+        "FULLTEXT" => Token::Fulltext,
+        "FOR" => Token::For,
         _ => Token::Ident(word),
     }
 }

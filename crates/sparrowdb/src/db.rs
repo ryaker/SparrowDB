@@ -874,6 +874,29 @@ impl GraphDb {
 
             let node_id = tx.create_node_named(label_id, &named_props)?;
 
+            // FTS auto-indexing: if a fulltext index is registered for this
+            // (label, property) pair, insert the string value into the BM25 index.
+            {
+                use sparrowdb_storage::fts_index::{FtsIndex, FtsRegistry};
+                use sparrowdb_storage::node_store::Value as StorageValue;
+                let registry = FtsRegistry::load(&self.inner.path);
+                for (prop_name, val) in &named_props {
+                    if registry.contains(&label, prop_name) {
+                        if let StorageValue::Bytes(ref bytes) = val {
+                            // Decode the string from the stored bytes.
+                            if let Ok(text) = std::str::from_utf8(bytes) {
+                                if let Ok(mut idx) =
+                                    FtsIndex::open(&self.inner.path, &label, prop_name)
+                                {
+                                    idx.insert(node_id.0, text);
+                                    let _ = idx.save();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // SPA-289: record secondary labels (labels[1..]) in the catalog
             // side table so that MATCH on secondary labels and labels(n)
             // return the full label set.
