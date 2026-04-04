@@ -79,10 +79,9 @@ impl Engine {
             &label,
             &property,
         ) {
-            Ok(idx) => {
-                let results = idx.search(&query, usize::MAX);
-                Value::Bool(results.iter().any(|(id, _)| *id == node_id))
-            }
+            // Use matches_query for a fast O(|terms| * avg_postings) membership
+            // check instead of computing and sorting all BM25 scores.
+            Ok(idx) => Value::Bool(idx.matches_query(node_id, &query)),
             Err(_) => Value::Bool(false),
         }
     }

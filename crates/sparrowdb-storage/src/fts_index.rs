@@ -230,6 +230,24 @@ impl FtsIndex {
         total as f32
     }
 
+    /// Returns `true` if `node_id` appears in the posting lists for **any**
+    /// token in `query`.  This is a boolean membership test
+    /// (O(|query terms| * avg_postings)) and does not compute BM25 scores or
+    /// sort results.  Used by `full_text_search()` to avoid calling `search()`.
+    pub fn matches_query(&self, node_id: u64, query: &str) -> bool {
+        let terms = tokenize(query);
+        if terms.is_empty() || self.data.doc_count == 0 {
+            return false;
+        }
+        terms.iter().any(|term| {
+            self.data
+                .postings
+                .get(term.as_str())
+                .map(|pl| pl.iter().any(|(id, _)| *id == node_id))
+                .unwrap_or(false)
+        })
+    }
+
     /// Returns `true` if `node_id` contains **all** of the given `terms` in
     /// its posting lists.  Used to accelerate CONTAINS pre-filtering.
     pub fn contains_all(&self, node_id: u64, terms: &[&str]) -> bool {
@@ -369,9 +387,12 @@ impl FtsRegistry {
 
 /// Tokenise `text` into lowercase alphanumeric tokens, discarding tokens
 /// shorter than 2 characters.
+///
+/// Uses `char::is_alphanumeric` (Unicode-aware) so accented and non-Latin
+/// characters are treated as word constituents rather than delimiters.
 pub fn tokenize(text: &str) -> Vec<String> {
     text.to_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
+        .split(|c: char| !c.is_alphanumeric())
         .filter(|s| s.len() >= 2)
         .map(String::from)
         .collect()
@@ -380,8 +401,18 @@ pub fn tokenize(text: &str) -> Vec<String> {
 // ── Helpers ─────────────────────────────────��─────────────────────────────────
 
 fn index_path(db_root: &Path, label: &str, property: &str) -> PathBuf {
-    // Use double-underscore separator between label and property.
-    db_root.join("fts").join(format!("{label}__{property}.bin"))
+    // Encode each component so that labels/properties containing `__`
+    // cannot produce colliding filenames.  Any `_` in the component is
+    // encoded as `_0` and the two-underscore separator is kept as `__`.
+    //
+    // Examples:
+    //   ("Foo", "bar")     →  Foo__bar.bin
+    //   ("Foo__Bar", "baz") → Foo_0_0Bar__baz.bin   (no collision with above)
+    let enc_label = label.replace('_', "_0");
+    let enc_prop = property.replace('_', "_0");
+    db_root
+        .join("fts")
+        .join(format!("{enc_label}__{enc_prop}.bin"))
 }
 
 fn validate_component(s: &str, kind: &str) -> Result<()> {
@@ -530,37 +561,114 @@ fn escape_json(s: &str) -> String {
 }
 
 fn parse_registry_json(s: &str) -> Vec<(String, String)> {
-    // Very simple parser for `[["A","b"],["C","d"]]` without external deps.
+    // Minimal recursive-descent parser for `[["A","b"],["C","d"]]`.
+    // Handles whitespace between tokens and escaped characters in strings.
+    // Does NOT split on `],[` (which breaks when spaces are present or when
+    // label/property names contain `],[`).
+    let bytes = s.trim().as_bytes();
+    let mut pos = 0;
+
+    /// Skip ASCII whitespace.
+    fn skip_ws(b: &[u8], p: &mut usize) {
+        while *p < b.len() && b[*p].is_ascii_whitespace() {
+            *p += 1;
+        }
+    }
+
+    /// Expect a specific byte, advancing pos past it.
+    fn expect_byte(b: &[u8], p: &mut usize, ch: u8) -> bool {
+        skip_ws(b, p);
+        if *p < b.len() && b[*p] == ch {
+            *p += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Parse a JSON string (including surrounding quotes), returning the
+    /// unescaped contents.  Returns `None` on parse error.
+    fn parse_string(b: &[u8], p: &mut usize) -> Option<String> {
+        skip_ws(b, p);
+        if *p >= b.len() || b[*p] != b'"' {
+            return None;
+        }
+        *p += 1; // consume opening quote
+        let mut out = String::new();
+        while *p < b.len() {
+            match b[*p] {
+                b'"' => {
+                    *p += 1; // consume closing quote
+                    return Some(out);
+                }
+                b'\\' => {
+                    *p += 1;
+                    if *p >= b.len() {
+                        return None;
+                    }
+                    match b[*p] {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        other => {
+                            out.push('\\');
+                            out.push(other as char);
+                        }
+                    }
+                    *p += 1;
+                }
+                c => {
+                    out.push(c as char);
+                    *p += 1;
+                }
+            }
+        }
+        None // unterminated string
+    }
+
     let mut out = Vec::new();
-    let s = s.trim();
-    let s = s
-        .strip_prefix('[')
-        .unwrap_or(s)
-        .strip_suffix(']')
-        .unwrap_or(s)
-        .trim();
-    if s.is_empty() {
+    if !expect_byte(bytes, &mut pos, b'[') {
+        return out; // not an array
+    }
+    skip_ws(bytes, &mut pos);
+    // Empty outer array.
+    if pos < bytes.len() && bytes[pos] == b']' {
         return out;
     }
-    // Split on `],[` to get individual pair strings.
-    for chunk in s.split("],[") {
-        let chunk = chunk.trim().trim_start_matches('[').trim_end_matches(']');
-        let parts: Vec<&str> = chunk.splitn(2, ',').collect();
-        if parts.len() == 2 {
-            let label = unquote_json(parts[0].trim());
-            let prop = unquote_json(parts[1].trim());
-            if !label.is_empty() && !prop.is_empty() {
-                out.push((label, prop));
-            }
+    loop {
+        // Expect inner array `["label","property"]`.
+        if !expect_byte(bytes, &mut pos, b'[') {
+            break;
+        }
+        let label = match parse_string(bytes, &mut pos) {
+            Some(s) if !s.is_empty() => s,
+            _ => break,
+        };
+        if !expect_byte(bytes, &mut pos, b',') {
+            break;
+        }
+        let prop = match parse_string(bytes, &mut pos) {
+            Some(s) if !s.is_empty() => s,
+            _ => break,
+        };
+        if !expect_byte(bytes, &mut pos, b']') {
+            break;
+        }
+        out.push((label, prop));
+        skip_ws(bytes, &mut pos);
+        // Either a comma (more entries) or `]` (end of outer array).
+        if pos >= bytes.len() || bytes[pos] == b']' {
+            break;
+        }
+        if bytes[pos] == b',' {
+            pos += 1; // consume comma between pairs
+        } else {
+            break; // unexpected byte
         }
     }
     out
-}
-
-fn unquote_json(s: &str) -> String {
-    let s = s.trim().strip_prefix('"').unwrap_or(s);
-    let s = s.strip_suffix('"').unwrap_or(s);
-    s.replace("\\\"", "\"").replace("\\\\", "\\")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -699,5 +807,65 @@ mod tests {
         assert!(loaded.contains("Memory", "content"));
         assert!(loaded.contains("Doc", "body"));
         assert!(!loaded.contains("Other", "prop"));
+    }
+
+    #[test]
+    fn registry_roundtrip_with_special_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = FtsRegistry::default();
+        // Labels/properties containing underscores should not collide.
+        reg.register(dir.path(), "A__B", "c").unwrap();
+        reg.register(dir.path(), "A", "B__c").unwrap();
+
+        let loaded = FtsRegistry::load(dir.path());
+        assert!(loaded.contains("A__B", "c"));
+        assert!(loaded.contains("A", "B__c"));
+    }
+
+    #[test]
+    fn registry_json_handles_whitespace() {
+        // The parser must tolerate spaces between tokens.
+        let json = r#"[ [ "Label" , "prop" ] , [ "Doc" , "body" ] ]"#;
+        let entries = parse_registry_json(json);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("Label".into(), "prop".into()));
+        assert_eq!(entries[1], ("Doc".into(), "body".into()));
+    }
+
+    #[test]
+    fn registry_json_handles_escaped_strings() {
+        let json = r#"[["Label\"X","prop\\y"]]"#;
+        let entries = parse_registry_json(json);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], ("Label\"X".into(), "prop\\y".into()));
+    }
+
+    #[test]
+    fn matches_query_is_union_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = FtsIndex::open(dir.path(), "X", "y").unwrap();
+        idx.insert(1, "alpha beta gamma");
+        idx.insert(2, "delta epsilon");
+
+        // Node 1 matches "alpha" (any term in query matches).
+        assert!(idx.matches_query(1, "alpha zeta"));
+        // Node 1 does NOT match "delta" (not in node 1's posting lists).
+        assert!(!idx.matches_query(1, "delta"));
+        // Node 2 matches "epsilon".
+        assert!(idx.matches_query(2, "epsilon"));
+        // Unknown node never matches.
+        assert!(!idx.matches_query(99, "alpha"));
+    }
+
+    #[test]
+    fn tokenize_unicode() {
+        // Accented characters should be kept as part of tokens.
+        let tokens = tokenize("Héllo wörld");
+        assert!(
+            tokens.contains(&"héllo".to_owned()),
+            "accented token 'héllo' should survive tokenization: {:?}",
+            tokens
+        );
+        assert!(tokens.contains(&"wörld".to_owned()));
     }
 }
