@@ -74,14 +74,6 @@ impl Engine {
             }
         };
 
-        if !sparrowdb_storage::fts_index::FtsIndex::exists(
-            &self.snapshot.db_root,
-            &label,
-            &property,
-        ) {
-            return Value::Bool(false);
-        }
-
         match sparrowdb_storage::fts_index::FtsIndex::open(
             &self.snapshot.db_root,
             &label,
@@ -138,14 +130,6 @@ impl Engine {
             },
             Err(_) => return Value::Float64(0.0),
         };
-
-        if !sparrowdb_storage::fts_index::FtsIndex::exists(
-            &self.snapshot.db_root,
-            &label,
-            &prop_name,
-        ) {
-            return Value::Float64(0.0);
-        }
 
         match sparrowdb_storage::fts_index::FtsIndex::open(
             &self.snapshot.db_root,

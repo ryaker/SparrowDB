@@ -923,7 +923,12 @@ impl Engine {
                                 FtsIndex::open(&self.snapshot.db_root, &label, &entry.key)
                             {
                                 idx.insert(node_id.0, &text);
-                                let _ = idx.save();
+                                if let Err(e) = idx.save() {
+                                    tracing::warn!(
+                                        "FTS index save failed for ({label}, {}): {e}",
+                                        entry.key
+                                    );
+                                }
                             }
                         }
                     }

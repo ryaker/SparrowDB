@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tracing::info_span;
+use tracing::{info_span, warn};
 
 // ── DbStats ───────────────────────────────────────────────────────────────────
 
@@ -889,7 +889,11 @@ impl GraphDb {
                                     FtsIndex::open(&self.inner.path, &label, prop_name)
                                 {
                                     idx.insert(node_id.0, text);
-                                    let _ = idx.save();
+                                    if let Err(e) = idx.save() {
+                                        warn!(
+                                            "FTS index save failed for ({label}, {prop_name}): {e}"
+                                        );
+                                    }
                                 }
                             }
                         }

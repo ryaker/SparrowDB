@@ -196,12 +196,38 @@ impl FtsIndex {
 
     /// Compute the BM25 score for a single document identified by `node_id`
     /// against `query`.  Returns `0.0` if the node is not in the index.
+    ///
+    /// This runs in O(|query terms| * avg_postings_per_term) time and does
+    /// not sort all matching documents — unlike calling `search()` and
+    /// filtering, which would be O(M log M) for M matching nodes.
     pub fn score(&self, node_id: u64, query: &str) -> f32 {
-        self.search(query, usize::MAX)
-            .into_iter()
-            .find(|(id, _)| *id == node_id)
-            .map(|(_, s)| s)
-            .unwrap_or(0.0)
+        let terms = tokenize(query);
+        if terms.is_empty() || self.data.doc_count == 0 {
+            return 0.0;
+        }
+        let Some(&doc_len) = self.data.doc_lengths.get(&node_id) else {
+            return 0.0;
+        };
+
+        let avg_dl = self.data.total_tokens as f64 / self.data.doc_count as f64;
+        let n = self.data.doc_count as f64;
+        let k1 = self.k1 as f64;
+        let b = self.b as f64;
+        let dl = doc_len as f64;
+
+        let mut total: f64 = 0.0;
+        for term in &terms {
+            let Some(postings) = self.data.postings.get(term.as_str()) else {
+                continue;
+            };
+            let df = postings.len() as f64;
+            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+            if let Some(&(_, tf)) = postings.iter().find(|(id, _)| *id == node_id) {
+                let tf_f = tf as f64;
+                total += idf * (tf_f * (k1 + 1.0)) / (tf_f + k1 * (1.0 - b + b * dl / avg_dl));
+            }
+        }
+        total as f32
     }
 
     /// Returns `true` if `node_id` contains **all** of the given `terms` in
