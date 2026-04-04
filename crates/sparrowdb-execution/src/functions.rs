@@ -794,70 +794,49 @@ fn parse_iso_duration(s: &str) -> Option<i64> {
 
 // ── Vector helper functions (issue #394) ─────────────────────────────────────
 
-/// `vector_similarity(vec_a, vec_b)` → Float64 (cosine similarity).
-fn fn_vector_similarity(args: Vec<Value>) -> Result<Value> {
-    expect_arity("vector_similarity", &args, 2)?;
+/// Extract and validate two equal-length vector arguments from `args`.
+///
+/// Returns `Err(InvalidArgument)` if either argument is not a vector/float-list,
+/// or if the two vectors have different dimensions.
+fn get_two_vectors(fn_name: &str, args: Vec<Value>) -> Result<(Vec<f32>, Vec<f32>)> {
+    expect_arity(fn_name, &args, 2)?;
     let a = args[0].as_vector().ok_or_else(|| {
-        Error::InvalidArgument(
-            "vector_similarity: first argument must be a vector or float list".into(),
-        )
+        Error::InvalidArgument(format!(
+            "{fn_name}: first argument must be a vector or float list"
+        ))
     })?;
     let b = args[1].as_vector().ok_or_else(|| {
-        Error::InvalidArgument(
-            "vector_similarity: second argument must be a vector or float list".into(),
-        )
+        Error::InvalidArgument(format!(
+            "{fn_name}: second argument must be a vector or float list"
+        ))
     })?;
     if a.len() != b.len() {
         return Err(Error::InvalidArgument(format!(
-            "vector_similarity: dimension mismatch ({} vs {})",
+            "{fn_name}: dimension mismatch ({} vs {})",
             a.len(),
             b.len()
         )));
     }
+    Ok((a, b))
+}
+
+/// `vector_similarity(vec_a, vec_b)` → Float64 (cosine similarity).
+fn fn_vector_similarity(args: Vec<Value>) -> Result<Value> {
+    let (a, b) = get_two_vectors("vector_similarity", args)?;
     let sim = sparrowdb_storage::vector_index::cosine_similarity(&a, &b);
     Ok(Value::Float64(sim as f64))
 }
 
 /// `vector_distance(vec_a, vec_b)` → Float64 (Euclidean / L2 distance).
 fn fn_vector_distance(args: Vec<Value>) -> Result<Value> {
-    expect_arity("vector_distance", &args, 2)?;
-    let a = args[0].as_vector().ok_or_else(|| {
-        Error::InvalidArgument(
-            "vector_distance: first argument must be a vector or float list".into(),
-        )
-    })?;
-    let b = args[1].as_vector().ok_or_else(|| {
-        Error::InvalidArgument(
-            "vector_distance: second argument must be a vector or float list".into(),
-        )
-    })?;
-    if a.len() != b.len() {
-        return Err(Error::InvalidArgument(format!(
-            "vector_distance: dimension mismatch ({} vs {})",
-            a.len(),
-            b.len()
-        )));
-    }
+    let (a, b) = get_two_vectors("vector_distance", args)?;
     let dist = sparrowdb_storage::vector_index::euclidean_distance(&a, &b);
     Ok(Value::Float64(dist as f64))
 }
 
 /// `vector_dot(vec_a, vec_b)` → Float64 (dot product).
 fn fn_vector_dot(args: Vec<Value>) -> Result<Value> {
-    expect_arity("vector_dot", &args, 2)?;
-    let a = args[0].as_vector().ok_or_else(|| {
-        Error::InvalidArgument("vector_dot: first argument must be a vector or float list".into())
-    })?;
-    let b = args[1].as_vector().ok_or_else(|| {
-        Error::InvalidArgument("vector_dot: second argument must be a vector or float list".into())
-    })?;
-    if a.len() != b.len() {
-        return Err(Error::InvalidArgument(format!(
-            "vector_dot: dimension mismatch ({} vs {})",
-            a.len(),
-            b.len()
-        )));
-    }
+    let (a, b) = get_two_vectors("vector_dot", args)?;
     let dp = sparrowdb_storage::vector_index::dot_product(&a, &b);
     Ok(Value::Float64(dp as f64))
 }

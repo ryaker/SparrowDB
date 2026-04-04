@@ -2034,7 +2034,11 @@ impl GraphDb {
             "cosine" | "cos" => Metric::Cosine,
             "dot" | "dot_product" => Metric::DotProduct,
             "euclidean" | "l2" => Metric::Euclidean,
-            _ => Metric::Cosine,
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "unsupported similarity metric: '{other}'; expected 'cosine', 'dot', or 'euclidean'"
+                )))
+            }
         };
 
         let key = (label.to_string(), prop.to_string());

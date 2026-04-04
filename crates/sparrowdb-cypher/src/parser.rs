@@ -1350,21 +1350,15 @@ impl Parser {
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_tok(&Token::Create)?;
         // CREATE VECTOR INDEX …
-        if let Token::Ident(ref s) = self.peek().clone() {
-            if s.eq_ignore_ascii_case("VECTOR") {
-                self.advance(); // consume VECTOR
-                                // consume INDEX (required)
-                match self.peek().clone() {
-                    Token::Index => {
-                        self.advance();
-                    }
-                    Token::Ident(ref s2) if s2.eq_ignore_ascii_case("INDEX") => {
-                        self.advance();
-                    }
-                    _ => {}
-                }
-                return self.parse_create_vector_index();
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("VECTOR")) {
+            self.advance(); // consume VECTOR
+                            // consume INDEX (required)
+            if matches!(self.peek(), Token::Index)
+                || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("INDEX"))
+            {
+                self.advance();
             }
+            return self.parse_create_vector_index();
         }
         if matches!(self.peek(), Token::Index) {
             self.advance();
@@ -1545,7 +1539,11 @@ impl Parser {
                         if matches!(self.peek(), Token::RBrace | Token::Eof) {
                             break;
                         }
-                        let key = self.expect_ident().unwrap_or_default().to_lowercase();
+                        let key = match self.expect_ident() {
+                            Ok(k) => k.to_lowercase(),
+                            Err(_) => break,
+                        };
+                        // consume `:`
                         if matches!(self.peek(), Token::Colon) {
                             self.advance();
                         }

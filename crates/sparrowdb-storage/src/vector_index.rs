@@ -374,7 +374,9 @@ impl VectorIndex {
         //          finding the single closest node at each upper layer.
         let mut ep_current = ep;
         if self.max_layer > new_level {
-            ep_current = self.greedy_search_layer(vector, ep, self.max_layer, new_level + 1);
+            for l in ((new_level + 1)..=self.max_layer).rev() {
+                ep_current = self.greedy_search_layer(vector, ep_current, l, l - 1);
+            }
         }
 
         // Phase 2: for each layer from min(new_level, max_layer) down to 0,
