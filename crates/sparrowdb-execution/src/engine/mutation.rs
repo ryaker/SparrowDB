@@ -806,6 +806,14 @@ impl Engine {
     ///    same FNV-1a hash used by `WriteTx::merge_node`.
     /// 4. Write the node to the node store.
     pub(crate) fn execute_create(&mut self, create: &CreateStatement) -> Result<QueryResult> {
+        // Load the FTS registry once for the entire CREATE statement rather than
+        // once per node.  The registry is a small JSON file; loading it inside
+        // the loop would cause redundant disk reads in bulk CREATE statements.
+        let fts_registry = {
+            use sparrowdb_storage::fts_index::FtsRegistry;
+            FtsRegistry::load(&self.snapshot.db_root)
+        };
+
         for node in &create.nodes {
             // Resolve the primary label, creating it if absent.
             let label = node.labels.first().cloned().unwrap_or_default();
@@ -913,10 +921,9 @@ impl Engine {
             // (label, property) pair of this node, insert the string value
             // into the BM25 index so it is searchable immediately.
             {
-                use sparrowdb_storage::fts_index::{FtsIndex, FtsRegistry};
-                let registry = FtsRegistry::load(&self.snapshot.db_root);
+                use sparrowdb_storage::fts_index::FtsIndex;
                 for entry in &node.props {
-                    if registry.contains(&label, &entry.key) {
+                    if fts_registry.contains(&label, &entry.key) {
                         let val = eval_expr(&entry.value, &HashMap::new());
                         if let Value::String(text) = val {
                             if let Ok(mut idx) =

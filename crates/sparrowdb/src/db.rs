@@ -778,6 +778,14 @@ impl GraphDb {
 
         let mut tx = self.begin_write()?;
 
+        // Load the FTS registry once for the entire CREATE statement.  Loading
+        // inside the per-node loop would cause redundant disk reads for every
+        // node in a bulk `CREATE` statement.
+        let fts_registry = {
+            use sparrowdb_storage::fts_index::FtsRegistry;
+            FtsRegistry::load(&self.inner.path)
+        };
+
         // Map variable name → NodeId for all newly created nodes.
         let mut var_to_node: HashMap<String, NodeId> = HashMap::new();
         // Map variable name → named props written (for RETURN projection).
@@ -877,11 +885,10 @@ impl GraphDb {
             // FTS auto-indexing: if a fulltext index is registered for this
             // (label, property) pair, insert the string value into the BM25 index.
             {
-                use sparrowdb_storage::fts_index::{FtsIndex, FtsRegistry};
+                use sparrowdb_storage::fts_index::FtsIndex;
                 use sparrowdb_storage::node_store::Value as StorageValue;
-                let registry = FtsRegistry::load(&self.inner.path);
                 for (prop_name, val) in &named_props {
-                    if registry.contains(&label, prop_name) {
+                    if fts_registry.contains(&label, prop_name) {
                         if let StorageValue::Bytes(ref bytes) = val {
                             // Decode the string from the stored bytes.
                             if let Ok(text) = std::str::from_utf8(bytes) {
