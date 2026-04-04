@@ -84,11 +84,17 @@ impl Value {
             Value::List(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
-                    match item {
-                        Value::Float64(f) => out.push(*f as f32),
-                        Value::Int64(i) => out.push(*i as f32),
+                    let f = match item {
+                        Value::Float64(f) => *f as f32,
+                        Value::Int64(i) => *i as f32,
                         _ => return None,
+                    };
+                    // Reject NaN and infinite values — they make distance
+                    // calculations meaningless and corrupt HNSW graph ordering.
+                    if !f.is_finite() {
+                        return None;
                     }
+                    out.push(f);
                 }
                 Some(out)
             }

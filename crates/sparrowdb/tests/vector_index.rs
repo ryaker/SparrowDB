@@ -242,7 +242,7 @@ fn hnsw_bulk_insert_and_top_k() {
     };
 
     let results = arc.read().expect("read").search(&query, 10, 50);
-    assert!(results.len() >= 1, "must return at least 1 result");
+    assert!(!results.is_empty(), "must return at least 1 result");
     // The closest node should be node 7 itself.
     assert_eq!(
         results[0].0, 7,

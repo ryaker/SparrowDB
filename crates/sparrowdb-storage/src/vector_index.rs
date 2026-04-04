@@ -75,10 +75,15 @@ fn to_internal_distance(score: f32, metric: Metric) -> f32 {
 }
 
 /// Convert internal distance back to a user-facing score.
+///
+/// For Euclidean the internal distance is the raw L2 value (lower = closer).
+/// We negate it here so that the universal "higher score = better match"
+/// invariant holds for all three metrics, matching the contract documented on
+/// `search()` and `brute_force_search()`.
 fn to_score(internal_dist: f32, metric: Metric) -> f32 {
     match metric {
         Metric::Cosine | Metric::DotProduct => -internal_dist,
-        Metric::Euclidean => internal_dist,
+        Metric::Euclidean => -internal_dist,
     }
 }
 
@@ -203,10 +208,15 @@ impl VectorIndex {
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     /// Draw a random layer for a new node using the HNSW level generation formula.
+    ///
+    /// Implements the canonical formula from Malkov & Yashunin (2018):
+    /// `level = floor(-ln(uniform) * mL)` where `mL = 1 / ln(m)`.
+    /// This produces a geometric distribution with P(level >= k) = (1/m)^k,
+    /// so upper layers are exponentially sparser as the paper requires.
     fn random_level(&self) -> usize {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        // Use a simple deterministic-ish hash of the current node count as a
+        // Use a deterministic-ish hash of the current node count as a
         // pseudo-random source (no rand dependency required).
         let mut hasher = DefaultHasher::new();
         (self.nodes.len() as u64)
@@ -214,10 +224,11 @@ impl VectorIndex {
             .wrapping_add(1442695040888963407)
             .hash(&mut hasher);
         let h = hasher.finish();
-        // Use the bit-reversal trick: count trailing zeros of a random u64.
-        // P(level >= k) = (1/m)^k — approximated by counting leading zeros.
-        let r = h | 1; // ensure non-zero
-        let level = r.trailing_zeros() as usize;
+        // Map the 64-bit hash to a uniform float in (0, 1].
+        // Avoid ln(0) by guaranteeing the value is at least 2^-64.
+        let uniform = (h as f64) / (u64::MAX as f64) + f64::EPSILON;
+        // HNSW paper formula: floor(-ln(u) * mL).
+        let level = (-uniform.ln() * self.ml).floor() as usize;
         // Cap at a practical maximum to avoid degenerate graphs.
         level.min(16)
     }
@@ -341,9 +352,20 @@ impl VectorIndex {
     /// - `node_id` — application-level identifier (e.g. `NodeId.0`).
     /// - `vector`  — the embedding; must have `self.dimensions` elements.
     ///
+    /// # Panics
+    /// Panics if `vector.len() != self.dimensions` to prevent corrupted
+    /// distance calculations across the graph.
+    ///
     /// If a vector with the same `node_id` already exists it is silently ignored
     /// (upsert semantics can be added later).
     pub fn insert(&mut self, node_id: u64, vector: &[f32]) {
+        assert_eq!(
+            vector.len(),
+            self.dimensions,
+            "insert: vector dimension {} does not match index dimension {}",
+            vector.len(),
+            self.dimensions
+        );
         if self.id_to_slot.contains_key(&node_id) {
             // Already present — skip (tombstone / update support is a future enhancement).
             return;
@@ -441,6 +463,13 @@ impl VectorIndex {
     /// For Euclidean, the returned score is the *negated* L2 distance so that
     /// "higher score = better match" is universally true for callers.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
+        assert_eq!(
+            query.len(),
+            self.dimensions,
+            "search: query dimension {} does not match index dimension {}",
+            query.len(),
+            self.dimensions
+        );
         if self.nodes.is_empty() {
             return Vec::new();
         }

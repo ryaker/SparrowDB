@@ -515,12 +515,19 @@ impl GraphDb {
                 return Ok(QueryResult::empty(vec![]));
             }
             Statement::DropIndex { name } => {
-                // DROP INDEX <name> — parse label/prop from the index name
-                // convention `label_prop` (used by CREATE VECTOR INDEX).
+                // DROP INDEX <name> — try to resolve as a vector index first.
+                // The naming convention for auto-named vector indexes is
+                // `<label>_<prop>` (last underscore splits label from prop).
+                // We only call drop_vector_index if the resolved (label, prop)
+                // pair is actually registered as a vector index; otherwise the
+                // statement is silently ignored (non-vector property indexes are
+                // not yet tracked by name in this implementation).
                 if let Some(pos) = name.rfind('_') {
                     let label = &name[..pos];
                     let prop = &name[pos + 1..];
-                    self.drop_vector_index(label, prop)?;
+                    if self.get_vector_index(label, prop).is_some() {
+                        self.drop_vector_index(label, prop)?;
+                    }
                 }
                 return Ok(QueryResult::empty(vec![]));
             }
@@ -602,7 +609,9 @@ impl GraphDb {
                 if let Some(pos) = name.rfind('_') {
                     let label = &name[..pos];
                     let prop = &name[pos + 1..];
-                    self.drop_vector_index(label, prop)?;
+                    if self.get_vector_index(label, prop).is_some() {
+                        self.drop_vector_index(label, prop)?;
+                    }
                 }
                 return Ok(QueryResult::empty(vec![]));
             }
@@ -711,7 +720,9 @@ impl GraphDb {
                 if let Some(pos) = name.rfind('_') {
                     let label = &name[..pos];
                     let prop = &name[pos + 1..];
-                    self.drop_vector_index(label, prop)?;
+                    if self.get_vector_index(label, prop).is_some() {
+                        self.drop_vector_index(label, prop)?;
+                    }
                 }
                 return Ok(QueryResult::empty(vec![]));
             }
@@ -973,16 +984,17 @@ impl GraphDb {
             // values, so vector embedding is normally injected via MERGE+params.
             // This block handles the rare case where a list literal is used.
             {
+                let vidx_dir = self.inner.path.join("vector_indexes");
                 let vidx_guard = self.inner.vector_indexes.read().expect("vector_indexes");
                 for (prop_key, sv) in &named_props {
                     let key = (label.clone(), prop_key.clone());
                     if let Some(arc_idx) = vidx_guard.get(&key) {
                         let exec_val = storage_value_to_exec(sv);
                         if let Some(vec) = exec_val.as_vector() {
-                            arc_idx
-                                .write()
-                                .expect("vector_index write")
-                                .insert(node_id.0, &vec);
+                            let mut idx = arc_idx.write().expect("vector_index write");
+                            idx.insert(node_id.0, &vec);
+                            // Persist after insert so the on-disk snapshot stays current.
+                            idx.save(&vidx_dir, &label, prop_key).map_err(Error::Io)?;
                         }
                     }
                 }
@@ -1201,7 +1213,9 @@ impl GraphDb {
             if let Some(pos) = name.rfind('_') {
                 let label = &name[..pos];
                 let prop = &name[pos + 1..];
-                self.drop_vector_index(label, prop)?;
+                if self.get_vector_index(label, prop).is_some() {
+                    self.drop_vector_index(label, prop)?;
+                }
             }
             return Ok(QueryResult::empty(vec![]));
         }
@@ -1385,6 +1399,7 @@ impl GraphDb {
         // through StoreValue which cannot represent vectors.
         {
             use sparrowdb_cypher::ast::{Expr, Literal};
+            let vidx_dir = self.inner.path.join("vector_indexes");
             let vidx_guard = self.inner.vector_indexes.read().expect("vector_indexes");
             for pe in &m.props {
                 let key = (m.label.clone(), pe.key.clone());
@@ -1393,10 +1408,10 @@ impl GraphDb {
                     if let Expr::Literal(Literal::Param(p)) = &pe.value {
                         if let Some(exec_val) = params.get(p.as_str()) {
                             if let Some(vec) = exec_val.as_vector() {
-                                arc_idx
-                                    .write()
-                                    .expect("vector_index write")
-                                    .insert(node_id.0, &vec);
+                                let mut idx = arc_idx.write().expect("vector_index write");
+                                idx.insert(node_id.0, &vec);
+                                // Persist after insert so the on-disk snapshot stays current.
+                                idx.save(&vidx_dir, &m.label, &pe.key).map_err(Error::Io)?;
                             }
                         }
                     }

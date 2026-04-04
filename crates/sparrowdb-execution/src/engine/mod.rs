@@ -1387,8 +1387,20 @@ fn value_to_store_value(val: Value) -> StoreValue {
         Value::EdgeRef(id) => StoreValue::Int64(id.0 as i64),
         Value::List(_) => StoreValue::Int64(0),
         Value::Map(_) => StoreValue::Int64(0),
-        // Vector values are not stored via the node property store; they are
-        // indexed separately in the HNSW vector index.  Return a sentinel.
+        // Vector values are managed exclusively by the HNSW vector-index
+        // write-path in GraphDb (db.rs), which inserts them directly into the
+        // in-memory index and persists the index snapshot to disk.  A vector
+        // value must never be written to the node property store (column files)
+        // because the storage layer has no vector representation.
+        //
+        // In practice, vector properties reach GraphDb via $params on the
+        // MERGE path, not through the AST literal path that calls this
+        // function.  If a vector value reaches here it is a programming error;
+        // we return a null sentinel (0) rather than panicking so a production
+        // write path does not crash, but the vector data will not be indexed.
+        //
+        // TODO(#394): change the signature to Result<StoreValue> and return
+        // Err(InvalidArgument) here once all callers can propagate errors.
         Value::Vector(_) => StoreValue::Int64(0),
     }
 }
