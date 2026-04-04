@@ -7,28 +7,63 @@ impl Engine {
     /// Executes stages left-to-right, passing the intermediate row set from
     /// one stage to the next, then projects the final RETURN clause.
     pub(crate) fn execute_pipeline(&self, p: &PipelineStatement) -> Result<QueryResult> {
+        self.execute_pipeline_inner(p, None)
+    }
+
+    /// Execute a pipeline seeded with an explicit initial row set.
+    ///
+    /// Used by correlated `CALL { WITH imports … }` to inject outer row bindings
+    /// into the pipeline instead of scanning from the leading MATCH/UNWIND.
+    pub(crate) fn execute_pipeline_seeded(
+        &self,
+        p: &PipelineStatement,
+        seed_rows: Vec<HashMap<String, Value>>,
+    ) -> Result<QueryResult> {
+        self.execute_pipeline_inner(p, Some(seed_rows))
+    }
+
+    /// Shared implementation for [`execute_pipeline`] and [`execute_pipeline_seeded`].
+    fn execute_pipeline_inner(
+        &self,
+        p: &PipelineStatement,
+        seed_rows: Option<Vec<HashMap<String, Value>>>,
+    ) -> Result<QueryResult> {
         // Step 1: Produce the initial row set from the leading clause.
-        let mut current_rows: Vec<HashMap<String, Value>> =
-            if let Some((expr, alias)) = &p.leading_unwind {
-                // UNWIND-led pipeline: expand the list into individual rows.
-                let values = eval_list_expr(expr, &self.params)?;
-                values
-                    .into_iter()
-                    .map(|v| {
-                        let mut m = HashMap::new();
-                        m.insert(alias.clone(), v);
-                        m
-                    })
-                    .collect()
-            } else if let Some(ref patterns) = p.leading_match {
-                // MATCH-led pipeline: scan the graph.
-                // For the pipeline we need a dummy WithClause (scan will collect all
-                // col IDs needed by subsequent stages).  Use a wide scan that includes
-                // NodeRefs for EXISTS support.
-                self.collect_pipeline_match_rows(patterns, p.leading_where.as_ref())?
+        let mut current_rows: Vec<HashMap<String, Value>> = if let Some(seeds) = seed_rows {
+            // Seeded pipeline (correlated subquery): start from outer bindings.
+            if let Some(ref patterns) = p.leading_match {
+                // Re-traverse graph for each seeded binding using the pipeline MATCH runner.
+                let where_clause = p.leading_where.as_ref();
+                let mut rows = Vec::new();
+                for binding in &seeds {
+                    let new_rows =
+                        self.execute_pipeline_match_stage(patterns, where_clause, binding)?;
+                    rows.extend(new_rows);
+                }
+                rows
             } else {
-                vec![HashMap::new()]
-            };
+                seeds
+            }
+        } else if let Some((expr, alias)) = &p.leading_unwind {
+            // UNWIND-led pipeline: expand the list into individual rows.
+            let values = eval_list_expr(expr, &self.params)?;
+            values
+                .into_iter()
+                .map(|v| {
+                    let mut m = HashMap::new();
+                    m.insert(alias.clone(), v);
+                    m
+                })
+                .collect()
+        } else if let Some(ref patterns) = p.leading_match {
+            // MATCH-led pipeline: scan the graph.
+            // For the pipeline we need a dummy WithClause (scan will collect all
+            // col IDs needed by subsequent stages).  Use a wide scan that includes
+            // NodeRefs for EXISTS support.
+            self.collect_pipeline_match_rows(patterns, p.leading_where.as_ref())?
+        } else {
+            vec![HashMap::new()]
+        };
 
         // Step 2: Execute pipeline stages in order.
         for stage in &p.stages {
@@ -203,16 +238,24 @@ impl Engine {
             current_rows.truncate(lim as usize);
         }
 
-        let mut rows: Vec<Vec<Value>> = current_rows
-            .iter()
-            .map(|row_vals| {
-                p.return_clause
-                    .items
-                    .iter()
-                    .map(|item| self.eval_expr_graph(&item.expr, row_vals))
-                    .collect()
-            })
-            .collect();
+        let has_agg = has_aggregate_in_return(&p.return_clause.items);
+        let mut rows: Vec<Vec<Value>> = if has_agg {
+            // Aggregate RETURN items (COUNT, SUM, collect, etc.) need grouping.
+            // This handles correlated subqueries whose inner MATCH returns zero rows —
+            // aggregate functions must still produce one output row (e.g. count = 0).
+            self.aggregate_rows_graph(&current_rows, &p.return_clause.items)
+        } else {
+            current_rows
+                .iter()
+                .map(|row_vals| {
+                    p.return_clause
+                        .items
+                        .iter()
+                        .map(|item| self.eval_expr_graph(&item.expr, row_vals))
+                        .collect()
+                })
+                .collect()
+        };
 
         if p.distinct {
             deduplicate_rows(&mut rows);

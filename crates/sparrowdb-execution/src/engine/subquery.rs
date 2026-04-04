@@ -5,9 +5,7 @@
 
 use std::collections::HashMap;
 
-use sparrowdb_cypher::ast::{
-    PipelineStage, PipelineStatement, ReturnClause, Statement, WithClause,
-};
+use sparrowdb_cypher::ast::{PipelineStatement, ReturnClause, Statement};
 
 use super::*;
 use crate::types::{QueryResult, Value};
@@ -54,29 +52,39 @@ impl Engine {
                 })
                 .collect();
 
+            // Only build the env map if at least one RETURN item needs expression eval
+            // (non-Var expressions).  For the common case of bare variable projections
+            // we skip the per-row allocation entirely.
+            let needs_env = ret
+                .items
+                .iter()
+                .any(|item| !matches!(item.expr, sparrowdb_cypher::ast::Expr::Var(_)));
+
             let out_rows: Vec<Vec<Value>> = inner
                 .rows
                 .iter()
                 .map(|row| {
-                    // Build an env map from the inner row.
-                    let env: HashMap<String, Value> = inner
-                        .columns
-                        .iter()
-                        .zip(row.iter())
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
+                    let env: Option<HashMap<String, Value>> = if needs_env {
+                        Some(
+                            inner
+                                .columns
+                                .iter()
+                                .zip(row.iter())
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    };
                     ret.items
                         .iter()
-                        .map(|item| {
-                            // Try direct column lookup first, then full expression eval.
-                            match &item.expr {
-                                sparrowdb_cypher::ast::Expr::Var(name) => col_idx
-                                    .get(name.as_str())
-                                    .and_then(|&i| row.get(i))
-                                    .cloned()
-                                    .unwrap_or(Value::Null),
-                                other => eval_expr(other, &env),
-                            }
+                        .map(|item| match &item.expr {
+                            sparrowdb_cypher::ast::Expr::Var(name) => col_idx
+                                .get(name.as_str())
+                                .and_then(|&i| row.get(i))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            other => eval_expr(other, env.as_ref().expect("env present")),
                         })
                         .collect()
                 })
@@ -117,10 +125,13 @@ impl Engine {
             // Unit subquery: execute once, cross-join with every outer row.
             let inner = self.execute_read_stmt(subquery)?;
             let inner_col_names: Vec<&str> = inner.columns.iter().map(|s| s.as_str()).collect();
+            let inner_col_count = inner_col_names.len();
 
             for outer_row in &current_rows {
                 for inner_row in &inner.rows {
-                    let mut merged = outer_row.clone();
+                    // Pre-allocate to avoid repeated rehashing during inserts.
+                    let mut merged = HashMap::with_capacity(outer_row.len() + inner_col_count);
+                    merged.extend(outer_row.iter().map(|(k, v)| (k.clone(), v.clone())));
                     for (col, val) in inner_col_names.iter().zip(inner_row.iter()) {
                         merged.insert(col.to_string(), val.clone());
                     }
@@ -132,9 +143,11 @@ impl Engine {
             for outer_row in &current_rows {
                 let inner = self.execute_read_stmt_with_bindings(subquery, imports, outer_row)?;
                 let inner_col_names: Vec<&str> = inner.columns.iter().map(|s| s.as_str()).collect();
+                let inner_col_count = inner_col_names.len();
 
                 for inner_row in &inner.rows {
-                    let mut merged = outer_row.clone();
+                    let mut merged = HashMap::with_capacity(outer_row.len() + inner_col_count);
+                    merged.extend(outer_row.iter().map(|(k, v)| (k.clone(), v.clone())));
                     for (col, val) in inner_col_names.iter().zip(inner_row.iter()) {
                         merged.insert(col.to_string(), val.clone());
                     }
@@ -190,11 +203,11 @@ impl Engine {
             for key in imports {
                 let nid_key = format!("{key}.__node_id__");
                 if let Some(val) = outer_row.get(&nid_key) {
-                    b.insert(nid_key, val.clone());
+                    b.insert(nid_key.clone(), val.clone());
                 }
                 if let Some(nr @ Value::NodeRef(_)) = outer_row.get(key) {
                     b.insert(key.clone(), nr.clone());
-                    b.insert(format!("{key}.__node_id__"), nr.clone());
+                    b.insert(nid_key, nr.clone());
                 }
             }
             b
@@ -229,6 +242,22 @@ impl Engine {
                     self.execute_pipeline(p)
                 }
             }
+            // For these statement variants, correlated import injection is not
+            // supported (they have no leading MATCH we can seed).  If the caller
+            // supplied imports, return a clear error rather than silently ignoring
+            // the bindings and producing wrong results.
+            Statement::MatchWith(_)
+            | Statement::OptionalMatch(_)
+            | Statement::MatchOptionalMatch(_)
+            | Statement::Unwind(_)
+                if use_seeded =>
+            {
+                Err(sparrowdb_common::Error::InvalidArgument(
+                    "CALL { WITH … }: correlated imports are not supported for this subquery form; \
+                     use MATCH … RETURN … or a Pipeline inside CALL { }"
+                        .to_string(),
+                ))
+            }
             Statement::MatchWith(mw) => self.execute_match_with(mw),
             Statement::OptionalMatch(om) => self.execute_optional_match(om),
             Statement::MatchOptionalMatch(mom) => self.execute_match_optional_match(mom),
@@ -249,200 +278,7 @@ impl Engine {
             ))),
         }
     }
-
-    /// Execute a `PipelineStatement` seeded with an initial set of rows instead
-    /// of scanning from the leading MATCH/UNWIND clause.
-    ///
-    /// Used by correlated `CALL { WITH imports … }` to feed the outer row
-    /// binding directly into the pipeline's first MATCH stage.
-    fn execute_pipeline_seeded(
-        &self,
-        p: &PipelineStatement,
-        seed_rows: Vec<HashMap<String, Value>>,
-    ) -> Result<QueryResult> {
-        // Start from the seed rows rather than scanning the leading MATCH.
-        let mut current_rows = if let Some(ref patterns) = p.leading_match {
-            // Re-traverse graph for each seeded binding using the pipeline MATCH runner.
-            let where_clause = p.leading_where.as_ref();
-            let mut rows = Vec::new();
-            for binding in &seed_rows {
-                let new_rows =
-                    self.execute_pipeline_match_stage(patterns, where_clause, binding)?;
-                rows.extend(new_rows);
-            }
-            rows
-        } else {
-            seed_rows
-        };
-
-        // Execute subsequent pipeline stages (reuse existing logic).
-        for stage in &p.stages {
-            match stage {
-                PipelineStage::With {
-                    clause,
-                    order_by,
-                    skip,
-                    limit,
-                } => {
-                    current_rows =
-                        self.apply_with_stage(current_rows, clause, order_by, skip, limit)?;
-                }
-                PipelineStage::Match {
-                    patterns,
-                    where_clause,
-                } => {
-                    let mut next = Vec::new();
-                    for binding in &current_rows {
-                        let new_rows = self.execute_pipeline_match_stage(
-                            patterns,
-                            where_clause.as_ref(),
-                            binding,
-                        )?;
-                        next.extend(new_rows);
-                    }
-                    current_rows = next;
-                }
-                PipelineStage::Unwind { alias, new_alias } => {
-                    let mut next = Vec::new();
-                    for row in &current_rows {
-                        let list_val = row.get(alias.as_str()).cloned().unwrap_or(Value::Null);
-                        let items = match list_val {
-                            Value::List(v) => v,
-                            other => vec![other],
-                        };
-                        for item in items {
-                            let mut new_row = row.clone();
-                            new_row.insert(new_alias.clone(), item);
-                            next.push(new_row);
-                        }
-                    }
-                    current_rows = next;
-                }
-                PipelineStage::CallSubquery { subquery, imports } => {
-                    current_rows =
-                        self.execute_pipeline_call_subquery_stage(subquery, imports, current_rows)?;
-                }
-            }
-        }
-
-        // Project the RETURN clause.
-        let column_names = extract_return_column_names(&p.return_clause.items);
-        let has_agg = has_aggregate_in_return(&p.return_clause.items);
-        let mut rows: Vec<Vec<Value>> = if has_agg {
-            // Aggregate RETURN items (COUNT, SUM, collect, etc.) need grouping.
-            self.aggregate_rows_graph(&current_rows, &p.return_clause.items)
-        } else {
-            current_rows
-                .iter()
-                .map(|row_vals| {
-                    p.return_clause
-                        .items
-                        .iter()
-                        .map(|item| self.eval_expr_graph(&item.expr, row_vals))
-                        .collect()
-                })
-                .collect()
-        };
-
-        if p.distinct {
-            deduplicate_rows(&mut rows);
-        }
-
-        Ok(QueryResult {
-            columns: column_names,
-            rows,
-        })
-    }
-
-    // ── WITH stage helper (extracted for reuse in seeded pipeline) ────────────
-
-    /// Apply a `PipelineStage::With` to a set of current rows.
-    fn apply_with_stage(
-        &self,
-        mut current_rows: Vec<HashMap<String, Value>>,
-        clause: &WithClause,
-        order_by: &[(sparrowdb_cypher::ast::Expr, SortDir)],
-        skip: &Option<u64>,
-        limit: &Option<u64>,
-    ) -> Result<Vec<HashMap<String, Value>>> {
-        if !order_by.is_empty() {
-            current_rows.sort_by(|a, b| {
-                for (expr, dir) in order_by {
-                    let va = eval_expr(expr, a);
-                    let vb = eval_expr(expr, b);
-                    let cmp = compare_values(&va, &vb);
-                    let cmp = if *dir == SortDir::Desc {
-                        cmp.reverse()
-                    } else {
-                        cmp
-                    };
-                    if cmp != std::cmp::Ordering::Equal {
-                        return cmp;
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
-        }
-        if let Some(s) = skip {
-            let s = (*s as usize).min(current_rows.len());
-            current_rows.drain(0..s);
-        }
-        if let Some(l) = limit {
-            current_rows.truncate(*l as usize);
-        }
-
-        let has_agg = clause
-            .items
-            .iter()
-            .any(|item| is_aggregate_expr(&item.expr));
-        let next_rows = if has_agg {
-            let agg_rows = self.aggregate_with_items(&current_rows, &clause.items);
-            agg_rows
-                .into_iter()
-                .filter(|with_vals| {
-                    if let Some(ref where_expr) = clause.where_clause {
-                        let mut wv = with_vals.clone();
-                        wv.extend(self.dollar_params());
-                        self.eval_where_graph(where_expr, &wv)
-                    } else {
-                        true
-                    }
-                })
-                .map(|mut with_vals| {
-                    with_vals.extend(self.dollar_params());
-                    with_vals
-                })
-                .collect()
-        } else {
-            let mut next = Vec::new();
-            for row_vals in &current_rows {
-                let mut with_vals: HashMap<String, Value> = HashMap::new();
-                for item in &clause.items {
-                    let val = self.eval_expr_graph(&item.expr, row_vals);
-                    with_vals.insert(item.alias.clone(), val);
-                    if let sparrowdb_cypher::ast::Expr::Var(ref src_var) = item.expr {
-                        if let Some(nr @ Value::NodeRef(_)) = row_vals.get(src_var) {
-                            with_vals.insert(item.alias.clone(), nr.clone());
-                            with_vals.insert(format!("{}.__node_id__", item.alias), nr.clone());
-                        }
-                        let nid_key = format!("{src_var}.__node_id__");
-                        if let Some(nr) = row_vals.get(&nid_key) {
-                            with_vals.insert(format!("{}.__node_id__", item.alias), nr.clone());
-                        }
-                    }
-                }
-                if let Some(ref where_expr) = clause.where_clause {
-                    let mut wv = with_vals.clone();
-                    wv.extend(self.dollar_params());
-                    if !self.eval_where_graph(where_expr, &wv) {
-                        continue;
-                    }
-                }
-                with_vals.extend(self.dollar_params());
-                next.push(with_vals);
-            }
-            next
-        };
-        Ok(next_rows)
-    }
 }
+// NOTE: `execute_pipeline_seeded` lives in `scan.rs` as part of the shared pipeline
+// implementation.  Correlated subquery execution delegates to that method to avoid
+// duplicating the pipeline stage loop.

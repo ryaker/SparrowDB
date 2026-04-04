@@ -2352,6 +2352,23 @@ impl Parser {
 
     // ── CALL { } subquery (issue #290) ──────────────────────────────────────
 
+    /// Parse a comma-separated list of import identifiers after `WITH` inside a
+    /// subquery body.  The `WITH` keyword must already have been consumed.
+    ///
+    /// Returns the list of imported variable names.
+    fn parse_subquery_import_list(&mut self) -> Result<Vec<String>> {
+        let mut imports = Vec::new();
+        loop {
+            imports.push(self.expect_ident()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(imports)
+    }
+
     /// Entry point when we have already consumed `CALL` and see `{`.
     ///
     /// `imports` carries any variable names parsed from a preceding `WITH`
@@ -2370,16 +2387,7 @@ impl Parser {
         // Parse optional WITH imports inside the brace (correlated form).
         let imports = if pre_imports.is_empty() && matches!(self.peek(), Token::With) {
             self.advance(); // consume WITH
-            let mut imports = Vec::new();
-            loop {
-                imports.push(self.expect_ident()?);
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-            imports
+            self.parse_subquery_import_list()?
         } else {
             pre_imports
         };
@@ -2427,16 +2435,7 @@ impl Parser {
         // Parse optional WITH imports inside the brace.
         let imports = if matches!(self.peek(), Token::With) {
             self.advance(); // consume WITH
-            let mut imports = Vec::new();
-            loop {
-                imports.push(self.expect_ident()?);
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-            imports
+            self.parse_subquery_import_list()?
         } else {
             vec![]
         };
