@@ -377,6 +377,15 @@ pub enum PipelineStage {
     /// `UNWIND alias_expr AS new_alias` — unwind a list variable from the preceding
     /// WITH into individual rows.
     Unwind { alias: String, new_alias: String },
+    /// `CALL { [WITH var1, var2] inner_stmt }` — inline subquery stage (issue #290).
+    ///
+    /// For each outer row the `subquery` is executed (optionally seeded with the
+    /// imported variables) and the subquery's output columns are appended to the
+    /// outer row, producing a cross product / nested-loop join.
+    CallSubquery {
+        subquery: Box<Statement>,
+        imports: Vec<String>,
+    },
 }
 
 /// A multi-clause Cypher pipeline (SPA-134).
@@ -507,5 +516,20 @@ pub enum Statement {
     CreateConstraint {
         label: String,
         property: String,
+    },
+    /// `CALL { subquery } [RETURN …]` — standalone unit subquery (issue #290).
+    ///
+    /// A unit subquery (no `imports`) is executed independently once and its
+    /// output rows are extended with the optional trailing `RETURN` clause.
+    ///
+    /// When embedded inside a pipeline (as a `PipelineStage::CallSubquery`),
+    /// this variant is **not** used — use `PipelineStage::CallSubquery` instead.
+    CallSubquery {
+        /// The statement inside `{ … }`.
+        subquery: Box<Statement>,
+        /// Variables imported from the outer scope via `CALL { WITH x, y … }`.
+        imports: Vec<String>,
+        /// Optional trailing `RETURN` clause projecting subquery columns.
+        return_clause: Option<ReturnClause>,
     },
 }

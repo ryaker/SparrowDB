@@ -857,6 +857,11 @@ impl Engine {
             Statement::CreateConstraint { label, property } => {
                 self.execute_create_constraint(&label, &property)
             }
+            Statement::CallSubquery {
+                subquery,
+                imports,
+                return_clause,
+            } => self.execute_call_subquery(&subquery, &imports, return_clause.as_ref()),
         }
     }
 
@@ -962,6 +967,7 @@ mod path;
 pub mod pipeline_exec;
 mod procedure;
 mod scan;
+mod subquery;
 
 // ── Free-standing prop-filter helper (usable without &self) ───────────────────
 
@@ -2720,7 +2726,7 @@ fn evaluate_aggregate_expr(
 }
 
 /// Returns `true` if any RETURN item is an aggregate expression.
-fn has_aggregate_in_return(items: &[ReturnItem]) -> bool {
+pub(crate) fn has_aggregate_in_return(items: &[ReturnItem]) -> bool {
     items.iter().any(|item| is_aggregate_expr(&item.expr))
 }
 

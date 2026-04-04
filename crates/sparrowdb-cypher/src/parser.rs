@@ -440,6 +440,13 @@ impl Parser {
                 // MATCH … OPTIONAL MATCH … RETURN
                 self.parse_match_optional_match_tail(patterns, None)
             }
+            Token::Call => {
+                // MATCH … CALL { } … RETURN — route into the pipeline engine.
+                // Consume CALL and parse as a pipeline with the CALL as first stage.
+                self.advance(); // consume CALL
+                let call_stage = self.parse_call_subquery_stage()?;
+                self.parse_pipeline_continuation(Some(patterns), None, None, vec![call_stage])
+            }
             other => Err(Error::InvalidArgument(format!(
                 "unexpected token after MATCH pattern: {:?}",
                 other
@@ -1083,6 +1090,12 @@ impl Parser {
                     let new_alias = self.expect_ident()?;
                     stages.push(PipelineStage::Unwind { alias, new_alias });
                 }
+                Token::Call => {
+                    // Parse a CALL { } subquery stage inside a pipeline.
+                    self.advance(); // consume CALL
+                    let stage = self.parse_call_subquery_stage()?;
+                    stages.push(stage);
+                }
                 Token::Return => {
                     // Terminal clause.
                     self.advance(); // consume RETURN
@@ -1159,7 +1172,7 @@ impl Parser {
                 }
                 other => {
                     return Err(Error::InvalidArgument(format!(
-                        "expected MATCH, WITH, UNWIND, or RETURN in pipeline, got {:?}",
+                        "expected MATCH, WITH, UNWIND, CALL, or RETURN in pipeline, got {:?}",
                         other
                     )))
                 }
@@ -2337,6 +2350,105 @@ impl Parser {
         Ok(items)
     }
 
+    // ── CALL { } subquery (issue #290) ──────────────────────────────────────
+
+    /// Entry point when we have already consumed `CALL` and see `{`.
+    ///
+    /// `imports` carries any variable names parsed from a preceding `WITH`
+    /// clause (correlated form).  For unit subqueries `imports` is empty.
+    fn parse_call_subquery(&mut self, imports: Vec<String>) -> Result<Statement> {
+        self.expect_tok(&Token::LBrace)?;
+        self.parse_call_subquery_body(imports)
+    }
+
+    /// Parse the body `[WITH imports] inner_stmt }` after the `{` has been consumed.
+    ///
+    /// Handles the optional `WITH var1, var2` import list at the start of the
+    /// subquery body (correlated form).  After the closing `}`, also looks for
+    /// an optional trailing `RETURN` clause for standalone usage.
+    fn parse_call_subquery_body(&mut self, pre_imports: Vec<String>) -> Result<Statement> {
+        // Parse optional WITH imports inside the brace (correlated form).
+        let imports = if pre_imports.is_empty() && matches!(self.peek(), Token::With) {
+            self.advance(); // consume WITH
+            let mut imports = Vec::new();
+            loop {
+                imports.push(self.expect_ident()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            imports
+        } else {
+            pre_imports
+        };
+
+        let subquery = self.parse_statement()?;
+        self.expect_tok(&Token::RBrace)?;
+
+        // Optional trailing RETURN clause for standalone `CALL { } RETURN ...`.
+        let return_clause = if matches!(self.peek(), Token::Return) {
+            self.advance(); // consume RETURN
+            let _distinct = if matches!(self.peek(), Token::Distinct) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            let items = self.parse_return_items()?;
+            Some(ReturnClause { items })
+        } else {
+            None
+        };
+
+        Ok(Statement::CallSubquery {
+            subquery: Box::new(subquery),
+            imports,
+            return_clause,
+        })
+    }
+
+    /// Parse a `CALL { [WITH imports] inner_stmt }` as a `PipelineStage`.
+    ///
+    /// Called from `parse_pipeline_continuation` when a `CALL` token is seen.
+    /// The leading `CALL` token must already have been consumed by the caller.
+    fn parse_call_subquery_stage(&mut self) -> Result<PipelineStage> {
+        // Check for correlated form: `CALL { WITH var1, var2 inner ... }`
+        // The `CALL` has already been consumed; now we decide based on next token.
+        //
+        // Correlated: `CALL { WITH x MATCH ... }`
+        // Unit:       `CALL { MATCH ... }`
+        //
+        // Both start with `{` here since `parse_pipeline_continuation` sees
+        // the token *before* consuming CALL.
+        self.expect_tok(&Token::LBrace)?;
+
+        // Parse optional WITH imports inside the brace.
+        let imports = if matches!(self.peek(), Token::With) {
+            self.advance(); // consume WITH
+            let mut imports = Vec::new();
+            loop {
+                imports.push(self.expect_ident()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            imports
+        } else {
+            vec![]
+        };
+
+        let subquery = self.parse_statement()?;
+        self.expect_tok(&Token::RBrace)?;
+        Ok(PipelineStage::CallSubquery {
+            subquery: Box::new(subquery),
+            imports,
+        })
+    }
+
     // ── CALL procedure(args) YIELD col [RETURN ...] ───────────────────────────
 
     /// Parse `CALL proc.name(args) YIELD col1, col2 [RETURN ...]`.
@@ -2348,6 +2460,13 @@ impl Parser {
     /// projects them further.
     fn parse_call(&mut self) -> Result<Statement> {
         self.expect_tok(&Token::Call)?;
+
+        // If the next token is `{`, this is a CALL { } subquery (issue #290),
+        // not a procedure call.  The WITH import list (for correlated form) lives
+        // *inside* the braces: `CALL { WITH n MATCH ... }`.
+        if matches!(self.peek(), Token::LBrace) {
+            return self.parse_call_subquery(vec![]);
+        }
 
         // Parse dotted procedure name: ident (. ident)*
         // Use advance_as_prop_name for all segments so that keyword tokens like

@@ -164,6 +164,11 @@ impl Engine {
                     }
                     current_rows = next_rows;
                 }
+                PipelineStage::CallSubquery { subquery, imports } => {
+                    // Execute a CALL { } subquery stage for each outer row.
+                    current_rows =
+                        self.execute_pipeline_call_subquery_stage(subquery, imports, current_rows)?;
+                }
             }
         }
 
