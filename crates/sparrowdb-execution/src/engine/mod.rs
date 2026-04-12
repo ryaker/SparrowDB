@@ -857,6 +857,23 @@ impl Engine {
             Statement::CreateConstraint { label, property } => {
                 self.execute_create_constraint(&label, &property)
             }
+            Statement::CallSubquery {
+                subquery,
+                imports,
+                return_clause,
+                return_order_by,
+                return_skip,
+                return_limit,
+                return_distinct,
+            } => self.execute_call_subquery(
+                &subquery,
+                &imports,
+                return_clause.as_ref(),
+                &return_order_by,
+                return_skip,
+                return_limit,
+                return_distinct,
+            ),
         }
     }
 
@@ -870,6 +887,10 @@ impl Engine {
             // write-transaction path to ensure WAL durability and correct
             // single-writer semantics, regardless of whether edges are present.
             Statement::Create(_) => true,
+            // Recursively check CALL { } subqueries so that a mutation inside
+            // the braces is routed through the write-transaction path rather than
+            // being silently dispatched via the read path and failing late.
+            Statement::CallSubquery { subquery, .. } => Self::is_mutation(subquery),
             _ => false,
         }
     }
@@ -962,6 +983,7 @@ mod path;
 pub mod pipeline_exec;
 mod procedure;
 mod scan;
+mod subquery;
 
 // ── Free-standing prop-filter helper (usable without &self) ───────────────────
 
@@ -2720,7 +2742,7 @@ fn evaluate_aggregate_expr(
 }
 
 /// Returns `true` if any RETURN item is an aggregate expression.
-fn has_aggregate_in_return(items: &[ReturnItem]) -> bool {
+pub(crate) fn has_aggregate_in_return(items: &[ReturnItem]) -> bool {
     items.iter().any(|item| is_aggregate_expr(&item.expr))
 }
 

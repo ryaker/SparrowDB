@@ -74,6 +74,9 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
         // Pipeline: label binding is deferred to execution time (SPA-134).
         Statement::Pipeline(_) => {}
         Statement::CreateIndex { .. } | Statement::CreateConstraint { .. } => {}
+        // CALL { } subquery: label binding is deferred to the subquery's own
+        // execution path, which recurses through bind/execute internally.
+        Statement::CallSubquery { .. } => {}
     }
     Ok(BoundStatement { inner: stmt })
 }
