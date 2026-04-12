@@ -115,6 +115,14 @@ fn value_to_rb(ruby: &Ruby, v: &sparrowdb_execution::Value) -> Value {
             }
             hash.as_value()
         }
+        // Vector: expose as a Ruby Array of Floats.
+        Ev::Vector(components) => {
+            let arr = ruby.ary_new_capa(components.len());
+            for f in components {
+                let _ = arr.push(ruby.float_from_f64(*f as f64).as_value());
+            }
+            arr.as_value()
+        }
     }
 }
 
