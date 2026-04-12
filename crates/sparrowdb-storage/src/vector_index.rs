@@ -604,7 +604,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut idx = VectorIndex::new(8, Metric::Cosine);
         for i in 0u64..10 {
-            idx.insert(i, &vec![i as f32; 8]);
+            idx.insert(i, &[i as f32; 8]);
         }
         idx.save(dir.path(), "TestLabel", "embedding").unwrap();
 
