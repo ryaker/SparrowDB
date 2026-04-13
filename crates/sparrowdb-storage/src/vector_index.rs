@@ -17,6 +17,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// On-disk format version for HNSW index files.
+///
+/// Increment when the serialisation format changes incompatibly.
+pub const HNSW_FORMAT_VERSION: u8 = 1;
+
 // ── Distance metrics ──────────────────────────────────────────────────────────
 
 /// Supported distance/similarity metrics.
