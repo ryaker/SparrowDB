@@ -806,6 +806,14 @@ impl Engine {
     ///    same FNV-1a hash used by `WriteTx::merge_node`.
     /// 4. Write the node to the node store.
     pub(crate) fn execute_create(&mut self, create: &CreateStatement) -> Result<QueryResult> {
+        // Load the FTS registry once for the entire CREATE statement rather than
+        // once per node.  The registry is a small JSON file; loading it inside
+        // the loop would cause redundant disk reads in bulk CREATE statements.
+        let fts_registry = {
+            use sparrowdb_storage::fts_index::FtsRegistry;
+            FtsRegistry::load(&self.snapshot.db_root)
+        };
+
         for node in &create.nodes {
             // Resolve the primary label, creating it if absent.
             let label = node.labels.first().cloned().unwrap_or_default();
@@ -909,6 +917,30 @@ impl Engine {
                     }
                 }
             }
+            // FTS auto-indexing: if a fulltext index is registered for any
+            // (label, property) pair of this node, insert the string value
+            // into the BM25 index so it is searchable immediately.
+            {
+                use sparrowdb_storage::fts_index::FtsIndex;
+                for entry in &node.props {
+                    if fts_registry.contains(&label, &entry.key) {
+                        let val = eval_expr(&entry.value, &HashMap::new());
+                        if let Value::String(text) = val {
+                            if let Ok(mut idx) =
+                                FtsIndex::open(&self.snapshot.db_root, &label, &entry.key)
+                            {
+                                idx.insert(node_id.0, &text);
+                                if let Err(e) = idx.save() {
+                                    tracing::warn!(
+                                        "FTS index save failed for ({label}, {}): {e}",
+                                        entry.key
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // SPA-200: record secondary labels in the catalog side table.
             // The primary label is already encoded in `node_id`; secondary
             // labels are persisted here so that MATCH on secondary labels
@@ -980,6 +1012,26 @@ impl Engine {
         // Register the constraint.
         self.unique_constraints.insert((label_id, col_id));
 
+        Ok(QueryResult::empty(vec![]))
+    }
+
+    /// Execute `CREATE FULLTEXT INDEX [name] FOR (n:Label) ON (n.property)`.
+    ///
+    /// Creates (or overwrites) a BM25 full-text index on the given label+property
+    /// and registers it in the FTS registry so that `full_text_search()` and
+    /// `bm25_score()` can locate it.
+    pub(crate) fn execute_create_fulltext_index(
+        &mut self,
+        _name: Option<&str>,
+        label: &str,
+        property: &str,
+    ) -> Result<QueryResult> {
+        use sparrowdb_storage::fts_index::{FtsIndex, FtsRegistry};
+        // Create (or overwrite) the on-disk BM25 index.
+        FtsIndex::create(&self.snapshot.db_root, label, property)?;
+        // Register in the persistent registry.
+        let mut registry = FtsRegistry::load(&self.snapshot.db_root);
+        registry.register(&self.snapshot.db_root, label, property)?;
         Ok(QueryResult::empty(vec![]))
     }
 }

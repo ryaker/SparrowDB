@@ -2,6 +2,149 @@
 use super::*;
 
 impl Engine {
+    // ── FTS scalar functions ──────────────────────────────────────────────────
+
+    /// Evaluate `full_text_search(label, property, query)`.
+    ///
+    /// Returns `Value::Bool(true)` if the current node's ID appears in the BM25
+    /// results for `(label, property, query)`.  The current node is resolved by
+    /// scanning `vals` for any `__node_id__` entry that matches the given label.
+    ///
+    /// Returns `Value::Bool(false)` when no matching entry is found or the FTS
+    /// index does not exist for the pair.
+    fn eval_full_text_search(&self, args: &[Expr], vals: &HashMap<String, Value>) -> Value {
+        if args.len() != 3 {
+            return Value::Bool(false);
+        }
+        let label_val = eval_expr(&args[0], vals);
+        let prop_val = eval_expr(&args[1], vals);
+        let query_val = eval_expr(&args[2], vals);
+
+        let (Value::String(label), Value::String(property), Value::String(query)) =
+            (label_val, prop_val, query_val)
+        else {
+            return Value::Bool(false);
+        };
+
+        // Locate the current node's ID for the given label.
+        //
+        // During WHERE evaluation (`execute_scan`) the NodeRef is stored under
+        // the plain variable name (e.g. "n").  During aggregation / eval path
+        // it is also stored under "{var}.__node_id__".  We accept both.
+        let expected_lid: Option<u32> = self
+            .snapshot
+            .catalog
+            .get_label(&label)
+            .ok()
+            .flatten()
+            .map(|id| id as u32);
+
+        let node_id: u64 = {
+            let mut found = None;
+
+            // Pass 1: prefer explicit __node_id__ keys.
+            for (k, v) in vals.iter() {
+                if k.ends_with(".__node_id__") {
+                    if let Value::NodeRef(nid) = v {
+                        let label_id_from_node = (nid.0 >> 32) as u32;
+                        if expected_lid.is_none_or(|eid| label_id_from_node == eid) {
+                            found = Some(nid.0);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Pass 2: fall back to any plain NodeRef entry matching the label.
+            if found.is_none() {
+                for (_k, v) in vals.iter() {
+                    if let Value::NodeRef(nid) = v {
+                        let label_id_from_node = (nid.0 >> 32) as u32;
+                        if expected_lid.is_none_or(|eid| label_id_from_node == eid) {
+                            found = Some(nid.0);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            match found {
+                Some(id) => id,
+                None => return Value::Bool(false),
+            }
+        };
+
+        // Use the per-query FTS cache so the index is loaded from disk at most
+        // once per (label, property) pair regardless of how many rows are scanned.
+        match self.snapshot.fts_index(&label, &property) {
+            Some(cache) => {
+                let key = (label, property);
+                let idx = cache.get(&key).expect("key was just inserted");
+                // Use matches_query for a fast O(|terms|*avg_postings) membership
+                // check instead of computing and sorting all BM25 scores.
+                Value::Bool(idx.matches_query(node_id, &query))
+            }
+            None => Value::Bool(false),
+        }
+    }
+
+    /// Evaluate `bm25_score(prop_expr, query)`.
+    ///
+    /// When `prop_expr` is a `PropAccess { var, prop }`, the BM25 score is
+    /// looked up from the persisted FTS index for that `(inferred_label, prop)`
+    /// pair.  Otherwise (bare string), returns 0.0.
+    fn eval_bm25_score(&self, args: &[Expr], vals: &HashMap<String, Value>) -> Value {
+        if args.len() != 2 {
+            return Value::Float64(0.0);
+        }
+
+        let query_val = eval_expr(&args[1], vals);
+        let Value::String(query) = query_val else {
+            return Value::Float64(0.0);
+        };
+
+        // Extract (var, prop) from the first argument.
+        let (var_name, prop_name) = match &args[0] {
+            Expr::PropAccess { var, prop } => (var.clone(), prop.clone()),
+            _ => return Value::Float64(0.0),
+        };
+
+        // Resolve the node_id and label for this variable.
+        let node_id_key = format!("{var_name}.__node_id__");
+        let node_id: u64 = match vals.get(&node_id_key) {
+            Some(Value::NodeRef(nid)) => nid.0,
+            _ => {
+                // Fallback: look for a var entry that is a NodeRef.
+                match vals.get(var_name.as_str()) {
+                    Some(Value::NodeRef(nid)) => nid.0,
+                    _ => return Value::Float64(0.0),
+                }
+            }
+        };
+
+        // Infer the label from the node_id (high 32 bits = label_id).
+        let label_id = (node_id >> 32) as u32;
+        let label = match self.snapshot.catalog.list_labels() {
+            Ok(labels) => match labels.into_iter().find(|(id, _)| *id as u32 == label_id) {
+                Some((_, name)) => name,
+                None => return Value::Float64(0.0),
+            },
+            Err(_) => return Value::Float64(0.0),
+        };
+
+        // Use the per-query FTS cache so the index is loaded from disk at most
+        // once per (label, property) pair across all rows in the result set.
+        match self.snapshot.fts_index(&label, &prop_name) {
+            Some(cache) => {
+                let key = (label, prop_name);
+                let idx = cache.get(&key).expect("key was just inserted");
+                let score = idx.score(node_id, &query);
+                Value::Float64(score as f64)
+            }
+            None => Value::Float64(0.0),
+        }
+    }
+
     // ── Property filter helpers ───────────────────────────────────────────────
 
     pub(crate) fn matches_prop_filter(
@@ -83,6 +226,11 @@ impl Engine {
                 }
                 Value::Null
             }
+            Expr::FnCall { name, args } => match name.to_ascii_lowercase().as_str() {
+                "full_text_search" => self.eval_full_text_search(args, vals),
+                "bm25_score" => self.eval_bm25_score(args, vals),
+                _ => eval_expr(expr, vals),
+            },
             _ => eval_expr(expr, vals),
         }
     }

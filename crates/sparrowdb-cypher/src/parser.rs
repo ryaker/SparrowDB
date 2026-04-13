@@ -76,6 +76,8 @@ fn token_keyword_name(tok: &Token) -> Option<&'static str> {
         Token::On => Some("ON"),
         Token::Constraint => Some("CONSTRAINT"),
         Token::Assert => Some("ASSERT"),
+        Token::Fulltext => Some("FULLTEXT"),
+        Token::For => Some("FOR"),
         _ => None,
     }
 }
@@ -259,6 +261,8 @@ impl Parser {
             Token::On => Ok("on".into()),
             Token::Constraint => Ok("constraint".into()),
             Token::Assert => Ok("assert".into()),
+            Token::Fulltext => Ok("fulltext".into()),
+            Token::For => Ok("for".into()),
             other => Err(Error::InvalidArgument(format!(
                 "expected property name, got {:?}",
                 other
@@ -1351,6 +1355,11 @@ impl Parser {
             self.advance();
             return self.parse_create_constraint();
         }
+        // CREATE FULLTEXT INDEX [name] FOR (n:Label) ON (n.prop)
+        if matches!(self.peek(), Token::Fulltext) {
+            self.advance(); // consume FULLTEXT
+            return self.parse_create_fulltext_index();
+        }
         let mut body = self.parse_create_body()?;
         // Check for optional RETURN clause (issue #366).
         if matches!(self.peek(), Token::Return) {
@@ -1399,6 +1408,62 @@ impl Parser {
             }
         }
         Ok(Statement::CreateConstraint { label, property })
+    }
+
+    /// Parse `CREATE FULLTEXT INDEX [name] FOR (n:Label) ON (n.property)`.
+    ///
+    /// The optional `name` is an unquoted identifier that appears immediately
+    /// after `INDEX`.  If the next token is `FOR` the name is omitted.
+    ///
+    /// Grammar:
+    /// ```text
+    /// CREATE FULLTEXT INDEX [<name>] FOR (<var>:<Label>) ON (<var>.<prop>)
+    /// ```
+    fn parse_create_fulltext_index(&mut self) -> Result<Statement> {
+        // Expect "INDEX"
+        self.expect_tok(&Token::Index)?;
+
+        // Optional name: present if next token is an Ident *and* the one after
+        // is not FOR (i.e. the name is followed by FOR).
+        let name: Option<String> = match self.peek().clone() {
+            Token::Ident(s) => {
+                // Peek ahead: if the token after the ident is FOR, consume name.
+                self.advance();
+                Some(s)
+            }
+            Token::For => None,
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "CREATE FULLTEXT INDEX: expected index name or FOR, got {other:?}"
+                )))
+            }
+        };
+
+        // Expect FOR
+        self.expect_tok(&Token::For)?;
+
+        // Expect `(var:Label)`
+        self.expect_tok(&Token::LParen)?;
+        let _var = self.expect_ident()?; // e.g. "n" — consumed but not used
+        self.expect_tok(&Token::Colon)?;
+        let label = self.expect_label_or_type()?;
+        self.expect_tok(&Token::RParen)?;
+
+        // Expect ON
+        self.expect_tok(&Token::On)?;
+
+        // Expect `(var.property)`
+        self.expect_tok(&Token::LParen)?;
+        let _prop_var = self.expect_ident()?; // e.g. "n" — consumed but not used
+        self.expect_tok(&Token::Dot)?;
+        let property = self.advance_as_prop_name()?;
+        self.expect_tok(&Token::RParen)?;
+
+        Ok(Statement::CreateFulltextIndex {
+            name,
+            label,
+            property,
+        })
     }
 
     // ── UNWIND ────────────────────────────────────────────────────────────────

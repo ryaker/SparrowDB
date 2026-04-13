@@ -3,6 +3,9 @@ pub mod metapage;
 /// Simple inverted full-text index for CALL db.index.fulltext.queryNodes.
 pub mod fulltext_index;
 
+/// BM25 inverted full-text index (issue #395).
+pub mod fts_index;
+
 /// At-rest page encryption using XChaCha20-Poly1305.
 pub mod encryption;
 

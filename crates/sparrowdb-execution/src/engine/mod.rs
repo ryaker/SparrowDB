@@ -242,9 +242,48 @@ pub struct ReadSnapshot {
     rel_degree_stats: std::sync::OnceLock<HashMap<u32, DegreeStats>>,
     /// Shared edge-property cache (SPA-261).
     edge_props_cache: EdgePropsCache,
+    /// Per-query FTS index cache: loaded lazily on first `full_text_search` /
+    /// `bm25_score` call for a given `(label, property)` pair.
+    ///
+    /// Without this cache, every evaluated row causes a disk read + binary
+    /// decode of the index file.  With it the file is read at most once per
+    /// `(label, property)` pair per query.
+    fts_cache: std::sync::Mutex<HashMap<(String, String), sparrowdb_storage::fts_index::FtsIndex>>,
 }
 
 impl ReadSnapshot {
+    /// Return a reference to the FTS index for `(label, property)`, loading
+    /// it from disk the first time it is requested within this query.
+    ///
+    /// Subsequent calls for the same pair return the cached copy without any
+    /// I/O, so a WHERE clause that calls `full_text_search` or `bm25_score`
+    /// for N rows only deserialises the index file once.
+    ///
+    /// Returns `None` if the index file does not exist or cannot be opened.
+    pub fn fts_index(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Option<
+        std::sync::MutexGuard<
+            '_,
+            HashMap<(String, String), sparrowdb_storage::fts_index::FtsIndex>,
+        >,
+    > {
+        let key = (label.to_owned(), property.to_owned());
+        let mut cache = self.fts_cache.lock().ok()?;
+        if !cache.contains_key(&key) {
+            match sparrowdb_storage::fts_index::FtsIndex::open(&self.db_root, label, property) {
+                Ok(idx) => {
+                    cache.insert(key.clone(), idx);
+                }
+                Err(_) => return None,
+            }
+        }
+        // Return the guard so callers can borrow the cached index.
+        Some(cache)
+    }
+
     /// Return per-relationship-type out-degree statistics, computing them on
     /// first call and caching the result for all subsequent calls.
     ///
@@ -477,6 +516,7 @@ impl Engine {
             rel_degree_stats: std::sync::OnceLock::new(),
             edge_props_cache: shared_edge_props_cache
                 .unwrap_or_else(|| std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()))),
+            fts_cache: std::sync::Mutex::new(HashMap::new()),
         };
 
         // If a shared cached index was provided, clone it out so we start
@@ -874,6 +914,11 @@ impl Engine {
                 return_limit,
                 return_distinct,
             ),
+            Statement::CreateFulltextIndex {
+                name,
+                label,
+                property,
+            } => self.execute_create_fulltext_index(name.as_deref(), &label, &property),
         }
     }
 

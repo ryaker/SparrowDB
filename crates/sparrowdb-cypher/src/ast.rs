@@ -540,4 +540,11 @@ pub enum Statement {
         /// Whether the outer RETURN is `RETURN DISTINCT …`.
         return_distinct: bool,
     },
+    /// `CREATE FULLTEXT INDEX [name] FOR (n:Label) ON (n.property)` — BM25 FTS index (issue #395).
+    CreateFulltextIndex {
+        /// Optional user-supplied index name (currently stored but not used for lookup).
+        name: Option<String>,
+        label: String,
+        property: String,
+    },
 }

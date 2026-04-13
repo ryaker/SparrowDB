@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tracing::info_span;
+use tracing::{info_span, warn};
 
 // ── DbStats ───────────────────────────────────────────────────────────────────
 
@@ -778,6 +778,14 @@ impl GraphDb {
 
         let mut tx = self.begin_write()?;
 
+        // Load the FTS registry once for the entire CREATE statement.  Loading
+        // inside the per-node loop would cause redundant disk reads for every
+        // node in a bulk `CREATE` statement.
+        let fts_registry = {
+            use sparrowdb_storage::fts_index::FtsRegistry;
+            FtsRegistry::load(&self.inner.path)
+        };
+
         // Map variable name → NodeId for all newly created nodes.
         let mut var_to_node: HashMap<String, NodeId> = HashMap::new();
         // Map variable name → named props written (for RETURN projection).
@@ -873,6 +881,32 @@ impl GraphDb {
             }
 
             let node_id = tx.create_node_named(label_id, &named_props)?;
+
+            // FTS auto-indexing: if a fulltext index is registered for this
+            // (label, property) pair, insert the string value into the BM25 index.
+            {
+                use sparrowdb_storage::fts_index::FtsIndex;
+                use sparrowdb_storage::node_store::Value as StorageValue;
+                for (prop_name, val) in &named_props {
+                    if fts_registry.contains(&label, prop_name) {
+                        if let StorageValue::Bytes(ref bytes) = val {
+                            // Decode the string from the stored bytes.
+                            if let Ok(text) = std::str::from_utf8(bytes) {
+                                if let Ok(mut idx) =
+                                    FtsIndex::open(&self.inner.path, &label, prop_name)
+                                {
+                                    idx.insert(node_id.0, text);
+                                    if let Err(e) = idx.save() {
+                                        warn!(
+                                            "FTS index save failed for ({label}, {prop_name}): {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // SPA-289: record secondary labels (labels[1..]) in the catalog
             // side table so that MATCH on secondary labels and labels(n)
