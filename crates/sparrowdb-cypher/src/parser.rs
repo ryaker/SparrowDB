@@ -1601,7 +1601,6 @@ impl Parser {
         Ok(Statement::DropIndex { name })
     }
 
-
     // ── UNWIND ────────────────────────────────────────────────────────────────
 
     /// Parse `UNWIND <expr> AS <var> RETURN <items>`.
