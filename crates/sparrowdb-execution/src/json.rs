@@ -43,6 +43,10 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
                 .collect();
             serde_json::Value::Object(obj)
         }
+        // Serialize vector as a JSON array of floats.
+        Value::Vector(floats) => {
+            serde_json::Value::Array(floats.iter().map(|f| serde_json::json!(f)).collect())
+        }
     }
 }
 

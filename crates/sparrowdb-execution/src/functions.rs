@@ -81,6 +81,14 @@ pub fn dispatch_function(name: &str, args: Vec<Value>) -> Result<Value> {
         "date" => fn_date(args),
         "duration" => fn_duration(args),
 
+        // ── Vector functions (issue #394) ─────────────────────────────────────
+        // These are brute-force scalar functions; the planner / engine can use
+        // HNSW when an index exists, but these always work regardless of index.
+        "vector_similarity" | "vector_cosine" => fn_vector_similarity(args),
+        "vector_distance" | "vector_euclidean" => fn_vector_distance(args),
+        "vector_dot" | "vector_dot_product" => fn_vector_dot(args),
+        "tofloatvector" | "vector" => fn_to_float_vector(args),
+
         other => Err(Error::InvalidArgument(format!("unknown function: {other}"))),
     }
 }
@@ -511,6 +519,7 @@ fn fn_to_string(args: Vec<Value>) -> Result<Value> {
             "{}",
             crate::types::Value::Map(entries.clone())
         ))),
+        Value::Vector(v) => Ok(Value::String(format!("{:?}", v))),
     }
 }
 
@@ -781,4 +790,64 @@ fn parse_iso_duration(s: &str) -> Option<i64> {
     }
 
     Some(total)
+}
+
+// ── Vector helper functions (issue #394) ─────────────────────────────────────
+
+/// Extract and validate two equal-length vector arguments from `args`.
+///
+/// Returns `Err(InvalidArgument)` if either argument is not a vector/float-list,
+/// or if the two vectors have different dimensions.
+fn get_two_vectors(fn_name: &str, args: Vec<Value>) -> Result<(Vec<f32>, Vec<f32>)> {
+    expect_arity(fn_name, &args, 2)?;
+    let a = args[0].as_vector().ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "{fn_name}: first argument must be a vector or float list"
+        ))
+    })?;
+    let b = args[1].as_vector().ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "{fn_name}: second argument must be a vector or float list"
+        ))
+    })?;
+    if a.len() != b.len() {
+        return Err(Error::InvalidArgument(format!(
+            "{fn_name}: dimension mismatch ({} vs {})",
+            a.len(),
+            b.len()
+        )));
+    }
+    Ok((a, b))
+}
+
+/// `vector_similarity(vec_a, vec_b)` → Float64 (cosine similarity).
+fn fn_vector_similarity(args: Vec<Value>) -> Result<Value> {
+    let (a, b) = get_two_vectors("vector_similarity", args)?;
+    let sim = sparrowdb_storage::vector_index::cosine_similarity(&a, &b);
+    Ok(Value::Float64(sim as f64))
+}
+
+/// `vector_distance(vec_a, vec_b)` → Float64 (Euclidean / L2 distance).
+fn fn_vector_distance(args: Vec<Value>) -> Result<Value> {
+    let (a, b) = get_two_vectors("vector_distance", args)?;
+    let dist = sparrowdb_storage::vector_index::euclidean_distance(&a, &b);
+    Ok(Value::Float64(dist as f64))
+}
+
+/// `vector_dot(vec_a, vec_b)` → Float64 (dot product).
+fn fn_vector_dot(args: Vec<Value>) -> Result<Value> {
+    let (a, b) = get_two_vectors("vector_dot", args)?;
+    let dp = sparrowdb_storage::vector_index::dot_product(&a, &b);
+    Ok(Value::Float64(dp as f64))
+}
+
+/// `vector([f, f, ...])` or `tofloatvector([f, f, ...])` — convert a list of numbers to a Vector value.
+fn fn_to_float_vector(args: Vec<Value>) -> Result<Value> {
+    expect_arity("vector", &args, 1)?;
+    match args[0].as_vector() {
+        Some(v) => Ok(Value::Vector(v)),
+        None => Err(Error::InvalidArgument(
+            "vector(): argument must be a list of numbers".into(),
+        )),
+    }
 }

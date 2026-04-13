@@ -296,6 +296,8 @@ impl Parser {
             Token::Return => self.parse_standalone_return(),
             // CALL procedure(args) YIELD col [RETURN ...]
             Token::Call => self.parse_call(),
+            // DROP INDEX <name>
+            Token::Ident(ref s) if s.eq_ignore_ascii_case("DROP") => self.parse_drop(),
             other => Err(Error::InvalidArgument(format!(
                 "unexpected token at statement start: {:?}",
                 other
@@ -1347,6 +1349,17 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_tok(&Token::Create)?;
+        // CREATE VECTOR INDEX …
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("VECTOR")) {
+            self.advance(); // consume VECTOR
+                            // consume INDEX (required)
+            if matches!(self.peek(), Token::Index)
+                || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("INDEX"))
+            {
+                self.advance();
+            }
+            return self.parse_create_vector_index();
+        }
         if matches!(self.peek(), Token::Index) {
             self.advance();
             return self.parse_create_index();
@@ -1464,6 +1477,128 @@ impl Parser {
             label,
             property,
         })
+    }
+
+    /// Parse `CREATE VECTOR INDEX [name] FOR (n:Label) ON (n.prop) OPTIONS { dimensions: N, similarity: 'metric' }`.
+    ///
+    /// The `[name]`, `OPTIONS`, and individual option fields are all optional —
+    /// the parser degrades gracefully and uses sensible defaults.
+    fn parse_create_vector_index(&mut self) -> Result<Statement> {
+        // Optional index name: if the next token is an ident not equal to "FOR", treat it as the name.
+        let name: Option<String> = {
+            let peeked = self.peek().clone();
+            match peeked {
+                Token::Ident(ref s) if !s.eq_ignore_ascii_case("FOR") => {
+                    let n = s.clone();
+                    self.advance();
+                    Some(n)
+                }
+                _ => None,
+            }
+        };
+
+        // `FOR (n:Label)`
+        match self.peek().clone() {
+            Token::Ident(ref s) if s.eq_ignore_ascii_case("FOR") => {
+                self.advance();
+            }
+            _ => {} // tolerate missing FOR
+        }
+        self.expect_tok(&Token::LParen)?;
+        let _var = self.expect_ident()?; // `n`
+        self.expect_tok(&Token::Colon)?;
+        let label = self.expect_label_or_type()?;
+        self.expect_tok(&Token::RParen)?;
+
+        // `ON (n.prop)`
+        match self.peek().clone() {
+            Token::On => {
+                self.advance();
+            }
+            Token::Ident(ref s) if s.eq_ignore_ascii_case("ON") => {
+                self.advance();
+            }
+            _ => {} // tolerate missing ON
+        }
+        self.expect_tok(&Token::LParen)?;
+        let _prop_var = self.expect_ident()?; // `n`
+        self.expect_tok(&Token::Dot)?;
+        let prop = self.expect_ident()?;
+        self.expect_tok(&Token::RParen)?;
+
+        // Optional `OPTIONS { dimensions: N, similarity: 'metric' }`
+        let mut dimensions: usize = 1536;
+        let mut similarity = "cosine".to_string();
+
+        if let Token::Ident(ref s) = self.peek().clone() {
+            if s.eq_ignore_ascii_case("OPTIONS") {
+                self.advance(); // consume OPTIONS
+                if matches!(self.peek(), Token::LBrace) {
+                    self.advance(); // consume `{`
+                    loop {
+                        if matches!(self.peek(), Token::RBrace | Token::Eof) {
+                            break;
+                        }
+                        let key = match self.expect_ident() {
+                            Ok(k) => k.to_lowercase(),
+                            Err(_) => break,
+                        };
+                        // consume `:`
+                        if matches!(self.peek(), Token::Colon) {
+                            self.advance();
+                        }
+                        match key.as_str() {
+                            "dimensions" => match self.advance().clone() {
+                                Token::Integer(n) => dimensions = n.max(1) as usize,
+                                Token::Float(f) => dimensions = f.max(1.0) as usize,
+                                _ => {}
+                            },
+                            "similarity" | "metric" => match self.advance().clone() {
+                                Token::Str(s) => similarity = s.to_lowercase(),
+                                Token::Ident(s) => similarity = s.to_lowercase(),
+                                _ => {}
+                            },
+                            _ => {
+                                self.advance();
+                            }
+                        }
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                        }
+                    }
+                    if matches!(self.peek(), Token::RBrace) {
+                        self.advance(); // consume `}`
+                    }
+                }
+            }
+        }
+
+        Ok(Statement::CreateVectorIndex {
+            name,
+            label,
+            prop,
+            dimensions,
+            similarity,
+        })
+    }
+
+    /// Parse `DROP INDEX <name>`.
+    fn parse_drop(&mut self) -> Result<Statement> {
+        // consume "DROP"
+        self.advance();
+        // expect "INDEX"
+        match self.advance().clone() {
+            Token::Index => {}
+            Token::Ident(ref s) if s.eq_ignore_ascii_case("INDEX") => {}
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "expected INDEX after DROP, got {:?}",
+                    other
+                )))
+            }
+        }
+        let name = self.expect_ident()?;
+        Ok(Statement::DropIndex { name })
     }
 
     // ── UNWIND ────────────────────────────────────────────────────────────────

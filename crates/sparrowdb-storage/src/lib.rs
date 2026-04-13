@@ -30,6 +30,11 @@ pub mod text_index;
 /// Edge delta log and CSR rebuild on checkpoint.
 pub mod edge_store;
 
+/// HNSW vector similarity index (issue #394).
+pub mod vector_index;
+
+pub use vector_index::{Metric, VectorIndex};
+
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 

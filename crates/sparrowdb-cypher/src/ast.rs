@@ -547,4 +547,17 @@ pub enum Statement {
         label: String,
         property: String,
     },
+    /// `CREATE VECTOR INDEX [name] FOR (n:Label) ON (n.prop) OPTIONS { dimensions: N, similarity: 'cosine' }` (issue #394).
+    CreateVectorIndex {
+        /// Optional index name (ignored at runtime but parsed for compatibility).
+        name: Option<String>,
+        label: String,
+        prop: String,
+        dimensions: usize,
+        similarity: String,
+    },
+    /// `DROP INDEX <name>` — remove a named property or vector index.
+    DropIndex {
+        name: String,
+    },
 }

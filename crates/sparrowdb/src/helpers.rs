@@ -9,6 +9,7 @@ use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
 use sparrowdb_storage::node_store::{NodeStore, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 // ── FNV-1a col_id derivation ─────────────────────────────────────────────────
 
@@ -329,6 +330,50 @@ pub(crate) fn try_open_csr_map(path: &Path) -> crate::Result<HashMap<u32, CsrFor
         }
     }
     Ok(map)
+}
+
+// ── Vector index helpers (issue #394) ────────────────────────────────────────
+
+/// Scan `<db_root>/vector_indexes/` and load all persisted HNSW indexes.
+///
+/// The directory contains files named `hnsw_<label>_<prop>.bin`. This function
+/// loads each one and reconstructs the `(label, prop)` key from the file name.
+/// Unreadable files are silently skipped.
+pub(crate) fn load_vector_indexes(db_root: &Path) -> crate::types::VectorIndexMap {
+    let dir = db_root.join("vector_indexes");
+    let mut map: crate::types::VectorIndexMap = HashMap::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return map,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let fname = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        // Expected format: "hnsw_<label>_<prop>"
+        if !fname.starts_with("hnsw_") {
+            continue;
+        }
+        let rest = &fname[5..]; // strip "hnsw_"
+                                // Split on the first '_' to recover label and prop.
+                                // Labels can contain underscores, so we use the *last* underscore as separator.
+        if let Some(sep) = rest.rfind('_') {
+            let label = &rest[..sep];
+            let prop = &rest[sep + 1..];
+            if label.is_empty() || prop.is_empty() {
+                continue;
+            }
+            if let Ok(Some(idx)) = sparrowdb_storage::VectorIndex::load(&dir, label, prop) {
+                map.insert(
+                    (label.to_string(), prop.to_string()),
+                    Arc::new(RwLock::new(idx)),
+                );
+            }
+        }
+    }
+    map
 }
 
 // ── Storage-size helpers (SPA-171) ────────────────────────────────────────────

@@ -8,8 +8,8 @@ use crate::batch::augment_rows_with_pending;
 use crate::helpers::{
     build_label_row_counts_from_disk, collect_maintenance_params, dir_size_bytes, eval_expr_merge,
     expr_to_value, expr_to_value_with_params, fnv1a_col_id, is_edge_delete_mutation,
-    is_reserved_label, literal_to_value, load_constraints, open_csr_map, save_constraints,
-    storage_value_to_exec, try_open_csr_map,
+    is_reserved_label, literal_to_value, load_constraints, load_vector_indexes, open_csr_map,
+    save_constraints, storage_value_to_exec, try_open_csr_map,
 };
 use crate::read_tx::ReadTx;
 use crate::types::{DbInner, NodeVersions, PendingOp, VersionStore, WriteBuffer, WriteGuard};
@@ -103,6 +103,7 @@ impl GraphDb {
         } else {
             0
         };
+        let vector_indexes = RwLock::new(load_vector_indexes(path));
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -120,6 +121,7 @@ impl GraphDb {
                 edge_props_cache: Arc::new(RwLock::new(HashMap::new())),
                 active_readers: Mutex::new(BTreeMap::new()),
                 commits_since_gc: AtomicU64::new(0),
+                vector_indexes,
             }),
         })
     }
@@ -164,6 +166,7 @@ impl GraphDb {
         } else {
             0
         };
+        let vector_indexes = RwLock::new(load_vector_indexes(path));
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -181,6 +184,7 @@ impl GraphDb {
                 edge_props_cache: Arc::new(RwLock::new(HashMap::new())),
                 active_readers: Mutex::new(BTreeMap::new()),
                 commits_since_gc: AtomicU64::new(0),
+                vector_indexes,
             }),
         })
     }
@@ -500,6 +504,33 @@ impl GraphDb {
             Statement::CreateConstraint { label, property } => {
                 return self.register_unique_constraint(label, property);
             }
+            Statement::CreateVectorIndex {
+                label,
+                prop,
+                dimensions,
+                similarity,
+                ..
+            } => {
+                self.create_vector_index(label, prop, *dimensions, similarity)?;
+                return Ok(QueryResult::empty(vec![]));
+            }
+            Statement::DropIndex { name } => {
+                // DROP INDEX <name> — try to resolve as a vector index first.
+                // The naming convention for auto-named vector indexes is
+                // `<label>_<prop>` (last underscore splits label from prop).
+                // We only call drop_vector_index if the resolved (label, prop)
+                // pair is actually registered as a vector index; otherwise the
+                // statement is silently ignored (non-vector property indexes are
+                // not yet tracked by name in this implementation).
+                if let Some(pos) = name.rfind('_') {
+                    let label = &name[..pos];
+                    let prop = &name[pos + 1..];
+                    if self.get_vector_index(label, prop).is_some() {
+                        self.drop_vector_index(label, prop)?;
+                    }
+                }
+                return Ok(QueryResult::empty(vec![]));
+            }
             _ => {}
         }
 
@@ -563,6 +594,26 @@ impl GraphDb {
             }
             Statement::CreateConstraint { label, property } => {
                 return self.register_unique_constraint(label, property);
+            }
+            Statement::CreateVectorIndex {
+                label,
+                prop,
+                dimensions,
+                similarity,
+                ..
+            } => {
+                self.create_vector_index(label, prop, *dimensions, similarity)?;
+                return Ok(QueryResult::empty(vec![]));
+            }
+            Statement::DropIndex { name } => {
+                if let Some(pos) = name.rfind('_') {
+                    let label = &name[..pos];
+                    let prop = &name[pos + 1..];
+                    if self.get_vector_index(label, prop).is_some() {
+                        self.drop_vector_index(label, prop)?;
+                    }
+                }
+                return Ok(QueryResult::empty(vec![]));
             }
             _ => {}
         }
@@ -654,6 +705,26 @@ impl GraphDb {
             }
             Statement::CreateConstraint { label, property } => {
                 return self.register_unique_constraint(label, property);
+            }
+            Statement::CreateVectorIndex {
+                label,
+                prop,
+                dimensions,
+                similarity,
+                ..
+            } => {
+                self.create_vector_index(label, prop, *dimensions, similarity)?;
+                return Ok(QueryResult::empty(vec![]));
+            }
+            Statement::DropIndex { name } => {
+                if let Some(pos) = name.rfind('_') {
+                    let label = &name[..pos];
+                    let prop = &name[pos + 1..];
+                    if self.get_vector_index(label, prop).is_some() {
+                        self.drop_vector_index(label, prop)?;
+                    }
+                }
+                return Ok(QueryResult::empty(vec![]));
             }
             _ => {}
         }
@@ -907,6 +978,27 @@ impl GraphDb {
                     }
                 }
             }
+            // Vector index write-path: if there is an HNSW index for any
+            // property on this label, check if the execution-layer value for
+            // that prop is a vector.  Standalone CREATE only supports literal
+            // values, so vector embedding is normally injected via MERGE+params.
+            // This block handles the rare case where a list literal is used.
+            {
+                let vidx_dir = self.inner.path.join("vector_indexes");
+                let vidx_guard = self.inner.vector_indexes.read().expect("vector_indexes");
+                for (prop_key, sv) in &named_props {
+                    let key = (label.clone(), prop_key.clone());
+                    if let Some(arc_idx) = vidx_guard.get(&key) {
+                        let exec_val = storage_value_to_exec(sv);
+                        if let Some(vec) = exec_val.as_vector() {
+                            let mut idx = arc_idx.write().expect("vector_index write");
+                            idx.insert(node_id.0, &vec);
+                            // Persist after insert so the on-disk snapshot stays current.
+                            idx.save(&vidx_dir, &label, prop_key).map_err(Error::Io)?;
+                        }
+                    }
+                }
+            }
 
             // SPA-289: record secondary labels (labels[1..]) in the catalog
             // side table so that MATCH on secondary labels and labels(n)
@@ -1106,6 +1198,27 @@ impl GraphDb {
         if let Statement::CreateConstraint { label, property } = &bound.inner {
             return self.register_unique_constraint(label, property);
         }
+        if let Statement::CreateVectorIndex {
+            label,
+            prop,
+            dimensions,
+            similarity,
+            ..
+        } = &bound.inner
+        {
+            self.create_vector_index(label, prop, *dimensions, similarity)?;
+            return Ok(QueryResult::empty(vec![]));
+        }
+        if let Statement::DropIndex { name } = &bound.inner {
+            if let Some(pos) = name.rfind('_') {
+                let label = &name[..pos];
+                let prop = &name[pos + 1..];
+                if self.get_vector_index(label, prop).is_some() {
+                    self.drop_vector_index(label, prop)?;
+                }
+            }
+            return Ok(QueryResult::empty(vec![]));
+        }
         if Engine::is_mutation(&bound.inner) {
             // Route mutations through params-aware helpers (SPA-218).
             use sparrowdb_cypher::ast::Statement as Stmt;
@@ -1279,6 +1392,33 @@ impl GraphDb {
         }
         tx.commit()?;
         self.invalidate_catalog();
+
+        // Vector index write-path: for each prop key in the MERGE pattern,
+        // check if there is an HNSW index.  Pull the vector directly from the
+        // exec-layer params (which preserve Value::Vector) rather than going
+        // through StoreValue which cannot represent vectors.
+        {
+            use sparrowdb_cypher::ast::{Expr, Literal};
+            let vidx_dir = self.inner.path.join("vector_indexes");
+            let vidx_guard = self.inner.vector_indexes.read().expect("vector_indexes");
+            for pe in &m.props {
+                let key = (m.label.clone(), pe.key.clone());
+                if let Some(arc_idx) = vidx_guard.get(&key) {
+                    // Resolve the parameter name, then look up the exec-layer value.
+                    if let Expr::Literal(Literal::Param(p)) = &pe.value {
+                        if let Some(exec_val) = params.get(p.as_str()) {
+                            if let Some(vec) = exec_val.as_vector() {
+                                let mut idx = arc_idx.write().expect("vector_index write");
+                                idx.insert(node_id.0, &vec);
+                                // Persist after insert so the on-disk snapshot stays current.
+                                idx.save(&vidx_dir, &m.label, &pe.key).map_err(Error::Io)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(ref ret) = m.return_clause {
             use sparrowdb_cypher::ast::Expr;
             type ExecValue = sparrowdb_execution::Value;
@@ -1888,6 +2028,85 @@ impl GraphDb {
         let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         FulltextIndex::create(&self.inner.path, name)?;
         Ok(())
+    }
+
+    // ── Vector index API (issue #394) ─────────────────────────────────────────
+
+    /// Create an HNSW vector similarity index on `(label, prop)`.
+    ///
+    /// If an index already exists for this `(label, prop)` pair, this is a
+    /// no-op.  The index is persisted to `<db_path>/vector_indexes/` and loaded
+    /// automatically on the next `GraphDb::open`.
+    pub fn create_vector_index(
+        &self,
+        label: &str,
+        prop: &str,
+        dimensions: usize,
+        similarity: &str,
+    ) -> Result<()> {
+        use sparrowdb_storage::vector_index::{Metric, VectorIndex};
+        let metric = match similarity.to_lowercase().as_str() {
+            "cosine" | "cos" => Metric::Cosine,
+            "dot" | "dot_product" => Metric::DotProduct,
+            "euclidean" | "l2" => Metric::Euclidean,
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "unsupported similarity metric: '{other}'; expected 'cosine', 'dot', or 'euclidean'"
+                )))
+            }
+        };
+
+        let key = (label.to_string(), prop.to_string());
+        {
+            let guard = self
+                .inner
+                .vector_indexes
+                .read()
+                .expect("vector_indexes poisoned");
+            if guard.contains_key(&key) {
+                return Ok(());
+            }
+        }
+        let idx = VectorIndex::new(dimensions, metric);
+        let dir = self.inner.path.join("vector_indexes");
+        idx.save(&dir, label, prop).map_err(Error::Io)?;
+        self.inner
+            .vector_indexes
+            .write()
+            .expect("vector_indexes poisoned")
+            .insert(key, std::sync::Arc::new(RwLock::new(idx)));
+        Ok(())
+    }
+
+    /// Drop the HNSW vector index on `(label, prop)`.
+    ///
+    /// Removes the in-memory entry and deletes the on-disk file.  No-op if no
+    /// index exists for this pair.
+    pub fn drop_vector_index(&self, label: &str, prop: &str) -> Result<()> {
+        let key = (label.to_string(), prop.to_string());
+        self.inner
+            .vector_indexes
+            .write()
+            .expect("vector_indexes poisoned")
+            .remove(&key);
+        let dir = self.inner.path.join("vector_indexes");
+        sparrowdb_storage::VectorIndex::remove(&dir, label, prop);
+        Ok(())
+    }
+
+    /// Return a handle to the HNSW vector index for `(label, prop)`, if one exists.
+    pub fn get_vector_index(
+        &self,
+        label: &str,
+        prop: &str,
+    ) -> Option<std::sync::Arc<RwLock<sparrowdb_storage::VectorIndex>>> {
+        let key = (label.to_string(), prop.to_string());
+        self.inner
+            .vector_indexes
+            .read()
+            .expect("vector_indexes poisoned")
+            .get(&key)
+            .cloned()
     }
 
     /// Execute multiple Cypher queries as a single atomic batch.
