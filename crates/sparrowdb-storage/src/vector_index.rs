@@ -1,6 +1,6 @@
 //! HNSW (Hierarchical Navigable Small World) vector similarity index.
 //!
-//! Pure-Rust implementation — no C dependencies, no external HNSW crates.
+//! Pure-Rust, zero-dependency ANN implementation.
 //! Implements the algorithm from Malkov & Yashunin (2018).
 //!
 //! ## Parameters
