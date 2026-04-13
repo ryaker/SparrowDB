@@ -45,6 +45,14 @@ fn value_to_py(py: Python<'_>, v: &sparrowdb_execution::Value) -> PyObject {
             }
             py_dict.into()
         }
+        // Vector: expose as a Python list of floats.
+        Value::Vector(floats) => {
+            let py_list = PyList::empty_bound(py);
+            for f in floats.iter() {
+                py_list.append((*f as f64).into_py(py)).unwrap();
+            }
+            py_list.into()
+        }
     }
 }
 
