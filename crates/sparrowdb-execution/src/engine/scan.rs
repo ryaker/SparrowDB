@@ -710,13 +710,15 @@ impl Engine {
     pub(crate) fn execute_match(&self, m: &MatchStatement) -> Result<QueryResult> {
         if m.pattern.is_empty() {
             // Standalone RETURN with no MATCH: evaluate each item as a scalar expression.
+            // Use eval_expr_graph so that graph-aware functions (hybrid_search,
+            // full_text_search, bm25_score, …) are also reachable.
             let column_names = extract_return_column_names(&m.return_clause.items);
             let empty_vals: HashMap<String, Value> = HashMap::new();
             let row: Vec<Value> = m
                 .return_clause
                 .items
                 .iter()
-                .map(|item| eval_expr(&item.expr, &empty_vals))
+                .map(|item| self.eval_expr_graph(&item.expr, &empty_vals))
                 .collect();
             return Ok(QueryResult {
                 columns: column_names,
