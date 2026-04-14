@@ -89,6 +89,12 @@ pub fn dispatch_function(name: &str, args: Vec<Value>) -> Result<Value> {
         "vector_dot" | "vector_dot_product" => fn_vector_dot(args),
         "tofloatvector" | "vector" => fn_to_float_vector(args),
 
+        // ── Hybrid search fusion functions (issue #396) ───────────────────────
+        // Pure list-processing functions; hybrid_search() is engine-dispatched
+        // (requires DB access) and is handled separately in engine/expr.rs.
+        "rrf_fusion" => fn_rrf_fusion(args),
+        "weighted_fusion" => fn_weighted_fusion(args),
+
         other => Err(Error::InvalidArgument(format!("unknown function: {other}"))),
     }
 }
@@ -849,5 +855,457 @@ fn fn_to_float_vector(args: Vec<Value>) -> Result<Value> {
         None => Err(Error::InvalidArgument(
             "vector(): argument must be a list of numbers".into(),
         )),
+    }
+}
+
+// ── Hybrid search fusion functions (issue #396) ───────────────────────────────
+
+/// Extract a `Vec<(node_id: u64, score: f64)>` from a `Value::List` of `Value::Map` entries.
+///
+/// Each map must contain a `"node_id"` key (Int64) and a `"score"` key (Float64 or Int64).
+/// Entries that are malformed are silently skipped so partial lists still work.
+fn extract_scored_list(fn_name: &str, v: &Value) -> Result<Vec<(u64, f64)>> {
+    let items = match v {
+        Value::List(items) => items,
+        _ => {
+            return Err(Error::InvalidArgument(format!(
+                "{fn_name}: expected a List of Maps, got {v}"
+            )))
+        }
+    };
+
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if let Value::Map(entries) = item {
+            let node_id = entries
+                .iter()
+                .find(|(k, _)| k == "node_id")
+                .and_then(|(_, v)| match v {
+                    Value::Int64(n) => Some(*n as u64),
+                    _ => None,
+                });
+            let score = entries
+                .iter()
+                .find(|(k, _)| k == "score")
+                .and_then(|(_, v)| match v {
+                    Value::Float64(f) => Some(*f),
+                    Value::Int64(n) => Some(*n as f64),
+                    _ => None,
+                });
+            if let (Some(nid), Some(sc)) = (node_id, score) {
+                out.push((nid, sc));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Build a `Value::List` of `Value::Map({node_id, score, rank})` from a scored list.
+///
+/// The list is already sorted by descending score before this is called.
+fn build_result_list(scored: &[(u64, f64)]) -> Value {
+    let items: Vec<Value> = scored
+        .iter()
+        .enumerate()
+        .map(|(rank, &(node_id, score))| {
+            Value::Map(vec![
+                ("node_id".to_owned(), Value::Int64(node_id as i64)),
+                ("score".to_owned(), Value::Float64(score)),
+                ("rank".to_owned(), Value::Int64((rank + 1) as i64)),
+            ])
+        })
+        .collect();
+    Value::List(items)
+}
+
+/// `rrf_fusion(list1, list2[, k])` — Reciprocal Rank Fusion.
+///
+/// Computes `score(d) = 1/(k + rank1(d)) + 1/(k + rank2(d))` for each document
+/// that appears in either list.  Documents absent from a list are assigned an
+/// implicit rank equal to `list.len() + 1` (worst rank + 1).
+///
+/// Arguments:
+/// - `list1` — `Value::List` of `Value::Map({node_id: Int64, score: Float64})`
+/// - `list2` — same format
+/// - `k`     — (optional, default 60) smoothing constant (Int64 or Float64)
+///
+/// Returns a `Value::List` of `Value::Map({node_id, score, rank})` sorted by
+/// descending RRF score.
+fn fn_rrf_fusion(args: Vec<Value>) -> Result<Value> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(Error::InvalidArgument(
+            "rrf_fusion() expects 2 or 3 arguments: (list1, list2[, k])".into(),
+        ));
+    }
+
+    let list1 = extract_scored_list("rrf_fusion", &args[0])?;
+    let list2 = extract_scored_list("rrf_fusion", &args[1])?;
+    let k: f64 = if args.len() == 3 {
+        as_float("rrf_fusion", &args[2])?
+    } else {
+        60.0
+    };
+
+    if k <= 0.0 {
+        return Err(Error::InvalidArgument(
+            "rrf_fusion(): k must be positive".into(),
+        ));
+    }
+
+    // Build rank maps: node_id → 1-based rank in each list.
+    use std::collections::HashMap;
+    let rank1: HashMap<u64, usize> = list1
+        .iter()
+        .enumerate()
+        .map(|(i, &(nid, _))| (nid, i + 1))
+        .collect();
+    let rank2: HashMap<u64, usize> = list2
+        .iter()
+        .enumerate()
+        .map(|(i, &(nid, _))| (nid, i + 1))
+        .collect();
+
+    // Collect all unique node IDs from both lists.
+    let mut all_ids: Vec<u64> = rank1.keys().copied().collect();
+    for &(nid, _) in &list2 {
+        if !rank1.contains_key(&nid) {
+            all_ids.push(nid);
+        }
+    }
+
+    // Worst-rank sentinels (absent from one list = rank len + 1).
+    let worst1 = list1.len() + 1;
+    let worst2 = list2.len() + 1;
+
+    // Compute RRF scores.
+    let mut scored: Vec<(u64, f64)> = all_ids
+        .into_iter()
+        .map(|nid| {
+            let r1 = *rank1.get(&nid).unwrap_or(&worst1) as f64;
+            let r2 = *rank2.get(&nid).unwrap_or(&worst2) as f64;
+            let score = 1.0 / (k + r1) + 1.0 / (k + r2);
+            (nid, score)
+        })
+        .collect();
+
+    // Sort: descending score, then ascending node_id for determinism.
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    Ok(build_result_list(&scored))
+}
+
+/// `weighted_fusion(list1, list2, alpha)` — alpha-weighted score fusion.
+///
+/// Normalises each list's scores to [0, 1] (min-max), then combines:
+/// `score(d) = alpha * norm_score1(d) + (1 - alpha) * norm_score2(d)`.
+///
+/// Arguments:
+/// - `list1`  — vector results: `Value::List<Value::Map({node_id, score})>`
+/// - `list2`  — FTS results in the same format
+/// - `alpha`  — weight for list1 in [0, 1]; `1 - alpha` is the weight for list2
+///
+/// Returns a `Value::List` of `Value::Map({node_id, score, rank})` sorted by
+/// descending weighted score.
+fn fn_weighted_fusion(args: Vec<Value>) -> Result<Value> {
+    expect_arity("weighted_fusion", &args, 3)?;
+
+    let list1 = extract_scored_list("weighted_fusion", &args[0])?;
+    let list2 = extract_scored_list("weighted_fusion", &args[1])?;
+    let alpha = as_float("weighted_fusion", &args[2])?;
+
+    if !(0.0..=1.0).contains(&alpha) {
+        return Err(Error::InvalidArgument(
+            "weighted_fusion(): alpha must be in [0, 1]".into(),
+        ));
+    }
+
+    // Min-max normalise a scored list to [0, 1].
+    let normalise = |list: &[(u64, f64)]| -> Vec<(u64, f64)> {
+        if list.is_empty() {
+            return vec![];
+        }
+        let min = list.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
+        let max = list
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let range = max - min;
+        list.iter()
+            .map(|&(nid, s)| {
+                let norm = if range < f64::EPSILON {
+                    1.0
+                } else {
+                    (s - min) / range
+                };
+                (nid, norm)
+            })
+            .collect()
+    };
+
+    let norm1 = normalise(&list1);
+    let norm2 = normalise(&list2);
+
+    use std::collections::HashMap;
+    let map1: HashMap<u64, f64> = norm1.into_iter().collect();
+    let map2: HashMap<u64, f64> = norm2.into_iter().collect();
+
+    // Union of all IDs.
+    let mut all_ids: Vec<u64> = map1.keys().copied().collect();
+    for &k in map2.keys() {
+        if !map1.contains_key(&k) {
+            all_ids.push(k);
+        }
+    }
+
+    let mut scored: Vec<(u64, f64)> = all_ids
+        .into_iter()
+        .map(|nid| {
+            let s1 = map1.get(&nid).copied().unwrap_or(0.0);
+            let s2 = map2.get(&nid).copied().unwrap_or(0.0);
+            (nid, alpha * s1 + (1.0 - alpha) * s2)
+        })
+        .collect();
+
+    // Sort: descending score, then ascending node_id for determinism.
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    Ok(build_result_list(&scored))
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(node_id: u64, score: f64) -> Value {
+        Value::Map(vec![
+            ("node_id".to_owned(), Value::Int64(node_id as i64)),
+            ("score".to_owned(), Value::Float64(score)),
+        ])
+    }
+
+    fn make_list(entries: Vec<Value>) -> Value {
+        Value::List(entries)
+    }
+
+    fn extract_ids_in_order(result: &Value) -> Vec<u64> {
+        match result {
+            Value::List(items) => items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::Map(kvs) => {
+                        kvs.iter()
+                            .find(|(k, _)| k == "node_id")
+                            .and_then(|(_, v)| match v {
+                                Value::Int64(n) => Some(*n as u64),
+                                _ => None,
+                            })
+                    }
+                    _ => None,
+                })
+                .collect(),
+            _ => panic!("expected List, got {result:?}"),
+        }
+    }
+
+    fn score_for(result: &Value, node_id: u64) -> Option<f64> {
+        match result {
+            Value::List(items) => items.iter().find_map(|item| match item {
+                Value::Map(kvs) => {
+                    let nid = kvs
+                        .iter()
+                        .find(|(k, _)| k == "node_id")
+                        .and_then(|(_, v)| match v {
+                            Value::Int64(n) => Some(*n as u64),
+                            _ => None,
+                        });
+                    let sc = kvs
+                        .iter()
+                        .find(|(k, _)| k == "score")
+                        .and_then(|(_, v)| match v {
+                            Value::Float64(f) => Some(*f),
+                            _ => None,
+                        });
+                    if nid == Some(node_id) {
+                        sc
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    // ── rrf_fusion ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn rrf_fusion_basic_two_lists() {
+        // list1: node 1 (rank 1), node 2 (rank 2), node 3 (rank 3)
+        // list2: node 3 (rank 1), node 1 (rank 2), node 4 (rank 3)
+        // With k=60:
+        //   node 1: 1/61 + 1/62 ≈ 0.032522 (top)
+        //   node 3: 1/63 + 1/61 ≈ 0.032266 (second)
+        //   node 2: 1/62 + 1/64 ≈ 0.031754 (third)
+        //   node 4: 1/64 + 1/63 ≈ 0.031498 (last)
+        let list1 = make_list(vec![entry(1, 0.9), entry(2, 0.8), entry(3, 0.7)]);
+        let list2 = make_list(vec![entry(3, 0.9), entry(1, 0.8), entry(4, 0.7)]);
+
+        let result = dispatch_function("rrf_fusion", vec![list1, list2]).expect("rrf_fusion");
+        let ids = extract_ids_in_order(&result);
+
+        assert_eq!(ids.len(), 4, "all 4 unique nodes should appear");
+        assert_eq!(ids[0], 1, "node 1 should rank first");
+        assert_eq!(ids[1], 3, "node 3 should rank second");
+        assert_eq!(ids[2], 2, "node 2 should rank third");
+        assert_eq!(ids[3], 4, "node 4 should rank last");
+    }
+
+    #[test]
+    fn rrf_fusion_custom_k() {
+        // k=1: each node is rank-1 in one list, rank-2 in the other → symmetric tie
+        // tie-broken by ascending node_id → 10 before 20
+        let list1 = make_list(vec![entry(10, 1.0), entry(20, 0.5)]);
+        let list2 = make_list(vec![entry(20, 1.0), entry(10, 0.5)]);
+
+        let result = dispatch_function("rrf_fusion", vec![list1, list2, Value::Float64(1.0)])
+            .expect("rrf_fusion k=1");
+        let ids = extract_ids_in_order(&result);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], 10);
+        assert_eq!(ids[1], 20);
+    }
+
+    #[test]
+    fn rrf_fusion_empty_lists() {
+        let empty = make_list(vec![]);
+        let result =
+            dispatch_function("rrf_fusion", vec![empty.clone(), empty]).expect("rrf_fusion empty");
+        assert_eq!(
+            extract_ids_in_order(&result).len(),
+            0,
+            "empty lists produce empty result"
+        );
+    }
+
+    #[test]
+    fn rrf_fusion_disjoint_lists() {
+        // No overlap: rank-1 nodes in both lists tie → resolved by node_id asc.
+        let list1 = make_list(vec![entry(1, 1.0), entry(2, 0.5)]);
+        let list2 = make_list(vec![entry(3, 1.0), entry(4, 0.5)]);
+
+        let result =
+            dispatch_function("rrf_fusion", vec![list1, list2]).expect("rrf_fusion disjoint");
+        let ids = extract_ids_in_order(&result);
+        assert_eq!(ids.len(), 4);
+        assert_eq!(ids[0], 1);
+        assert_eq!(ids[1], 3);
+    }
+
+    #[test]
+    fn rrf_fusion_arity_error() {
+        let list = make_list(vec![entry(1, 1.0)]);
+        assert!(
+            dispatch_function("rrf_fusion", vec![list]).is_err(),
+            "single-argument call must error"
+        );
+    }
+
+    // ── weighted_fusion ───────────────────────────────────────────────────────
+
+    #[test]
+    fn weighted_fusion_alpha_one_favors_list1() {
+        let list1 = make_list(vec![entry(1, 1.0), entry(2, 0.0)]);
+        let list2 = make_list(vec![entry(2, 1.0), entry(1, 0.0)]);
+
+        let result = dispatch_function("weighted_fusion", vec![list1, list2, Value::Float64(1.0)])
+            .expect("weighted_fusion alpha=1");
+        let ids = extract_ids_in_order(&result);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], 1, "alpha=1 should rank list1's top item first");
+    }
+
+    #[test]
+    fn weighted_fusion_alpha_zero_favors_list2() {
+        let list1 = make_list(vec![entry(1, 1.0), entry(2, 0.0)]);
+        let list2 = make_list(vec![entry(2, 1.0), entry(1, 0.0)]);
+
+        let result = dispatch_function("weighted_fusion", vec![list1, list2, Value::Float64(0.0)])
+            .expect("weighted_fusion alpha=0");
+        let ids = extract_ids_in_order(&result);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], 2, "alpha=0 should rank list2's top item first");
+    }
+
+    #[test]
+    fn weighted_fusion_alpha_half_tie_breaks_by_node_id() {
+        // Symmetric at alpha=0.5 → both nodes get 0.5 → tie → node_id asc
+        let list1 = make_list(vec![entry(1, 1.0), entry(2, 0.0)]);
+        let list2 = make_list(vec![entry(2, 1.0), entry(1, 0.0)]);
+
+        let result = dispatch_function("weighted_fusion", vec![list1, list2, Value::Float64(0.5)])
+            .expect("weighted_fusion alpha=0.5");
+        let ids = extract_ids_in_order(&result);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], 1);
+        assert_eq!(ids[1], 2);
+    }
+
+    #[test]
+    fn weighted_fusion_known_scores() {
+        // list1: node 100=0.8, node 200=0.4  → norm: 100→1.0, 200→0.0
+        // list2: node 200=0.9, node 100=0.6  → norm: 200→1.0, 100→0.0
+        // alpha=0.7: node100 = 0.7*1.0 + 0.3*0.0 = 0.7
+        //            node200 = 0.7*0.0 + 0.3*1.0 = 0.3
+        let list1 = make_list(vec![entry(100, 0.8), entry(200, 0.4)]);
+        let list2 = make_list(vec![entry(200, 0.9), entry(100, 0.6)]);
+
+        let result = dispatch_function("weighted_fusion", vec![list1, list2, Value::Float64(0.7)])
+            .expect("weighted_fusion known scores");
+
+        let score_a = score_for(&result, 100).expect("node 100 in result");
+        let score_b = score_for(&result, 200).expect("node 200 in result");
+        assert!(
+            (score_a - 0.7).abs() < 1e-9,
+            "node 100 expected 0.7, got {score_a}"
+        );
+        assert!(
+            (score_b - 0.3).abs() < 1e-9,
+            "node 200 expected 0.3, got {score_b}"
+        );
+        let ids = extract_ids_in_order(&result);
+        assert_eq!(ids[0], 100, "node 100 should rank first");
+    }
+
+    #[test]
+    fn weighted_fusion_arity_error() {
+        let list = make_list(vec![entry(1, 1.0)]);
+        assert!(
+            dispatch_function("weighted_fusion", vec![list.clone(), list]).is_err(),
+            "two-argument call must error (needs alpha)"
+        );
+    }
+
+    #[test]
+    fn weighted_fusion_invalid_alpha() {
+        let list = make_list(vec![entry(1, 1.0)]);
+        assert!(
+            dispatch_function(
+                "weighted_fusion",
+                vec![list.clone(), list, Value::Float64(1.5)]
+            )
+            .is_err(),
+            "alpha > 1.0 must error"
+        );
     }
 }

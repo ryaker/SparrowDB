@@ -145,6 +145,128 @@ impl Engine {
         }
     }
 
+    // ── Hybrid search (issue #396) ────────────────────────────────────────────
+
+    /// Evaluate `hybrid_search(label, emb_prop, text_prop, query_vec, query_text, k[, alpha])`.
+    ///
+    /// Runs vector search (HNSW) + BM25 full-text search independently, then
+    /// fuses the result lists using Reciprocal Rank Fusion (default) or a
+    /// weighted combination when `alpha` is supplied.
+    ///
+    /// Arguments:
+    /// - `label`      — node label (String)
+    /// - `emb_prop`   — property name holding the embedding (String)
+    /// - `text_prop`  — property name holding the text (String)
+    /// - `query_vec`  — query embedding (Value::Vector or List<Float>)
+    /// - `query_text` — query string (String)
+    /// - `k`          — number of results to return (Int64)
+    /// - `alpha`      — optional; if provided, uses weighted_fusion with this weight;
+    ///   if omitted, uses RRF (k=60)
+    ///
+    /// Returns `Value::List<Value::Map({node_id, score, rank}>>` sorted by
+    /// descending fused score, or `Value::Null` on any error.
+    pub(crate) fn eval_hybrid_search(&self, args: &[Expr], vals: &HashMap<String, Value>) -> Value {
+        if args.len() < 6 || args.len() > 7 {
+            return Value::Null;
+        }
+
+        // Evaluate all arguments.
+        let label_val = eval_expr(&args[0], vals);
+        let emb_prop_val = eval_expr(&args[1], vals);
+        let text_prop_val = eval_expr(&args[2], vals);
+        let query_vec_val = eval_expr(&args[3], vals);
+        let query_text_val = eval_expr(&args[4], vals);
+        let k_val = eval_expr(&args[5], vals);
+
+        let (Value::String(label), Value::String(emb_prop), Value::String(text_prop)) =
+            (label_val, emb_prop_val, text_prop_val)
+        else {
+            return Value::Null;
+        };
+
+        let query_vec = match query_vec_val.as_vector() {
+            Some(v) => v,
+            None => return Value::Null,
+        };
+
+        let Value::String(query_text) = query_text_val else {
+            return Value::Null;
+        };
+
+        let k: usize = match k_val {
+            Value::Int64(n) if n > 0 => n as usize,
+            Value::Float64(f) if f > 0.0 => f as usize,
+            _ => return Value::Null,
+        };
+
+        // Optional alpha for weighted fusion.
+        let alpha: Option<f64> = if args.len() == 7 {
+            let av = eval_expr(&args[6], vals);
+            match av {
+                Value::Float64(f) => Some(f),
+                Value::Int64(n) => Some(n as f64),
+                _ => return Value::Null,
+            }
+        } else {
+            None
+        };
+
+        // ── 1. Vector search ────────────────────────────────────────────────
+        let vec_dir = self.snapshot.db_root.join("vector_indexes");
+        let vec_results: Vec<(u64, f32)> =
+            match sparrowdb_storage::vector_index::VectorIndex::load(&vec_dir, &label, &emb_prop) {
+                // ef = max(k*2, 50) gives a reasonable exploration budget.
+                Ok(Some(idx)) => idx.search(&query_vec, k * 2, (k * 2).max(50)),
+                _ => vec![],
+            };
+
+        // ── 2. Full-text (BM25) search ───────────────────────────────────────
+        let fts_results: Vec<(u64, f32)> = match sparrowdb_storage::fts_index::FtsIndex::open(
+            &self.snapshot.db_root,
+            &label,
+            &text_prop,
+        ) {
+            Ok(idx) => idx.search(&query_text, k * 2),
+            Err(_) => vec![],
+        };
+
+        // ── 3. Build Value::List inputs for fusion functions ─────────────────
+        let make_list = |results: Vec<(u64, f32)>| -> Value {
+            Value::List(
+                results
+                    .into_iter()
+                    .map(|(nid, score)| {
+                        Value::Map(vec![
+                            ("node_id".to_owned(), Value::Int64(nid as i64)),
+                            ("score".to_owned(), Value::Float64(score as f64)),
+                        ])
+                    })
+                    .collect(),
+            )
+        };
+
+        let list1 = make_list(vec_results);
+        let list2 = make_list(fts_results);
+
+        // ── 4. Fuse ──────────────────────────────────────────────────────────
+        let fused = if let Some(a) = alpha {
+            crate::functions::dispatch_function(
+                "weighted_fusion",
+                vec![list1, list2, Value::Float64(a)],
+            )
+        } else {
+            crate::functions::dispatch_function("rrf_fusion", vec![list1, list2])
+        };
+
+        match fused {
+            Ok(Value::List(mut items)) => {
+                items.truncate(k);
+                Value::List(items)
+            }
+            _ => Value::Null,
+        }
+    }
+
     // ── Property filter helpers ───────────────────────────────────────────────
 
     pub(crate) fn matches_prop_filter(
@@ -229,6 +351,7 @@ impl Engine {
             Expr::FnCall { name, args } => match name.to_ascii_lowercase().as_str() {
                 "full_text_search" => self.eval_full_text_search(args, vals),
                 "bm25_score" => self.eval_bm25_score(args, vals),
+                "hybrid_search" => self.eval_hybrid_search(args, vals),
                 _ => eval_expr(expr, vals),
             },
             _ => eval_expr(expr, vals),

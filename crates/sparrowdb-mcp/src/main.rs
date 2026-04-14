@@ -207,6 +207,50 @@ fn handle_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
                         "properties": {"db_path": {"type": "string"}},
                         "required": ["db_path"]
                     }
+                },
+                {
+                    "name": "hybrid_search",
+                    "description": "Run hybrid search: fuses HNSW vector similarity results with BM25 full-text results using Reciprocal Rank Fusion (default) or a weighted combination. Returns a ranked list of {node_id, score, rank} maps. (closes #396)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "db_path": {
+                                "type": "string",
+                                "description": "Path to the SparrowDB database directory"
+                            },
+                            "label": {
+                                "type": "string",
+                                "description": "Node label to search (e.g. \"Memory\")"
+                            },
+                            "embedding_property": {
+                                "type": "string",
+                                "description": "Property name holding the vector embedding (e.g. \"embedding\")"
+                            },
+                            "text_property": {
+                                "type": "string",
+                                "description": "Property name holding the text content (e.g. \"content\")"
+                            },
+                            "query_vector": {
+                                "type": "array",
+                                "items": {"type": "number"},
+                                "description": "Query embedding vector (list of floats)"
+                            },
+                            "query_text": {
+                                "type": "string",
+                                "description": "Query text for BM25 full-text search"
+                            },
+                            "k": {
+                                "type": "integer",
+                                "description": "Number of results to return (default: 10)",
+                                "default": 10
+                            },
+                            "alpha": {
+                                "type": "number",
+                                "description": "Optional. When provided, uses weighted_fusion: alpha * norm_vec_score + (1-alpha) * norm_bm25_score. When omitted, uses RRF. Must be in [0, 1]."
+                            }
+                        },
+                        "required": ["db_path", "label", "embedding_property", "text_property", "query_vector", "query_text"]
+                    }
                 }
             ]
         })),
@@ -524,7 +568,105 @@ fn handle_tool_call_inner(params: Option<Value>) -> Result<Value, String> {
                 "created": created
             }))
         }
+        "hybrid_search" => {
+            let db_path = args["db_path"].as_str().ok_or("Missing db_path")?;
+            let label = args["label"].as_str().ok_or("Missing label")?;
+            let emb_prop = args["embedding_property"]
+                .as_str()
+                .ok_or("Missing embedding_property")?;
+            let text_prop = args["text_property"]
+                .as_str()
+                .ok_or("Missing text_property")?;
+            let query_vector = args["query_vector"]
+                .as_array()
+                .ok_or("Missing or invalid query_vector (must be a JSON array of numbers)")?;
+            let query_text = args["query_text"].as_str().ok_or("Missing query_text")?;
+            let k = args["k"].as_i64().unwrap_or(10).max(1);
+
+            validate_cypher_identifier(label, "hybrid_search: label")?;
+            validate_cypher_identifier(emb_prop, "hybrid_search: embedding_property")?;
+            validate_cypher_identifier(text_prop, "hybrid_search: text_property")?;
+
+            // Convert JSON array of numbers to a Cypher float list literal.
+            let vec_parts: Result<Vec<String>, String> = query_vector
+                .iter()
+                .map(|v| {
+                    v.as_f64().map(|f| f.to_string()).ok_or_else(|| {
+                        "hybrid_search: query_vector must contain only numbers".to_string()
+                    })
+                })
+                .collect();
+            let vec_literal = format!("[{}]", vec_parts?.join(", "));
+
+            // Build a Cypher query that calls hybrid_search() and materialises
+            // the result list as rows via UNWIND.
+            let cypher = if args["alpha"].is_null() {
+                format!(
+                    "RETURN hybrid_search('{label}', '{emb_prop}', '{text_prop}', {vec_literal}, '{query_text}', {k}) AS results",
+                )
+            } else {
+                let alpha = args["alpha"]
+                    .as_f64()
+                    .ok_or("hybrid_search: alpha must be a number")?;
+                if !(0.0..=1.0).contains(&alpha) {
+                    return Err("hybrid_search: alpha must be in [0, 1]".to_string());
+                }
+                format!(
+                    "RETURN hybrid_search('{label}', '{emb_prop}', '{text_prop}', {vec_literal}, '{query_text}', {k}, {alpha}) AS results",
+                )
+            };
+
+            let db = sparrowdb::GraphDb::open(std::path::Path::new(db_path))
+                .map_err(|e| format!("hybrid_search: failed to open database: {e}"))?;
+
+            let result = db
+                .execute(&cypher)
+                .map_err(|e| format!("hybrid_search: query failed: {e}"))?;
+
+            // The result is a single row with the fused list.
+            // Serialise it as a JSON array for the caller.
+            let results_val = result
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .cloned()
+                .unwrap_or(sparrowdb_execution::types::Value::Null);
+
+            let results_json = value_to_json(&results_val);
+
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": results_json.to_string()
+                }],
+                "results": results_json
+            }))
+        }
         _ => Err(format!("Unknown tool: {tool_name}")),
+    }
+}
+
+/// Convert a `sparrowdb_execution::types::Value` to a `serde_json::Value` for
+/// MCP tool output.
+fn value_to_json(v: &sparrowdb_execution::types::Value) -> Value {
+    use sparrowdb_execution::types::Value as DbVal;
+    match v {
+        DbVal::Null => Value::Null,
+        DbVal::Int64(n) => json!(n),
+        DbVal::Float64(f) => json!(f),
+        DbVal::Bool(b) => json!(b),
+        DbVal::String(s) => json!(s),
+        DbVal::NodeRef(id) => json!(id.0),
+        DbVal::EdgeRef(id) => json!(id.0),
+        DbVal::Vector(v) => Value::Array(v.iter().map(|f| json!(f)).collect()),
+        DbVal::List(items) => Value::Array(items.iter().map(value_to_json).collect()),
+        DbVal::Map(entries) => {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in entries {
+                obj.insert(k.clone(), value_to_json(v));
+            }
+            Value::Object(obj)
+        }
     }
 }
 
