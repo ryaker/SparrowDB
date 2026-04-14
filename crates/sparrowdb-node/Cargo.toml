@@ -14,9 +14,13 @@ crate-type = ["cdylib"]
 [dependencies]
 sparrowdb = { workspace = true }
 sparrowdb-execution = { workspace = true }
+sparrowdb-storage = { workspace = true }
 serde_json = { workspace = true }
 napi = { version = "2", features = ["napi8", "serde-json"] }
 napi-derive = "2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [build-dependencies]
 napi-build = "2"
