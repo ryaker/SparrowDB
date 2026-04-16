@@ -369,32 +369,118 @@ impl SparrowDB {
             .collect())
     }
 
-    // ── Hybrid search (stub) ──────────────────────────────────────────────────
+    // ── Hybrid search ────────────────────────────────────────────────────────
 
     /// Hybrid vector + full-text search using Reciprocal Rank Fusion (RRF).
     ///
-    /// **Not yet available** — requires issue #396 (RRF hybrid fusion) to land.
+    /// Runs HNSW vector search and BM25 full-text search independently, then
+    /// fuses the ranked lists.  Missing indexes are treated as empty — so if
+    /// only a vector index exists the call degrades gracefully to vector-only.
     ///
-    /// Throws always until #396 is merged.
+    /// `label`           — node label (e.g. `"Memory"`)
+    /// `text_property`   — property holding the text content (for BM25)
+    /// `vector_property` — property holding the embedding (for HNSW)
+    /// `query_vector`    — Float32Array query embedding
+    /// `text_query`      — query string for full-text search
+    /// `k`               — max results to return (default 10)
+    /// `alpha`           — optional; when supplied uses weighted fusion:
+    ///                     `alpha * norm_vec + (1-alpha) * norm_bm25`.
+    ///                     When omitted, uses RRF with k=60.
     ///
     /// ```typescript
-    /// // Will throw: "hybrid search requires #396 (RRF fusion) to be merged"
-    /// db.hybridSearch('Memory', 'content', 'embedding', queryVec, 'neural networks', 10)
+    /// const hits = db.hybridSearch('Memory', 'content', 'embedding', queryVec, 'neural networks', 10)
+    /// // hits: Array<{ id: string, score: number }>
+    ///
+    /// // Weighted fusion (vector-heavy):
+    /// const hits2 = db.hybridSearch('Memory', 'content', 'embedding', queryVec, 'query', 10, 0.7)
     /// ```
+    #[allow(clippy::too_many_arguments)]
     #[napi]
     pub fn hybrid_search(
         &self,
-        _label: String,
-        _text_property: String,
-        _vector_property: String,
-        _query_vector: Float32Array,
-        _text_query: String,
-        _k: Option<u32>,
+        label: String,
+        text_property: String,
+        vector_property: String,
+        query_vector: Float32Array,
+        text_query: String,
+        k: Option<u32>,
+        alpha: Option<f64>,
     ) -> napi::Result<Vec<NodeResult>> {
-        Err(napi::Error::from_reason(
-            "hybrid search requires #396 (RRF fusion) to be merged; \
-             use vectorSearch() and fulltextSearch() separately until then",
-        ))
+        use sparrowdb_storage::fts_index::FtsIndex;
+        use std::collections::HashMap;
+
+        let k_usize = k.unwrap_or(10) as usize;
+        // Fetch k*2 candidates from each index for better fusion quality.
+        let fetch_k = (k_usize * 2).max(20);
+
+        // ── 1. Vector search ─────────────────────────────────────────────────
+        let vec_results: Vec<(u64, f32)> =
+            match self.inner.get_vector_index(&label, &vector_property) {
+                Some(arc) => {
+                    let idx = arc
+                        .read()
+                        .map_err(|e| to_napi(format!("lock poisoned: {e}")))?;
+                    let ef = (fetch_k * 4).max(50);
+                    idx.search(query_vector.as_ref(), fetch_k, ef)
+                }
+                None => vec![],
+            };
+
+        // ── 2. Full-text (BM25) search ───────────────────────────────────────
+        let db_path = self.inner.path();
+        let fts_results: Vec<(u64, f32)> = match FtsIndex::open(db_path, &label, &text_property) {
+            Ok(idx) => idx.search(&text_query, fetch_k),
+            Err(_) => vec![],
+        };
+
+        // ── 3. Fuse ──────────────────────────────────────────────────────────
+        let mut scores: HashMap<u64, f64> = HashMap::new();
+
+        if let Some(a) = alpha {
+            // Weighted fusion: normalise each list to [0,1] then blend.
+            let a = a.clamp(0.0, 1.0);
+            let max_vec = vec_results.first().map(|(_, s)| *s as f64).unwrap_or(1.0);
+            let max_fts = fts_results.first().map(|(_, s)| *s as f64).unwrap_or(1.0);
+
+            for (node_id, score) in &vec_results {
+                let norm = if max_vec > 0.0 {
+                    *score as f64 / max_vec
+                } else {
+                    0.0
+                };
+                *scores.entry(*node_id).or_insert(0.0) += a * norm;
+            }
+            for (node_id, score) in &fts_results {
+                let norm = if max_fts > 0.0 {
+                    *score as f64 / max_fts
+                } else {
+                    0.0
+                };
+                *scores.entry(*node_id).or_insert(0.0) += (1.0 - a) * norm;
+            }
+        } else {
+            // RRF: score += 1 / (60 + rank).
+            const RRF_K: f64 = 60.0;
+            for (rank, (node_id, _)) in vec_results.iter().enumerate() {
+                *scores.entry(*node_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f64 + 1.0);
+            }
+            for (rank, (node_id, _)) in fts_results.iter().enumerate() {
+                *scores.entry(*node_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f64 + 1.0);
+            }
+        }
+
+        // ── 4. Sort descending by fused score, truncate to k ─────────────────
+        let mut ranked: Vec<(u64, f64)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(k_usize);
+
+        Ok(ranked
+            .into_iter()
+            .map(|(node_id, score)| NodeResult {
+                id: node_id.to_string(),
+                score,
+            })
+            .collect())
     }
 }
 

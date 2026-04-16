@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.21"
+version = "0.1.22"
 edition = "2021"
 license = "MIT"
 authors = ["Rich Yaker"]
@@ -27,13 +27,13 @@ documentation = "https://docs.rs/sparrowdb"
 readme = "README.md"
 
 [workspace.dependencies]
-sparrowdb-common = { path = "crates/sparrowdb-common", version = "0.1.21" }
-sparrowdb-storage = { path = "crates/sparrowdb-storage", version = "0.1.21" }
-sparrowdb-catalog = { path = "crates/sparrowdb-catalog", version = "0.1.21" }
-sparrowdb-cypher  = { path = "crates/sparrowdb-cypher", version = "0.1.21" }
-sparrowdb-execution = { path = "crates/sparrowdb-execution", version = "0.1.21" }
-sparrowdb = { path = "crates/sparrowdb", version = "0.1.21" }
-sparrowdb-metrics = { path = "crates/sparrowdb-metrics", version = "0.1.21" }
+sparrowdb-common = { path = "crates/sparrowdb-common", version = "0.1.22" }
+sparrowdb-storage = { path = "crates/sparrowdb-storage", version = "0.1.22" }
+sparrowdb-catalog = { path = "crates/sparrowdb-catalog", version = "0.1.22" }
+sparrowdb-cypher  = { path = "crates/sparrowdb-cypher", version = "0.1.22" }
+sparrowdb-execution = { path = "crates/sparrowdb-execution", version = "0.1.22" }
+sparrowdb = { path = "crates/sparrowdb", version = "0.1.22" }
+sparrowdb-metrics = { path = "crates/sparrowdb-metrics", version = "0.1.22" }
 tiny_http         = "0.12"
 tempfile          = "3"
 crc32fast         = "1"
