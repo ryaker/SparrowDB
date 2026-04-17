@@ -1158,14 +1158,13 @@ fn extract_return_column_names(items: &[ReturnItem]) -> Vec<String> {
 /// accidentally fetching unrelated properties from the wrong node.
 fn collect_col_ids_from_expr_for_var(expr: &Expr, target_var: &str, out: &mut Vec<u32>) {
     match expr {
-        Expr::PropAccess { var, prop } => {
-            if var == target_var {
-                let col_id = prop_name_to_col_id(prop);
-                if !out.contains(&col_id) {
-                    out.push(col_id);
-                }
+        Expr::PropAccess { var, prop } if var == target_var => {
+            let col_id = prop_name_to_col_id(prop);
+            if !out.contains(&col_id) {
+                out.push(col_id);
             }
         }
+        Expr::PropAccess { .. } => {}
         Expr::BinOp { left, right, .. } => {
             collect_col_ids_from_expr_for_var(left, target_var, out);
             collect_col_ids_from_expr_for_var(right, target_var, out);

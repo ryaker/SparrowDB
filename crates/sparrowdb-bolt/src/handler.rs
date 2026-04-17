@@ -152,7 +152,7 @@ async fn handle_inner(
                     }
                 };
 
-                tracing::info!("RUN: {query}");
+                tracing::debug!("RUN: {query}");
 
                 let db2 = db.clone();
                 let exec_result = tokio::task::spawn_blocking(move || db2.execute(&query))
