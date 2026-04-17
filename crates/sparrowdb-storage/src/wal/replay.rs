@@ -157,10 +157,8 @@ impl WalReplayer {
                 WalRecordKind::Begin => {
                     begun.insert(rec.txn_id.0, true);
                 }
-                WalRecordKind::Commit => {
-                    if begun.contains_key(&rec.txn_id.0) {
-                        committed.insert(rec.txn_id.0);
-                    }
+                WalRecordKind::Commit if begun.contains_key(&rec.txn_id.0) => {
+                    committed.insert(rec.txn_id.0);
                 }
                 WalRecordKind::Abort => {
                     begun.remove(&rec.txn_id.0);
