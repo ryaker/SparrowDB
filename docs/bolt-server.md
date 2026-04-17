@@ -79,9 +79,9 @@ Leave username/password blank.
 | `RUN` | ✅ Executes Cypher |
 | `PULL` | ✅ Streams result rows |
 | `DISCARD` | ✅ Discards pending results |
-| `BEGIN` | ✅ No-op (auto-commit only) |
-| `COMMIT` | ✅ No-op |
-| `ROLLBACK` | ✅ No-op |
+| `BEGIN` | ❌ Unsupported — returns `SIG_FAILURE` (`SparrowDB.Unsupported`) |
+| `COMMIT` | ❌ Unsupported — returns `SIG_FAILURE` (`SparrowDB.Unsupported`) |
+| `ROLLBACK` | ❌ Unsupported — returns `SIG_FAILURE` (`SparrowDB.Unsupported`) |
 | `RESET` | ✅ Returns to Ready state |
 | `GOODBYE` | ✅ Closes connection |
 
@@ -101,8 +101,9 @@ database metadata on connect do not error:
 - The server identifies itself as `Neo4j/5.20.0` in the HELLO handshake.
   This is required for compatibility with clients that check the vendor string.
   SparrowDB is not affiliated with or endorsed by Neo4j.
-- Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) are accepted but are no-ops;
-  SparrowDB uses auto-commit semantics in this release.
+- Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) are not supported. Each message
+  returns `SIG_FAILURE` with code `SparrowDB.Unsupported` and moves the
+  connection to the Failed state. SparrowDB uses auto-commit semantics only.
 - Parameterized queries (`{$param}`) are not yet supported over Bolt; include
   values inline in the query string.
 - Authentication is not enforced. Bind to `127.0.0.1` (the default) and do not
@@ -113,5 +114,4 @@ database metadata on connect do not error:
 - **Default bind address is `127.0.0.1`** — the server is localhost-only unless
   you explicitly pass `--host 0.0.0.0`.
 - There is no authentication in this release. Do not expose the port remotely.
-- Query text is logged at `DEBUG` level only; sensitive literals are not emitted
-  at `INFO`.
+- Query text is logged at `DEBUG` level only; sensitive literals are not emitted at `INFO`.
