@@ -157,11 +157,10 @@ impl WalReplayer {
                 WalRecordKind::Begin => {
                     begun.insert(rec.txn_id.0, true);
                 }
-                WalRecordKind::Commit => {
-                    if begun.contains_key(&rec.txn_id.0) {
-                        committed.insert(rec.txn_id.0);
-                    }
+                WalRecordKind::Commit if begun.contains_key(&rec.txn_id.0) => {
+                    committed.insert(rec.txn_id.0);
                 }
+                WalRecordKind::Commit => {}
                 WalRecordKind::Abort => {
                     begun.remove(&rec.txn_id.0);
                     aborted.insert(rec.txn_id.0);
@@ -329,11 +328,10 @@ impl WalReplayer {
                 WalRecordKind::Begin => {
                     begun.insert(rec.txn_id.0);
                 }
-                WalRecordKind::Commit => {
-                    if begun.contains(&rec.txn_id.0) {
-                        committed.insert(rec.txn_id.0);
-                    }
+                WalRecordKind::Commit if begun.contains(&rec.txn_id.0) => {
+                    committed.insert(rec.txn_id.0);
                 }
+                WalRecordKind::Commit => {}
                 WalRecordKind::Abort => {
                     begun.remove(&rec.txn_id.0);
                 }
@@ -462,11 +460,10 @@ impl WalReplayer {
                 WalRecordKind::Begin => {
                     begun.insert(rec.txn_id.0);
                 }
-                WalRecordKind::Commit => {
-                    if begun.contains(&rec.txn_id.0) {
-                        committed.insert(rec.txn_id.0);
-                    }
+                WalRecordKind::Commit if begun.contains(&rec.txn_id.0) => {
+                    committed.insert(rec.txn_id.0);
                 }
+                WalRecordKind::Commit => {}
                 WalRecordKind::Abort => {
                     begun.remove(&rec.txn_id.0);
                 }
@@ -501,17 +498,15 @@ impl WalReplayer {
                         entry.insert(name.clone());
                     }
                 }
-                WalPayload::NodeUpdate { node_id, key, .. } => {
+                WalPayload::NodeUpdate { node_id, key, .. } if !key.is_empty() => {
                     // Only include non-empty keys (guard against low-level
                     // col_id-only paths that may not record a human-readable name).
-                    if !key.is_empty() {
-                        if let Some(&label_id) = node_label.get(node_id) {
-                            schema
-                                .node_props
-                                .entry(label_id)
-                                .or_default()
-                                .insert(key.clone());
-                        }
+                    if let Some(&label_id) = node_label.get(node_id) {
+                        schema
+                            .node_props
+                            .entry(label_id)
+                            .or_default()
+                            .insert(key.clone());
                     }
                 }
                 WalPayload::EdgeCreate {

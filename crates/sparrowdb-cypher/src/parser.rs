@@ -1739,6 +1739,19 @@ impl Parser {
         let mut nodes = Vec::new();
         let mut rels = Vec::new();
 
+        // Optional path-variable assignment: `p = (a)-[r]->(b)`
+        let path_var =
+            if matches!(self.peek(), Token::Ident(_)) && matches!(self.peek2(), Token::Eq) {
+                let name = match self.advance().clone() {
+                    Token::Ident(s) => s,
+                    _ => unreachable!(),
+                };
+                self.advance(); // consume `=`
+                Some(name)
+            } else {
+                None
+            };
+
         nodes.push(self.parse_node_pattern()?);
 
         while matches!(self.peek(), Token::Dash | Token::Arrow | Token::LeftArrow) {
@@ -1748,7 +1761,11 @@ impl Parser {
             rels.push(rel);
         }
 
-        Ok(PathPattern { nodes, rels })
+        Ok(PathPattern {
+            path_var,
+            nodes,
+            rels,
+        })
     }
 
     // ── Node pattern ──────────────────────────────────────────────────────────

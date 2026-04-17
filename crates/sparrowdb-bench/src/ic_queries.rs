@@ -467,7 +467,7 @@ pub fn ic12_expert_search(
     }
 
     let mut results: Vec<(PersonName, i64)> = person_counts.into_iter().collect();
-    results.sort_by(|a, b| b.1.cmp(&a.1));
+    results.sort_by_key(|b| std::cmp::Reverse(b.1));
     results.truncate(20);
     Ok(results)
 }

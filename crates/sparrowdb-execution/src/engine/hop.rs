@@ -249,7 +249,7 @@ impl Engine {
                 let all_neighbors: Vec<u64> = csr_neighbors
                     .iter()
                     .copied()
-                    .chain(delta_neighbors.into_iter())
+                    .chain(delta_neighbors)
                     .collect();
 
                 // ── SPA-200: batch-read dst properties — O(cols) fs::read() calls
@@ -620,7 +620,7 @@ impl Engine {
                     let all_predecessors: Vec<u64> = csr_predecessors
                         .iter()
                         .copied()
-                        .chain(delta_predecessors.into_iter())
+                        .chain(delta_predecessors)
                         .collect();
 
                     let mut seen_preds: HashSet<u64> = HashSet::new();
