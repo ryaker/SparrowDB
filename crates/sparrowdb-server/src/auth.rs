@@ -2,6 +2,7 @@
 //!
 //! Phase A supports a single bearer token (or no auth, gated to loopback).
 
+use constant_time_eq::constant_time_eq;
 use std::net::{IpAddr, SocketAddr};
 
 /// How the server authenticates incoming requests.
@@ -39,9 +40,9 @@ impl AuthConfig {
     /// Check whether the supplied `Authorization` header value is acceptable.
     ///
     /// Returns `true` if auth is disabled, or the header carries a matching
-    /// `Bearer <token>` value.  Comparison is constant-time-ish: it walks
-    /// every byte of the expected token rather than short-circuiting on
-    /// mismatch, to make timing-attack reasoning slightly easier.
+    /// `Bearer <token>` value.  Comparison is constant-time via the
+    /// `constant_time_eq` crate, which handles both differing lengths and
+    /// differing contents without short-circuiting.
     pub fn check_header(&self, header: Option<&str>) -> bool {
         match self {
             AuthConfig::None => true,
@@ -62,20 +63,6 @@ impl AuthConfig {
 /// Return `true` if `addr` is a loopback IP (127.0.0.0/8 or ::1).
 pub fn is_loopback_addr(addr: IpAddr) -> bool {
     addr.is_loopback()
-}
-
-/// Constant-ish-time byte comparison.
-///
-/// Walks the longer of the two slices to avoid leaking the length of `expected`.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]

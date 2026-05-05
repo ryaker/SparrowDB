@@ -20,12 +20,11 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub fn dispatch(mut req: Request, db: &GraphDb, auth: &AuthConfig) {
     let method = req.method().clone();
     // Strip query string — Phase A has no query parameters.
-    let raw_url = req.url().to_owned();
-    let path = raw_url.split('?').next().unwrap_or("").to_owned();
+    let path = req.url().split('?').next().unwrap_or("");
 
     tracing::debug!(?method, %path, "incoming request");
 
-    let response = match (&method, path.as_str()) {
+    let response = match (&method, path) {
         // CORS preflight — answer any path.
         (Method::Options, _) => cors_preflight(),
 

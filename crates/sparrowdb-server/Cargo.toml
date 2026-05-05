@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+constant_time_eq = "0.3"
 
 [dev-dependencies]
 tempfile = { workspace = true }
