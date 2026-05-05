@@ -11,7 +11,7 @@
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use sparrowdb_execution::query_result_to_json;
+use sparrowdb_execution::value_to_json;
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
@@ -36,6 +36,28 @@ fn to_napi_typed(e: sparrowdb::Error) -> napi::Error {
         }
         _ => to_napi(e),
     }
+}
+
+// ── QueryResult ───────────────────────────────────────────────────────────────
+
+/// The result of a Cypher query: a list of column names and a list of rows.
+///
+/// Each row is an object mapping column name to its value.  Value types: `null`,
+/// `number`, `boolean`, `string`, `{ $type: "node", id: string }`,
+/// `{ $type: "edge", id: string }`.
+///
+/// ```typescript
+/// interface QueryResult {
+///   columns: string[];
+///   rows: Record<string, unknown>[];
+/// }
+/// ```
+#[napi(object)]
+pub struct QueryResult {
+    /// Ordered list of column names returned by the query.
+    pub columns: Vec<String>,
+    /// One element per result row; each row maps column name to its value.
+    pub rows: Vec<serde_json::Value>,
 }
 
 // ── NodeResult ────────────────────────────────────────────────────────────────
@@ -104,9 +126,25 @@ impl SparrowDB {
     /// `{ $type: "node", id: string }`, `{ $type: "edge", id: string }`.
     /// Note: `Int64` values outside `±(2^53-1)` are also returned as strings.
     #[napi]
-    pub fn execute(&self, cypher: String) -> napi::Result<serde_json::Value> {
+    pub fn execute(&self, cypher: String) -> napi::Result<QueryResult> {
         let result = self.inner.execute(&cypher).map_err(to_napi)?;
-        Ok(query_result_to_json(&result))
+        let rows: Vec<serde_json::Value> = result
+            .rows
+            .iter()
+            .map(|row| {
+                let obj: serde_json::Map<String, serde_json::Value> = result
+                    .columns
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(col, val)| (col.clone(), value_to_json(val)))
+                    .collect();
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        Ok(QueryResult {
+            columns: result.columns.clone(),
+            rows,
+        })
     }
 
     /// Flush the WAL and compact the database.
@@ -522,7 +560,7 @@ impl ReadTx {
     ///
     /// Throws always until SPA-100 lands.
     #[napi]
-    pub fn execute(&self, _cypher: String) -> napi::Result<serde_json::Value> {
+    pub fn execute(&self, _cypher: String) -> napi::Result<QueryResult> {
         Err(napi::Error::from_reason(
             "ReadTx.execute not yet available; snapshot-pinned query execution is tracked \
              in SPA-100. Use SparrowDB.execute() to query the latest committed state.",
@@ -569,7 +607,7 @@ impl WriteTx {
     ///
     /// Returns `{ columns, rows }` (typically empty for write statements).
     #[napi]
-    pub fn execute(&mut self, _cypher: String) -> napi::Result<serde_json::Value> {
+    pub fn execute(&mut self, _cypher: String) -> napi::Result<QueryResult> {
         match &self.inner {
             Some(_) => {
                 // WriteTx doesn't expose a Cypher execute method directly;
