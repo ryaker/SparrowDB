@@ -134,10 +134,58 @@ jobs:
   # Re-enable by uncommenting the publish-pypi and publish-rubygems jobs
   # and adding PYPI_TOKEN / RUBYGEMS_TOKEN secrets to the repo.
 
+  # ── Build CLI binaries (for Homebrew bottles + direct download) ──────────
+  build-cli:
+    name: Build CLI — ${{ matrix.artifact-name }}
+    needs: meta
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact-name: linux-x86_64
+            binary: sparrowdb
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact-name: darwin-arm64
+            binary: sparrowdb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
+
+      - name: Build sparrowdb CLI
+        run: cargo build --release -p sparrowdb-cli --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          BINARY="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          ARCHIVE="sparrowdb-${{ needs.meta.outputs.version }}-${{ matrix.artifact-name }}.tar.gz"
+          tar -czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.artifact-name }}
+          path: |
+            sparrowdb-${{ needs.meta.outputs.version }}-${{ matrix.artifact-name }}.tar.gz
+            sparrowdb-${{ needs.meta.outputs.version }}-${{ matrix.artifact-name }}.tar.gz.sha256
+
   # ── Create GitHub Release ────────────────────────────────────────────────
   github-release:
     name: Create GitHub Release
-    needs: [meta, npm-publish]
+    needs: [meta, npm-publish, build-cli]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -145,22 +193,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: cli-artifacts/
+          merge-multiple: true
+
+      - name: Compute source tarball SHA256 (for Homebrew formula)
+        id: sha
+        run: |
+          SHA=$(curl -sL "https://github.com/ryaker/SparrowDB/archive/refs/tags/${{ github.ref_name }}.tar.gz" | sha256sum | awk '{print $1}')
+          echo "source_sha=$SHA" >> "$GITHUB_OUTPUT"
+
       - name: Gather publish results
         id: results
         run: |
-          echo "## Release v${{ needs.meta.outputs.version }}" > release-notes.md
-          echo "" >> release-notes.md
-          echo "### Published packages" >> release-notes.md
-          echo "- **npm**: \`sparrowdb@${{ needs.meta.outputs.version }}\`" >> release-notes.md
-          echo "- **crates.io**: \`sparrowdb = \"${{ needs.meta.outputs.version }}\"\`" >> release-notes.md
-          echo "- **PyPI**: _disabled pending auth_ " >> release-notes.md
-          echo "- **RubyGems**: _disabled pending auth_" >> release-notes.md
-          echo "" >> release-notes.md
-          echo "### Install" >> release-notes.md
-          echo '```bash' >> release-notes.md
-          echo "npm install sparrowdb@${{ needs.meta.outputs.version }}" >> release-notes.md
-          echo "cargo add sparrowdb@${{ needs.meta.outputs.version }}" >> release-notes.md
-          echo '```' >> release-notes.md
+          VER="${{ needs.meta.outputs.version }}"
+          SHA="${{ steps.sha.outputs.source_sha }}"
+          cat > release-notes.md <<EOF
+          ## Release v${VER}
+
+          ### Install
+
+          **Homebrew (macOS / Linux)**
+          \`\`\`bash
+          brew tap ryaker/sparrowdb
+          brew install sparrowdb
+          \`\`\`
+
+          **Cargo**
+          \`\`\`bash
+          cargo add sparrowdb@${VER}
+          \`\`\`
+
+          **npm**
+          \`\`\`bash
+          npm install sparrowdb@${VER}
+          \`\`\`
+
+          ### Published packages
+          - **Homebrew tap**: \`ryaker/sparrowdb\`
+          - **crates.io**: \`sparrowdb = "${VER}"\`
+          - **npm**: \`sparrowdb@${VER}\`
+
+          ### Homebrew formula SHA256
+          Source tarball: \`${SHA}\`
+          _(Used to update the [homebrew-sparrowdb](https://github.com/ryaker/homebrew-sparrowdb) formula)_
+          EOF
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -170,3 +250,46 @@ jobs:
           body_path: release-notes.md
           draft: false
           prerelease: ${{ contains(needs.meta.outputs.version, '-') }}
+          files: cli-artifacts/*
+
+  # ── Update Homebrew tap formula ──────────────────────────────────────────
+  update-homebrew-tap:
+    name: Update Homebrew tap
+    needs: [meta, github-release]
+    if: ${{ !contains(needs.meta.outputs.version, '-') }}  # skip pre-releases
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute source SHA256
+        id: sha
+        run: |
+          SHA=$(curl -sL "https://github.com/ryaker/SparrowDB/archive/refs/tags/${{ github.ref_name }}.tar.gz" | sha256sum | awk '{print $1}')
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: ryaker/homebrew-sparrowdb
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Update formula version and SHA
+        run: |
+          VER="${{ needs.meta.outputs.version }}"
+          SHA="${{ steps.sha.outputs.sha }}"
+          FORMULA="tap/Formula/sparrowdb.rb"
+          # Update url line
+          sed -i "s|/archive/refs/tags/v[0-9.]*\.tar\.gz|/archive/refs/tags/v${VER}.tar.gz|" "$FORMULA"
+          # Update sha256 line
+          sed -i "s/sha256 \"[a-f0-9]*\"/sha256 \"${SHA}\"/" "$FORMULA"
+          # Update version in formula
+          sed -i "s/version \"[0-9.]*\"/version \"${VER}\"/" "$FORMULA"
+
+      - name: Commit and push formula update
+        run: |
+          VER="${{ needs.meta.outputs.version }}"
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/sparrowdb.rb
+          git commit -m "chore: update formula to v${VER}"
+          git push
