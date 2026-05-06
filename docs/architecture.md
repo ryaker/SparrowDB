@@ -20,7 +20,7 @@ The workspace contains eleven crates. The five that form the core are:
 
 The top-level `sparrowdb` crate re-exports the public API (`GraphDb`, `ReadTx`, `WriteTx`, `Value`, `NodeId`, `EdgeId`, `Error`, `QueryResult`) and owns the SWMR transaction machinery and the in-memory MVCC version store.
 
-The remaining crates are language bindings (`sparrowdb-python`, `sparrowdb-node`, `sparrowdb-ruby`), a CLI (`sparrowdb-cli`), an MCP server (`sparrowdb-mcp`), and a metrics exporter (`sparrowdb-metrics`).
+The remaining crates are language bindings (`sparrowdb-python`, `sparrowdb-node`, `sparrowdb-ruby`), a CLI (`sparrowdb-cli`), an MCP server (`sparrowdb-mcp`), a metrics exporter (`sparrowdb-metrics`), and two network transports — the Bolt-protocol server (`sparrowdb-bolt`, port 7687 by default) for Neo4j-compatible drivers, and an HTTP REST server (`sparrowdb-server`, port 7480 by default) that exposes JSON-over-HTTP for browsers and language-agnostic clients.
 
 ---
 

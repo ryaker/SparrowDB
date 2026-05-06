@@ -664,3 +664,140 @@ WalReplayer::replay(wal_dir, last_applied_lsn, |page_id, data, lsn| {
     Ok(())
 })?;
 ```
+
+---
+
+## HTTP API (`sparrowdb-server`, Phase A)
+
+The `sparrowdb-server` crate exposes a small JSON-over-HTTP surface so
+language-agnostic clients (browsers, `curl`, Go, Java, etc.) can run Cypher
+queries against an embedded SparrowDB instance without speaking Bolt.
+
+The server is synchronous (`tiny_http` worker pool) and routes every request
+to a cloned `GraphDb` handle, matching the SWMR engine model.  Phase A
+buffers full result sets into a JSON response.  Streaming (SSE / NDJSON) is
+Phase B.
+
+### Binary
+
+```bash
+sparrowdb-server \
+  --db /path/to/sparrowdb \
+  --bind 127.0.0.1 \
+  --port 7480 \
+  --token-file /etc/sparrowdb/http.token
+```
+
+| Flag           | Default       | Notes                                                          |
+|----------------|---------------|----------------------------------------------------------------|
+| `--db`         | (required)    | Database directory.  Also reads `SPARROWDB_PATH`.              |
+| `--bind`       | `127.0.0.1`   | IP to bind to.  Use `0.0.0.0` to expose the server externally. |
+| `--port`       | `7480`        | TCP port.                                                      |
+| `--token-file` | (none)        | File containing the bearer token (single line, trimmed).       |
+| `--no-auth`    | `false`       | Disable auth.  **Refused** on any non-loopback bind address.   |
+
+The bearer token may also be supplied via `SPARROWDB_HTTP_TOKEN`.
+
+### Authentication
+
+Authenticated routes require:
+
+```
+Authorization: Bearer <token>
+```
+
+`/health` is intentionally unauthenticated so liveness probes work without
+secrets.  `--no-auth` is only allowed on loopback (`127.0.0.0/8`, `::1`) —
+attempts to combine `--no-auth` with a non-loopback `--bind` are rejected
+at startup.
+
+### Routes
+
+#### `GET /health`
+
+No auth.  Liveness probe.
+
+```json
+{ "status": "ok", "version": "0.1.22" }
+```
+
+#### `GET /info`
+
+Auth required.  Returns DB metadata.
+
+```json
+{
+  "version": "0.1.22",
+  "labels": ["Person", "Movie"],
+  "relationship_types": ["ACTED_IN", "DIRECTED"],
+  "counts": { "nodes": 8400, "edges": 16002 }
+}
+```
+
+#### `POST /cypher`
+
+Auth required.  Executes a single Cypher statement.
+
+Request:
+```json
+{
+  "query": "MATCH (n:Person) WHERE n.name = $name RETURN n.name",
+  "params": { "name": "alice" }
+}
+```
+
+`params` is optional; omit or set to `null`/`{}` for no parameters.  Values
+are coerced as follows:
+
+| JSON type        | SparrowDB `Value`     |
+|------------------|-----------------------|
+| `null`           | `Null`                |
+| `true`/`false`   | `Bool`                |
+| integer number   | `Int64`               |
+| fractional number| `Float64`             |
+| string           | `String`              |
+| array            | `List` (recursive)    |
+| object           | `Map` (recursive)     |
+
+Response (`200 OK`):
+
+```json
+{
+  "columns": ["n.name"],
+  "rows": [ { "n.name": "alice" } ]
+}
+```
+
+`NodeRef` and `EdgeRef` values are encoded as
+`{"$type":"node","id":"<u64-as-string>"}` to preserve precision across the
+JSON boundary (see `sparrowdb_execution::json::value_to_json`).
+
+#### Errors
+
+All error responses are JSON `{ "error": "<message>" }`.
+
+| Status | Cause                                                         |
+|--------|---------------------------------------------------------------|
+| `400`  | Malformed body, empty query, or non-coercible parameter type. |
+| `401`  | Missing or invalid bearer token.                              |
+| `404`  | Unknown route.                                                |
+| `500`  | Engine error (parse, bind, execute).                          |
+
+### CORS
+
+Phase A serves a permissive CORS policy:
+
+```
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: POST, GET, OPTIONS
+Access-Control-Allow-Headers: Authorization, Content-Type
+```
+
+`OPTIONS` preflight requests are answered with `204 No Content` and the
+headers above.
+
+### Library use
+
+The crate also exposes `Server::new(addr, ServerConfig)` for embedding the
+HTTP transport directly into a Rust application — useful for tests and for
+applications that already own a `GraphDb`.

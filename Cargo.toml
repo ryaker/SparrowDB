@@ -15,6 +15,7 @@ members = [
     "crates/sparrowdb-bench",
     "crates/sparrowdb-ruby",
     "crates/sparrowdb-bolt",
+    "crates/sparrowdb-server",
 ]
 
 [workspace.package]

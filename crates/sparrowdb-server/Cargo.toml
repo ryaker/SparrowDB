@@ -1,0 +1,32 @@
+[package]
+name = "sparrowdb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "HTTP REST server for SparrowDB (Phase A: synchronous JSON)"
+publish = false
+
+[lib]
+name = "sparrowdb_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sparrowdb-server"
+path = "src/main.rs"
+
+[dependencies]
+sparrowdb = { workspace = true }
+sparrowdb-execution = { workspace = true }
+tiny_http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+constant_time_eq = "0.3"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+ureq = { version = "2", features = ["json"] }
