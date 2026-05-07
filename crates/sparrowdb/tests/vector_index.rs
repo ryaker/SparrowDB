@@ -250,6 +250,77 @@ fn hnsw_bulk_insert_and_top_k() {
     );
 }
 
+// ── Regression: MATCH…SET $vector_param must write to HNSW (KMSmcp ch#202) ─────
+//
+// Before the fix, `MATCH (n:L {id: $id}) SET n.embedding = $emb` stored the
+// property but left the HNSW file unchanged — silent data loss.  This test
+// confirms that the inserted node is returned by vector_search after SET.
+
+#[test]
+fn set_vector_param_populates_hnsw() {
+    let (_dir, db) = make_db();
+
+    // Create the vector index and a bare node (no embedding yet).
+    db.create_vector_index("Memory", "embedding", 4, "cosine")
+        .expect("create index");
+    db.execute("CREATE (n:Memory {id: 'k1'})")
+        .expect("CREATE node");
+
+    // Use execute_with_params to SET the embedding via a $param.
+    let emb: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4];
+    let mut params = std::collections::HashMap::new();
+    params.insert("id".to_string(), Value::String("k1".to_string()));
+    params.insert("emb".to_string(), Value::Vector(emb.clone()));
+    db.execute_with_params("MATCH (n:Memory {id: $id}) SET n.embedding = $emb", params)
+        .expect("SET with vector param must not error");
+
+    // Verify the HNSW index now contains the node.
+    let arc = db
+        .get_vector_index("Memory", "embedding")
+        .expect("index must exist");
+    let idx = arc.read().expect("read lock");
+    let results = idx.search(&emb, 5, 20);
+    assert!(
+        !results.is_empty(),
+        "vectorSearch after SET must return the inserted node (HNSW was empty — silent data loss bug)"
+    );
+    // The only node in the index should be the one we just SET.
+    assert_eq!(results.len(), 1, "exactly one node should be in the index");
+}
+
+#[test]
+fn set_vector_param_hnsw_roundtrip_survives_reopen() {
+    // Same as above, but also verifies persistence: close + re-open the DB
+    // and confirm vectorSearch still returns the node.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = GraphDb::open(&path).expect("open");
+        db.create_vector_index("Chunk", "emb", 3, "cosine")
+            .expect("create index");
+        db.execute("CREATE (n:Chunk {id: 'c1'})").expect("CREATE");
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("id".to_string(), Value::String("c1".to_string()));
+        params.insert("emb".to_string(), Value::Vector(vec![1.0, 0.0, 0.0]));
+        db.execute_with_params("MATCH (n:Chunk {id: $id}) SET n.emb = $emb", params)
+            .expect("SET emb");
+    }
+
+    // Re-open and query.
+    let db = GraphDb::open(&path).expect("reopen");
+    let arc = db
+        .get_vector_index("Chunk", "emb")
+        .expect("index must survive restart");
+    let idx = arc.read().expect("read");
+    let results = idx.search(&[1.0_f32, 0.0, 0.0], 5, 20);
+    assert!(
+        !results.is_empty(),
+        "node must be in HNSW after restart (persistence verification)"
+    );
+}
+
 // ── Metrics ────────────────────────────────────────────────────────────────────
 
 #[test]

@@ -357,6 +357,110 @@ impl SparrowDB {
             .map_err(to_napi_typed)
     }
 
+    /// Directly insert a vector into the HNSW index for an existing node.
+    ///
+    /// This is the explicit backfill API requested by KMSmcp (ch #202).  It is
+    /// useful when nodes were created without an inline embedding and you want to
+    /// populate the HNSW index without DETACH DELETE + recreate.
+    ///
+    /// - `label`    — node label (e.g. `"Memory"`)
+    /// - `property` — the vector property name (e.g. `"embedding"`)
+    /// - `node_id`  — the **user-facing** `id` property value (string), not the
+    ///                internal u64 slot number.
+    /// - `vector`   — Float32Array of `dimensions` elements.
+    ///
+    /// Throws `RangeError` if no vector index exists for `(label, property)`.
+    /// Throws `TypeError`  if `vector.length` does not match the index dimensions.
+    /// Throws `RangeError` if no node with `id = node_id` is found under `label`.
+    ///
+    /// ```typescript
+    /// db.addToVectorIndex('Memory', 'embedding', 'node-uuid-here', myFloat32Array)
+    /// ```
+    #[napi]
+    pub fn add_to_vector_index(
+        &self,
+        label: String,
+        property: String,
+        node_id: String,
+        vector: Float32Array,
+    ) -> napi::Result<()> {
+        // 1. Resolve (label, property) → HNSW index arc.
+        let arc = self
+            .inner
+            .get_vector_index(&label, &property)
+            .ok_or_else(|| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!(
+                        "RangeError: no vector index on ({label}, {property}); \
+                         call createVectorIndex first"
+                    ),
+                )
+            })?;
+
+        // 2. Validate dimensionality before any write.
+        let vec_slice = vector.as_ref();
+        {
+            let idx = arc
+                .read()
+                .map_err(|e| to_napi(format!("lock poisoned: {e}")))?;
+            if vec_slice.len() != idx.dimensions {
+                return Err(napi::Error::new(
+                    napi::Status::InvalidArg,
+                    format!(
+                        "TypeError: vector has {} dimensions but the index expects {}",
+                        vec_slice.len(),
+                        idx.dimensions
+                    ),
+                ));
+            }
+        }
+
+        // 3. Resolve the user-facing string id to the internal u64 node slot.
+        //    We do this with a simple MATCH+RETURN id(n) query so we don't
+        //    need to replicate the id-property lookup logic inline.
+        let cypher = format!("MATCH (n:{label} {{id: $id}}) RETURN id(n) AS nid");
+        let mut lookup_params = std::collections::HashMap::new();
+        lookup_params.insert(
+            "id".to_string(),
+            sparrowdb_execution::Value::String(node_id.clone()),
+        );
+        let result = self
+            .inner
+            .execute_with_params(&cypher, lookup_params)
+            .map_err(|e| to_napi(format!("{e}")))?;
+
+        if result.rows.is_empty() {
+            return Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("RangeError: no node with id='{node_id}' found under label '{label}'"),
+            ));
+        }
+
+        let internal_id: u64 = match &result.rows[0][0] {
+            sparrowdb_execution::Value::Int64(n) => *n as u64,
+            other => {
+                return Err(to_napi(format!(
+                    "unexpected id(n) type from query: {other:?}"
+                )));
+            }
+        };
+
+        // 4. Insert into HNSW and persist.
+        let db_path = self.inner.path();
+        let vidx_dir = db_path.join("vector_indexes");
+        {
+            let mut idx = arc
+                .write()
+                .map_err(|e| to_napi(format!("lock poisoned: {e}")))?;
+            idx.insert(internal_id, vec_slice);
+            idx.save(&vidx_dir, &label, &property)
+                .map_err(|e| to_napi(format!("HNSW save failed: {e}")))?;
+        }
+
+        Ok(())
+    }
+
     /// Search the HNSW vector index for `k` nearest neighbours.
     ///
     /// Returns results sorted by descending similarity score (highest first).

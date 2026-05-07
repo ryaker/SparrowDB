@@ -1527,6 +1527,58 @@ impl GraphDb {
         if has_detach_delete {
             self.invalidate_csr_map();
         }
+
+        // Vector index write-path: for each SET mutation whose value is a
+        // vector param, write to the HNSW index for every matched node.
+        //
+        // This mirrors the MERGE write-path at db.rs:1396-1420. Without this
+        // block, `MATCH (n:L {id: $id}) SET n.embedding = $emb` would silently
+        // store the property but leave the HNSW file untouched — silent data
+        // loss surfaced by KMSmcp channel message #202.
+        //
+        // We derive the label from the first node pattern in the MATCH clause.
+        // Multi-pattern MATCH with multiple node labels is an edge case; the
+        // common single-node pattern is fully covered here.
+        {
+            use sparrowdb_cypher::ast::{Expr, Literal};
+            // Extract the primary label from the MATCH pattern.  If none is
+            // declared (anonymous pattern) we have no way to find the right
+            // vector index, so skip.
+            let label_opt: Option<String> = mm
+                .match_patterns
+                .first()
+                .and_then(|pp| pp.nodes.first())
+                .and_then(|np| np.labels.first())
+                .cloned();
+            if let Some(label) = label_opt {
+                let vidx_dir = self.inner.path.join("vector_indexes");
+                let vidx_guard = self.inner.vector_indexes.read().expect("vector_indexes");
+                for mutation in &mm.mutations {
+                    if let sparrowdb_cypher::ast::Mutation::Set {
+                        prop,
+                        value: Expr::Literal(Literal::Param(p)),
+                        ..
+                    } = mutation
+                    {
+                        if let Some(exec_val) = params.get(p.as_str()) {
+                            if let Some(vec) = exec_val.as_vector() {
+                                let key = (label.clone(), prop.clone());
+                                if let Some(arc_idx) = vidx_guard.get(&key) {
+                                    let mut idx = arc_idx.write().expect("vector_index write");
+                                    for node_id in &matching_ids {
+                                        idx.insert(node_id.0, &vec);
+                                    }
+                                    // Persist once after all inserts for
+                                    // this (label, prop) pair.
+                                    idx.save(&vidx_dir, &label, prop).map_err(Error::Io)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(QueryResult::empty(vec![]))
     }
 
