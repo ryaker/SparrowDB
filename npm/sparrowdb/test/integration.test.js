@@ -325,6 +325,95 @@ describe('beginWrite — write transactions', () => {
   })
 })
 
+describe('executeWithParams — parameterized queries (KMSmcp #67)', () => {
+  let db
+  let dir
+
+  before(() => {
+    dir = makeTempDir()
+    db = SparrowDB.open(path.join(dir, 'graph.db'))
+    db.createVectorIndex('Memory', 'embedding', 4, 'cosine')
+    db.execute("CREATE (n:Memory {id: 'k1'})")
+    db.execute("CREATE (n:Memory {id: 'k2'})")
+    db.execute("CREATE (n:Person {id: 'p-42', age: 30, name: 'Alice'})")
+  })
+
+  after(() => {
+    removeDir(dir)
+  })
+
+  it('SET n.embedding = $emb writes a vector via param (the dedup-gate path)', () => {
+    // The flagship KMSmcp #67 use case: 768d embeddings can't be inlined as
+    // Cypher list literals — they must be passed as $emb.
+    const emb = [0.1, 0.2, 0.3, 0.4]
+    const r = db.executeWithParams(
+      'MATCH (n:Memory {id: $id}) SET n.embedding = $emb',
+      { id: 'k1', emb }
+    )
+    assert.ok(Array.isArray(r.rows), 'rows must be an array')
+    assert.equal(r.rows.length, 0, 'SET returns no rows')
+
+    // The property must roundtrip on a follow-up read.
+    const got = db.execute("MATCH (n:Memory {id: 'k1'}) RETURN n.embedding")
+    assert.equal(got.rows.length, 1, 'must find the node back')
+    assert.ok(got.rows[0]['n.embedding'] != null, 'embedding must be set')
+  })
+
+  it('Float32Array embedding via Array.from() roundtrips', () => {
+    // Real KMSmcp callers will derive the array from a Float32Array model output.
+    const f32 = new Float32Array([0.5, -0.3, 0.7, 0.1])
+    const emb = Array.from(f32)
+    const r = db.executeWithParams(
+      'MATCH (n:Memory {id: $id}) SET n.embedding = $emb',
+      { id: 'k2', emb }
+    )
+    assert.equal(r.rows.length, 0)
+  })
+
+  it('MATCH … WHERE n.id = $id with a string param', () => {
+    const r = db.executeWithParams(
+      'MATCH (n:Person {id: $id}) RETURN n.name',
+      { id: 'p-42' }
+    )
+    assert.equal(r.rows.length, 1, 'must find Alice')
+    assert.equal(r.rows[0]['n.name'], 'Alice')
+  })
+
+  it('UNWIND $nums AS n with a numeric list param', () => {
+    const r = db.executeWithParams(
+      'UNWIND $nums AS n RETURN n',
+      { nums: [10, 20, 30] }
+    )
+    assert.equal(r.rows.length, 3)
+    assert.equal(r.rows[0]['n'], 10)
+    assert.equal(r.rows[2]['n'], 30)
+  })
+
+  it('throws TypeError when params is not an object', () => {
+    assert.throws(
+      () => db.executeWithParams('UNWIND $x AS n RETURN n', [1, 2, 3]),
+      /TypeError|object/i,
+      'top-level array params must be rejected'
+    )
+  })
+
+  it('missing param key produces 0 rows (not an error) for UNWIND', () => {
+    // Matches the engine's spa190_unwind_missing_param_produces_no_rows test.
+    const r = db.executeWithParams(
+      'UNWIND $items AS x RETURN x',
+      { other: 1 }
+    )
+    assert.equal(r.rows.length, 0)
+  })
+
+  it('null params arg is treated as an empty parameter map', () => {
+    // Cypher with no $params should still execute when params is null/undefined.
+    const r = db.executeWithParams('MATCH (n:Person {id: \'p-42\'}) RETURN n.age', null)
+    assert.equal(r.rows.length, 1)
+    assert.equal(r.rows[0]['n.age'], 30)
+  })
+})
+
 describe('DISTINCT aggregation — SPA-172 regression', () => {
   let db
   let dir
