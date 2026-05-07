@@ -27,13 +27,7 @@ impl Engine {
             return Ok(vec![]);
         }
         let node_pat = &pat.nodes[0];
-        let label = node_pat.labels.first().cloned().unwrap_or_default();
-
-        let label_id = match self.snapshot.catalog.get_label(&label)? {
-            Some(id) => id as u32,
-            // SPA-266: unknown label → no nodes can match; return empty result.
-            None => return Ok(vec![]),
-        };
+        let label_opt = node_pat.labels.first().cloned();
 
         // Col_ids referenced by the WHERE clause (needed for WHERE evaluation
         // even after the index narrows candidates by inline prop filter).
@@ -48,25 +42,46 @@ impl Engine {
 
         let var_name = node_pat.var.as_str();
 
-        // Use the property index for O(1) equality lookups on inline prop
-        // filters, falling back to full scan for overflow strings / params.
-        let candidates = self.scan_nodes_for_label_with_index(label_id, &node_pat.props)?;
+        // Build the list of label_ids to scan.  For anonymous patterns
+        // (`MATCH (n) SET n.prop = $val`) there is no label constraint, so we
+        // scan every label known to the catalog.  For labelled patterns we
+        // resolve the single label (SPA-266: unknown label → empty result).
+        let label_ids: Vec<u32> = match label_opt {
+            Some(ref label) => match self.snapshot.catalog.get_label(label)? {
+                Some(id) => vec![id as u32],
+                // SPA-266: unknown label → no nodes can match; return empty result.
+                None => return Ok(vec![]),
+            },
+            None => self
+                .snapshot
+                .catalog
+                .list_labels()?
+                .into_iter()
+                .map(|(id, _)| id as u32)
+                .collect(),
+        };
 
         let mut matching_ids = Vec::new();
-        for node_id in candidates {
-            // Re-read props needed for WHERE clause evaluation.
-            if mm.where_clause.is_some() {
-                let props = read_node_props(&self.snapshot.store, node_id, &where_col_ids)?;
-                if let Some(ref where_expr) = mm.where_clause {
-                    let mut row_vals =
-                        build_row_vals(&props, var_name, &where_col_ids, &self.snapshot.store);
-                    row_vals.extend(self.dollar_params());
-                    if !self.eval_where_graph(where_expr, &row_vals) {
-                        continue;
+        for label_id in label_ids {
+            // Use the property index for O(1) equality lookups on inline prop
+            // filters, falling back to full scan for overflow strings / params.
+            let candidates = self.scan_nodes_for_label_with_index(label_id, &node_pat.props)?;
+
+            for node_id in candidates {
+                // Re-read props needed for WHERE clause evaluation.
+                if mm.where_clause.is_some() {
+                    let props = read_node_props(&self.snapshot.store, node_id, &where_col_ids)?;
+                    if let Some(ref where_expr) = mm.where_clause {
+                        let mut row_vals =
+                            build_row_vals(&props, var_name, &where_col_ids, &self.snapshot.store);
+                        row_vals.extend(self.dollar_params());
+                        if !self.eval_where_graph(where_expr, &row_vals) {
+                            continue;
+                        }
                     }
                 }
+                matching_ids.push(node_id);
             }
-            matching_ids.push(node_id);
         }
 
         Ok(matching_ids)

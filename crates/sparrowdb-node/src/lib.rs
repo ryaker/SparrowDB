@@ -39,6 +39,32 @@ fn to_napi_typed(e: sparrowdb::Error) -> napi::Error {
     }
 }
 
+// ── Cypher identifier validation ─────────────────────────────────────────────
+
+/// Validate that `s` is a safe Cypher identifier: `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// Labels and relationship types that are user-supplied must be validated
+/// before being interpolated into Cypher query strings to prevent injection.
+/// Returns `Ok(())` when valid, or a `TypeError` napi::Error otherwise.
+fn validate_cypher_identifier(s: &str) -> napi::Result<()> {
+    let valid = !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            format!(
+                "TypeError: invalid Cypher identifier '{s}'; \
+                 must match [A-Za-z_][A-Za-z0-9_]*"
+            ),
+        ))
+    }
+}
+
 // ── JSON → engine Value conversion ────────────────────────────────────────────
 
 /// Convert a `serde_json::Value` (received from JS via napi-rs's `serde-json`
@@ -384,6 +410,11 @@ impl SparrowDB {
         node_id: String,
         vector: Float32Array,
     ) -> napi::Result<()> {
+        // 0. Validate label is a safe Cypher identifier before interpolation
+        //    (prevents Cypher injection — label is user-controlled input).
+        //    Accepted: [A-Za-z_][A-Za-z0-9_]*
+        validate_cypher_identifier(&label)?;
+
         // 1. Resolve (label, property) → HNSW index arc.
         let arc = self
             .inner
@@ -416,6 +447,20 @@ impl SparrowDB {
             }
         }
 
+        // 3+4. Hold the database write lock across the node lookup and HNSW
+        //      insert+save so that a concurrent delete_node cannot create an
+        //      orphaned HNSW entry, and a concurrent drop_vector_index cannot
+        //      be silently undone by our save().
+        //
+        //      We acquire the lock via begin_write() (same discipline as other
+        //      durable write paths).  We do NOT commit the WriteTx — dropping
+        //      it releases the lock with no disk writes (HNSW save is handled
+        //      separately below, outside the WAL).
+        let _write_guard = self
+            .inner
+            .begin_write()
+            .map_err(|e| to_napi(format!("WriterBusy: cannot acquire write lock: {e}")))?;
+
         // 3. Resolve the user-facing string id to the internal u64 node slot.
         //    We do this with a simple MATCH+RETURN id(n) query so we don't
         //    need to replicate the id-property lookup logic inline.
@@ -434,6 +479,17 @@ impl SparrowDB {
             return Err(napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("RangeError: no node with id='{node_id}' found under label '{label}'"),
+            ));
+        }
+
+        if result.rows.len() != 1 {
+            return Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                format!(
+                    "RangeError: expected exactly one node with id='{node_id}' under label \
+                     '{label}', found {} — use a unique id property",
+                    result.rows.len()
+                ),
             ));
         }
 
@@ -457,6 +513,10 @@ impl SparrowDB {
             idx.save(&vidx_dir, &label, &property)
                 .map_err(|e| to_napi(format!("HNSW save failed: {e}")))?;
         }
+
+        // Release write lock by dropping _write_guard (no commit — HNSW file
+        // was already persisted above; WAL does not track vector index files).
+        drop(_write_guard);
 
         Ok(())
     }
@@ -1272,5 +1332,78 @@ mod tests {
                 // is enforced by the binding itself.
             }
         }
+    }
+
+    // ── Regression: validate_cypher_identifier (Issue 1 — PR #410) ───────────
+
+    /// `validate_cypher_identifier` must reject strings that contain characters
+    /// outside [A-Za-z_][A-Za-z0-9_]* to prevent Cypher injection via the
+    /// `label` parameter of `addToVectorIndex`.
+    #[test]
+    fn validate_cypher_identifier_rejects_injection_strings() {
+        use super::validate_cypher_identifier;
+
+        // Valid identifiers must pass.
+        assert!(validate_cypher_identifier("Memory").is_ok());
+        assert!(validate_cypher_identifier("my_label").is_ok());
+        assert!(validate_cypher_identifier("_Private").is_ok());
+        assert!(validate_cypher_identifier("Label123").is_ok());
+
+        // Injection attempts must be rejected with TypeError.
+        let cases = [
+            "Memory; DROP",
+            "Memory RETURN 1 //",
+            "Mem`ory",
+            "label-name",
+            "label name",
+            "123label",
+            "",
+            "label'",
+        ];
+        for bad in &cases {
+            let err = validate_cypher_identifier(bad).expect_err(&format!("must reject '{bad}'"));
+            assert!(
+                err.to_string().contains("TypeError")
+                    || err.to_string().contains("invalid Cypher identifier"),
+                "error for '{bad}' must mention TypeError, got: {}",
+                err
+            );
+        }
+    }
+
+    // ── Regression: non-unique id must error (Issue 3 — PR #410) ─────────────
+
+    /// When two nodes share the same `id` property under the same label,
+    /// `add_to_vector_index` must return an error (not silently pick one).
+    ///
+    /// We test this through the engine layer (GraphDb) because the NAPI layer
+    /// is hard to call without a Node.js runtime.  The duplicate-id guard lives
+    /// in the Rust code path that the NAPI binding calls.
+    #[test]
+    fn add_to_vector_index_duplicate_id_detected_via_engine() {
+        // We can't call the NAPI `add_to_vector_index` directly without a
+        // Node.js env.  Instead, verify the Cypher query that the binding uses
+        // returns >1 row when two nodes share an id, proving the guard works.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = open_db(dir.path());
+
+        // Insert two Memory nodes with the same `id` property (intentionally
+        // duplicated to trigger the guard).
+        db.execute("CREATE (n:Memory {id: 'dup'})").expect("first");
+        db.execute("CREATE (n:Memory {id: 'dup'})").expect("second");
+
+        // The MATCH query used by add_to_vector_index.
+        let mut params = HashMap::new();
+        params.insert("id".into(), ExecValue::String("dup".into()));
+        let result = db
+            .execute_with_params("MATCH (n:Memory {id: $id}) RETURN id(n) AS nid", params)
+            .expect("query must succeed");
+
+        // Two rows → the binding's `rows.len() != 1` guard fires.
+        assert_eq!(
+            result.rows.len(),
+            2,
+            "duplicate id must produce 2 rows, triggering the non-unique guard in the binding"
+        );
     }
 }
