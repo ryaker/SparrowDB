@@ -11,7 +11,8 @@
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use sparrowdb_execution::value_to_json;
+use sparrowdb_execution::{value_to_json, Value as ExecValue};
+use std::collections::HashMap;
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
@@ -36,6 +37,93 @@ fn to_napi_typed(e: sparrowdb::Error) -> napi::Error {
         }
         _ => to_napi(e),
     }
+}
+
+// ── JSON → engine Value conversion ────────────────────────────────────────────
+
+/// Convert a `serde_json::Value` (received from JS via napi-rs's `serde-json`
+/// feature) into a SparrowDB engine [`ExecValue`].
+///
+/// Mapping:
+/// - JSON `null` → `Value::Null`
+/// - JSON bool → `Value::Bool`
+/// - JSON integer → `Value::Int64`
+/// - JSON float → `Value::Float64`
+/// - JSON string → `Value::String`
+/// - JSON array → `Value::List` (element types preserved recursively; a
+///   homogeneous numeric array is kept as `List<Float64>` / `List<Int64>` —
+///   the engine's `Value::as_vector()` coerces these to `Vec<f32>` for
+///   vector-index writes)
+/// - JSON object → `Value::Map(Vec<(String, Value)>)` (property maps)
+///
+/// Returns a useful error string if a JSON value cannot be represented (e.g.
+/// a number that doesn't fit `i64` or `f64` or NaN/Inf — JSON forbids those
+/// natively, so this should never trigger from normal JS input).
+fn json_to_exec_value(v: &serde_json::Value) -> std::result::Result<ExecValue, String> {
+    use serde_json::Value as J;
+    match v {
+        J::Null => Ok(ExecValue::Null),
+        J::Bool(b) => Ok(ExecValue::Bool(*b)),
+        J::Number(n) => {
+            // Prefer i64 when the JSON number is an integer (common case for
+            // ids/counters); fall back to f64 (covers all JS Number values).
+            if let Some(i) = n.as_i64() {
+                Ok(ExecValue::Int64(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(ExecValue::Float64(f))
+            } else {
+                Err(format!("JS number {n} cannot be represented as i64 or f64"))
+            }
+        }
+        J::String(s) => Ok(ExecValue::String(s.clone())),
+        J::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(json_to_exec_value(item)?);
+            }
+            Ok(ExecValue::List(out))
+        }
+        J::Object(map) => {
+            let mut entries = Vec::with_capacity(map.len());
+            for (k, v) in map {
+                entries.push((k.clone(), json_to_exec_value(v)?));
+            }
+            Ok(ExecValue::Map(entries))
+        }
+    }
+}
+
+/// Convert a top-level JS object (received as a JSON object) into the
+/// `HashMap<String, Value>` shape that `GraphDb::execute_with_params` expects.
+///
+/// Returns a `napi::Error` (TypeError-prefixed) if the value is not an object
+/// or if any nested value cannot be converted.
+fn json_object_to_params(raw: &serde_json::Value) -> napi::Result<HashMap<String, ExecValue>> {
+    let obj = match raw {
+        serde_json::Value::Object(map) => map,
+        serde_json::Value::Null => {
+            return Ok(HashMap::new());
+        }
+        _ => {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "TypeError: params must be a plain object (e.g. { id: 'foo', emb: [..] })"
+                    .to_string(),
+            ));
+        }
+    };
+
+    let mut params: HashMap<String, ExecValue> = HashMap::with_capacity(obj.len());
+    for (k, v) in obj {
+        let ev = json_to_exec_value(v).map_err(|e| {
+            napi::Error::new(
+                napi::Status::InvalidArg,
+                format!("TypeError: param '{k}': {e}"),
+            )
+        })?;
+        params.insert(k.clone(), ev);
+    }
+    Ok(params)
 }
 
 // ── QueryResult ───────────────────────────────────────────────────────────────
@@ -128,6 +216,69 @@ impl SparrowDB {
     #[napi]
     pub fn execute(&self, cypher: String) -> napi::Result<QueryResult> {
         let result = self.inner.execute(&cypher).map_err(to_napi)?;
+        let rows: Vec<serde_json::Value> = result
+            .rows
+            .iter()
+            .map(|row| {
+                let obj: serde_json::Map<String, serde_json::Value> = result
+                    .columns
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(col, val)| (col.clone(), value_to_json(val)))
+                    .collect();
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        Ok(QueryResult {
+            columns: result.columns.clone(),
+            rows,
+        })
+    }
+
+    /// Execute a Cypher query with named parameters and return `{ columns, rows }`.
+    ///
+    /// `params` is a plain JS object whose keys correspond to `$name` references
+    /// in the Cypher source.  Values may be:
+    ///
+    /// - `null` → `Value::Null`
+    /// - `boolean`
+    /// - `number` (integer → `Int64`, otherwise `Float64`)
+    /// - `string`
+    /// - `Array<number>` — the canonical shape for vector embeddings; the engine
+    ///   accepts these for `SET n.embedding = $emb` and similar mutations on
+    ///   HNSW-indexed properties.
+    /// - `Array<any>` — generic list parameters (e.g. `UNWIND $names AS name`)
+    /// - `object` — converted to a property map; rarely needed
+    ///
+    /// This unblocks the dedup-gate write pattern from KMSmcp issue #67:
+    /// the Cypher parser cannot accept 768-element list literals, so 768d
+    /// embeddings must be passed as parameters.  The engine surface
+    /// (`GraphDb::execute_with_params`) has supported this since SPA-218; this
+    /// binding simply exposes it to JS callers.
+    ///
+    /// ```typescript
+    /// const emb = Array.from(new Float32Array(768))  // your model output
+    /// db.executeWithParams(
+    ///   "MERGE (k:Memory {id: $id}) SET k.embedding = $emb",
+    ///   { id: 'abc-123', emb }
+    /// )
+    /// ```
+    ///
+    /// Throws `TypeError` if `params` is not an object or contains a value
+    /// that cannot be converted to a SparrowDB engine value.
+    /// Throws on Cypher parse / bind / execution errors (passed through from
+    /// the engine).
+    #[napi]
+    pub fn execute_with_params(
+        &self,
+        cypher: String,
+        params: serde_json::Value,
+    ) -> napi::Result<QueryResult> {
+        let exec_params = json_object_to_params(&params)?;
+        let result = self
+            .inner
+            .execute_with_params(&cypher, exec_params)
+            .map_err(to_napi_typed)?;
         let rows: Vec<serde_json::Value> = result
             .rows
             .iter()
@@ -666,11 +817,189 @@ impl WriteTx {
 
 #[cfg(test)]
 mod tests {
+    use super::{json_object_to_params, json_to_exec_value};
     use sparrowdb::GraphDb;
+    use sparrowdb_execution::Value as ExecValue;
     use sparrowdb_storage::fts_index::FtsIndex;
+    use std::collections::HashMap;
 
     fn open_db(dir: &std::path::Path) -> GraphDb {
         GraphDb::open(dir).expect("open db")
+    }
+
+    // ── json_to_exec_value: scalar + array conversion ─────────────────────────
+
+    #[test]
+    fn json_to_exec_value_scalars() {
+        assert_eq!(
+            json_to_exec_value(&serde_json::Value::Null).unwrap(),
+            ExecValue::Null
+        );
+        assert_eq!(
+            json_to_exec_value(&serde_json::json!(true)).unwrap(),
+            ExecValue::Bool(true)
+        );
+        assert_eq!(
+            json_to_exec_value(&serde_json::json!(42)).unwrap(),
+            ExecValue::Int64(42)
+        );
+        // f64 path: 1.5 has no exact i64 form so as_i64 returns None.
+        assert_eq!(
+            json_to_exec_value(&serde_json::json!(1.5_f64)).unwrap(),
+            ExecValue::Float64(1.5)
+        );
+        assert_eq!(
+            json_to_exec_value(&serde_json::json!("hi")).unwrap(),
+            ExecValue::String("hi".into())
+        );
+    }
+
+    #[test]
+    fn json_to_exec_value_array_of_floats() {
+        // The dedup-gate use case: a Float32Array converted to a plain Array
+        // of numbers.  Each element is a JSON float, mapped to Value::Float64.
+        let arr = serde_json::json!([0.1_f64, 0.2_f64, 0.3_f64]);
+        let ev = json_to_exec_value(&arr).expect("convert");
+        match ev {
+            ExecValue::List(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], ExecValue::Float64(0.1));
+                assert_eq!(items[1], ExecValue::Float64(0.2));
+                assert_eq!(items[2], ExecValue::Float64(0.3));
+                // Confirm the engine's `as_vector()` helper coerces this
+                // List<Float64> to a Vec<f32> — that is the path the vector
+                // index write-side takes for SET/MERGE on HNSW columns.
+                let v = ExecValue::List(items).as_vector().expect("as_vector");
+                assert_eq!(v.len(), 3);
+                assert!((v[0] - 0.1).abs() < 1e-6);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_exec_value_nested_object_to_map() {
+        let obj = serde_json::json!({ "name": "Alice", "age": 30 });
+        let ev = json_to_exec_value(&obj).expect("convert");
+        match ev {
+            ExecValue::Map(entries) => {
+                assert_eq!(entries.len(), 2);
+                let m: std::collections::BTreeMap<_, _> = entries.into_iter().collect();
+                assert_eq!(m.get("name"), Some(&ExecValue::String("Alice".into())));
+                assert_eq!(m.get("age"), Some(&ExecValue::Int64(30)));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    // ── json_object_to_params ─────────────────────────────────────────────────
+
+    #[test]
+    fn json_object_to_params_extracts_keys() {
+        let obj = serde_json::json!({ "id": "abc", "n": 5, "emb": [0.1, 0.2] });
+        let params = json_object_to_params(&obj).expect("params");
+        assert_eq!(params.len(), 3);
+        assert_eq!(params.get("id"), Some(&ExecValue::String("abc".into())));
+        assert_eq!(params.get("n"), Some(&ExecValue::Int64(5)));
+        match params.get("emb") {
+            Some(ExecValue::List(items)) => {
+                assert_eq!(items.len(), 2);
+            }
+            other => panic!("expected List for emb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_object_to_params_null_is_empty_map() {
+        // A null params arg means "no parameters".
+        let params = json_object_to_params(&serde_json::Value::Null).expect("ok");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn json_object_to_params_rejects_non_object_top_level() {
+        // Top-level must be an object — passing a bare array is a TypeError.
+        let bad = serde_json::json!([1, 2, 3]);
+        let err = json_object_to_params(&bad).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plain object") || msg.contains("TypeError"),
+            "error must mention object/TypeError, got: {msg}"
+        );
+    }
+
+    // ── End-to-end: dedup-gate write pattern (SET embedding via $emb) ────────
+
+    /// The flagship use case from KMSmcp issue #67: write a 768-element
+    /// embedding via parameters because the parser rejects huge list literals.
+    /// We use a smaller 4-dim vector here to keep the test fast — the engine
+    /// path is dimension-independent.
+    #[test]
+    fn end_to_end_set_embedding_via_param() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = open_db(dir.path());
+
+        // Set up: vector index + a node to update.
+        db.create_vector_index("Memory", "embedding", 4, "cosine")
+            .expect("create vector index");
+        db.execute("CREATE (n:Memory {id: 'k1'})")
+            .expect("create node");
+
+        // Convert the embedding to a JSON array — same shape JS would send via
+        // `Array.from(new Float32Array(...))`.
+        let emb_json = serde_json::json!([0.1, 0.2, 0.3, 0.4]);
+        let emb_val = json_to_exec_value(&emb_json).expect("convert embedding");
+
+        let mut params: HashMap<String, ExecValue> = HashMap::new();
+        params.insert("id".into(), ExecValue::String("k1".into()));
+        params.insert("emb".into(), emb_val);
+
+        // This is the exact mutation the dedup gate wants to issue.
+        let result = db
+            .execute_with_params("MATCH (n:Memory {id: $id}) SET n.embedding = $emb", params)
+            .expect("SET with $emb param must succeed");
+        // SET returns no rows.
+        assert_eq!(result.rows.len(), 0);
+
+        // Spot-check: read the property back.  set_property persists Value::List
+        // for non-vector-indexed paths; the property roundtrips as a list.
+        let got = db
+            .execute("MATCH (n:Memory {id: 'k1'}) RETURN n.embedding")
+            .expect("read embedding");
+        assert_eq!(got.rows.len(), 1, "must find the node back");
+    }
+
+    /// MATCH with a string parameter — the second core dedup-gate pattern
+    /// (look up node by id without string-interpolating the id).
+    #[test]
+    fn end_to_end_match_string_param() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = open_db(dir.path());
+        db.execute("CREATE (n:Person {id: 'p-42', name: 'Alice'})")
+            .expect("create node");
+
+        let mut params = HashMap::new();
+        params.insert("id".into(), ExecValue::String("p-42".into()));
+        let result = db
+            .execute_with_params("MATCH (n:Person {id: $id}) RETURN n.name", params)
+            .expect("match by $id");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], ExecValue::String("Alice".into()));
+    }
+
+    /// Numeric param via UNWIND — covers the "JS number → Int64" path.
+    #[test]
+    fn end_to_end_numeric_param_via_unwind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = open_db(dir.path());
+
+        let mut params = HashMap::new();
+        params.insert("nums".into(), ExecValue::List(vec![ExecValue::Int64(7)]));
+        let result = db
+            .execute_with_params("UNWIND $nums AS n RETURN n", params)
+            .expect("unwind");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], ExecValue::Int64(7));
     }
 
     // ── Float32Array roundtrip ────────────────────────────────────────────────

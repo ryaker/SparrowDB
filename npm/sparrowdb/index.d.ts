@@ -71,6 +71,42 @@ export declare class SparrowDB {
    * Note: `Int64` values outside `±(2^53-1)` are also returned as strings.
    */
   execute(cypher: string): QueryResult
+  /**
+   * Execute a Cypher query with named parameters and return `{ columns, rows }`.
+   *
+   * `params` is a plain JS object whose keys correspond to `$name` references
+   * in the Cypher source.  Values may be:
+   *
+   * - `null` → `Value::Null`
+   * - `boolean`
+   * - `number` (integer → `Int64`, otherwise `Float64`)
+   * - `string`
+   * - `Array<number>` — the canonical shape for vector embeddings; the engine
+   *   accepts these for `SET n.embedding = $emb` and similar mutations on
+   *   HNSW-indexed properties.
+   * - `Array<any>` — generic list parameters (e.g. `UNWIND $names AS name`)
+   * - `object` — converted to a property map; rarely needed
+   *
+   * This unblocks the dedup-gate write pattern from KMSmcp issue #67:
+   * the Cypher parser cannot accept 768-element list literals, so 768d
+   * embeddings must be passed as parameters.  The engine surface
+   * (`GraphDb::execute_with_params`) has supported this since SPA-218; this
+   * binding simply exposes it to JS callers.
+   *
+   * ```typescript
+   * const emb = Array.from(new Float32Array(768))  // your model output
+   * db.executeWithParams(
+   *   "MERGE (k:Memory {id: $id}) SET k.embedding = $emb",
+   *   { id: 'abc-123', emb }
+   * )
+   * ```
+   *
+   * Throws `TypeError` if `params` is not an object or contains a value
+   * that cannot be converted to a SparrowDB engine value.
+   * Throws on Cypher parse / bind / execution errors (passed through from
+   * the engine).
+   */
+  executeWithParams(cypher: string, params: any): QueryResult
   /** Flush the WAL and compact the database. */
   checkpoint(): void
   /** Checkpoint + sort neighbour lists for faster traversal. */
