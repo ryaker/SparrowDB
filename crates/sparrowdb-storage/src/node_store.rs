@@ -610,6 +610,12 @@ impl NodeStore {
     /// Returns `Ok(0)` when the column file does not exist yet — a missing file
     /// means no value has ever been written for this `(label_id, col_id)` pair,
     /// which is represented as the zero bit-pattern (SPA-166).
+    ///
+    /// Also returns `Ok(0)` when `slot` is beyond the end of the column file.
+    /// This can happen when the HWM (high-water mark) was bumped by a CREATE
+    /// but the node never wrote a value for this column (sparse write scenario).
+    /// The absent-value sentinel for non-nullable reads is `0` regardless of
+    /// whether the absence is from a missing file or a truncated column (SPA-406).
     fn read_col_slot(&self, label_id: u32, col_id: u32, slot: u32) -> Result<u64> {
         let path = self.col_path(label_id, col_id);
         let bytes = match fs::read(&path) {
@@ -619,7 +625,11 @@ impl NodeStore {
         };
         let offset = slot as usize * 8;
         if bytes.len() < offset + 8 {
-            return Err(Error::NotFound);
+            // Slot is beyond the written region of this column — treat as absent
+            // (same zero-sentinel as a missing file).  The HWM may exceed the
+            // col-file length when the node was created but never wrote this
+            // particular property.
+            return Ok(0);
         }
         Ok(u64::from_le_bytes(
             bytes[offset..offset + 8].try_into().unwrap(),
