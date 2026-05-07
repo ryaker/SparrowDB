@@ -271,8 +271,20 @@ async fn do_hello(stream: &mut TcpStream) {
     encode_tiny_map(&mut buf, &[("user_agent", "sparrowdb-test/1.0")]);
     send_msg(stream, &buf).await;
 
-    let (sig, _) = recv_and_decode(stream).await;
+    let (sig, fields) = recv_and_decode(stream).await;
     assert_eq!(sig, SIG_SUCCESS, "HELLO should return SUCCESS");
+
+    // Regression guard: the server metadata must identify as a Neo4j-compatible
+    // vendor so that gdotv and other Bolt clients that validate the vendor prefix
+    // do not reject the connection.
+    if let Some(TestValue::Map(meta)) = fields.first() {
+        if let Some(TestValue::Str(server)) = meta.get("server") {
+            assert!(
+                server.starts_with("Neo4j/"),
+                "HELLO SUCCESS metadata `server` must start with \"Neo4j/\" for gdotv compatibility, got: {server:?}"
+            );
+        }
+    }
 }
 
 /// Send RUN + PULL and return all records.

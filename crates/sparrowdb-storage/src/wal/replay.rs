@@ -160,6 +160,7 @@ impl WalReplayer {
                 WalRecordKind::Commit if begun.contains_key(&rec.txn_id.0) => {
                     committed.insert(rec.txn_id.0);
                 }
+                WalRecordKind::Commit => {}
                 WalRecordKind::Abort => {
                     begun.remove(&rec.txn_id.0);
                     aborted.insert(rec.txn_id.0);
@@ -330,6 +331,7 @@ impl WalReplayer {
                 WalRecordKind::Commit if begun.contains(&rec.txn_id.0) => {
                     committed.insert(rec.txn_id.0);
                 }
+                WalRecordKind::Commit => {}
                 WalRecordKind::Abort => {
                     begun.remove(&rec.txn_id.0);
                 }
@@ -461,6 +463,7 @@ impl WalReplayer {
                 WalRecordKind::Commit if begun.contains(&rec.txn_id.0) => {
                     committed.insert(rec.txn_id.0);
                 }
+                WalRecordKind::Commit => {}
                 WalRecordKind::Abort => {
                     begun.remove(&rec.txn_id.0);
                 }
@@ -495,9 +498,9 @@ impl WalReplayer {
                         entry.insert(name.clone());
                     }
                 }
-                // Only include non-empty keys (guard against low-level
-                // col_id-only paths that may not record a human-readable name).
                 WalPayload::NodeUpdate { node_id, key, .. } if !key.is_empty() => {
+                    // Only include non-empty keys (guard against low-level
+                    // col_id-only paths that may not record a human-readable name).
                     if let Some(&label_id) = node_label.get(node_id) {
                         schema
                             .node_props

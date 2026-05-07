@@ -1125,13 +1125,13 @@ impl Engine {
                             return Ok(None);
                         }
                     }
-                    Expr::PropAccess { var, prop } if var == src_var => {
+                    Expr::PropAccess { var, prop }
                         // n.prop — must reference the source variable.
+                        if var == src_var =>
+                    {
                         prop_col = Some(prop.clone());
                     }
-                    Expr::PropAccess { .. } => {
-                        return Ok(None);
-                    }
+                    Expr::PropAccess { .. } => return Ok(None),
                     _ => return Ok(None),
                 }
             }
