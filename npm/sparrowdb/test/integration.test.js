@@ -342,9 +342,11 @@ describe('executeWithParams — parameterized queries (KMSmcp #67)', () => {
     removeDir(dir)
   })
 
-  it('SET n.embedding = $emb writes a vector via param (the dedup-gate path)', () => {
+  it('SET n.embedding = $emb writes a vector via param AND populates HNSW', () => {
     // The flagship KMSmcp #67 use case: 768d embeddings can't be inlined as
     // Cypher list literals — they must be passed as $emb.
+    // Regression test for KMSmcp ch#202: previously SET stored the property
+    // but silently skipped the HNSW write — vectorSearch returned nothing.
     const emb = [0.1, 0.2, 0.3, 0.4]
     const r = db.executeWithParams(
       'MATCH (n:Memory {id: $id}) SET n.embedding = $emb',
@@ -357,9 +359,21 @@ describe('executeWithParams — parameterized queries (KMSmcp #67)', () => {
     const got = db.execute("MATCH (n:Memory {id: 'k1'}) RETURN n.embedding")
     assert.equal(got.rows.length, 1, 'must find the node back')
     assert.ok(got.rows[0]['n.embedding'] != null, 'embedding must be set')
+
+    // CRITICAL: vectorSearch must return the node — the HNSW index must have
+    // been updated by the SET.  Before the fix this returned an empty array.
+    // Resolve k1's raw u64 node ID so we can assert the hit is specifically
+    // this node and not a leftover from a previous test.
+    const k1Row = db.execute("MATCH (n:Memory {id: 'k1'}) RETURN id(n)")
+    // id(n) → Int64 → JS number (safe range for typical node IDs); vectorSearch
+    // returns NodeResult.id as a string, so stringify before comparing.
+    const k1InternalId = String(k1Row.rows[0]['id(n)'])
+    const hits = db.vectorSearch('Memory', 'embedding', new Float32Array(emb), 5)
+    const hitIds = hits.map(h => h.id)
+    assert.ok(hitIds.includes(k1InternalId), `vectorSearch must include k1 (internal id ${k1InternalId}) — HNSW was not updated (KMSmcp ch#202 regression); got: ${hitIds}`)
   })
 
-  it('Float32Array embedding via Array.from() roundtrips', () => {
+  it('Float32Array embedding via Array.from() roundtrips AND is vectorSearchable', () => {
     // Real KMSmcp callers will derive the array from a Float32Array model output.
     const f32 = new Float32Array([0.5, -0.3, 0.7, 0.1])
     const emb = Array.from(f32)
@@ -368,6 +382,50 @@ describe('executeWithParams — parameterized queries (KMSmcp #67)', () => {
       { id: 'k2', emb }
     )
     assert.equal(r.rows.length, 0)
+
+    // Also verify the HNSW index was populated with k2 specifically.
+    const k2Row = db.execute("MATCH (n:Memory {id: 'k2'}) RETURN id(n)")
+    const k2InternalId = String(k2Row.rows[0]['id(n)'])
+    const hits = db.vectorSearch('Memory', 'embedding', f32, 5)
+    const hitIds = hits.map(h => h.id)
+    assert.ok(hitIds.includes(k2InternalId), `Float32Array SET must populate HNSW for k2 (internal id ${k2InternalId}); got: ${hitIds}`)
+  })
+
+  it('addToVectorIndex inserts a node into HNSW directly', () => {
+    // The explicit backfill API added as part of KMSmcp ch#202 fix.
+    // Create a fresh node without any embedding.
+    db.execute("CREATE (n:Memory {id: 'k3'})")
+    const emb = new Float32Array([0.9, 0.1, 0.0, 0.0])
+
+    // Insert directly into the HNSW index without going through Cypher SET.
+    assert.doesNotThrow(() => {
+      db.addToVectorIndex('Memory', 'embedding', 'k3', emb)
+    }, 'addToVectorIndex must not throw')
+
+    // vectorSearch must return k3 specifically.
+    const k3Row = db.execute("MATCH (n:Memory {id: 'k3'}) RETURN id(n)")
+    const k3InternalId = String(k3Row.rows[0]['id(n)'])
+    const hits = db.vectorSearch('Memory', 'embedding', emb, 5)
+    const hitIds = hits.map(h => h.id)
+    assert.ok(hitIds.includes(k3InternalId), `addToVectorIndex must make k3 discoverable via vectorSearch (internal id ${k3InternalId}); got: ${hitIds}`)
+  })
+
+  it('addToVectorIndex throws RangeError for missing node', () => {
+    const emb = new Float32Array([0.1, 0.2, 0.3, 0.4])
+    assert.throws(
+      () => db.addToVectorIndex('Memory', 'embedding', 'no-such-node', emb),
+      /RangeError/,
+      'must throw RangeError when node does not exist'
+    )
+  })
+
+  it('addToVectorIndex throws RangeError for missing index', () => {
+    const emb = new Float32Array([0.1, 0.2, 0.3, 0.4])
+    assert.throws(
+      () => db.addToVectorIndex('Memory', 'nonexistent_prop', 'k1', emb),
+      /RangeError/,
+      'must throw RangeError when vector index does not exist'
+    )
   })
 
   it('MATCH … WHERE n.id = $id with a string param', () => {

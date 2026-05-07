@@ -1477,12 +1477,16 @@ impl GraphDb {
     ) -> Result<QueryResult> {
         let mut tx = self.begin_write()?;
         let csrs = self.cached_csr_map();
+        // Pass runtime params to the engine so that $param expressions in
+        // WHERE clauses and inline prop filters are resolved during the scan
+        // (e.g. `MATCH (n) WHERE n.id = $id SET n.embedding = $emb`).
         let engine = Engine::new(
             NodeStore::open(&self.inner.path)?,
             self.catalog_snapshot(),
             csrs,
             &self.inner.path,
-        );
+        )
+        .with_params(params.clone());
 
         // SPA-219: `MATCH (a)-[r:REL]->(b) DELETE r` — edge delete path.
         if is_edge_delete_mutation(mm) {
@@ -1522,11 +1526,80 @@ impl GraphDb {
                 }
             }
         }
+        // Vector index write-path: for each SET mutation whose value is a
+        // vector param, write to the HNSW index for every matched node.
+        //
+        // This block runs BEFORE tx.commit() so the property write and HNSW
+        // insert are atomic under the same WriteGuard held by `tx`.  If
+        // idx.save() fails the transaction is not committed, keeping disk state
+        // consistent.
+        //
+        // This mirrors the MERGE write-path at db.rs:1396-1420. Without this
+        // block, `MATCH (n:L {id: $id}) SET n.embedding = $emb` would silently
+        // store the property but leave the HNSW file untouched — silent data
+        // loss surfaced by KMSmcp channel message #202.
+        //
+        // Label is derived per matched NodeId (upper 32 bits of node_id.0
+        // encode the label_id) rather than from the AST.  This correctly
+        // handles:
+        //   • Anonymous matches (`MATCH (n) SET n.embedding = $emb`) where
+        //     the AST carries no label — the label is resolved from the node.
+        //   • Multi-pattern queries: each matched node's label is used, not
+        //     the first MATCH pattern's label (multi-pattern is currently
+        //     rejected by the engine guard, but this code is future-proof).
+        {
+            use sparrowdb_cypher::ast::{Expr, Literal};
+            let vidx_dir = self.inner.path.join("vector_indexes");
+            // Build a label_id → name map from the catalog once.
+            let cat = self.catalog_snapshot();
+            let label_id_to_name: std::collections::HashMap<u16, String> =
+                cat.list_labels().unwrap_or_default().into_iter().collect();
+            let vidx_guard = self.inner.vector_indexes.read().expect("vector_indexes");
+            for mutation in &mm.mutations {
+                if let sparrowdb_cypher::ast::Mutation::Set {
+                    prop,
+                    value: Expr::Literal(Literal::Param(p)),
+                    ..
+                } = mutation
+                {
+                    if let Some(exec_val) = params.get(p.as_str()) {
+                        if let Some(vec) = exec_val.as_vector() {
+                            // Group matched nodes by their primary label so we
+                            // can do one save() per (label, prop) pair.
+                            let mut label_to_node_ids: std::collections::HashMap<&str, Vec<u64>> =
+                                std::collections::HashMap::new();
+                            for node_id in &matching_ids {
+                                let lid = (node_id.0 >> 32) as u16;
+                                if let Some(label_name) = label_id_to_name.get(&lid) {
+                                    label_to_node_ids
+                                        .entry(label_name.as_str())
+                                        .or_default()
+                                        .push(node_id.0);
+                                }
+                            }
+                            for (label, slot_ids) in &label_to_node_ids {
+                                let key = (label.to_string(), prop.clone());
+                                if let Some(arc_idx) = vidx_guard.get(&key) {
+                                    let mut idx = arc_idx.write().expect("vector_index write");
+                                    for &raw_id in slot_ids {
+                                        idx.insert(raw_id, &vec);
+                                    }
+                                    // Persist once per (label, prop) pair.
+                                    idx.save(&vidx_dir, label, prop).map_err(Error::Io)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         tx.commit()?;
         self.invalidate_catalog();
         if has_detach_delete {
             self.invalidate_csr_map();
         }
+
         Ok(QueryResult::empty(vec![]))
     }
 

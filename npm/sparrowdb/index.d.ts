@@ -93,6 +93,11 @@ export declare class SparrowDB {
    * (`GraphDb::execute_with_params`) has supported this since SPA-218; this
    * binding simply exposes it to JS callers.
    *
+   * **HNSW note (as of 0.1.23):** When the target property has a vector index,
+   * `SET n.prop = $vec` now ALSO writes the vector into the HNSW index.
+   * Previously the property was stored but the HNSW file was not updated —
+   * a silent data-loss bug surfaced by KMSmcp channel message #202.
+   *
    * ```typescript
    * const emb = Array.from(new Float32Array(768))  // your model output
    * db.executeWithParams(
@@ -136,6 +141,28 @@ export declare class SparrowDB {
    * ```
    */
   createVectorIndex(label: string, property: string, dimensions: number, similarity?: string | undefined | null): void
+  /**
+   * Directly insert a vector into the HNSW index for an existing node.
+   *
+   * This is the explicit backfill API requested by KMSmcp (ch #202).  It is
+   * useful when nodes were created without an inline embedding and you want to
+   * populate the HNSW index without DETACH DELETE + recreate.
+   *
+   * - `label`    — node label (e.g. `"Memory"`)
+   * - `property` — the vector property name (e.g. `"embedding"`)
+   * - `node_id`  — the **user-facing** `id` property value (string), not the
+   *                internal u64 slot number.
+   * - `vector`   — Float32Array of `dimensions` elements.
+   *
+   * Throws `RangeError` if no vector index exists for `(label, property)`.
+   * Throws `TypeError`  if `vector.length` does not match the index dimensions.
+   * Throws `RangeError` if no node with `id = node_id` is found under `label`.
+   *
+   * ```typescript
+   * db.addToVectorIndex('Memory', 'embedding', 'node-uuid-here', myFloat32Array)
+   * ```
+   */
+  addToVectorIndex(label: string, property: string, nodeId: string, vector: Float32Array): void
   /**
    * Search the HNSW vector index for `k` nearest neighbours.
    *

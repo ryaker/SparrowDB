@@ -250,6 +250,160 @@ fn hnsw_bulk_insert_and_top_k() {
     );
 }
 
+// ── Regression: MATCH…SET $vector_param must write to HNSW (KMSmcp ch#202) ─────
+//
+// Before the fix, `MATCH (n:L {id: $id}) SET n.embedding = $emb` stored the
+// property but left the HNSW file unchanged — silent data loss.  This test
+// confirms that the inserted node is returned by vector_search after SET.
+
+#[test]
+fn set_vector_param_populates_hnsw() {
+    let (_dir, db) = make_db();
+
+    // Create the vector index and a bare node (no embedding yet).
+    db.create_vector_index("Memory", "embedding", 4, "cosine")
+        .expect("create index");
+    db.execute("CREATE (n:Memory {id: 'k1'})")
+        .expect("CREATE node");
+
+    // Use execute_with_params to SET the embedding via a $param.
+    let emb: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4];
+    let mut params = std::collections::HashMap::new();
+    params.insert("id".to_string(), Value::String("k1".to_string()));
+    params.insert("emb".to_string(), Value::Vector(emb.clone()));
+    db.execute_with_params("MATCH (n:Memory {id: $id}) SET n.embedding = $emb", params)
+        .expect("SET with vector param must not error");
+
+    // Verify the HNSW index now contains the node.
+    let arc = db
+        .get_vector_index("Memory", "embedding")
+        .expect("index must exist");
+    let idx = arc.read().expect("read lock");
+    let results = idx.search(&emb, 5, 20);
+    assert!(
+        !results.is_empty(),
+        "vectorSearch after SET must return the inserted node (HNSW was empty — silent data loss bug)"
+    );
+    // The only node in the index should be the one we just SET.
+    assert_eq!(results.len(), 1, "exactly one node should be in the index");
+}
+
+#[test]
+fn set_vector_param_hnsw_roundtrip_survives_reopen() {
+    // Same as above, but also verifies persistence: close + re-open the DB
+    // and confirm vectorSearch still returns the node.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = GraphDb::open(&path).expect("open");
+        db.create_vector_index("Chunk", "emb", 3, "cosine")
+            .expect("create index");
+        db.execute("CREATE (n:Chunk {id: 'c1'})").expect("CREATE");
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("id".to_string(), Value::String("c1".to_string()));
+        params.insert("emb".to_string(), Value::Vector(vec![1.0, 0.0, 0.0]));
+        db.execute_with_params("MATCH (n:Chunk {id: $id}) SET n.emb = $emb", params)
+            .expect("SET emb");
+    }
+
+    // Re-open and query.
+    let db = GraphDb::open(&path).expect("reopen");
+    let arc = db
+        .get_vector_index("Chunk", "emb")
+        .expect("index must survive restart");
+    let idx = arc.read().expect("read");
+    let results = idx.search(&[1.0_f32, 0.0, 0.0], 5, 20);
+    assert!(
+        !results.is_empty(),
+        "node must be in HNSW after restart (persistence verification)"
+    );
+}
+
+// ── Regression: anonymous MATCH must populate HNSW (Issues #2/#4 in PR #410) ──
+//
+// `MATCH (n) WHERE n.id = $id SET n.embedding = $emb` has no label in the AST.
+// Before the fix, scan_match_mutate bailed early (unknown label ""), leaving
+// both the property and the HNSW index untouched — silent data loss.
+
+#[test]
+fn anonymous_match_set_vector_populates_hnsw() {
+    let (_dir, db) = make_db();
+
+    db.create_vector_index("Memory", "embedding", 3, "cosine")
+        .expect("create index");
+    db.execute("CREATE (n:Memory {id: 'anon-1'})")
+        .expect("CREATE node");
+
+    let emb = vec![1.0_f32, 0.0, 0.0];
+    let mut params = std::collections::HashMap::new();
+    params.insert("id".to_string(), Value::String("anon-1".to_string()));
+    params.insert("emb".to_string(), Value::Vector(emb.clone()));
+
+    // Anonymous match (no label in MATCH clause).
+    db.execute_with_params("MATCH (n) WHERE n.id = $id SET n.embedding = $emb", params)
+        .expect("anonymous MATCH SET must succeed");
+
+    let arc = db
+        .get_vector_index("Memory", "embedding")
+        .expect("index must exist");
+    let results = arc.read().expect("read").search(&emb, 5, 20);
+    assert!(
+        !results.is_empty(),
+        "anonymous MATCH SET must populate HNSW (was silently skipped before fix)"
+    );
+}
+
+// ── Regression: label derived from NodeId, not from first MATCH pattern ────────
+//
+// The HNSW write-path must derive the label from the matched NodeId's upper
+// 32 bits rather than from the first AST node pattern.  Single-node queries
+// are already correct; this test guards the NodeId-derivation code path
+// explicitly, confirming the (label, prop) key is resolved correctly.
+
+#[test]
+fn set_vector_hnsw_label_derived_from_node_id() {
+    let (_dir, db) = make_db();
+
+    // Two separate labels, each with its own vector index.
+    db.create_vector_index("PersonVec", "emb", 2, "cosine")
+        .expect("create PersonVec index");
+    db.create_vector_index("DocVec", "emb", 2, "cosine")
+        .expect("create DocVec index");
+
+    db.execute("CREATE (n:PersonVec {id: 'p1'})")
+        .expect("CREATE PersonVec node");
+    db.execute("CREATE (n:DocVec {id: 'd1'})")
+        .expect("CREATE DocVec node");
+
+    // SET embedding on the DocVec node by label.
+    let doc_emb = vec![0.0_f32, 1.0];
+    let mut params = std::collections::HashMap::new();
+    params.insert("id".to_string(), Value::String("d1".to_string()));
+    params.insert("emb".to_string(), Value::Vector(doc_emb.clone()));
+    db.execute_with_params("MATCH (n:DocVec {id: $id}) SET n.emb = $emb", params)
+        .expect("SET DocVec embedding");
+
+    // DocVec index must contain the node.
+    let doc_arc = db.get_vector_index("DocVec", "emb").expect("DocVec index");
+    let doc_results = doc_arc.read().expect("read").search(&doc_emb, 5, 20);
+    assert!(
+        !doc_results.is_empty(),
+        "DocVec HNSW must contain the SET node"
+    );
+
+    // PersonVec index must remain empty (no cross-label pollution).
+    let person_arc = db
+        .get_vector_index("PersonVec", "emb")
+        .expect("PersonVec index");
+    let person_results = person_arc.read().expect("read").search(&doc_emb, 5, 20);
+    assert!(
+        person_results.is_empty(),
+        "PersonVec HNSW must NOT contain the DocVec node (wrong-label write)"
+    );
+}
+
 // ── Metrics ────────────────────────────────────────────────────────────────────
 
 #[test]
