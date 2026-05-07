@@ -1526,14 +1526,13 @@ impl GraphDb {
                 }
             }
         }
-        tx.commit()?;
-        self.invalidate_catalog();
-        if has_detach_delete {
-            self.invalidate_csr_map();
-        }
-
         // Vector index write-path: for each SET mutation whose value is a
         // vector param, write to the HNSW index for every matched node.
+        //
+        // This block runs BEFORE tx.commit() so the property write and HNSW
+        // insert are atomic under the same WriteGuard held by `tx`.  If
+        // idx.save() fails the transaction is not committed, keeping disk state
+        // consistent.
         //
         // This mirrors the MERGE write-path at db.rs:1396-1420. Without this
         // block, `MATCH (n:L {id: $id}) SET n.embedding = $emb` would silently
@@ -1593,6 +1592,12 @@ impl GraphDb {
                     }
                 }
             }
+        }
+
+        tx.commit()?;
+        self.invalidate_catalog();
+        if has_detach_delete {
+            self.invalidate_csr_map();
         }
 
         Ok(QueryResult::empty(vec![]))
