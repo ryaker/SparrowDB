@@ -11,7 +11,7 @@ use crate::ast::{
     MatchOptionalMatchStatement, MatchStatement, MergeStatement, Mutation, NodePattern,
     OptionalMatchStatement, PathPattern, PipelineStage, PipelineStatement, PropEntry, RelPattern,
     ReturnClause, ReturnItem, ShortestPathExpr, SortDir, Statement, UnionStatement,
-    UnwindStatement, WithClause, WithItem,
+    UnwindMatchMutateStatement, UnwindStatement, WithClause, WithItem,
 };
 use crate::lexer::{tokenize, Token};
 
@@ -353,10 +353,12 @@ impl Parser {
                 // MATCH ... SET var.prop = expr [, var.prop = expr ...]
                 self.advance();
                 let mutations = self.parse_set_items()?;
+                let return_clause = self.parse_optional_return()?;
                 Ok(Statement::MatchMutate(MatchMutateStatement {
                     match_patterns: patterns,
                     where_clause: None,
                     mutations,
+                    return_clause,
                 }))
             }
             Token::Detach => {
@@ -364,20 +366,24 @@ impl Parser {
                 self.advance();
                 self.expect_tok(&Token::Delete)?;
                 let var = self.expect_ident()?;
+                let return_clause = self.parse_optional_return()?;
                 Ok(Statement::MatchMutate(MatchMutateStatement {
                     match_patterns: patterns,
                     where_clause: None,
                     mutations: vec![Mutation::Delete { var, detach: true }],
+                    return_clause,
                 }))
             }
             Token::Delete => {
                 // MATCH ... DELETE var
                 self.advance();
                 let var = self.expect_ident()?;
+                let return_clause = self.parse_optional_return()?;
                 Ok(Statement::MatchMutate(MatchMutateStatement {
                     match_patterns: patterns,
                     where_clause: None,
                     mutations: vec![Mutation::Delete { var, detach: false }],
+                    return_clause,
                 }))
             }
             Token::Where => {
@@ -388,10 +394,12 @@ impl Parser {
                     Token::Set => {
                         self.advance();
                         let mutations = self.parse_set_items()?;
+                        let return_clause = self.parse_optional_return()?;
                         Ok(Statement::MatchMutate(MatchMutateStatement {
                             match_patterns: patterns,
                             where_clause: Some(where_expr),
                             mutations,
+                            return_clause,
                         }))
                     }
                     Token::Detach => {
@@ -399,19 +407,23 @@ impl Parser {
                         self.advance();
                         self.expect_tok(&Token::Delete)?;
                         let var = self.expect_ident()?;
+                        let return_clause = self.parse_optional_return()?;
                         Ok(Statement::MatchMutate(MatchMutateStatement {
                             match_patterns: patterns,
                             where_clause: Some(where_expr),
                             mutations: vec![Mutation::Delete { var, detach: true }],
+                            return_clause,
                         }))
                     }
                     Token::Delete => {
                         self.advance();
                         let var = self.expect_ident()?;
+                        let return_clause = self.parse_optional_return()?;
                         Ok(Statement::MatchMutate(MatchMutateStatement {
                             match_patterns: patterns,
                             where_clause: Some(where_expr),
                             mutations: vec![Mutation::Delete { var, detach: false }],
+                            return_clause,
                         }))
                     }
                     Token::With => {
@@ -1620,8 +1632,12 @@ impl Parser {
         // If the next token is WITH or MATCH, this is a pipeline:
         //   UNWIND … WITH … RETURN  (SPA-134)
         //   UNWIND … MATCH … RETURN (SPA-237)
-        if matches!(self.peek(), Token::With | Token::Match) {
+        //   UNWIND … MATCH … SET/DELETE … [RETURN] (SPA-415)
+        if matches!(self.peek(), Token::With) {
             return self.parse_pipeline_continuation(None, None, Some((expr, alias)), vec![]);
+        }
+        if matches!(self.peek(), Token::Match) {
+            return self.parse_unwind_match_mutate(expr, alias);
         }
 
         self.expect_tok(&Token::Return)?;
@@ -1673,6 +1689,90 @@ impl Parser {
         }
         self.expect_tok(&Token::RBracket)?;
         Ok(Expr::List(elems))
+    }
+
+    // ── UNWIND … MATCH … SET/DELETE (SPA-415) ────────────────────────────────
+
+    /// Parse `UNWIND <expr> AS <var> MATCH <patterns> SET/DELETE ... [RETURN ...]`.
+    ///
+    /// The UNWIND keyword and expression have already been consumed by
+    /// `parse_unwind`.  This function handles the MATCH + mutation tail.
+    fn parse_unwind_match_mutate(&mut self, expr: Expr, alias: String) -> Result<Statement> {
+        self.expect_tok(&Token::Match)?;
+        let patterns = self.parse_pattern_list()?;
+
+        // Dispatch on the next token to determine the mutation type, reusing
+        // the same logic as parse_match_or_match_mutate.
+        let (where_clause, mutations) = match self.peek().clone() {
+            Token::Set => {
+                self.advance();
+                (None, self.parse_set_items()?)
+            }
+            Token::Detach => {
+                self.advance();
+                self.expect_tok(&Token::Delete)?;
+                let var = self.expect_ident()?;
+                (None, vec![Mutation::Delete { var, detach: true }])
+            }
+            Token::Delete => {
+                self.advance();
+                let var = self.expect_ident()?;
+                (None, vec![Mutation::Delete { var, detach: false }])
+            }
+            Token::Where => {
+                self.advance();
+                let where_expr = self.parse_expr()?;
+                let mutations = match self.peek().clone() {
+                    Token::Set => {
+                        self.advance();
+                        self.parse_set_items()?
+                    }
+                    Token::Detach => {
+                        self.advance();
+                        self.expect_tok(&Token::Delete)?;
+                        let var = self.expect_ident()?;
+                        vec![Mutation::Delete { var, detach: true }]
+                    }
+                    Token::Delete => {
+                        self.advance();
+                        let var = self.expect_ident()?;
+                        vec![Mutation::Delete { var, detach: false }]
+                    }
+                    other => {
+                        return Err(Error::InvalidArgument(format!(
+                            "expected SET, DELETE, or DETACH DELETE after WHERE in UNWIND MATCH, got {:?}",
+                            other
+                        )));
+                    }
+                };
+                (Some(where_expr), mutations)
+            }
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "expected SET, DELETE, DETACH DELETE, or WHERE after UNWIND MATCH patterns, got {:?}",
+                    other
+                )));
+            }
+        };
+
+        // Optional RETURN clause after mutations.
+        let return_clause = if matches!(self.peek(), Token::Return) {
+            self.advance();
+            let items = self.parse_return_items()?;
+            Some(ReturnClause { items })
+        } else {
+            None
+        };
+
+        Ok(Statement::UnwindMatchMutate(UnwindMatchMutateStatement {
+                expr,
+                alias,
+                match_patterns: patterns,
+                where_clause,
+                mutations,
+                return_clause,
+            },
+        ))
     }
 
     fn parse_create_body(&mut self) -> Result<CreateStatement> {
@@ -2522,6 +2622,19 @@ impl Parser {
     }
 
     // ── RETURN items ──────────────────────────────────────────────────────────
+
+    /// Parse an optional RETURN clause that may follow a mutation (SET/DELETE).
+    ///
+    /// Returns `None` when the next token is not `RETURN`.
+    fn parse_optional_return(&mut self) -> Result<Option<ReturnClause>> {
+        if matches!(self.peek(), Token::Return) {
+            self.advance();
+            let items = self.parse_return_items()?;
+            Ok(Some(ReturnClause { items }))
+        } else {
+            Ok(None)
+        }
+    }
 
     fn parse_return_items(&mut self) -> Result<Vec<ReturnItem>> {
         if matches!(self.peek(), Token::Star) {

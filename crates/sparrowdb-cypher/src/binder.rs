@@ -14,8 +14,8 @@ use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::Result;
 
 use crate::ast::{
-    MatchMergeRelStatement, MatchMutateStatement, MatchOptionalMatchStatement, MatchStatement,
-    MatchWithStatement, PathPattern, Statement,
+    MatchMergeRelStatement, MatchOptionalMatchStatement, MatchStatement,
+    MatchWithStatement, PathPattern, Statement, UnwindMatchMutateStatement,
 };
 
 /// A bound statement — the AST annotated with resolved catalog IDs.
@@ -57,7 +57,8 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
         // MATCH…MERGE relationship: validate the MATCH patterns (labels must
         // exist); the rel type may not exist yet — merge_edge will create it.
         Statement::MatchMergeRel(mm) => bind_match_merge_rel(mm, catalog)?,
-        Statement::MatchMutate(mm) => bind_match_mutate(mm, catalog)?,
+        Statement::MatchMutate(mm) => bind_match_mutate_patterns(&mm.match_patterns, catalog)?,
+        Statement::UnwindMatchMutate(umm) => bind_unwind_match_mutate(umm, catalog)?,
         // OPTIONAL MATCH: label/rel-type may not exist yet — that is exactly
         // the case that produces NULL rows.  Skip existence checks.
         Statement::OptionalMatch(_) => {}
@@ -92,13 +93,19 @@ fn bind_match_with(mw: &MatchWithStatement, catalog: &Catalog) -> Result<()> {
     Ok(())
 }
 
-fn bind_match_mutate(mm: &MatchMutateStatement, catalog: &Catalog) -> Result<()> {
-    for pat in &mm.match_patterns {
+fn bind_match_mutate_patterns(patterns: &[PathPattern], catalog: &Catalog) -> Result<()> {
+    for pat in patterns {
         bind_path_pattern(pat, catalog)?;
     }
     // The mutation itself (SET/DELETE) targets variables already bound by
     // the MATCH patterns — no additional catalog lookups are needed here.
     Ok(())
+}
+
+fn bind_unwind_match_mutate(umm: &UnwindMatchMutateStatement, catalog: &Catalog) -> Result<()> {
+    // UNWIND expression uses parameters ($param) — no catalog binding needed.
+    // MATCH patterns must reference existing labels/rel-types.
+    bind_match_mutate_patterns(&umm.match_patterns, catalog)
 }
 
 fn bind_match_merge_rel(mm: &MatchMergeRelStatement, catalog: &Catalog) -> Result<()> {
