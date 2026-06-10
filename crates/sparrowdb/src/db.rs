@@ -1649,7 +1649,7 @@ impl GraphDb {
                     let col = rc.items[0]
                         .alias
                         .clone()
-                        .unwrap_or_else(|| format!("count({})", count));
+                        .unwrap_or_else(|| "count(n)".to_string());
                     Ok(QueryResult {
                         columns: vec![col],
                         rows: vec![vec![sparrowdb_execution::Value::Int64(count as i64)]],
@@ -1672,7 +1672,7 @@ impl GraphDb {
         params: &HashMap<String, sparrowdb_execution::Value>,
     ) -> Result<QueryResult> {
         let list = eval_unwind_list(&umm.expr, params)?;
-        self.execute_unwind_mutate_inner(umm, list.as_slice())
+        self.execute_unwind_mutate_inner(umm, list.as_slice(), Some(params))
     }
 
     /// Execute `UNWIND [literal] AS var MATCH ... SET/DELETE` without params.
@@ -1694,14 +1694,18 @@ impl GraphDb {
                 ));
             }
         };
-        self.execute_unwind_mutate_inner(umm, list.as_slice())
+        self.execute_unwind_mutate_inner(umm, list.as_slice(), None)
     }
 
     /// Shared inner: iterate UNWIND elements, apply mutations per row, single tx.
+    ///
+    /// When `params` is `Some`, the engine and `resolve_set_value` can resolve
+    /// `$param` references in `where_clause` and `SET` value expressions.
     fn execute_unwind_mutate_inner(
         &self,
         umm: &sparrowdb_cypher::ast::UnwindMatchMutateStatement,
         list: &[sparrowdb_execution::Value],
+        params: Option<&HashMap<String, sparrowdb_execution::Value>>,
     ) -> Result<QueryResult> {
         if list.is_empty() {
             return Ok(QueryResult::empty(vec![]));
@@ -1709,12 +1713,16 @@ impl GraphDb {
 
         let mut tx = self.begin_write()?;
         let csrs = self.cached_csr_map();
-        let engine = Engine::new(
+        let mut engine = Engine::new(
             NodeStore::open(&self.inner.path)?,
             self.catalog_snapshot(),
             csrs,
             &self.inner.path,
         );
+        // Configure engine with params so WHERE clause can resolve $param.
+        if let Some(p) = params {
+            engine = engine.with_params(p.clone());
+        }
         let mut total_mutated: u64 = 0;
         let mut has_detach_delete = false;
 
@@ -1724,8 +1732,8 @@ impl GraphDb {
                 sparrowdb_execution::Value::Map(entries) => entries,
                 _ => {
                     return Err(Error::InvalidArgument(format!(
-                        "UNWIND element must be a map (e.g. {{id: '...', score: 0.5}}), got {:?}",
-                        std::mem::discriminant(element)
+                        "UNWIND element must be a map (e.g. {{id: '...', score: 0.5}}), got {}",
+                        element
                     )));
                 }
             };
@@ -1753,7 +1761,7 @@ impl GraphDb {
             for mutation in &umm.mutations {
                 match mutation {
                     sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
-                        let sv = resolve_set_value(value, &umm.alias, row);
+                        let sv = resolve_set_value(value, &umm.alias, row, params)?;
                         for node_id in &matching_ids {
                             tx.set_property(*node_id, prop, sv.clone())?;
                         }
@@ -3174,9 +3182,8 @@ fn eval_unwind_list(
             match params.get(name.as_str()) {
                 Some(sparrowdb_execution::Value::List(items)) => Ok(items.clone()),
                 Some(other) => Err(Error::InvalidArgument(format!(
-                    "UNWIND parameter ${} must be a list, got {:?}",
-                    name,
-                    std::mem::discriminant(other)
+                    "UNWIND parameter ${} must be a list, got {}",
+                    name, other
                 ))),
                 None => Err(Error::InvalidArgument(format!(
                     "UNWIND parameter ${} not found in params",
@@ -3264,24 +3271,29 @@ fn exec_value_to_expr_literal(v: &sparrowdb_execution::Value) -> sparrowdb_cyphe
 
 /// Resolve a mutation SET value expression to a storage-layer Value.
 /// If the value is `alias.prop`, look it up from the row map; otherwise
-/// evaluate it directly via `expr_to_value`.
+/// evaluate it via `expr_to_value_with_params` when params are available,
+/// falling back to `expr_to_value` for literal-only expressions.
 fn resolve_set_value(
     value: &sparrowdb_cypher::ast::Expr,
     alias: &str,
     row: &[(String, sparrowdb_execution::Value)],
-) -> Value {
+    params: Option<&HashMap<String, sparrowdb_execution::Value>>,
+) -> crate::Result<Value> {
     use sparrowdb_cypher::ast::Expr;
     if let Expr::PropAccess { var, prop } = value {
         if var == alias {
             for (key, val) in row {
                 if key == prop {
-                    return exec_value_to_storage(val);
+                    return Ok(exec_value_to_storage(val));
                 }
             }
         }
     }
-    // Fall back to standard literal evaluation.
-    expr_to_value(value)
+    // Fall back: use params-aware evaluation when available, otherwise literal-only.
+    match params {
+        Some(p) => expr_to_value_with_params(value, p),
+        None => Ok(expr_to_value(value)),
+    }
 }
 
 /// Migrate WAL segments from legacy v21 (CRC32 IEEE) to v2 (CRC32C Castagnoli).

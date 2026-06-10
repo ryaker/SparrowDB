@@ -1765,13 +1765,7 @@ impl Parser {
         };
 
         // Optional RETURN clause after mutations.
-        let return_clause = if matches!(self.peek(), Token::Return) {
-            self.advance();
-            let items = self.parse_return_items()?;
-            Some(ReturnClause { items })
-        } else {
-            None
-        };
+        let return_clause = self.parse_optional_return()?;
 
         Ok(Statement::UnwindMatchMutate(UnwindMatchMutateStatement {
                 expr,
