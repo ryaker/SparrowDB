@@ -976,6 +976,7 @@ impl Engine {
             Statement::Merge(_)
             | Statement::MatchMergeRel(_)
             | Statement::MatchMutate(_)
+            | Statement::UnwindMatchMutate(_)
             | Statement::MatchCreate(_) => Err(sparrowdb_common::Error::InvalidArgument(
                 "mutation statements must be executed via execute_mutation".into(),
             )),
@@ -1031,6 +1032,7 @@ impl Engine {
             Statement::Merge(_)
             | Statement::MatchMergeRel(_)
             | Statement::MatchMutate(_)
+            | Statement::UnwindMatchMutate(_)
             | Statement::MatchCreate(_) => true,
             // All standalone CREATE statements must go through the
             // write-transaction path to ensure WAL durability and correct
