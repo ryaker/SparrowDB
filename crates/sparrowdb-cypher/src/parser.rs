@@ -677,28 +677,37 @@ impl Parser {
     /// Called after the `SET` keyword has already been consumed.
     /// Returns a `Vec<Mutation::Set>` with at least one item.
     fn parse_set_items(&mut self) -> Result<Vec<Mutation>> {
+        self.parse_set_items_inner(false)
+    }
+
+    /// Variant that allows `PropAccess` values (e.g. `row.score`) in SET,
+    /// used inside `UNWIND … MATCH … SET` where the caller resolves row
+    /// references at execution time (SPA-415).
+    fn parse_set_items_allow_prop(&mut self) -> Result<Vec<Mutation>> {
+        self.parse_set_items_inner(true)
+    }
+
+    fn parse_set_items_inner(&mut self, allow_prop_access: bool) -> Result<Vec<Mutation>> {
         let mut items = Vec::new();
         loop {
             let var = self.expect_ident()?;
             self.expect_tok(&Token::Dot)?;
-            // Use advance_as_prop_name so keyword tokens (e.g. `match`, `count`)
-            // are accepted as property names, consistent with SPA-265 behavior.
             let prop = self.advance_as_prop_name()?;
             self.expect_tok(&Token::Eq)?;
             let value = self.parse_expr()?;
             // Guard: the write helpers (expr_to_value / expr_to_value_with_params)
-            // only materialise Expr::Literal values.  Any other expression (e.g.
-            // arithmetic, property access) would be silently coerced to
-            // Value::Int64(0) and corrupt data.  Reject them at parse time until
-            // a full expression evaluator is wired into the SET path.
-            if !matches!(value, Expr::Literal(_)) {
+            // only materialise Expr::Literal values.  PropAccess is allowed when
+            // the caller (UNWIND … MATCH … SET) resolves it at execution time.
+            let is_literal = matches!(value, Expr::Literal(_));
+            let is_prop = matches!(value, Expr::PropAccess { .. });
+            if !is_literal && !(allow_prop_access && is_prop) {
                 return Err(Error::InvalidArgument(
                     "SET property value must be a literal or $parameter".into(),
                 ));
             }
             items.push(Mutation::Set { var, prop, value });
             if matches!(self.peek(), Token::Comma) {
-                self.advance(); // consume the comma
+                self.advance();
             } else {
                 break;
             }
@@ -1735,7 +1744,7 @@ impl Parser {
         let (where_clause, mutations) = match self.peek().clone() {
             Token::Set => {
                 self.advance();
-                (None, self.parse_set_items()?)
+                (None, self.parse_set_items_allow_prop()?)
             }
             Token::Detach => {
                 self.advance();
@@ -1754,7 +1763,7 @@ impl Parser {
                 let mutations = match self.peek().clone() {
                     Token::Set => {
                         self.advance();
-                        self.parse_set_items()?
+                        self.parse_set_items_allow_prop()?
                     }
                     Token::Detach => {
                         self.advance();
