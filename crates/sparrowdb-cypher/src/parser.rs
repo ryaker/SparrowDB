@@ -1637,7 +1637,24 @@ impl Parser {
             return self.parse_pipeline_continuation(None, None, Some((expr, alias)), vec![]);
         }
         if matches!(self.peek(), Token::Match) {
-            return self.parse_unwind_match_mutate(expr, alias);
+            self.advance(); // consume MATCH
+            let patterns = self.parse_pattern_list()?;
+
+            // Peek ahead to decide: mutation (SET/DELETE/WHERE) or read pipeline?
+            match self.peek().clone() {
+                Token::Set | Token::Delete | Token::Detach | Token::Where => {
+                    return self.parse_unwind_match_mutate_tail(expr, alias, patterns);
+                }
+                _ => {
+                    // Read pipeline: UNWIND ... MATCH ... RETURN/WITH/...
+                    return self.parse_pipeline_continuation(
+                        Some(patterns),
+                        None,
+                        Some((expr, alias)),
+                        vec![],
+                    );
+                }
+            }
         }
 
         self.expect_tok(&Token::Return)?;
@@ -1693,13 +1710,16 @@ impl Parser {
 
     // ── UNWIND … MATCH … SET/DELETE (SPA-415) ────────────────────────────────
 
-    /// Parse `UNWIND <expr> AS <var> MATCH <patterns> SET/DELETE ... [RETURN ...]`.
-    ///
-    /// The UNWIND keyword and expression have already been consumed by
-    /// `parse_unwind`.  This function handles the MATCH + mutation tail.
-    fn parse_unwind_match_mutate(&mut self, expr: Expr, alias: String) -> Result<Statement> {
-        self.expect_tok(&Token::Match)?;
-        let patterns = self.parse_pattern_list()?;
+    /// Parse the mutation tail after `UNWIND … AS alias MATCH patterns`
+    /// have already been consumed by the caller.  The caller is responsible
+    /// for peeking at the token after `patterns` to decide whether this is
+    /// a mutation (SET/DELETE/DETACH/WHERE) or a read pipeline.
+    fn parse_unwind_match_mutate_tail(
+        &mut self,
+        expr: Expr,
+        alias: String,
+        patterns: Vec<PathPattern>,
+    ) -> Result<Statement> {
 
         // Dispatch on the next token to determine the mutation type, reusing
         // the same logic as parse_match_or_match_mutate.

@@ -741,7 +741,7 @@ impl GraphDb {
                 Statement::Merge(ref m) => self.execute_merge(m),
                 Statement::MatchMutate(ref mm) => self.execute_match_mutate_deadline(mm, deadline),
                 Statement::UnwindMatchMutate(ref umm) => {
-                    self.execute_unwind_match_mutate(umm)
+                    self.execute_unwind_match_mutate_deadline(umm, deadline)
                 }
                 Statement::MatchCreate(ref mc) => self.execute_match_create_deadline(mc, deadline),
                 Statement::Create(ref c) => self.execute_create_standalone(c),
@@ -1623,10 +1623,10 @@ impl GraphDb {
         match return_clause {
             None => Ok(QueryResult::empty(vec![])),
             Some(rc) => {
-                // Simple heuristic: if RETURN has a single count-like item,
-                // return the count.  Full RETURN expression evaluation for
-                // mutations is deferred to a future engine extension.
-                if rc.items.len() == 1 {
+                // Only honour RETURN when the expression is count(n) / count(*).
+                // Full RETURN expression evaluation for mutations is deferred
+                // to a future engine extension.
+                if rc.items.len() == 1 && is_count_expr(&rc.items[0].expr) {
                     let col = rc.items[0]
                         .alias
                         .clone()
@@ -1653,7 +1653,7 @@ impl GraphDb {
         params: &HashMap<String, sparrowdb_execution::Value>,
     ) -> Result<QueryResult> {
         let list = eval_unwind_list(&umm.expr, params)?;
-        self.execute_unwind_mutate_inner(umm, list.as_slice(), Some(params))
+        self.execute_unwind_mutate_inner(umm, list.as_slice(), Some(params), None)
     }
 
     /// Execute `UNWIND [literal] AS var MATCH ... SET/DELETE` without params.
@@ -1675,18 +1675,55 @@ impl GraphDb {
                 ));
             }
         };
-        self.execute_unwind_mutate_inner(umm, list.as_slice(), None)
+        self.execute_unwind_mutate_inner(umm, list.as_slice(), None, None)
+    }
+
+    /// Deadline-aware variant (fixes #310).
+    fn execute_unwind_match_mutate_deadline(
+        &self,
+        umm: &sparrowdb_cypher::ast::UnwindMatchMutateStatement,
+        deadline: std::time::Instant,
+    ) -> Result<QueryResult> {
+        // Evaluate the UNWIND list from the expression (non-params path).
+        let list = match &umm.expr {
+            sparrowdb_cypher::ast::Expr::List(items) => items
+                .iter()
+                .map(|e| {
+                    let sv = expr_to_value(e);
+                    Ok(storage_value_to_exec(&sv))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => {
+                return Err(Error::InvalidArgument(
+                    "UNWIND MATCH SET/DELETE with timeout requires a list literal".into(),
+                ));
+            }
+        };
+        self.execute_unwind_mutate_inner(umm, list.as_slice(), None, Some(deadline))
     }
 
     /// Shared inner: iterate UNWIND elements, apply mutations per row, single tx.
     ///
     /// When `params` is `Some`, the engine and `resolve_set_value` can resolve
     /// `$param` references in `where_clause` and `SET` value expressions.
+    ///
+    /// When `deadline` is `Some`, each iteration checks elapsed time and returns
+    /// `Err(Timeout)` if the caller's deadline has passed (fixes #310).
+    ///
+    /// **Visibility limitation**: each UNWIND row is scanned against committed
+    /// storage — earlier rows' mutations within the same transaction are NOT
+    /// visible to later rows' MATCH scans.  This is by design: the single-pass
+    /// engine reuses the same read snapshot for all iterations, matching the
+    /// semantics of `UNWIND` in standard Cypher (all rows see the same pre-query
+    /// state).  Use cases that require row-to-row visibility (e.g. accumulating
+    /// mutations on the same node across iterations) must issue separate
+    /// statements.
     fn execute_unwind_mutate_inner(
         &self,
         umm: &sparrowdb_cypher::ast::UnwindMatchMutateStatement,
         list: &[sparrowdb_execution::Value],
         params: Option<&HashMap<String, sparrowdb_execution::Value>>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<QueryResult> {
         if list.is_empty() {
             return Ok(QueryResult::empty(vec![]));
@@ -1708,6 +1745,11 @@ impl GraphDb {
         let mut has_detach_delete = false;
 
         for element in list {
+            // Honour caller's deadline between iterations (fixes #310).
+            if let Some(dl) = deadline {
+                Self::check_deadline(dl)?;
+            }
+
             // Each element must be a Map (e.g. {id: "m1", score: 0.5}).
             let row = match element {
                 sparrowdb_execution::Value::Map(entries) => entries,
@@ -3089,6 +3131,18 @@ impl GraphDb {
         self.invalidate_csr_map();
         Ok(())
     }
+}
+
+// ── RETURN helpers ──────────────────────────────────────────────────────────
+
+/// Check whether an expression is a `count(n)` or `count(*)` aggregate call.
+fn is_count_expr(expr: &sparrowdb_cypher::ast::Expr) -> bool {
+    use sparrowdb_cypher::ast::Expr;
+    matches!(
+        expr,
+        Expr::FnCall { name, .. } if name.eq_ignore_ascii_case("count")
+            || name == "COUNT"
+    ) || matches!(expr, Expr::CountStar)
 }
 
 // ── UNWIND helpers (SPA-415) ────────────────────────────────────────────────
