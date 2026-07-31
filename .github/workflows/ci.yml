@@ -10,6 +10,14 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Every `run:` step uses `bash --noprofile --norc -eo pipefail {0}`.
+# Without this, GitHub's default `bash -e {0}` has no pipefail, so any step
+# ending in `| tee …` exits with tee's status (always 0) and test failures
+# are silently reported as green.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # ── Unit + Integration tests ───────────────────────────────────────────────
   test:

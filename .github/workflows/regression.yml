@@ -10,6 +10,12 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# See ci.yml — without pipefail, `cargo test … | tee` exits with tee's status
+# and regression failures are reported as green.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   regression:
     name: Real-World Regression Suite
