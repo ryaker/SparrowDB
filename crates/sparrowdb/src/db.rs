@@ -3029,18 +3029,46 @@ fn replay_wal_mutations(db_path: &Path, encryption_key: Option<[u8; 32]>) -> Res
                     catalog.get_or_create_rel_type_id(src_label_id, dst_label_id, rel_type)?;
                 let rel_table_id = RelTableId(catalog_rel_id as u32);
 
-                // Idempotency: skip if this edge_id is already in the delta log.
+                let src_node = sparrowdb_common::NodeId(*src);
+                let dst_node = sparrowdb_common::NodeId(*dst);
+                let mut es = EdgeStore::open(db_path, rel_table_id)?;
+
+                // Idempotency: an edge is already durable if it lives in EITHER
+                // the delta log or the checkpointed CSR base.  Both must be
+                // checked (SPA-191 regression):
+                //
+                // CHECKPOINT folds the delta into the CSR base, truncates the
+                // delta, and resets `next_edge_id` to 0 (see
+                // EdgeStore::truncate_delta).  So after a checkpoint the
+                // delta-only check below reads 0, `0 > edge_id` is false for the
+                // first edge, and replay re-inserts an edge that is already in
+                // the base — leaving it counted once in the base and once in the
+                // delta, so queries return it twice.
+                let src_slot = *src & 0xFFFF_FFFF;
+                let dst_slot = *dst & 0xFFFF_FFFF;
+                let in_csr_base = match es.open_fwd() {
+                    Ok(fwd) => {
+                        src_slot < fwd.n_nodes() && fwd.neighbors(src_slot).contains(&dst_slot)
+                    }
+                    // No base file yet — normal before the first checkpoint.
+                    Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    // Any other failure must not be treated as "absent": doing so
+                    // would re-insert an edge that is already in the base.
+                    Err(e) => return Err(e),
+                };
+                if in_csr_base {
+                    continue; // already folded into the CSR base by a checkpoint
+                }
+
+                // Not in the base — fall back to the delta-log high-water mark.
                 let current_edge_id = sparrowdb_storage::edge_store::EdgeStore::peek_next_edge_id(
                     db_path,
                     rel_table_id,
                 )?;
                 if current_edge_id.0 > *edge_id {
-                    continue; // already written
+                    continue; // already in the delta log
                 }
 
-                let src_node = sparrowdb_common::NodeId(*src);
-                let dst_node = sparrowdb_common::NodeId(*dst);
-                let mut es = EdgeStore::open(db_path, rel_table_id)?;
                 es.create_edge(src_node, rel_table_id, dst_node)?;
 
                 // Re-apply edge properties if present.
