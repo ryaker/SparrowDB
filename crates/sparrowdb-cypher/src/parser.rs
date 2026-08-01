@@ -1498,7 +1498,16 @@ impl Parser {
         };
 
         // `FOR (n:Label)`
+        //
+        // The lexer maps the FOR keyword to the dedicated `Token::For`
+        // (lexer.rs), never to `Token::Ident("FOR")`, so matching only on the
+        // ident form left the token unconsumed and the `expect_tok(LParen)`
+        // below failed with "expected LParen, got For" — CREATE VECTOR INDEX
+        // could not be parsed at all (#417).
         match self.peek().clone() {
+            Token::For => {
+                self.advance();
+            }
             Token::Ident(ref s) if s.eq_ignore_ascii_case("FOR") => {
                 self.advance();
             }
