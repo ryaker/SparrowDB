@@ -29,22 +29,64 @@ fn load_mini_db() -> (tempfile::TempDir, GraphDb) {
 
 // ── IC3 ─────────────────────────────────────────────────────────────────────
 
+// Fixture facts used by IC3/IC11 below, read by hand out of
+// `crates/sparrowdb-bench/fixtures/ldbc/mini` — never captured from output.
+//
+// person_knows_person_0_0.csv (directed; the loader creates one edge per row):
+//   1→2, 1→3, 1→6, 2→4, 2→5, 3→4, 3→5, 4→6, 5→7, 6→7, 7→8, 8→9, 9→10
+// So from Alice (1): depth 1 = {2, 3, 6}; depth 2 = {4, 5, 7}.
+// `knows*1..2` therefore binds {2, 3, 4, 5, 6, 7}.
+//
+// person_isLocatedIn_place_0_0.csv, with place 1 = United States,
+// 2 = United Kingdom, 3 = Germany:
+//   1→1, 2→2, 3→1, 4→3, 5→2, 6→3, 7→1, 8→2, 9→3, 10→1
+//
+// person_0_0.csv names: 1 Alice Smith, 2 Bob Jones, 3 Carol White,
+//   4 Dave Brown, 5 Eve Davis, 6 Frank Miller, 7 Grace Wilson.
+
 #[test]
-#[ignore = "blocked on #421: this query uses (a)-[:knows*1..2]->(b)-[:isLocatedIn]->(c), \
-which silently returned only depth-1 matches. Now rejected outright rather than \
-answered incompletely. Un-ignore when variable-length + hop traversal is implemented."]
 fn ic3_friends_in_country() {
     let (_dir, db) = load_mini_db();
 
-    // Alice (ldbc_id=1) knows Bob (UK) and Carol (US).
-    // Person 1 is located in US, person 2 in UK.
+    // Alice's 1..2-hop friends are {2, 3, 4, 5, 6, 7}.
+    // In the United Kingdom (place 2): persons 2 (Bob Jones) and 5 (Eve Davis).
+    // The query is `RETURN DISTINCT friend.firstName, friend.lastName
+    // ORDER BY friend.lastName`, so Davis precedes Jones.
     let results =
         ic_queries::ic3_friends_in_countries(&db, 1, "United Kingdom", "Germany", 30).unwrap();
 
-    // Bob (ldbc_id=2) is in UK and is a direct friend of Alice.
-    assert!(
-        !results.is_empty(),
-        "IC3 should find friends in United Kingdom; got empty"
+    assert_eq!(
+        results,
+        vec![
+            ("Eve".to_string(), "Davis".to_string()),
+            ("Bob".to_string(), "Jones".to_string()),
+        ],
+        "IC3(1, United Kingdom): person 2 (Bob Jones, depth 1) and person 5 \
+         (Eve Davis, depth 2) are the UK residents within 2 hops of Alice; got {results:?}"
+    );
+}
+
+/// #421 regression: the depth-2 match must survive the trailing `isLocatedIn`
+/// hop.  Before the fix this returned only `[Frank Miller]` — Dave Brown sits
+/// at depth 2 (1→2→4 and 1→3→4) and was silently dropped.
+#[test]
+fn ic3_friends_in_germany_includes_depth_two_match() {
+    let (_dir, db) = load_mini_db();
+
+    // Germany is place 3; its residents are persons 4, 6 and 9.
+    // Within Alice's 1..2-hop set {2, 3, 4, 5, 6, 7}: person 4 (Dave Brown,
+    // depth 2) and person 6 (Frank Miller, depth 1). Person 9 is 5 hops away.
+    // ORDER BY lastName → Brown, Miller.
+    let results = ic_queries::ic3_friends_in_countries(&db, 1, "Germany", "France", 14).unwrap();
+
+    assert_eq!(
+        results,
+        vec![
+            ("Dave".to_string(), "Brown".to_string()),
+            ("Frank".to_string(), "Miller".to_string()),
+        ],
+        "IC3(1, Germany): Dave Brown is reached at depth 2 and must not be \
+         truncated away by the trailing isLocatedIn hop (#421); got {results:?}"
     );
 }
 
@@ -177,19 +219,52 @@ fn ic10_friend_recommendations() {
 
 // ── IC11 ────────────────────────────────────────────────────────────────────
 
+// IC11 walks `(p)-[:knows*1..2]->(friend)-[:workAt]->(org)-[:isLocatedIn]->(place)`
+// — a variable-length hop followed by *two* fixed hops.
+//
+// person_workAt_organisation_0_0.csv: 1→org1, 2→org1, 3→org2, 4→org3, 5→org1
+// organisation_isLocatedIn_place_0_0.csv: org1→place1, org2→place2, org3→place3
+// organisation_0_0.csv: 1 Acme Corp, 2 University of Oxford, 3 TechStart Inc
+//
+// Alice's 1..2-hop friend set is {2, 3, 4, 5, 6, 7} (see the IC3 notes above).
+
 #[test]
-#[ignore = "blocked on #421: variable-length relationship followed by additional hops. \
-Un-ignore when that traversal shape is implemented."]
 fn ic11_job_referral() {
     let (_dir, db) = load_mini_db();
 
-    // Alice (1) knows Bob (2). Bob works at Acme Corp (org 1) in United States.
-    // Alice (1) -> Bob (2) -> Dave (4). Dave works at TechStart (org 3) in Germany.
+    // United States is place 1, reached only via org 1 (Acme Corp).
+    // Acme employs persons 1, 2 and 5; of those, 2 (Bob Jones, depth 1) and
+    // 5 (Eve Davis, depth 2) are in Alice's friend set — Alice herself is not.
+    // ORDER BY lastName → Davis, Jones.
     let results = ic_queries::ic11_job_referral(&db, 1, "United States", 2005).unwrap();
 
-    assert!(
-        !results.is_empty(),
-        "IC11 should find friends working in US; got empty"
+    assert_eq!(
+        results,
+        vec![
+            ("Eve".to_string(), "Davis".to_string()),
+            ("Bob".to_string(), "Jones".to_string()),
+        ],
+        "IC11(1, United States): Acme Corp is the only US organisation and \
+         employs friends 2 and 5; got {results:?}"
+    );
+}
+
+/// #421 regression: IC11's varlen hop is followed by two fixed hops, so the
+/// depth-2 friend must survive both joins.
+#[test]
+fn ic11_job_referral_germany_is_depth_two_only() {
+    let (_dir, db) = load_mini_db();
+
+    // Germany is place 3, reached only via org 3 (TechStart Inc), which employs
+    // person 4 (Dave Brown) alone.  Dave sits at depth 2 from Alice, so before
+    // #421 was fixed this returned nothing at all.
+    let results = ic_queries::ic11_job_referral(&db, 1, "Germany", 2005).unwrap();
+
+    assert_eq!(
+        results,
+        vec![("Dave".to_string(), "Brown".to_string())],
+        "IC11(1, Germany): TechStart Inc is the only German organisation and \
+         its sole employee, Dave Brown, is a depth-2 friend; got {results:?}"
     );
 }
 

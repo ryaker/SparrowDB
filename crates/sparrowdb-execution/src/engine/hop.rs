@@ -1737,6 +1737,19 @@ impl Engine {
     ///
     /// This replaces the previous fallthrough to `execute_scan` which only
     /// scanned the first node and ignored all relationship hops.
+    ///
+    /// # Variable-length hops (#421)
+    ///
+    /// Any hop in the chain may carry a variable-length quantifier
+    /// (`-[:R*1..2]->`).  Such a hop expands the frontier with
+    /// [`Engine::execute_variable_hops`] — the same DFS/BFS used by the
+    /// standalone `execute_variable_length` path — instead of taking a single
+    /// step, so `(a)-[:R*1..2]->(b)-[:S]->(c)` binds `b` to every node reachable
+    /// from `a` in 1..2 hops and then joins each of those against the trailing
+    /// `:S` hop.  Before this, `is_var_len` in `execute_match` only recognised a
+    /// quantifier when the varlen relationship was the *only* relationship in
+    /// the pattern, so a trailing hop silently demoted `*1..2` to a plain single
+    /// hop and every depth >= 2 match was dropped without an error.
     pub(crate) fn execute_n_hop(
         &self,
         m: &MatchStatement,
@@ -1810,10 +1823,61 @@ impl Engine {
         // We read all delta edges once up front to avoid repeated file I/O.
         let delta_all = self.read_delta_all();
 
+        // ── #421: variable-length quantifiers anywhere in the chain ──────────
+        //
+        // `Some((min, max))` for a hop written `-[:R*min..max]->`.  An open
+        // upper bound is capped at 10, matching `execute_variable_length`.
+        let varlen_per_hop: Vec<Option<(u32, u32)>> = pat
+            .rels
+            .iter()
+            .map(|r| {
+                if r.min_hops.is_some() || r.max_hops.is_some() {
+                    Some((r.min_hops.unwrap_or(1), r.max_hops.unwrap_or(10)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let has_varlen = varlen_per_hop.iter().any(Option::is_some);
+
         // Pre-resolve per-hop rel-table IDs so the inner loop uses filtered
         // CSR lookups instead of scanning every relation type (SPA-284).
+        //
+        // #429: a relationship *type* can back several rel tables — LDBC's
+        // `isLocatedIn` exists as both `(Person)->(Place)` and
+        // `(Organisation)->(Place)`.  CSRs are keyed by rel-table id and indexed
+        // by *source slot*, so unioning every table of a given type makes
+        // `Person` slot 2 inherit `Organisation` slot 2's edges.  (Concretely:
+        // Carol White, Person slot 2, appeared to live in Germany because
+        // TechStart Inc is Organisation slot 2.)  When both endpoint labels of a
+        // fixed hop are declared, narrow to the single rel table for that triple
+        // — the same discrimination `resolve_rel_table_id` already gives the
+        // one- and two-hop executors.
+        //
+        // Two cases stay exposed and are tracked in #429: hops whose endpoint
+        // labels are not both declared, and variable-length hops, whose
+        // intermediate nodes are not constrained by the endpoint labels and so
+        // must keep the type-wide set.
         let rel_ids_per_hop: Vec<Vec<u32>> = (0..n_rels)
-            .map(|i| self.resolve_rel_ids_for_type(&pat.rels[i].rel_type))
+            .map(|i| {
+                let type_wide = self.resolve_rel_ids_for_type(&pat.rels[i].rel_type);
+                if varlen_per_hop[i].is_some() || type_wide.len() < 2 {
+                    return type_wide;
+                }
+                match (label_ids_per_node[i], label_ids_per_node[i + 1]) {
+                    (Some(src), Some(dst)) => self
+                        .snapshot
+                        .catalog
+                        .get_rel_table(src as u16, dst as u16, &pat.rels[i].rel_type)
+                        .ok()
+                        .flatten()
+                        .map(|id| vec![id as u32])
+                        // No table for this (src, dst, type) triple: the hop
+                        // cannot match anything.
+                        .unwrap_or_default(),
+                    _ => type_wide,
+                }
+            })
             .collect();
         // If any hop specifies a rel type that doesn't exist in the catalog, no
         // traversal can produce results — return empty immediately.
@@ -1825,6 +1889,33 @@ impl Engine {
                 });
             }
         }
+
+        // `execute_variable_hops` only walks outgoing edges.  Reject rather than
+        // quietly answering an `<-[:R*1..2]-` pattern with the wrong direction.
+        for (i, v) in varlen_per_hop.iter().enumerate() {
+            if v.is_some() && pat.rels[i].dir != sparrowdb_cypher::ast::EdgeDir::Outgoing {
+                return Err(sparrowdb_common::Error::Unimplemented);
+            }
+        }
+
+        // Delta index + label registry used by the variable-length expansion.
+        // Built once (not per source node) and only when a varlen hop exists.
+        let (delta_idx, node_label, all_label_ids) = if has_varlen {
+            let idx = build_delta_index(&delta_all);
+            let mut labels: HashSet<(u64, u32)> = HashSet::new();
+            for r in &delta_all {
+                labels.insert((r.src.0 & 0xFFFF_FFFF, (r.src.0 >> 32) as u32));
+                labels.insert((r.dst.0 & 0xFFFF_FFFF, (r.dst.0 >> 32) as u32));
+            }
+            let mut ids: Vec<u32> = labels.iter().map(|&(_, l)| l).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            (idx, labels, ids)
+        } else {
+            (DeltaIndex::new(), HashSet::new(), Vec::new())
+        };
+        // Reusable neighbor buffer for the variable-length traversal.
+        let mut neighbors_buf: HashSet<(u64, u32)> = HashSet::new();
 
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
@@ -1870,38 +1961,75 @@ impl Engine {
                 let mut next_frontier: Vec<(u64, HashMap<String, Value>)> = Vec::new();
 
                 for (cur_slot, cur_vals) in frontier {
-                    // Gather neighbors from CSR + delta for this hop.
-                    // SPA-284: use filtered CSR lookup when rel type is specified.
-                    let csr_nb: Vec<u64> =
-                        self.csr_neighbors_filtered(cur_slot, &rel_ids_per_hop[hop_idx]);
                     let hop_rel_ids = &rel_ids_per_hop[hop_idx];
-                    let delta_nb: Vec<u64> = delta_all
-                        .iter()
-                        .filter(|r| {
-                            let r_src_label = (r.src.0 >> 32) as u32;
-                            let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                            if r_src_label != cur_label_id || r_src_slot != cur_slot {
-                                return false;
-                            }
-                            // Filter by relation-table IDs when a type constraint exists.
-                            hop_rel_ids.is_empty() || hop_rel_ids.contains(&r.rel_id.0)
-                        })
-                        .map(|r| r.dst.0 & 0xFFFF_FFFF)
-                        .collect();
 
-                    let mut seen: HashSet<u64> = HashSet::new();
-                    let all_nb: Vec<u64> = csr_nb
-                        .into_iter()
-                        .chain(delta_nb)
-                        .filter(|&nb| seen.insert(nb))
-                        .collect();
+                    // `(slot, resolved_label_id)` candidates for this hop.
+                    let all_nb: Vec<(u64, u32)> = match varlen_per_hop[hop_idx] {
+                        // ── #421: variable-length hop ────────────────────────
+                        Some((min_hops, max_hops)) => {
+                            // Per-path enumeration is only collapsed to
+                            // reachability when the query is DISTINCT and no
+                            // relationship variable is bound — same rule as
+                            // `execute_variable_length` (issue #165).
+                            let use_reachability = m.distinct && pat.rels[hop_idx].var.is_empty();
+                            let reached = self.execute_variable_hops(
+                                cur_slot,
+                                cur_label_id,
+                                min_hops,
+                                max_hops,
+                                &delta_idx,
+                                &node_label,
+                                &all_label_ids,
+                                &mut neighbors_buf,
+                                use_reachability,
+                                usize::MAX,
+                                hop_rel_ids,
+                            );
+                            reached
+                                .into_iter()
+                                .filter_map(|(slot, discovered_label)| {
+                                    match next_label_id_opt {
+                                        // A label on the pattern is a filter:
+                                        // drop nodes whose recovered label differs.
+                                        Some(required) if discovered_label != required => None,
+                                        Some(required) => Some((slot, required)),
+                                        None => Some((slot, discovered_label)),
+                                    }
+                                })
+                                .collect()
+                        }
+                        // ── fixed single hop ─────────────────────────────────
+                        None => {
+                            // Gather neighbors from CSR + delta for this hop.
+                            // SPA-284: use filtered CSR lookup when rel type is specified.
+                            let csr_nb: Vec<u64> =
+                                self.csr_neighbors_filtered(cur_slot, hop_rel_ids);
+                            let delta_nb: Vec<u64> = delta_all
+                                .iter()
+                                .filter(|r| {
+                                    let r_src_label = (r.src.0 >> 32) as u32;
+                                    let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                                    if r_src_label != cur_label_id || r_src_slot != cur_slot {
+                                        return false;
+                                    }
+                                    // Filter by relation-table IDs when a type constraint exists.
+                                    hop_rel_ids.is_empty() || hop_rel_ids.contains(&r.rel_id.0)
+                                })
+                                .map(|r| r.dst.0 & 0xFFFF_FFFF)
+                                .collect();
 
-                    for next_slot in all_nb {
-                        let next_node_id = if let Some(lbl_id) = next_label_id_opt {
-                            NodeId(((lbl_id as u64) << 32) | next_slot)
-                        } else {
-                            NodeId(next_slot)
-                        };
+                            let mut seen: HashSet<u64> = HashSet::new();
+                            csr_nb
+                                .into_iter()
+                                .chain(delta_nb)
+                                .filter(|&nb| seen.insert(nb))
+                                .map(|nb| (nb, next_label_id_opt.unwrap_or(0)))
+                                .collect()
+                        }
+                    };
+
+                    for (next_slot, next_label_id) in all_nb {
+                        let next_node_id = NodeId(((next_label_id as u64) << 32) | next_slot);
 
                         let next_props =
                             read_node_props(&self.snapshot.store, next_node_id, next_col_ids)?;
