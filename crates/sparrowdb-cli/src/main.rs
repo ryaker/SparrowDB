@@ -168,13 +168,9 @@ fn main() {
 
 fn cmd_query(db_path: &std::path::Path, cypher: &str) -> Result<(), Box<dyn std::error::Error>> {
     let db = sparrowdb::GraphDb::open(db_path)?;
-    match db.execute(cypher) {
-        Ok(result) => {
-            let json = query_result_to_json(&result);
-            println!("{}", serde_json::to_string_pretty(&json)?);
-        }
-        Err(e) => return Err(e.into()),
-    }
+    let result = db.execute(cypher)?;
+    let json = query_result_to_json(&result);
+    println!("{}", serde_json::to_string_pretty(&json)?);
     Ok(())
 }
 

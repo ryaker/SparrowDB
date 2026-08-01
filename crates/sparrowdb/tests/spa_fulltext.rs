@@ -214,7 +214,7 @@ fn call_yield_node_usable_in_return() {
     assert!(
         matches!(&result.rows[0][0], Value::NodeRef(_)),
         "RETURN node should produce a NodeRef, got {:?}",
-        &result.rows[0][0]
+        result.rows[0][0]
     );
 
     // CALL with RETURN node.score — verifies property projection from yielded NodeRef.
@@ -230,7 +230,7 @@ fn call_yield_node_usable_in_return() {
         result2.rows[0][0],
         Value::Int64(expected_val),
         "RETURN node.score should project the stored property value, got {:?}",
-        &result2.rows[0][0]
+        result2.rows[0][0]
     );
 }
 
