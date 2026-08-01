@@ -116,7 +116,40 @@ impl Engine {
         if return_requires_row_engine(&m.return_clause.items) {
             return false;
         }
-        !m.pattern[0].nodes[0].labels.is_empty()
+        let labels = &m.pattern[0].nodes[0].labels;
+        if labels.is_empty() {
+            return false;
+        }
+        // SPA-289 (#415): the chunked scan is single-label and walks only the
+        // label's own primary node store. Two cases it answers incorrectly, both
+        // of which the row engine handles, so fall back to it:
+        //
+        // 1. Multi-label patterns. The chunked path ignores every label after
+        //    the first, so `MATCH (n:Animal:Pet)` returned all Animals instead
+        //    of the intersection. `execute_scan_multi_label` lives behind the
+        //    chunked check in execute_scan, so it was unreachable.
+        if labels.len() > 1 {
+            return false;
+        }
+        // 2. A label used as a *secondary* label. The chunked path can't see
+        //    those nodes at all — `CREATE (n:Animal:Pet)` then `MATCH (n:Pet)`
+        //    returned 0 rows. The row engine unions the primary scan with the
+        //    catalog's secondary-label reverse index.
+        //
+        // Cheap: one HashMap lookup, and it only diverts queries that would
+        // otherwise be wrong.
+        if let Ok(Some(label_id)) = self.snapshot.catalog.get_label(&labels[0]) {
+            if self
+                .snapshot
+                .catalog
+                .nodes_with_secondary_label(label_id)
+                .next()
+                .is_some()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Return `true` when `m` qualifies for Phase 2 one-hop chunked execution.
