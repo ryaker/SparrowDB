@@ -495,3 +495,125 @@ describe('DISTINCT aggregation — SPA-172 regression', () => {
     assert.equal(r.rows.length, 2, 'should return 2 distinct names (red, blue)')
   })
 })
+
+describe('anonymous relationship patterns — issue #406 regression', () => {
+  // Issue #406: `MATCH ()-[r]->() RETURN count(r)` threw "not found"
+  // (napi code GenericFailure) through the Node binding on the KMS production
+  // database, while node-only patterns kept working.
+  //
+  // Root cause (fixed in #408, crates/sparrowdb-storage/src/node_store.rs):
+  // `NodeStore::read_col_slot` returned `Err(Error::NotFound)` when the
+  // requested slot fell beyond the end of a column file.  A one-hop traversal
+  // reads source-node columns for every slot up to the label HWM, so any
+  // database whose HWM exceeds the length of one of its column files failed the
+  // whole query.  The correct sentinel for an absent non-nullable read is `0`,
+  // matching the already-existing behaviour for a completely missing file.
+  //
+  // Seed below is fixed and small so every expected value is derived by hand,
+  // never captured from program output:
+  //   nodes  : a, b, c, d                       → 4 :Knowledge nodes
+  //   edges  : (a)-[:RELATED_TO]->(b)
+  //            (b)-[:ABOUT]->(c)                → 2 directed edges
+  //   so     : count(n)          = 4
+  //            directed count(r) = 2
+  //            undirected        = 4  (each edge is walked from both endpoints)
+
+  const EXPECTED_NODES = 4
+  const EXPECTED_DIRECTED_EDGES = 2
+  const EXPECTED_UNDIRECTED_EDGES = EXPECTED_DIRECTED_EDGES * 2
+
+  let db
+  let dir
+  let dbPath
+
+  before(() => {
+    dir = makeTempDir()
+    dbPath = path.join(dir, 'graph.db')
+
+    // 1. Seed the graph and flush to disk.
+    const seed = SparrowDB.open(dbPath)
+    for (const name of ['a', 'b', 'c', 'd']) {
+      seed.execute(`CREATE (n:Knowledge {name: '${name}'})`)
+    }
+    seed.execute(
+      "MATCH (a:Knowledge {name: 'a'}), (b:Knowledge {name: 'b'}) CREATE (a)-[:RELATED_TO]->(b)"
+    )
+    seed.execute(
+      "MATCH (b:Knowledge {name: 'b'}), (c:Knowledge {name: 'c'}) CREATE (b)-[:ABOUT]->(c)"
+    )
+    seed.checkpoint()
+
+    // 2. Recreate the on-disk shape that triggered #406: a column file that
+    //    EXISTS but is shorter than the label's high-water mark.  On the KMS
+    //    production DB this was col_0.bin with 1064 slots against an HWM of
+    //    1065 — legacy data written before columns were zero-padded on CREATE.
+    //    A fresh DB never produces that state on its own, which is why the
+    //    original synthetic Rust regression test did not actually reproduce the
+    //    bug; planting the short column here makes this a real guard.
+    const nodesDir = path.join(dbPath, 'nodes')
+    const labelDirs = fs
+      .readdirSync(nodesDir, { withFileTypes: true })
+      .filter(e => e.isDirectory())
+      .map(e => path.join(nodesDir, e.name))
+    assert.ok(labelDirs.length > 0, 'expected at least one label directory under nodes/')
+
+    let planted = 0
+    for (const labelDir of labelDirs) {
+      const col0 = path.join(labelDir, 'col_0.bin')
+      if (!fs.existsSync(col0)) {
+        // 8 bytes = 1 slot, while the label HWM is 4 → slots 1..3 are past EOF.
+        fs.writeFileSync(col0, Buffer.alloc(8))
+        planted++
+      }
+    }
+    assert.ok(planted > 0, 'expected to plant at least one short col_0.bin fixture')
+
+    // 3. Reopen so the engine reads the planted on-disk state.
+    db = SparrowDB.open(dbPath)
+  })
+
+  after(() => {
+    removeDir(dir)
+  })
+
+  it('node-only count still works (control)', () => {
+    const r = db.execute('MATCH (n:Knowledge) RETURN count(n) AS cnt')
+    assert.equal(r.rows.length, 1)
+    assert.equal(r.rows[0]['cnt'], EXPECTED_NODES)
+  })
+
+  it('MATCH ()-[r]->() RETURN count(r) does not throw "not found"', () => {
+    // The exact query from issue #406.
+    const r = db.execute('MATCH ()-[r]->() RETURN count(r) AS cnt')
+    assert.equal(r.rows.length, 1, 'must return one aggregated row')
+    assert.equal(r.rows[0]['cnt'], EXPECTED_DIRECTED_EDGES)
+  })
+
+  it('MATCH ()-[r]-() RETURN count(r) (undirected) does not throw', () => {
+    const r = db.execute('MATCH ()-[r]-() RETURN count(r) AS cnt')
+    assert.equal(r.rows.length, 1)
+    assert.equal(r.rows[0]['cnt'], EXPECTED_UNDIRECTED_EDGES)
+  })
+
+  it('MATCH (a)-[r]->(b) with named endpoints does not throw', () => {
+    const r = db.execute('MATCH (a)-[r]->(b) RETURN count(r) AS cnt')
+    assert.equal(r.rows.length, 1)
+    assert.equal(r.rows[0]['cnt'], EXPECTED_DIRECTED_EDGES)
+  })
+
+  it('typed anonymous pattern counts only that rel type', () => {
+    // Exactly one (a)-[:RELATED_TO]->(b) edge was seeded.
+    const r = db.execute('MATCH ()-[r:RELATED_TO]->() RETURN count(r) AS cnt')
+    assert.equal(r.rows.length, 1)
+    assert.equal(r.rows[0]['cnt'], 1)
+  })
+
+  it('MATCH ()-[r]->() RETURN r enumerates every edge', () => {
+    // KMSmcp's _getRelationships traversal — must yield one row per directed edge.
+    const r = db.execute('MATCH ()-[r]->() RETURN r')
+    assert.equal(r.rows.length, EXPECTED_DIRECTED_EDGES)
+    for (const row of r.rows) {
+      assert.equal(row['r'].$type, 'edge', 'each row must carry an edge handle')
+    }
+  })
+})
