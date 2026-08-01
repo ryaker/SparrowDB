@@ -14,7 +14,7 @@
 
 use sparrowdb::GraphDb;
 use sparrowdb_execution::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ── Result types ──────────────────────────────────────────────────────────────
 
@@ -138,6 +138,10 @@ pub fn ic3_friends_in_countries(
 /// **IC4** — Tags on posts created by direct friends.
 ///
 /// Two-step: first get friend IDs, then query posts by those creators.
+///
+/// Ties on `cnt` are broken by `tag.name ASC` so the ordering is total and the
+/// result is reproducible across runs — otherwise equal-count tags come back in
+/// whatever order the aggregation happens to produce.
 pub fn ic4_top_tags(
     db: &GraphDb,
     person_id: i64,
@@ -174,7 +178,7 @@ pub fn ic4_top_tags(
         "MATCH (post:Post)-[:hasTag]->(tag:Tag) \
          WHERE post.ldbc_id IN [{}] \
          RETURN tag.name, COUNT(*) AS cnt \
-         ORDER BY cnt DESC LIMIT 10",
+         ORDER BY cnt DESC, tag.name ASC LIMIT 10",
         post_ids_list.join(", ")
     );
     let result = db.execute(&tag_query)?;
@@ -218,9 +222,23 @@ pub fn ic5_forums_with_friends(
 
 // ── IC6 — Tag co-occurrence ─────────────────────────────────────────────────
 
-/// **IC6** — Tags on posts by friends, excluding a given tag.
+/// **IC6** — Tags that co-occur with `tag_name` on the person's friends' posts.
 ///
-/// Two-step: reuses IC4 post discovery, filters tags.
+/// LDBC IC6 asks: among the posts *carrying* `tag_name` that were created by the
+/// person's friends, which other tags appear? Three steps, because the engine
+/// cannot chain these hops in one pattern:
+///
+/// 1. friends of `person_id`,
+/// 2. posts created by those friends,
+/// 3. of those, the posts carrying `tag_name` — then count the *other* tags on
+///    exactly those posts.
+///
+/// Step 3's first half is the restriction that was missing (#422): the query
+/// previously counted every tag on every friend post and merely excluded
+/// `tag_name` from the output, so a tag carried by no friend post — or absent
+/// from the graph entirely — still returned the full set of friends' tags.
+///
+/// Ties on `cnt` are broken by `tag.name ASC` for a reproducible ordering.
 pub fn ic6_tag_co_occurrence(
     db: &GraphDb,
     person_id: i64,
@@ -249,14 +267,36 @@ pub fn ic6_tag_co_occurrence(
         return Ok(Vec::new());
     }
 
+    // Step 2: narrow the friends' posts to those actually carrying `tag_name`.
+    // Without this the tag argument only ever suppressed a row in the output.
     let post_ids_list: Vec<String> = post_ids.iter().map(|id| id.to_string()).collect();
+    let tagged_query = format!(
+        "MATCH (post:Post)-[:hasTag]->(tag:Tag) \
+         WHERE post.ldbc_id IN [{}] AND tag.name = $tagName \
+         RETURN post.ldbc_id",
+        post_ids_list.join(", ")
+    );
+    let tagged_params = HashMap::from([("tagName".into(), Value::String(tag_name.into()))]);
+    let tagged_result = db.execute_with_params(&tagged_query, tagged_params)?;
+    let tagged_post_ids: Vec<i64> = tagged_result
+        .rows
+        .iter()
+        .map(|row| value_to_i64(&row[0]))
+        .collect();
+
+    if tagged_post_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Step 3: count the other tags carried by exactly those posts.
+    let tagged_ids_list: Vec<String> = tagged_post_ids.iter().map(|id| id.to_string()).collect();
     let params = HashMap::from([("tagName".into(), Value::String(tag_name.into()))]);
     let tag_query = format!(
         "MATCH (post:Post)-[:hasTag]->(tag:Tag) \
          WHERE post.ldbc_id IN [{}] AND tag.name <> $tagName \
          RETURN tag.name, COUNT(*) AS cnt \
-         ORDER BY cnt DESC LIMIT 10",
-        post_ids_list.join(", ")
+         ORDER BY cnt DESC, tag.name ASC LIMIT 10",
+        tagged_ids_list.join(", ")
     );
     let result = db.execute_with_params(&tag_query, params)?;
     Ok(result
@@ -474,27 +514,81 @@ pub fn ic12_expert_search(
 
 // ── IC13 — Shortest path ────────────────────────────────────────────────────
 
+/// Hop ceiling for [`ic13_shortest_path`]. Matches the bound the engine's
+/// `shortestPath()` used, so a path longer than this reads as "no path".
+const IC13_MAX_HOPS: i64 = 10;
+
+/// Does a `Person` with this `ldbc_id` exist?
+fn person_exists(db: &GraphDb, person_id: i64) -> sparrowdb::Result<bool> {
+    let cypher = "MATCH (p:Person {ldbc_id: $personId}) RETURN p.ldbc_id LIMIT 1";
+    let params = HashMap::from([("personId".into(), Value::Int64(person_id))]);
+    Ok(!db.execute_with_params(cypher, params)?.rows.is_empty())
+}
+
 /// **IC13** — Shortest path length between two persons via KNOWS.
 ///
-/// Returns the hop count, or -1 if no path exists.
+/// Returns the hop count, or -1 if no path exists within [`IC13_MAX_HOPS`].
+/// `knows` edges are followed in their stored direction only, matching how the
+/// rest of this module traverses them.
+///
+/// # Why this does not use `shortestPath()`
+///
+/// The engine's `shortestPath((a)-[:knows*]->(b))` is unusable here (#423). Its
+/// BFS is invoked with an empty relationship-type filter, so it walks *every*
+/// edge type rather than just `knows`, and it decides it has arrived by
+/// comparing storage slots alone, without comparing labels — so the slot-N node
+/// of any label counts as a hit. On the LDBC mini fixture both faults combine:
+/// person 10 has one outgoing edge, `isLocatedIn` to Place slot 0, and the
+/// target person 1 sits at Person slot 0, so the engine reports a 1-hop path
+/// between two persons that are not connected at all. That lives in
+/// `sparrowdb-execution` (`engine/expr.rs::eval_shortest_path_expr`, which
+/// passes `&[]` to `bfs_shortest_path`), outside this crate.
+///
+/// So IC13 does its own level-synchronous BFS in the bench layer — one Cypher
+/// query per hop, over `knows` only, keyed on `ldbc_id` rather than slots.
 pub fn ic13_shortest_path(
     db: &GraphDb,
     person1_id: i64,
     person2_id: i64,
 ) -> sparrowdb::Result<i64> {
-    let cypher = "\
-        MATCH (a:Person {ldbc_id: $person1Id}), (b:Person {ldbc_id: $person2Id}) \
-        RETURN shortestPath((a)-[:knows*]->(b))";
-
-    let params = HashMap::from([
-        ("person1Id".into(), Value::Int64(person1_id)),
-        ("person2Id".into(), Value::Int64(person2_id)),
-    ]);
-    let result = db.execute_with_params(cypher, params)?;
-    if result.rows.is_empty() || result.rows[0].is_empty() {
-        return Ok(-1);
+    if person1_id == person2_id {
+        return Ok(if person_exists(db, person1_id)? {
+            0
+        } else {
+            -1
+        });
     }
-    Ok(value_to_i64(&result.rows[0][0]))
+
+    let mut visited: HashSet<i64> = HashSet::from([person1_id]);
+    let mut frontier: Vec<i64> = vec![person1_id];
+
+    for depth in 1..=IC13_MAX_HOPS {
+        let ids_list: Vec<String> = frontier.iter().map(|id| id.to_string()).collect();
+        let cypher = format!(
+            "MATCH (p:Person)-[:knows]->(friend:Person) \
+             WHERE p.ldbc_id IN [{}] \
+             RETURN DISTINCT friend.ldbc_id",
+            ids_list.join(", ")
+        );
+        let result = db.execute(&cypher)?;
+
+        let mut next_frontier: Vec<i64> = Vec::new();
+        for row in &result.rows {
+            let neighbor = value_to_i64(&row[0]);
+            if neighbor == person2_id {
+                return Ok(depth);
+            }
+            if visited.insert(neighbor) {
+                next_frontier.push(neighbor);
+            }
+        }
+        if next_frontier.is_empty() {
+            break;
+        }
+        frontier = next_frontier;
+    }
+
+    Ok(-1)
 }
 
 // ── IC14 — Weighted shortest path ───────────────────────────────────────────
