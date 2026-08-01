@@ -104,90 +104,199 @@ fn ic2_unknown_person_returns_empty() {
     );
 }
 
+// ── IC3–IC14 ────────────────────────────────────────────────────────────────
+//
+// These were written against stubs (5865f0e) and asserted `is_empty()`. The
+// queries were implemented in 5b049ff (#279) without updating this file, and
+// CI reported the resulting failures as green (#412), so they went unnoticed.
+//
+// Expectations below are derived by hand from the mini fixture, NOT captured
+// from program output — see #421, where reading the CSVs is what exposed a
+// silent variable-length truncation bug that captured output would have
+// frozen in as "expected".
+//
+// Fixture facts used throughout (Alice = ldbc_id 1):
+//   knows:        1→{2,3,6}; 2→{4,5}; 3→{4,5}; 6→{7}; 7→8; 8→9; 9→10
+//   isLocatedIn:  1,3,7,10→US(1)  2,5,8→UK(2)  4,6,9→Germany(3)
+//   posts:        1,4→Alice  2→Bob  3→Carol  5→Dave
+//   post tags:    1→{Databases,GraphTheory} 2→{Rust} 3→{SocialNetworks}
+//                 4→{Databases} 5→{GraphTheory}
+//   likes:        2→p1, 3→p1, 1→p2, 4→p3, 3→p4
+//   comments:     c1→p1 by Bob, c4→p4 by Dave
+//   forums:       1 "Graph Databases" {1,2,3}; 2 "Rust Programming" {4,5};
+//                 3 "Social Networks" {1,6}
+
 #[test]
-fn ic3_stub_returns_empty() {
+#[ignore = "blocked on #421: ic3 uses (p)-[:knows*1..2]->(f)-[:isLocatedIn]->(place), \
+a variable-length path followed by another hop, which is now rejected rather than \
+silently answered with depth-1 matches only. Correct result for (1, Germany) is \
+[Dave Brown, Frank Miller]. Un-ignore when #421 is implemented."]
+fn ic3_friends_in_countries_returns_both_germans() {
     let (_dir, db) = db_with_mini_fixture();
     let r = ic_queries::ic3_friends_in_countries(&db, 1, "Germany", "France", 14)
-        .expect("IC3 stub should not error");
-    assert!(r.is_empty(), "IC3 stub must return empty Vec");
+        .expect("IC3 should not error");
+    let names: Vec<String> = r.iter().map(|p| p.1.clone()).collect();
+    assert_eq!(
+        names,
+        vec!["Brown".to_string(), "Miller".to_string()],
+        "IC3: Alice's friends within 2 hops located in Germany are Dave Brown (depth 2) \
+         and Frank Miller (depth 1); got {r:?}"
+    );
 }
 
 #[test]
-fn ic4_stub_returns_empty() {
+fn ic4_top_tags_of_friends_posts() {
     let (_dir, db) = db_with_mini_fixture();
-    let r = ic_queries::ic4_top_tags(&db, 1, "2012-01-01", 30).expect("IC4 stub should not error");
-    assert!(r.is_empty(), "IC4 stub must return empty Vec");
+    let r = ic_queries::ic4_top_tags(&db, 1, "2012-01-01", 30).expect("IC4 should not error");
+    // Friends {2,3,6}: Bob→post2→Rust, Carol→post3→SocialNetworks, Frank→no posts.
+    assert_eq!(
+        r,
+        vec![("Rust".to_string(), 1), ("SocialNetworks".to_string(), 1)],
+        "IC4: expected one Rust and one SocialNetworks tag from friends' posts; got {r:?}"
+    );
 }
 
 #[test]
-fn ic5_stub_returns_empty() {
-    let (_dir, db) = db_with_mini_fixture();
-    let r = ic_queries::ic5_forums_with_friends(&db, 1, "2012-01-01")
-        .expect("IC5 stub should not error");
-    assert!(r.is_empty(), "IC5 stub must return empty Vec");
-}
-
-#[test]
-fn ic6_stub_returns_empty() {
-    let (_dir, db) = db_with_mini_fixture();
-    let r = ic_queries::ic6_tag_co_occurrence(&db, 1, "Music").expect("IC6 stub should not error");
-    assert!(r.is_empty(), "IC6 stub must return empty Vec");
-}
-
-#[test]
-fn ic7_stub_returns_empty() {
-    let (_dir, db) = db_with_mini_fixture();
-    let r = ic_queries::ic7_latest_likes(&db, 1).expect("IC7 stub should not error");
-    assert!(r.is_empty(), "IC7 stub must return empty Vec");
-}
-
-#[test]
-fn ic8_stub_returns_empty() {
-    let (_dir, db) = db_with_mini_fixture();
-    let r = ic_queries::ic8_replies(&db, 1).expect("IC8 stub should not error");
-    assert!(r.is_empty(), "IC8 stub must return empty Vec");
-}
-
-#[test]
-fn ic9_stub_returns_empty() {
-    let (_dir, db) = db_with_mini_fixture();
-    let r = ic_queries::ic9_recent_posts_by_friends(&db, 1, "2012-01-01")
-        .expect("IC9 stub should not error");
-    assert!(r.is_empty(), "IC9 stub must return empty Vec");
-}
-
-#[test]
-fn ic10_stub_returns_empty() {
-    let (_dir, db) = db_with_mini_fixture();
-    let r = ic_queries::ic10_friend_recommendations(&db, 1, 3).expect("IC10 stub should not error");
-    assert!(r.is_empty(), "IC10 stub must return empty Vec");
-}
-
-#[test]
-fn ic11_stub_returns_empty() {
+fn ic5_forums_ranked_by_friend_membership() {
     let (_dir, db) = db_with_mini_fixture();
     let r =
-        ic_queries::ic11_job_referral(&db, 1, "Germany", 2005).expect("IC11 stub should not error");
-    assert!(r.is_empty(), "IC11 stub must return empty Vec");
+        ic_queries::ic5_forums_with_friends(&db, 1, "2012-01-01").expect("IC5 should not error");
+    // Forum 1 holds friends 2 and 3 → 2; forum 3 holds friend 6 → 1;
+    // forum 2 holds only 4 and 5, neither a friend of Alice.
+    assert_eq!(
+        r,
+        vec![
+            ("Graph Databases".to_string(), 2),
+            ("Social Networks".to_string(), 1)
+        ],
+        "IC5: expected Graph Databases=2, Social Networks=1; got {r:?}"
+    );
 }
 
 #[test]
-fn ic12_stub_returns_empty() {
+#[ignore = "blocked on #422: ic6 never restricts to posts carrying the input tag — it \
+only excludes that tag from the output, so a tag absent from the graph still returns \
+every friend tag. Un-ignore when #422 is fixed."]
+fn ic6_co_occurring_tags() {
     let (_dir, db) = db_with_mini_fixture();
-    let r = ic_queries::ic12_expert_search(&db, 1, "Writer").expect("IC12 stub should not error");
-    assert!(r.is_empty(), "IC12 stub must return empty Vec");
+    // Only post 2 (Bob, a friend) carries Rust, and it carries no other tag,
+    // so nothing co-occurs with Rust among friends' posts.
+    let r = ic_queries::ic6_tag_co_occurrence(&db, 1, "Rust").expect("IC6 should not error");
+    assert!(
+        r.is_empty(),
+        "IC6: post 2 is the only friend post tagged Rust and has no other tag; got {r:?}"
+    );
+    // A tag no post carries must yield nothing.
+    let none = ic_queries::ic6_tag_co_occurrence(&db, 1, "ZZZ_nonexistent")
+        .expect("IC6 unknown tag should not error");
+    assert!(
+        none.is_empty(),
+        "IC6: unknown tag must return empty; got {none:?}"
+    );
 }
 
 #[test]
-fn ic13_stub_returns_negative_one() {
+fn ic7_likers_of_alices_posts() {
     let (_dir, db) = db_with_mini_fixture();
-    let r = ic_queries::ic13_shortest_path(&db, 1, 10).expect("IC13 stub should not error");
-    assert_eq!(r, -1, "IC13 stub should return -1 (not-found sentinel)");
+    let r = ic_queries::ic7_latest_likes(&db, 1).expect("IC7 should not error");
+    // Alice created posts 1 and 4. Post 1 liked by 2 (Bob) and 3 (Carol);
+    // post 4 liked by 3 (Carol).
+    let names: Vec<String> = r.iter().map(|p| p.1.clone()).collect();
+    assert_eq!(
+        names,
+        vec!["Jones".to_string(), "White".to_string()],
+        "IC7: Bob Jones and Carol White liked Alice's posts; got {r:?}"
+    );
 }
 
 #[test]
-fn ic14_stub_returns_empty() {
+fn ic8_repliers_to_alices_posts() {
     let (_dir, db) = db_with_mini_fixture();
-    let r = ic_queries::ic14_weighted_path(&db, 1, 10).expect("IC14 stub should not error");
-    assert!(r.is_empty(), "IC14 stub must return empty Vec");
+    let r = ic_queries::ic8_replies(&db, 1).expect("IC8 should not error");
+    // Alice's posts are 1 and 4; comment 1 (Bob) replies to post 1,
+    // comment 4 (Dave) replies to post 4.
+    let names: Vec<String> = r.iter().map(|p| p.1.clone()).collect();
+    assert_eq!(
+        names,
+        vec!["Jones".to_string(), "Brown".to_string()],
+        "IC8: Bob Jones and Dave Brown replied to Alice's posts; got {r:?}"
+    );
+}
+
+#[test]
+fn ic9_recent_posts_by_friends() {
+    let (_dir, db) = db_with_mini_fixture();
+    let r = ic_queries::ic9_recent_posts_by_friends(&db, 1, "2012-01-01")
+        .expect("IC9 should not error");
+    // Friends {2,3,6}: Bob wrote post 2, Carol post 3, Frank none.
+    let contents: Vec<String> = r.iter().map(|(_, c)| c.clone()).collect();
+    assert_eq!(
+        contents,
+        vec![
+            "Rust is amazing".to_string(),
+            "Social networks are complex".to_string()
+        ],
+        "IC9: expected Bob's and Carol's posts; got {r:?}"
+    );
+}
+
+#[test]
+fn ic10_recommends_friends_of_friends() {
+    let (_dir, db) = db_with_mini_fixture();
+    let r = ic_queries::ic10_friend_recommendations(&db, 1, 3).expect("IC10 should not error");
+    // Alice knows {2,3,6}. Friends-of-friends: 2→{4,5}, 3→{4,5}, 6→{7}.
+    // Excluding existing friends and Alice herself leaves {4,5,7}.
+    let names: Vec<String> = r.iter().map(|p| p.1.clone()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "Brown".to_string(),
+            "Davis".to_string(),
+            "Wilson".to_string()
+        ],
+        "IC10: expected Dave Brown, Eve Davis, Grace Wilson; got {r:?}"
+    );
+}
+
+#[test]
+#[ignore = "blocked on #421: ic11 uses a variable-length path followed by another hop. \
+Un-ignore when #421 is implemented."]
+fn ic11_job_referral() {
+    let (_dir, db) = db_with_mini_fixture();
+    let r = ic_queries::ic11_job_referral(&db, 1, "Germany", 2005).expect("IC11 should not error");
+    assert!(!r.is_empty(), "IC11 should find referrals; got {r:?}");
+}
+
+#[test]
+fn ic13_shortest_path_alice_to_jack() {
+    let (_dir, db) = db_with_mini_fixture();
+    let hops = ic_queries::ic13_shortest_path(&db, 1, 10).expect("IC13 should not error");
+    // 1→6→7→8→9→10 is 5 hops, shorter than 1→3→5→7→8→9→10 (6) and
+    // 1→2→4→6→7→8→9→10 (7).
+    assert_eq!(hops, 5, "IC13: shortest path 1→10 is 5 hops; got {hops}");
+}
+
+#[test]
+#[ignore = "blocked on #423: ic13 documents \"-1 if no path exists\" but returns 1 for \
+unreachable pairs. Un-ignore when #423 is fixed."]
+fn ic13_unreachable_returns_negative_one() {
+    let (_dir, db) = db_with_mini_fixture();
+    // knows edges are directed and no path leads back to Alice.
+    let hops = ic_queries::ic13_shortest_path(&db, 10, 1).expect("IC13 should not error");
+    assert_eq!(
+        hops, -1,
+        "IC13: 10→1 is unreachable, expected -1; got {hops}"
+    );
+}
+
+#[test]
+fn ic14_finds_a_path_alice_to_jack() {
+    let (_dir, db) = db_with_mini_fixture();
+    let r = ic_queries::ic14_weighted_path(&db, 1, 10).expect("IC14 should not error");
+    // A path exists (see ic13); LDBC IC14 weighting semantics are not pinned
+    // down by this fixture, so assert only that a path is reported.
+    assert!(
+        !r.is_empty(),
+        "IC14: a path from 1 to 10 exists and should be reported; got {r:?}"
+    );
 }

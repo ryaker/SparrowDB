@@ -736,6 +736,31 @@ impl Engine {
             && m.pattern[0].rels.len() == 1
             && m.pattern[0].rels[0].min_hops.is_some();
 
+        // #421: `is_var_len` only recognises a variable-length quantifier when it
+        // is the *only* relationship in the pattern. With a trailing hop —
+        // `(a)-[:R*1..2]->(b)-[:S]->(c)` — `rels.len() == 2`, so `is_two_hop`
+        // wins and `execute_two_hop` treats `*1..2` as a plain single hop,
+        // silently discarding every match at depth >= 2 and returning a
+        // plausible but incomplete result set.
+        //
+        // Executing variable-length expansion followed by further hops is not
+        // implemented. Until it is, reject the pattern loudly: a clear error is
+        // far better than quietly wrong data the caller cannot detect.
+        if m.pattern.len() == 1
+            && m.pattern[0].rels.len() > 1
+            && m.pattern[0]
+                .rels
+                .iter()
+                .any(|r| r.min_hops.is_some() || r.max_hops.is_some())
+        {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "variable-length relationship followed by additional hops is not supported \
+                 (e.g. (a)-[:R*1..2]->(b)-[:S]->(c)); split the pattern into separate \
+                 MATCH clauses — see issue #421"
+                    .to_string(),
+            ));
+        }
+
         let column_names = extract_return_column_names(&m.return_clause.items);
 
         // SPA-136: multi-node-pattern MATCH (e.g. MATCH (a), (b) RETURN shortestPath(...))
