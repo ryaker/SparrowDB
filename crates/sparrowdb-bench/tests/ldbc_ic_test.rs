@@ -223,6 +223,8 @@ fn ic6_co_occurring_tags() {
     // satisfiable by an ic6 that always returns empty. IC4 walks the same
     // friend→post→tag pipeline without the tag restriction, so its non-emptiness
     // proves the empties are the restriction at work, not a dead query.
+    // Tracked in #428 — a friend-owned multi-tag post would let IC6 be asserted
+    // positively and retire this guard.
     let ic4 = ic_queries::ic4_top_tags(&db, 1, "2012-01-01", 30).expect("IC4 should not error");
     assert!(
         !ic4.is_empty(),
