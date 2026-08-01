@@ -57,7 +57,7 @@ impl Engine {
 
             // Pass 2: fall back to any plain NodeRef entry matching the label.
             if found.is_none() {
-                for (_k, v) in vals.iter() {
+                for v in vals.values() {
                     if let Value::NodeRef(nid) = v {
                         let label_id_from_node = (nid.0 >> 32) as u32;
                         if expected_lid.is_none_or(|eid| label_id_from_node == eid) {
