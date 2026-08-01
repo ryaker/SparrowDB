@@ -259,6 +259,30 @@ fn ic10_recommends_friends_of_friends() {
 }
 
 #[test]
+fn ic12_expert_search_by_tag_class() {
+    let (_dir, db) = db_with_mini_fixture();
+    // Friends {2,3,6}: Bob wrote post 2 → tag Rust → class Technology;
+    // Carol wrote post 3 → tag SocialNetworks → class Science; Frank none.
+    let tech = ic_queries::ic12_expert_search(&db, 1, "Technology").expect("IC12 should not error");
+    assert_eq!(
+        tech,
+        vec![(("Bob".to_string(), "Jones".to_string()), 1)],
+        "IC12: only Bob posted under tag class Technology; got {tech:?}"
+    );
+
+    let science = ic_queries::ic12_expert_search(&db, 1, "Science").expect("IC12 should not error");
+    assert_eq!(
+        science,
+        vec![(("Carol".to_string(), "White".to_string()), 1)],
+        "IC12: only Carol posted under tag class Science; got {science:?}"
+    );
+
+    // No tag maps to OffTopic in tag_hasType_tagclass_0_0.csv.
+    let off = ic_queries::ic12_expert_search(&db, 1, "OffTopic").expect("IC12 should not error");
+    assert!(off.is_empty(), "IC12: no expert for OffTopic; got {off:?}");
+}
+
+#[test]
 #[ignore = "blocked on #421: ic11 uses a variable-length path followed by another hop. \
 Un-ignore when #421 is implemented."]
 fn ic11_job_referral() {
