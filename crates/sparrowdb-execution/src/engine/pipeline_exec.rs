@@ -116,7 +116,60 @@ impl Engine {
         if return_requires_row_engine(&m.return_clause.items) {
             return false;
         }
-        !m.pattern[0].nodes[0].labels.is_empty()
+        let labels = &m.pattern[0].nodes[0].labels;
+        if labels.is_empty() {
+            return false;
+        }
+        // SPA-289 (#415): see all_chunked_node_labels_are_primary_only. Repeated
+        // here because can_use_chunked_pipeline is also called directly from
+        // execute_scan (scan.rs), not only via try_plan_chunked_match.
+        self.all_chunked_node_labels_are_primary_only(m)
+    }
+
+    /// Return `true` when every node in `m` can be resolved by primary label
+    /// alone — the only case the chunked executors handle correctly.
+    ///
+    /// Every chunked plan (Scan, OneHop, TwoHop, MutualNeighbors) resolves a
+    /// node pattern by taking `labels[0]` and walking that label's own primary
+    /// node store. Two shapes that breaks (SPA-289 / #415):
+    ///
+    /// 1. **Multi-label patterns** — labels after the first are ignored, so
+    ///    `MATCH (n:Animal:Pet)` matched every `Animal` instead of the
+    ///    intersection.
+    /// 2. **Labels used as a secondary label** — those nodes live in a
+    ///    different primary store and are invisible to the scan, so
+    ///    `CREATE (n:Animal:Pet)` then `MATCH (n:Pet)` returned 0 rows.
+    ///
+    /// The row-at-a-time engine handles both (intersection via
+    /// `execute_scan_multi_label`, secondary labels via the SPA-200 union), so
+    /// returning `false` here routes the query there.
+    ///
+    /// Cost: one catalog HashMap lookup per node, and it only diverts queries
+    /// the chunked path would otherwise answer incorrectly — a label never used
+    /// as a secondary label keeps the fast path.
+    fn all_chunked_node_labels_are_primary_only(&self, m: &MatchStatement) -> bool {
+        for pat in &m.pattern {
+            for node in &pat.nodes {
+                if node.labels.len() > 1 {
+                    return false;
+                }
+                let Some(label) = node.labels.first() else {
+                    continue;
+                };
+                if let Ok(Some(label_id)) = self.snapshot.catalog.get_label(label) {
+                    if self
+                        .snapshot
+                        .catalog
+                        .nodes_with_secondary_label(label_id)
+                        .next()
+                        .is_some()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Return `true` when `m` qualifies for Phase 2 one-hop chunked execution.
@@ -647,6 +700,14 @@ impl Engine {
     /// MutualNeighbors is checked before TwoHop because it is a more specific
     /// pattern (both endpoints bound) that would otherwise fall into TwoHop.
     pub fn try_plan_chunked_match(&self, m: &MatchStatement) -> Option<ChunkedPlan> {
+        // SPA-289 (#415): every chunked plan resolves nodes by primary label
+        // only. Gate all of them, not just Scan — the one-hop, two-hop and
+        // mutual-neighbor executors take `labels[0]` and never consult the
+        // secondary-label index, so a relationship query would silently omit
+        // secondary-label nodes or ignore a multi-label intersection.
+        if !self.all_chunked_node_labels_are_primary_only(m) {
+            return None;
+        }
         // MutualNeighbors is a specialised 2-hop shape — check first.
         if self.can_use_mutual_neighbors_chunked(m) {
             return Some(ChunkedPlan::MutualNeighbors);

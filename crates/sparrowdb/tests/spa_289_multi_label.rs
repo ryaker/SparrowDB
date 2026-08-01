@@ -445,3 +445,87 @@ fn multi_label_match_discriminates_in_mixed_graph() {
         sec_pet.rows[0][0]
     );
 }
+
+// ── Test 11: relationship patterns must also honour secondary labels ─────────
+
+/// Regression for the chunked one-hop/two-hop/mutual-neighbor plans.
+///
+/// `can_use_chunked_pipeline` guarded only the single-node Scan plan. The
+/// relationship plans in `try_plan_chunked_match` resolve each endpoint by
+/// `labels[0]` against that label's own primary store, so a hop whose endpoint
+/// is matched via a *secondary* label silently returned nothing.
+#[test]
+#[ignore = "SPA-289 Phase 1 is node-scan only: relationship patterns ignore \
+secondary labels in BOTH the chunked and row engines. Tracked in #419."]
+fn one_hop_match_honours_secondary_label_endpoint() {
+    let (_dir, db) = make_db();
+
+    // Rex is primary Animal, secondary Pet. Ann is a plain Person.
+    db.execute("CREATE (n:Animal:Pet {name: 'Rex'})")
+        .expect("CREATE Animal:Pet");
+    db.execute("CREATE (n:Person {name: 'Ann'})")
+        .expect("CREATE Person");
+    db.execute("MATCH (a:Person {name:'Ann'}),(b:Animal {name:'Rex'}) CREATE (a)-[:OWNS]->(b)")
+        .expect("CREATE OWNS edge");
+
+    // Endpoint matched via its SECONDARY label must still resolve.
+    let via_secondary = db
+        .execute("MATCH (a:Person)-[:OWNS]->(b:Pet) RETURN a.name")
+        .expect("one-hop with secondary-label endpoint");
+    assert_eq!(
+        via_secondary.rows.len(),
+        1,
+        "one-hop MATCH through a secondary-label endpoint must find the edge; got: {:?}",
+        via_secondary.rows
+    );
+
+    // Same edge via the primary label — must agree.
+    let via_primary = db
+        .execute("MATCH (a:Person)-[:OWNS]->(b:Animal) RETURN a.name")
+        .expect("one-hop with primary-label endpoint");
+    assert_eq!(
+        via_primary.rows.len(),
+        1,
+        "one-hop MATCH through the primary label must find the same edge; got: {:?}",
+        via_primary.rows
+    );
+}
+
+/// A multi-label endpoint in a relationship pattern must intersect, not take
+/// the first label and ignore the rest.
+#[test]
+#[ignore = "SPA-289 Phase 1 is node-scan only: relationship-pattern endpoints \
+use labels[0] only in BOTH the chunked and row engines. Tracked in #419."]
+fn one_hop_match_honours_multi_label_endpoint() {
+    let (_dir, db) = make_db();
+
+    db.execute("CREATE (n:Animal:Pet {name: 'Rex'})")
+        .expect("CREATE Animal:Pet");
+    db.execute("CREATE (n:Animal {name: 'Simba'})")
+        .expect("CREATE Animal");
+    db.execute("CREATE (n:Person {name: 'Ann'})")
+        .expect("CREATE Person");
+
+    // Ann owns BOTH animals.
+    db.execute("MATCH (a:Person {name:'Ann'}),(b:Animal {name:'Rex'}) CREATE (a)-[:OWNS]->(b)")
+        .expect("CREATE OWNS Rex");
+    db.execute("MATCH (a:Person {name:'Ann'}),(b:Animal {name:'Simba'}) CREATE (a)-[:OWNS]->(b)")
+        .expect("CREATE OWNS Simba");
+
+    // (b:Animal:Pet) must match only Rex — one row, not two.
+    let intersected = db
+        .execute("MATCH (a:Person)-[:OWNS]->(b:Animal:Pet) RETURN b.name")
+        .expect("one-hop with multi-label endpoint");
+    assert_eq!(
+        intersected.rows.len(),
+        1,
+        "multi-label endpoint must intersect, not match every Animal; got: {:?}",
+        intersected.rows
+    );
+    assert_eq!(
+        intersected.rows[0][0],
+        Value::String("Rex".to_string()),
+        "multi-label endpoint must resolve to Rex; got: {:?}",
+        intersected.rows[0][0]
+    );
+}
