@@ -305,3 +305,48 @@ fn unknown_relationship_type_yields_no_path() {
         "no SPEAKS_TO edges exist in the graph"
     );
 }
+
+// ── The same answers must hold once the graph is checkpointed ───────────────
+
+/// `checkpoint()` moves every edge out of the delta log and into the per-rel-type
+/// CSR files. The delta log carries full `NodeId`s, so a neighbour's label can be
+/// read straight off it; a CSR entry is a bare slot, so the label has to come
+/// from somewhere else. The answers must not change.
+///
+/// Every expectation below is the same hand derivation as the tests above,
+/// re-asserted against CSR-backed storage:
+///   * Alice -[:LIVES_IN]-> Junction (e1) is one hop, and Junction is a `City`
+///     while Alice is a `Person` — a cross-label destination, which is precisely
+///     the case a slot-only comparison cannot express.
+///   * Dave has no outgoing KNOWS edge, so no KNOWS path reaches Alice.
+///   * Alice -> Bob -> Carol -> Dave is 3 KNOWS hops.
+///   * Bob -> Alice -> Frank is 2 MENTIONS hops. `MENTIONS` spans two label
+///     pairs here (Person->Post via e9 and Person->Person via e10/e11/e12), so
+///     it is registered as two separate relationship tables — the traversal has
+///     to merge both and keep each one's destination label straight.
+#[test]
+fn answers_are_unchanged_after_checkpoint() {
+    let (_dir, db) = build_graph();
+    db.checkpoint().expect("checkpoint");
+
+    assert_eq!(
+        sp(&db, "Person", "Alice", "LIVES_IN", "City", "Junction"),
+        Value::Int64(1),
+        "Alice -[:LIVES_IN]-> Junction is a direct cross-label edge"
+    );
+    assert_eq!(
+        sp(&db, "Person", "Dave", "KNOWS", "Person", "Alice"),
+        Value::Null,
+        "Dave has no outgoing KNOWS edge"
+    );
+    assert_eq!(
+        sp(&db, "Person", "Alice", "KNOWS", "Person", "Dave"),
+        Value::Int64(3),
+        "Alice -> Bob -> Carol -> Dave is 3 KNOWS hops"
+    );
+    assert_eq!(
+        sp(&db, "Person", "Bob", "MENTIONS", "Person", "Frank"),
+        Value::Int64(2),
+        "Bob -[:MENTIONS]-> Alice -[:MENTIONS]-> Frank is 2 hops"
+    );
+}
