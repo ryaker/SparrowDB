@@ -27,7 +27,13 @@ use sparrowdb_execution::types::Value;
 
 // ── Fixture ─────────────────────────────────────────────────────────────────
 //
-// Three node labels, four relationship types, and a deliberately isolated node.
+// Three node labels (Person, City, Post), five relationship types (KNOWS,
+// LIVES_IN, LIKES, FOLLOWS, MENTIONS) and a deliberately isolated node.
+//
+// MENTIONS deliberately spans two label pairs — Person->Post (e9) and
+// Person->Person (e10, e11, e12) — so the catalog registers it as two separate
+// relationship tables that a traversal has to merge without confusing their
+// destination labels.
 //
 // Slots are assigned per label in creation order, so the fixture is written so
 // that slot collisions ACROSS labels are unavoidable — that is the whole point.
