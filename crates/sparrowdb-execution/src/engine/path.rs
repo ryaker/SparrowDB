@@ -268,28 +268,11 @@ impl Engine {
         results
     }
 
-    /// Compatibility shim used by callers that do not need per-node label tracking.
-    pub(crate) fn get_node_neighbors_by_slot(
-        &self,
-        src_slot: u64,
-        src_label_id: u32,
-        delta_idx: &DeltaIndex,
-        rel_ids: &[u32],
-    ) -> Vec<u64> {
-        // SPA-284: use filtered CSR lookup when rel type IDs are provided.
-        let csr_neighbors: Vec<u64> = self.csr_neighbors_filtered(src_slot, rel_ids);
-        // SPA-283: O(1) indexed lookup instead of linear scan.
-        // SPA-284: filter by relation-table IDs when a type constraint exists.
-        let mut all: std::collections::HashSet<u64> = csr_neighbors.into_iter().collect();
-        if let Some(recs) = delta_idx.get(&(src_label_id, src_slot)) {
-            all.extend(
-                recs.iter()
-                    .filter(|r| rel_ids.is_empty() || rel_ids.contains(&r.rel_id.0))
-                    .map(|r| node_id_parts(r.dst.0).1),
-            );
-        }
-        all.into_iter().collect()
-    }
+    // NOTE (#427): the former `get_node_neighbors_by_slot` shim lived here.  It
+    // returned bare `Vec<u64>` slots, discarding the neighbour labels, and its
+    // last caller (`bfs_shortest_path`) was the source of the #427 slot-aliasing
+    // bug.  Use `get_node_neighbors_labeled` instead — slots are only unique
+    // within a label, so a neighbour is never fully identified by its slot.
 
     /// Execute a variable-length path query: `MATCH (a:L1)-[:R*M..N]->(b:L2) RETURN …`.
     pub(crate) fn execute_variable_length(
