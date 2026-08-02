@@ -443,10 +443,13 @@ fn sort_key(f: &IndexFile) -> (&str, &str, &Path) {
 pub(crate) fn load_vector_indexes(db_root: &Path) -> crate::Result<crate::types::VectorIndexMap> {
     let dir = db_root.join("vector_indexes");
     let mut map: crate::types::VectorIndexMap = HashMap::new();
-    for (label, prop) in scan_vector_index_dir(&dir).into_iter().filter_map(|f| match f {
-        IndexFile::Live { label, prop } => Some((label, prop)),
-        IndexFile::Quarantined { .. } => None,
-    }) {
+    for (label, prop) in scan_vector_index_dir(&dir)
+        .into_iter()
+        .filter_map(|f| match f {
+            IndexFile::Live { label, prop } => Some((label, prop)),
+            IndexFile::Quarantined { .. } => None,
+        })
+    {
         match sparrowdb_storage::VectorIndex::load(&dir, &label, &prop) {
             Ok(Some(idx)) => {
                 map.insert((label, prop), Arc::new(RwLock::new(idx)));
