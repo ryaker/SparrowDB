@@ -255,6 +255,30 @@ pub struct NodeResult {
     pub score: f64,
 }
 
+// ── VectorIndexHealth ─────────────────────────────────────────────────────────
+
+/// Coverage report for an HNSW index — see `SparrowDB.vectorIndexHealth`.
+///
+/// ```typescript
+/// interface VectorIndexHealth {
+///   /** Vectors stored in the index. */
+///   stored: number;
+///   /** Vectors `vectorSearch` can actually reach. */
+///   reachable: number;
+///   /** `stored - reachable`; must be 0 on a healthy index. */
+///   unreachable: number;
+/// }
+/// ```
+#[napi(object)]
+pub struct VectorIndexHealth {
+    /// Vectors stored in the index.
+    pub stored: u32,
+    /// Vectors reachable by greedy traversal from the entry point.
+    pub reachable: u32,
+    /// `stored - reachable`. Non-zero means silent recall loss.
+    pub unreachable: u32,
+}
+
 // ── SparrowDB ─────────────────────────────────────────────────────────────────
 
 /// Top-level database handle.
@@ -636,6 +660,169 @@ impl SparrowDB {
             .map_err(|e| to_napi(format!("commit failed: {e}")))?;
 
         Ok(())
+    }
+
+    /// Whether `node_id` currently has a vector in the `(label, property)`
+    /// index.
+    ///
+    /// This answers the question `vectorSearch` cannot.  "Not returned by
+    /// `vectorSearch`" and "absent from the index" are different facts, and
+    /// with only `vectorSearch` to probe with there was no way to tell them
+    /// apart — which is how issue #443 stayed invisible, and how an
+    /// investigation twice concluded that writes were failing when the vectors
+    /// were in fact stored and merely unreachable.
+    ///
+    /// Returns `false` when the node has no vector, and also when no node with
+    /// that id exists.  Throws `RangeError` only if the index itself is absent.
+    ///
+    /// ```typescript
+    /// db.hasVector('Memory', 'embedding', 'node-uuid-here')  // => true
+    /// ```
+    #[napi]
+    pub fn has_vector(
+        &self,
+        label: String,
+        property: String,
+        node_id: String,
+    ) -> napi::Result<bool> {
+        validate_cypher_identifier(&label)?;
+        let arc = self
+            .inner
+            .get_vector_index(&label, &property)
+            .ok_or_else(|| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!(
+                        "RangeError: no vector index on ({label}, {property}); \
+                         call createVectorIndex first"
+                    ),
+                )
+            })?;
+        let Some(internal_id) = self.resolve_internal_id(&label, &node_id)? else {
+            return Ok(false);
+        };
+        let idx = arc
+            .read()
+            .map_err(|e| to_napi(format!("lock poisoned: {e}")))?;
+        Ok(idx.has_vector(internal_id))
+    }
+
+    /// Coverage of the `(label, property)` index: how many vectors are stored
+    /// versus how many `vectorSearch` can actually reach.
+    ///
+    /// `stored === reachable` on a healthy index.  Any gap is silent recall
+    /// loss: those vectors are in the file, `hasVector` reports them present,
+    /// and no search will ever return them.  Issue #443 went unnoticed for
+    /// months because this number was not observable — the live store sat at
+    /// 1347 stored / 1307 reachable with nothing to surface it.
+    ///
+    /// Cheap: one graph walk, no distance arithmetic.
+    ///
+    /// ```typescript
+    /// const h = db.vectorIndexHealth('Memory', 'embedding')
+    /// // { stored: 1347, reachable: 1307, unreachable: 40 }
+    /// ```
+    #[napi]
+    pub fn vector_index_health(
+        &self,
+        label: String,
+        property: String,
+    ) -> napi::Result<VectorIndexHealth> {
+        let arc = self
+            .inner
+            .get_vector_index(&label, &property)
+            .ok_or_else(|| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!(
+                        "RangeError: no vector index on ({label}, {property}); \
+                         call createVectorIndex first"
+                    ),
+                )
+            })?;
+        let idx = arc
+            .read()
+            .map_err(|e| to_napi(format!("lock poisoned: {e}")))?;
+        let stored = idx.len() as u32;
+        let reachable = idx.reachable_count() as u32;
+        Ok(VectorIndexHealth {
+            stored,
+            reachable,
+            unreachable: stored - reachable,
+        })
+    }
+
+    /// Reconnect every stored-but-unreachable vector and persist the result.
+    /// Returns the number of vectors re-linked.
+    ///
+    /// Needed for any index written before the reciprocal-link guarantee
+    /// shipped: those orphans live in the file, and nothing else repairs them —
+    /// re-inserting the same node takes the "already present" path, so a
+    /// backfill cannot heal it either.
+    ///
+    /// A no-op (returns 0) on a healthy index, so it is safe to call on
+    /// startup.
+    ///
+    /// ```typescript
+    /// const n = db.repairVectorIndex('Memory', 'embedding')  // => 40
+    /// ```
+    #[napi]
+    pub fn repair_vector_index(&self, label: String, property: String) -> napi::Result<u32> {
+        validate_cypher_identifier(&label)?;
+        let arc = self
+            .inner
+            .get_vector_index(&label, &property)
+            .ok_or_else(|| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!(
+                        "RangeError: no vector index on ({label}, {property}); \
+                         call createVectorIndex first"
+                    ),
+                )
+            })?;
+
+        // Hold the database write lock for the same reason `addToVectorIndex`
+        // does: a concurrent `dropVectorIndex` must not be silently undone by
+        // our save().  The WriteTx is dropped without committing — the HNSW
+        // file is written outside the WAL.
+        let _write_guard = self
+            .inner
+            .begin_write()
+            .map_err(|e| to_napi(format!("WriterBusy: cannot acquire write lock: {e}")))?;
+
+        let vidx_dir = self.inner.path().join("vector_indexes");
+        let mut idx = arc
+            .write()
+            .map_err(|e| to_napi(format!("lock poisoned: {e}")))?;
+        let repaired = idx.repair();
+        if repaired > 0 {
+            idx.save(&vidx_dir, &label, &property)
+                .map_err(|e| to_napi(format!("HNSW save failed: {e}")))?;
+        }
+        Ok(repaired as u32)
+    }
+
+    /// Resolve a user-facing `id` property to the internal `u64` node id.
+    /// `Ok(None)` when no such node exists.
+    fn resolve_internal_id(&self, label: &str, node_id: &str) -> napi::Result<Option<u64>> {
+        let cypher = format!("MATCH (n:{label} {{id: $id}}) RETURN id(n) AS nid");
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "id".to_string(),
+            sparrowdb_execution::Value::String(node_id.to_owned()),
+        );
+        let result = self
+            .inner
+            .execute_with_params(&cypher, params)
+            .map_err(|e| to_napi(format!("{e}")))?;
+        match result.rows.first().and_then(|r| r.first()) {
+            Some(sparrowdb_execution::Value::Int64(n)) => Ok(Some(*n as u64)),
+            Some(other) => Err(to_napi(format!(
+                "unexpected id(n) type from query: {other:?}"
+            ))),
+            None => Ok(None),
+        }
     }
 
     /// Search the HNSW vector index for `k` nearest neighbours.
