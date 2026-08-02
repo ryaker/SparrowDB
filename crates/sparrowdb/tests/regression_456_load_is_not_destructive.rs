@@ -936,3 +936,216 @@ fn save_sidecars_from_issue_453_are_not_mistaken_for_indexes() {
         "one vector was saved, so one must come back"
     );
 }
+
+// ── 10. A damaged index is read once per incident, not once per row ──────────
+
+/// `hybrid_search` is a scalar function: it is evaluated once per candidate row.
+/// The success path has been cached against the on-disk fingerprint since #442,
+/// but the *failure* path was not, so a damaged index was re-read and re-decoded
+/// on every row and emitted an identical warning on every row.
+///
+/// For KMSmcp's 8 MB `Knowledge.embedding` index an N-row scan is N x 8 MB of
+/// I/O plus N identical log lines — an I/O storm and a log flood arriving
+/// exactly when the store is already degraded and someone is reading the logs to
+/// find out why. A file that decodes cleanly and then fails
+/// `validate_invariants` paid a full `bincode` decode every row.
+///
+/// The warning count is the observable: row 2 can only skip its warning by
+/// taking the cached path, so `warns == 1` over a 5-row scan is direct evidence
+/// that four rows never touched the file.
+///
+/// The second half is the dangerous half. A cached negative that outlived its
+/// repair would recreate, one layer down, the "fixed but still reports broken"
+/// failure this PR removes from the diagnostic — so the repair must become
+/// visible mid-session, and it is asserted here rather than assumed.
+mod warn_counter {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub static HYBRID_WARNS: AtomicUsize = AtomicUsize::new(0);
+    static INIT: std::sync::Once = std::sync::Once::new();
+
+    /// Collects an event's formatted fields so we can tell *our* warning apart
+    /// from any other warning the engine might emit.
+    struct Collect(String);
+
+    impl tracing::field::Visit for Collect {
+        fn record_debug(&mut self, _f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, "{v:?} ");
+        }
+    }
+
+    struct Counter;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Counter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut fields = Collect(String::new());
+            event.record(&mut fields);
+            if fields.0.contains("hybrid_search") {
+                HYBRID_WARNS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Install the counting subscriber once for this test binary.
+    ///
+    /// A global subscriber rather than a thread-local one: the query engine is
+    /// free to evaluate rows on a worker thread, and a thread-local default
+    /// would silently count zero there — a test that cannot observe the thing it
+    /// asserts is worse than no test. No other test in this binary produces a
+    /// warning mentioning `hybrid_search`, so the shared counter is unambiguous.
+    pub fn install() {
+        INIT.call_once(|| {
+            use tracing_subscriber::layer::SubscriberExt;
+            let subscriber = tracing_subscriber::registry().with(Counter);
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    pub fn reset() {
+        HYBRID_WARNS.store(0, Ordering::SeqCst);
+    }
+
+    pub fn count() -> usize {
+        HYBRID_WARNS.load(Ordering::SeqCst)
+    }
+}
+
+#[test]
+fn a_damaged_index_is_read_and_warned_about_once_per_incident_not_once_per_row() {
+    warn_counter::install();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let db = GraphDb::open(root).expect("open fresh db");
+
+    // Fixture: 5 Doc nodes, each with a vector, one saved index, no FTS index.
+    const ROWS: usize = 5;
+    db.create_vector_index("Doc", "embedding", 3, "cosine")
+        .expect("create vector index");
+    let arc = db.get_vector_index("Doc", "embedding").expect("handle");
+    for i in 0..ROWS {
+        db.execute(&format!(
+            "CREATE (d:Doc {{dockey: 'n{i}', content: 'alpha'}})"
+        ))
+        .expect("create node");
+        let node_id = match &db
+            .execute(&format!(
+                "MATCH (n:Doc) WHERE n.dockey = 'n{i}' RETURN id(n) AS nid"
+            ))
+            .expect("id query")
+            .rows[0][0]
+        {
+            Value::Int64(n) => *n as u64,
+            other => panic!("expected Int64 node id, got {other:?}"),
+        };
+        arc.write()
+            .expect("write lock")
+            .insert(node_id, &[1.0_f32, 0.0, 0.0]);
+    }
+    arc.read()
+        .expect("read lock")
+        .save(&root.join("vector_indexes"), "Doc", "embedding")
+        .expect("persist index");
+
+    // One row per Doc node, and `hybrid_search` is evaluated once per row.
+    //
+    // The `WITH d` is load-bearing, not decoration. Without it the chunked
+    // pipeline serves the scan and never dispatches `hybrid_search` at all —
+    // it returns Null for a perfectly healthy index, which would make this test
+    // pass for entirely the wrong reason. The baseline assertion below is what
+    // catches that: a shape that cannot produce a list when the index is intact
+    // cannot prove anything about what happens when it is damaged.
+    const QUERY: &str = "MATCH (d:Doc) WITH d RETURN hybrid_search('Doc', 'embedding', 'content', \
+                         [1.0, 0.0, 0.0], 'alpha', 3) AS hits";
+
+    // ── Baseline: healthy. Hand-derived: ROWS rows, every value a list. ──
+    let baseline = db.execute(QUERY).expect("baseline executes");
+    assert_eq!(
+        baseline.rows.len(),
+        ROWS,
+        "fixture precondition: one row per Doc node, so the scalar is evaluated \
+         {ROWS} times"
+    );
+    for (i, row) in baseline.rows.iter().enumerate() {
+        assert!(
+            matches!(row[0], Value::List(_)),
+            "fixture precondition: row {i} of a healthy index must be a list, got {:?}",
+            row[0]
+        );
+    }
+
+    let file = index_file(root, "Doc", "embedding");
+    let healthy_bytes = std::fs::read(&file).expect("read healthy index");
+
+    // ── Damage it under the open database. ──
+    truncate_to_4_bytes(&file);
+    warn_counter::reset();
+    let damaged = db.execute(QUERY).expect("the query still executes");
+
+    // Hand-derived. The scalar is evaluated once per row, so {ROWS} times.
+    // Row 1 finds no cache entry matching the new fingerprint, reads the file,
+    // fails, caches the verdict and warns. Rows 2..{ROWS} find that verdict
+    // under an unchanged fingerprint and reuse it without touching the file and
+    // without warning. Expected: {ROWS} Null values, and exactly ONE warning.
+    assert_eq!(
+        damaged.rows.len(),
+        ROWS,
+        "the scan still produces every row"
+    );
+    for (i, row) in damaged.rows.iter().enumerate() {
+        assert!(
+            matches!(row[0], Value::Null),
+            "row {i}: a damaged index must yield Null, not {:?}",
+            row[0]
+        );
+    }
+    assert_eq!(
+        warn_counter::count(),
+        1,
+        "a {ROWS}-row scan against one damaged index must warn once, not once \
+         per row; N identical lines bury the signal at the moment someone is \
+         reading the logs to find out what broke"
+    );
+    // Still non-destructive, and still exactly the bytes we wrote.
+    assert!(file.is_file(), "the read must not have moved the file");
+    assert!(
+        quarantine_artifacts(root).is_empty(),
+        "a read must not quarantine, found {:?}",
+        quarantine_artifacts(root)
+    );
+
+    // ── Repair it mid-session, the way an operator restoring a backup would. ──
+    //
+    // Hand-derived: writing the original image back restores the original
+    // fingerprint, `(generation, crc32c)`, which cannot equal the damaged file's
+    // `(4, mtime_nanos)` fallback — mtime_nanos is ~1.7e18 and crc32c is at most
+    // u32::MAX = 4_294_967_295, so the second elements can never match. The
+    // cached negative therefore cannot be reused, every row must see the
+    // repaired index, and no row may warn.
+    std::fs::write(&file, &healthy_bytes).expect("restore the index");
+    warn_counter::reset();
+    let repaired = db.execute(QUERY).expect("post-repair query executes");
+    assert_eq!(repaired.rows.len(), ROWS);
+    for (i, row) in repaired.rows.iter().enumerate() {
+        assert!(
+            matches!(row[0], Value::List(_)),
+            "row {i}: the repair must be visible immediately — a cached negative \
+             that outlives its repair is the 'fixed but still reports broken' \
+             failure this PR exists to remove, one layer down. Got {:?}",
+            row[0]
+        );
+    }
+    assert_eq!(
+        warn_counter::count(),
+        0,
+        "a repaired index must not warn at all"
+    );
+}
