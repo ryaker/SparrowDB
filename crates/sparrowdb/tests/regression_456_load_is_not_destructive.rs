@@ -838,3 +838,101 @@ fn the_cheap_tier_reads_no_index_contents() {
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
         .expect("restore permissions");
 }
+
+// ── 9. Composition with #453's save() sidecars ───────────────────────────────
+
+/// #453 put two new files next to every index: `<index>.bin.lock`, which it
+/// deliberately never unlinks, and `<index>.bin.tmp.<pid>.<nonce>` staging
+/// files, which a crashed writer leaves behind for good.
+///
+/// Neither is an index. Both live in the directory this PR's scanner classifies
+/// **by file name**, and a scanner that guessed wrong would either refuse to
+/// open a healthy store or report a healthy store as damaged — on every store
+/// that has ever saved a vector, which is all of them.
+///
+/// #442 and #446 each behaved correctly alone and composed into #450, so this
+/// is asserted by execution rather than by reading the two patches side by side.
+#[test]
+fn save_sidecars_from_issue_453_are_not_mistaken_for_indexes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let vdir = root.join("vector_indexes");
+    {
+        let db = GraphDb::open(root).expect("open fresh db");
+        db.create_vector_index("Memory", "embedding", 3, "cosine")
+            .expect("create vector index");
+        let arc = db.get_vector_index("Memory", "embedding").expect("handle");
+        arc.write()
+            .expect("write lock")
+            .insert(7, &[1.0_f32, 0.0, 0.0]);
+        // A real save, so the lock file is created by #453's own code path
+        // rather than by this test guessing at its name.
+        arc.read()
+            .expect("read lock")
+            .save(&vdir, "Memory", "embedding")
+            .expect("persist index");
+    }
+
+    // Hand-derived from #453: `lock_path` appends `.lock` to the index path, so
+    // a store that has saved once holds `hnsw_Memory_embedding.bin.lock`. Assert
+    // it is really there — if #453 ever stops creating it, this test must fail
+    // loudly rather than quietly stop testing anything.
+    let lock = vdir.join("hnsw_Memory_embedding.bin.lock");
+    assert!(
+        lock.is_file(),
+        "fixture precondition: #453's save() must leave {} behind",
+        lock.display()
+    );
+
+    // And a staging file from a writer that died mid-save. `temp_path` appends
+    // `.tmp.<pid>.<nonce>`; the exact pid and nonce do not matter, only the
+    // shape, so plant one directly.
+    let staging = vdir.join("hnsw_Memory_embedding.bin.tmp.99999.0");
+    std::fs::write(&staging, [0xFF_u8; 64]).expect("plant stale staging file");
+    // Plus the pre-#452 fixed name, which #453's sweep still recognises.
+    let legacy_staging = vdir.join("hnsw_Memory_embedding.bin.tmp");
+    std::fs::write(&legacy_staging, [0xFF_u8; 64]).expect("plant legacy staging file");
+
+    // Hand-derived expectation. The scanner recognises exactly two shapes:
+    // a name ending `.bin`, and a name containing `.bin.corrupt.`.
+    //   hnsw_Memory_embedding.bin.lock      -> ends `.lock`, not `.bin`; no `.corrupt.`
+    //   hnsw_Memory_embedding.bin.tmp.99999.0 -> ends `.0`;    no `.corrupt.`
+    //   hnsw_Memory_embedding.bin.tmp       -> ends `.tmp`;    no `.corrupt.`
+    // So all three are ignored, and the only recognised entry is the healthy
+    // live index. Expected at BOTH tiers: 0 active, 0 historical, healthy.
+    for (tier, health) in [
+        ("deep", GraphDb::vector_index_load_failures(root)),
+        ("cheap", GraphDb::vector_index_health(root)),
+    ] {
+        assert_eq!(
+            health.unscannable, None,
+            "{tier}: the directory is perfectly readable"
+        );
+        assert!(
+            health.active.is_empty(),
+            "{tier}: #453's sidecars must not be reported as damage, got {:?}",
+            health.active
+        );
+        assert!(
+            health.historical.is_empty(),
+            "{tier}: and they are not quarantine artifacts either, got {:?}",
+            health.historical
+        );
+        assert!(
+            health.is_healthy(),
+            "{tier}: a store that merely saved a vector must read healthy"
+        );
+    }
+
+    // The other direction: open() must not refuse because of them, and the real
+    // index must still load with its one vector.
+    let db = GraphDb::open(root).expect("sidecars must not make open() fail");
+    let arc = db
+        .get_vector_index("Memory", "embedding")
+        .expect("the healthy index must still load");
+    assert_eq!(
+        arc.read().expect("read lock").len(),
+        1,
+        "one vector was saved, so one must come back"
+    );
+}
