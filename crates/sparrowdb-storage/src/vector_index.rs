@@ -365,8 +365,8 @@ impl VectorIndex {
     /// 2. Write `header || payload` to `<path>.tmp.<pid>.<nonce>` and `fsync`
     ///    it, so the bytes are on stable storage before anything else changes.
     /// 3. `rename(<staging>, <path>)` — atomic within a filesystem, so a
-    ///    reader ever sees either the complete old file or the complete new
-    ///    one, never a partial one.
+    ///    reader only ever sees either the complete old file or the complete
+    ///    new one, never a partial one.
     /// 4. `fsync` the containing directory so the rename itself survives a
     ///    power loss (a renamed file whose directory entry was never flushed
     ///    can revert after a crash).

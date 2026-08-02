@@ -244,8 +244,18 @@ fn await_flag(flag: &Path, who: &str) {
 #[test]
 #[ignore = "worker process for two_processes_saving_at_once_leave_one_winner"]
 fn child_writer() {
+    // Return rather than panic: `cargo test -- --ignored` is a standard way to
+    // sweep ignored tests, and in that run the parent never sets CHILD_DIR_ENV.
+    // Panicking there fails the job even though nothing is wrong.  The guard's
+    // purpose — do nothing useful when invoked directly — is preserved, and
+    // `two_processes_saving_at_once_leave_one_winner` still fails loudly if the
+    // child never writes its ready flag.
     let Ok(scratch) = std::env::var(CHILD_DIR_ENV) else {
-        panic!("child_writer is the worker half of a multi-process test and is not run directly");
+        eprintln!(
+            "child_writer is the worker half of \
+             two_processes_saving_at_once_leave_one_winner and does nothing when run directly"
+        );
+        return;
     };
     let base: u64 = std::env::var(CHILD_BASE_ENV)
         .expect("base id")
