@@ -199,18 +199,28 @@ fn truncated_index_file_never_loads_as_fewer_vectors() {
 /// replacement exists.
 ///
 /// The failure is injected deterministically — no timing, no signals, no
-/// flakiness — by creating a *directory* at the staging path `<file>.bin.tmp`.
-/// `File::create` on a directory fails with `EISDIR` on every Unix, so the save
-/// aborts at exactly the point a crash would: after serialisation, before the
-/// destination is touched.
+/// flakiness — by removing write permission from the directory that holds the
+/// index.  Creating a *new* file in a directory requires write permission on
+/// the directory, so `File::create(<staging path>)` fails with `EACCES`, while
+/// re-opening files that already exist (the index itself, the save lock) still
+/// succeeds.  The save therefore aborts at exactly the point a crash would:
+/// after serialisation, before the destination is touched.
+///
+/// This used to be injected by creating a directory at the fixed staging path
+/// `<file>.bin.tmp`.  Since #452 the staging name carries a pid and a nonce, so
+/// no single path can be blocked ahead of time; permissions are the remaining
+/// deterministic lever.
 ///
 /// Hand-derived expectations:
 /// * before: 10 vectors on disk (ids 0..10, one `insert` each);
 /// * the aborted save carries 30 vectors (ids 0..30);
 /// * after: `save()` returns `Err`, and `load()` returns **10**, not 30 and not
 ///   an error — the old index is untouched.
+#[cfg(unix)]
 #[test]
 fn failed_save_leaves_the_previous_index_intact() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = tempfile::tempdir().expect("tempdir");
 
     let mut small = VectorIndex::new(4, Metric::Cosine);
@@ -222,11 +232,23 @@ fn failed_save_leaves_the_previous_index_intact() {
     let path = index_file(dir.path(), "L", "p");
     let good_bytes = std::fs::read(&path).expect("read good");
 
-    // Block the staging path so the next save cannot complete.
-    let mut tmp = path.clone().into_os_string();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    std::fs::create_dir(&tmp).expect("occupy the staging path");
+    // Block creation of any new file in the directory.
+    let original = std::fs::metadata(dir.path()).expect("stat").permissions();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+        .expect("make the index directory read-only");
+
+    // Directory permissions do not apply to a superuser, so confirm the
+    // injection actually took before asserting on it.
+    let probe = dir.path().join(".write_probe");
+    if std::fs::File::create(&probe).is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(dir.path(), original).expect("restore");
+        eprintln!(
+            "skipping failed_save_leaves_the_previous_index_intact: this process can write to a \
+             read-only directory (running as root?), so the failure cannot be injected"
+        );
+        return;
+    }
 
     let mut big = VectorIndex::new(4, Metric::Cosine);
     for i in 0u64..30 {
@@ -245,7 +267,7 @@ fn failed_save_leaves_the_previous_index_intact() {
     );
 
     // Unblock and confirm the survivor is a real, loadable, 10-vector index.
-    std::fs::remove_dir(&tmp).expect("unblock");
+    std::fs::set_permissions(dir.path(), original).expect("restore permissions");
     let reloaded = VectorIndex::load(dir.path(), "L", "p")
         .expect("the surviving index must still load")
         .expect("the surviving index file must exist");
@@ -257,7 +279,22 @@ fn failed_save_leaves_the_previous_index_intact() {
 }
 
 /// A leftover staging file from a crashed save must never be mistaken for the
-/// index, and `save()` must overwrite it rather than fail.
+/// index, and `save()` must reclaim it rather than leave it to accumulate.
+///
+/// Since #452 staging names are `<index>.tmp.<pid>.<nonce>`, so a crashed
+/// process leaves behind a name no later run will ever choose again: reclaiming
+/// cannot be "overwrite the one fixed name", it has to sweep the whole family.
+/// The fixture therefore plants three shapes at once:
+///
+/// * `<index>.tmp` — the fixed name a pre-#452 build wrote, still on disk in
+///   any deployment that crashed before upgrading;
+/// * `<index>.tmp.999999.0` — a per-pid staging file from a process that is
+///   long gone (pid 999999 is not this test);
+/// * `<index>.tmp.999999.1` — a second one from the same dead process.
+///
+/// All three must be gone after one save, and the unrelated sibling
+/// `<index>.tmpfoo` — which is not a staging file, it just starts with the same
+/// characters — must survive, or the sweep is deleting things it does not own.
 #[test]
 fn leftover_staging_file_is_ignored_and_reclaimed() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -268,10 +305,21 @@ fn leftover_staging_file_is_ignored_and_reclaimed() {
     idx.save(dir.path(), "L", "p").expect("save");
 
     let path = index_file(dir.path(), "L", "p");
-    let mut tmp = path.clone().into_os_string();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    std::fs::write(&tmp, b"garbage from a crashed save").expect("write leftover");
+    let sibling = |suffix: &str| {
+        let mut s = path.clone().into_os_string();
+        s.push(suffix);
+        std::path::PathBuf::from(s)
+    };
+    let leftovers = [
+        sibling(".tmp"),
+        sibling(".tmp.999999.0"),
+        sibling(".tmp.999999.1"),
+    ];
+    for p in &leftovers {
+        std::fs::write(p, b"garbage from a crashed save").expect("write leftover");
+    }
+    let bystander = sibling(".tmpfoo");
+    std::fs::write(&bystander, b"not a staging file").expect("write bystander");
 
     let loaded = VectorIndex::load(dir.path(), "L", "p")
         .expect("leftover staging file must not affect load")
@@ -280,7 +328,29 @@ fn leftover_staging_file_is_ignored_and_reclaimed() {
 
     idx.save(dir.path(), "L", "p")
         .expect("save must reclaim a stale staging file");
-    assert!(!tmp.exists(), "the staging file must not outlive a save");
+    for p in &leftovers {
+        assert!(
+            !p.exists(),
+            "{} outlived a save; per-pid staging files from crashed processes are never \
+             reused, so nothing else will ever clean them up",
+            p.display()
+        );
+    }
+    assert!(
+        bystander.exists(),
+        "the sweep removed {}, which is not a staging file",
+        bystander.display()
+    );
+
+    // And the save itself still produced a good index.
+    assert_eq!(
+        VectorIndex::load(dir.path(), "L", "p")
+            .expect("load after reclaim")
+            .expect("index must exist")
+            .len(),
+        6,
+        "6 vectors were saved; 6 must survive the reclaim"
+    );
 }
 
 // ── 3. Re-inserting an existing node id must be observable ───────────────────
