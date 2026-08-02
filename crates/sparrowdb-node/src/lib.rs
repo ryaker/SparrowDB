@@ -65,6 +65,67 @@ fn validate_cypher_identifier(s: &str) -> napi::Result<()> {
     }
 }
 
+/// Prefix identifying a node property that holds an embedding written by
+/// `addToVectorIndex`.  Self-describing so a recovery tool can find and decode
+/// these without guessing.
+const VEC32_PREFIX: &str = "sparrowdb:vec32:";
+
+/// Encode `vector` as a node property value: `sparrowdb:vec32:<hex>`, where
+/// `<hex>` is the little-endian IEEE-754 bytes of each `f32` in order.
+///
+/// # Why a text encoding
+///
+/// The storage layer's `Value` has three variants — `Int64`, `Bytes`, `Float` —
+/// and no vector type, so a vector reaching the property path today is coerced
+/// to `Int64(0)`: `SET n.embedding = $vec` stores a zero and puts the real
+/// embedding only in the HNSW file.  `Bytes` *can* carry the data (values over
+/// 7 bytes spill to the overflow heap), but the read path decodes `Bytes` with
+/// `String::from_utf8_lossy`, which mangles arbitrary binary irreversibly.
+/// Hex keeps the value valid UTF-8, so it round-trips through the existing
+/// read path unchanged and stays decodable by `decode_vector_property`.
+///
+/// Returns `None` when the encoded form would exceed the 65535-byte limit of
+/// the overflow heap's length field (about 8189 dimensions).
+fn encode_vector_property(vector: &[f32]) -> Option<String> {
+    let encoded_len = VEC32_PREFIX
+        .len()
+        .checked_add(vector.len().checked_mul(8)?)?;
+    if encoded_len > u16::MAX as usize {
+        return None;
+    }
+    let mut s = String::with_capacity(encoded_len);
+    s.push_str(VEC32_PREFIX);
+    for f in vector {
+        for b in f.to_le_bytes() {
+            s.push(char::from_digit((b >> 4) as u32, 16).expect("nibble"));
+            s.push(char::from_digit((b & 0x0f) as u32, 16).expect("nibble"));
+        }
+    }
+    Some(s)
+}
+
+/// Inverse of [`encode_vector_property`].  Returns `None` if `s` is not a
+/// `sparrowdb:vec32:` value or its hex body is malformed.
+#[cfg_attr(not(test), allow(dead_code))]
+fn decode_vector_property(s: &str) -> Option<Vec<f32>> {
+    let hex = s.strip_prefix(VEC32_PREFIX)?;
+    if hex.len() % 8 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 8);
+    let bytes = hex.as_bytes();
+    for chunk in bytes.chunks_exact(8) {
+        let mut raw = [0u8; 4];
+        for (i, pair) in chunk.chunks_exact(2).enumerate() {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            raw[i] = ((hi << 4) | lo) as u8;
+        }
+        out.push(f32::from_le_bytes(raw));
+    }
+    Some(out)
+}
+
 // ── JSON → engine Value conversion ────────────────────────────────────────────
 
 /// Convert a `serde_json::Value` (received from JS via napi-rs's `serde-json`
@@ -383,7 +444,8 @@ impl SparrowDB {
             .map_err(to_napi_typed)
     }
 
-    /// Directly insert a vector into the HNSW index for an existing node.
+    /// Directly insert (or replace) a vector in the HNSW index for an existing
+    /// node.
     ///
     /// This is the explicit backfill API requested by KMSmcp (ch #202).  It is
     /// useful when nodes were created without an inline embedding and you want to
@@ -394,6 +456,30 @@ impl SparrowDB {
     /// - `node_id`  — the **user-facing** `id` property value (string), not the
     ///                internal u64 slot number.
     /// - `vector`   — Float32Array of `dimensions` elements.
+    ///
+    /// Calling it twice for the same node now *replaces* the stored vector
+    /// (issue #441).  Before that fix the second call was a silent no-op, so a
+    /// re-embedding pass could report success while changing nothing.
+    ///
+    /// # The node property is written too
+    ///
+    /// Before issue #441 this method wrote only the HNSW file, making that file
+    /// the sole copy of every embedding it stored: not rebuildable from the
+    /// column store, not covered by the WAL, not recoverable to a point in
+    /// time.  A backfill of 1721 vectors was lost that way.
+    ///
+    /// It now also writes `n.<property>` as
+    /// `sparrowdb:vec32:<little-endian f32 hex>` inside the same write
+    /// transaction as the index update, so the embedding survives in the
+    /// checkpointed column store and the index can be rebuilt from it.  The
+    /// storage layer has no vector type yet — its `Value` is `Int64` / `Bytes`
+    /// / `Float` — so the value reads back as that text form rather than as an
+    /// array.  (For comparison, the Cypher path `SET n.embedding = $vec` still
+    /// stores an `Int64(0)` placeholder; that is tracked separately.)
+    ///
+    /// Vectors above ~8189 dimensions cannot be encoded within the overflow
+    /// heap's 65535-byte value limit; the call is refused rather than leaving
+    /// an unrecoverable index entry.
     ///
     /// Throws `RangeError` if no vector index exists for `(label, property)`.
     /// Throws `TypeError`  if `vector.length` does not match the index dimensions.
@@ -502,21 +588,52 @@ impl SparrowDB {
             }
         };
 
-        // 4. Insert into HNSW and persist.
+        // 4. Write the embedding to the node's property column so the vector
+        //    is recoverable from the WAL-backed, checkpointed store and the
+        //    HNSW file stops being the only copy.  See `encode_vector_property`
+        //    for the encoding and why it is a text form.
+        let encoded = encode_vector_property(vec_slice).ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::InvalidArg,
+                format!(
+                    "RangeError: a {}-dimension vector cannot be stored as a node property \
+                     (the overflow heap addresses at most 65535 bytes per value); the HNSW \
+                     index would be the only copy, so the write is refused",
+                    vec_slice.len()
+                ),
+            )
+        })?;
+        let mut write_guard = _write_guard;
+        write_guard
+            .set_property(
+                sparrowdb::NodeId(internal_id),
+                &property,
+                sparrowdb::Value::Bytes(encoded.into_bytes()),
+            )
+            .map_err(|e| to_napi(format!("property write failed: {e}")))?;
+
+        // 5. Insert into HNSW and persist, *before* committing, so a failed
+        //    index write aborts the property write too and disk state stays
+        //    consistent (this mirrors the Cypher SET path in db.rs).
+        //
+        //    `insert` reports whether this was a new vector or a replacement.
+        //    The distinction is not surfaced through the NAPI signature (that
+        //    would change the generated `index.d.ts`), but both outcomes change
+        //    the index and both must reach disk.
         let db_path = self.inner.path();
         let vidx_dir = db_path.join("vector_indexes");
         {
             let mut idx = arc
                 .write()
                 .map_err(|e| to_napi(format!("lock poisoned: {e}")))?;
-            idx.insert(internal_id, vec_slice);
+            let _outcome: sparrowdb_storage::InsertOutcome = idx.insert(internal_id, vec_slice);
             idx.save(&vidx_dir, &label, &property)
                 .map_err(|e| to_napi(format!("HNSW save failed: {e}")))?;
         }
 
-        // Release write lock by dropping _write_guard (no commit — HNSW file
-        // was already persisted above; WAL does not track vector index files).
-        drop(_write_guard);
+        write_guard
+            .commit()
+            .map_err(|e| to_napi(format!("commit failed: {e}")))?;
 
         Ok(())
     }
@@ -981,11 +1098,50 @@ impl WriteTx {
 
 #[cfg(test)]
 mod tests {
-    use super::{json_object_to_params, json_to_exec_value};
+    use super::{
+        decode_vector_property, encode_vector_property, json_object_to_params, json_to_exec_value,
+    };
     use sparrowdb::GraphDb;
     use sparrowdb_execution::Value as ExecValue;
     use sparrowdb_storage::fts_index::FtsIndex;
     use std::collections::HashMap;
+
+    /// The property encoding written by `addToVectorIndex` must be exactly
+    /// reversible — it is the recovery path for embeddings whose only other
+    /// copy is the HNSW file.
+    ///
+    /// Hand-derived spot check: `1.0f32` is `0x3F800000`, which little-endian
+    /// is the byte sequence `00 00 80 3F`, i.e. the hex text `0000803f`.
+    #[test]
+    fn vector_property_encoding_round_trips_exactly() {
+        assert_eq!(
+            encode_vector_property(&[1.0f32]).expect("encode"),
+            "sparrowdb:vec32:0000803f",
+            "1.0f32 is 0x3F800000; little-endian that is 00 00 80 3F"
+        );
+
+        let v: Vec<f32> = vec![0.0, -1.0, 1.5, f32::MIN_POSITIVE, 1e-8, 12345.678];
+        let encoded = encode_vector_property(&v).expect("encode");
+        assert_eq!(
+            encoded.len(),
+            "sparrowdb:vec32:".len() + v.len() * 8,
+            "each f32 occupies 4 bytes = 8 hex characters"
+        );
+        assert_eq!(
+            decode_vector_property(&encoded).expect("decode"),
+            v,
+            "decoding must reproduce every bit of the original vector"
+        );
+
+        // Dimensions that cannot fit the overflow heap's 16-bit length are
+        // refused rather than silently truncated.
+        // 65535 - 16 (prefix) = 65519 hex chars → 65519 / 8 = 8189 dimensions.
+        assert!(encode_vector_property(&vec![0.0f32; 8189]).is_some());
+        assert!(encode_vector_property(&vec![0.0f32; 8190]).is_none());
+
+        assert!(decode_vector_property("not a vector").is_none());
+        assert!(decode_vector_property("sparrowdb:vec32:abc").is_none());
+    }
 
     fn open_db(dir: &std::path::Path) -> GraphDb {
         GraphDb::open(dir).expect("open db")
