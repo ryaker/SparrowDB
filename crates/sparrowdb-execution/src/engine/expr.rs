@@ -162,13 +162,26 @@ impl Engine {
     /// same write lock that mutates it, a matching fingerprint means the cached
     /// copy is byte-identical to what the current writer would hand us.
     ///
-    /// Returns `None` when the index does not exist or fails to load; the
-    /// caller then falls back to full-text-only results, exactly as before.
+    /// # Absent is not damaged (#456)
+    ///
+    /// `Ok(None)` means no index is configured for the pair — a legitimate
+    /// state, and the caller degrades to full-text-only results exactly as
+    /// before.  `Err(reason)` means a file *is* there and cannot be served.
+    ///
+    /// Collapsing those two into `None` is what made this a data-loss path: the
+    /// loader used to be `VectorIndex::load(..).ok().flatten()?`, and since #442
+    /// had moved the quarantine rename inside `load`, a plain read query
+    /// renamed the last live copy of the index aside, then reported success
+    /// with zero vector hits.  This function now calls the non-destructive
+    /// `load` and keeps the two outcomes apart.
     fn hybrid_vector_index(
         vec_dir: &std::path::Path,
         label: &str,
         prop: &str,
-    ) -> Option<std::sync::Arc<sparrowdb_storage::vector_index::VectorIndex>> {
+    ) -> std::result::Result<
+        Option<std::sync::Arc<sparrowdb_storage::vector_index::VectorIndex>>,
+        String,
+    > {
         type Key = (std::path::PathBuf, String, String);
         type Entry = (
             (u64, u64),
@@ -177,35 +190,71 @@ impl Engine {
         static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<Key, Entry>>> =
             std::sync::OnceLock::new();
 
-        // Missing file / unreadable header → nothing to search.
+        // The fingerprint is a cache-validity token, not an existence test.
+        // `fingerprint` opens the path, so a dangling symlink reports NotFound
+        // and a damaged header reports an error — neither of which means "no
+        // index here".  When it yields nothing we fall through to `load`, which
+        // is the one place that distinguishes absent from unreadable.  That
+        // costs two extra syscalls per row in the no-index-configured case,
+        // against the full `FtsIndex::open` the same row already performs.
         let fingerprint =
             sparrowdb_storage::vector_index::VectorIndex::fingerprint(vec_dir, label, prop)
-                .ok()
-                .flatten()?;
+                .unwrap_or_default();
 
-        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-        let mut guard = cache.lock().ok()?;
         let key: Key = (vec_dir.to_path_buf(), label.to_owned(), prop.to_owned());
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut guard = match cache.lock() {
+            Ok(g) => g,
+            // A poisoned cache mutex is not evidence about the index file.
+            // Skip the cache rather than claim the index is missing.
+            Err(_) => {
+                return match sparrowdb_storage::vector_index::VectorIndex::load(
+                    vec_dir, label, prop,
+                ) {
+                    Ok(idx) => Ok(idx.map(std::sync::Arc::new)),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        };
 
-        if let Some((cached_fp, idx)) = guard.get(&key) {
-            if *cached_fp == fingerprint {
-                return Some(std::sync::Arc::clone(idx));
+        if let Some(fp) = fingerprint {
+            if let Some((cached_fp, idx)) = guard.get(&key) {
+                if *cached_fp == fp {
+                    return Ok(Some(std::sync::Arc::clone(idx)));
+                }
             }
         }
 
-        let loaded = sparrowdb_storage::vector_index::VectorIndex::load(vec_dir, label, prop)
-            .ok()
-            .flatten()?;
+        let loaded = match sparrowdb_storage::vector_index::VectorIndex::load(vec_dir, label, prop)
+        {
+            Ok(Some(idx)) => idx,
+            // The pair no longer has a usable index.  Drop any cached copy
+            // rather than keeping an 8 MB deserialised graph alive for a key
+            // that can no longer be served.
+            Ok(None) => {
+                guard.remove(&key);
+                return Ok(None);
+            }
+            Err(e) => {
+                guard.remove(&key);
+                return Err(e.to_string());
+            }
+        };
         let idx = std::sync::Arc::new(loaded);
 
-        // Bound the cache: a process that opens many databases should not
-        // retain every index it has ever queried.
-        const MAX_CACHED_INDEXES: usize = 8;
-        if guard.len() >= MAX_CACHED_INDEXES && !guard.contains_key(&key) {
-            guard.clear();
+        // Only a fingerprinted index is cacheable: without one there is no
+        // token to invalidate the entry against, and a stale copy would be
+        // served forever.
+        if let Some(fp) = fingerprint {
+            // Bound the cache: a process that opens many databases should not
+            // retain every index it has ever queried.
+            const MAX_CACHED_INDEXES: usize = 8;
+            if guard.len() >= MAX_CACHED_INDEXES && !guard.contains_key(&key) {
+                guard.clear();
+            }
+            guard.insert(key, (fp, std::sync::Arc::clone(&idx)));
         }
-        guard.insert(key, (fingerprint, std::sync::Arc::clone(&idx)));
-        Some(idx)
+        Ok(Some(idx))
     }
 
     /// Evaluate `hybrid_search(label, emb_prop, text_prop, query_vec, query_text, k[, alpha])`.
@@ -273,12 +322,43 @@ impl Engine {
         };
 
         // ── 1. Vector search ────────────────────────────────────────────────
+        //
+        // A damaged index does NOT degrade to full-text-only here (#456).
+        //
+        // The three candidate behaviours were: return an error, quietly fall
+        // back to FTS, or refuse to answer.  Returning an error is not
+        // reachable from a scalar function — `eval_expr_graph` and every
+        // function it dispatches are infallible by signature, and making them
+        // fallible is an engine-wide change well outside this fix.  That leaves
+        // fall-back or refusal, and fall-back is the wrong one: it produces the
+        // *same* observable as a legitimately absent index, which is precisely
+        // the absent-vs-damaged confusion #445 exists to eliminate.  A caller
+        // who asked for a fusion of vector and text results, and silently got
+        // text only, has been told the store is healthy by a store that is not.
+        //
+        // So: absent → FTS-only, unchanged.  Damaged → `Value::Null`, which is
+        // already this function's failure signal (bad arity, bad argument
+        // types, fusion failure), plus a warning naming the file and the
+        // decode reason.  Null is a shape the caller cannot mistake for an
+        // empty result list.
         let vec_dir = self.snapshot.db_root.join("vector_indexes");
         let vec_results: Vec<(u64, f32)> =
             match Self::hybrid_vector_index(&vec_dir, &label, &emb_prop) {
                 // ef = max(k*2, 50) gives a reasonable exploration budget.
-                Some(idx) => idx.search(&query_vec, k * 2, (k * 2).max(50)),
-                None => vec![],
+                Ok(Some(idx)) => idx.search(&query_vec, k * 2, (k * 2).max(50)),
+                // No index configured for this pair: full-text-only is the
+                // honest answer and always has been.
+                Ok(None) => vec![],
+                Err(reason) => {
+                    tracing::warn!(
+                        label = %label,
+                        property = %emb_prop,
+                        reason = %reason,
+                        "hybrid_search: the vector index for this pair is present but unusable; \
+                         returning NULL rather than silently degrading to full-text-only results"
+                    );
+                    return Value::Null;
+                }
             };
 
         // ── 2. Full-text (BM25) search ───────────────────────────────────────

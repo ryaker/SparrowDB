@@ -125,7 +125,7 @@ fn absent_index_and_unloadable_index_are_distinguishable() {
         "absent case: no index was ever created, so there must be no handle"
     );
     assert!(
-        GraphDb::vector_index_load_failures(absent_dir.path()).is_empty(),
+        GraphDb::vector_index_load_failures(absent_dir.path()).is_healthy(),
         "absent case: nothing on disk can have failed to load"
     );
     drop(absent_db);
@@ -143,7 +143,9 @@ fn absent_index_and_unloadable_index_are_distinguishable() {
 
     // The bug being guarded is precisely that these two produced the *same*
     // observable: open() -> Ok, get_vector_index() -> None.
-    let failures = GraphDb::vector_index_load_failures(damaged_dir.path());
+    let health = GraphDb::vector_index_load_failures(damaged_dir.path());
+    assert_eq!(health.unscannable, None, "the directory is readable");
+    let failures = &health.active;
     // Hand-derived: exactly one file was planted, for exactly one (label, prop),
     // so exactly one entry must be reported.
     //
@@ -161,7 +163,7 @@ fn absent_index_and_unloadable_index_are_distinguishable() {
         "expected exactly 1 damaged index, got {failures:?}"
     );
     assert_eq!(
-        (failures[0].0.as_str(), failures[0].1.as_str()),
+        (failures[0].label.as_str(), failures[0].prop.as_str()),
         ("Memory", "embedding"),
         "the reported failure must identify the (label, prop) pair"
     );
@@ -170,9 +172,9 @@ fn absent_index_and_unloadable_index_are_distinguishable() {
     // assertion that would have caught the reported path going stale when the
     // file is renamed out from under it.
     assert!(
-        failures[0].2.is_file(),
+        failures[0].path.is_file(),
         "reported path {} must exist on disk",
-        failures[0].2.display()
+        failures[0].path.display()
     );
 }
 
@@ -229,7 +231,7 @@ fn absent_index_is_not_an_error() {
     let db = GraphDb::open(dir.path()).expect("a db with no vector index must open");
     assert!(db.get_vector_index("Memory", "embedding").is_none());
     assert!(
-        GraphDb::vector_index_load_failures(dir.path()).is_empty(),
+        GraphDb::vector_index_load_failures(dir.path()).is_healthy(),
         "no files at all means no damage to report"
     );
 }
@@ -272,19 +274,19 @@ fn quarantined_corrupt_file_is_not_loaded_but_is_reported() {
     // `hnsw_Memory_embedding.bin.corrupt.1712345678901` to get the stem
     // `hnsw_Memory_embedding`, then split at the last underscore, giving
     // label `Memory` and prop `embedding`.  So exactly one entry.
-    let failures = GraphDb::vector_index_load_failures(dir.path());
+    let failures = GraphDb::vector_index_load_failures(dir.path()).active;
     assert_eq!(
         failures.len(),
         1,
         "the quarantine artifact must be reported, got {failures:?}"
     );
     assert_eq!(
-        (failures[0].0.as_str(), failures[0].1.as_str()),
+        (failures[0].label.as_str(), failures[0].prop.as_str()),
         ("Memory", "embedding"),
         "the report must identify the (label, prop) whose vectors are gone"
     );
     assert_eq!(
-        failures[0].2, artifact,
+        failures[0].path, artifact,
         "the report must name the quarantine path, so the bytes can be recovered"
     );
 }
@@ -327,14 +329,14 @@ fn healthy_and_quarantined_indexes_are_reported_separately() {
         "the quarantined index must not produce a handle"
     );
 
-    let failures = GraphDb::vector_index_load_failures(path);
+    let failures = GraphDb::vector_index_load_failures(path).active;
     assert_eq!(
         failures.len(),
         1,
         "exactly the damaged pair must be reported, got {failures:?}"
     );
     assert_eq!(
-        (failures[0].0.as_str(), failures[0].1.as_str()),
+        (failures[0].label.as_str(), failures[0].prop.as_str()),
         ("Doc", "vec"),
         "the healthy pair must not be reported as damaged"
     );

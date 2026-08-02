@@ -269,6 +269,30 @@ pub enum InsertOutcome {
     Updated,
 }
 
+/// What reading an index file found, before any policy is applied to it.
+///
+/// Private on purpose: the public surface is [`VectorIndex::load`] and
+/// [`VectorIndex::load_and_quarantine`], which agree on how a file is judged and
+/// differ only in whether a rejected file is moved aside.  Keeping the judgement
+/// in one place is what stops the two from drifting apart — before #456 there
+/// was only one function and the side effect was welded to the judgement.
+enum LoadOutcome {
+    /// Nothing exists at the path.  The only case that is not an error.
+    Absent,
+    /// A well-formed index, fully restored.  Boxed to keep the enum small.
+    Loaded(Box<VectorIndex>),
+    /// The directory entry exists but its bytes are not reachable — a dangling
+    /// symlink.  Never quarantined: there are no bytes to preserve.
+    Unreadable(String),
+    /// Bytes are present and do not decode.  Quarantine-eligible: these are the
+    /// only surviving copy of the vectors.
+    Undecodable(String),
+    /// The bytes decoded but the graph is internally inconsistent.  Never
+    /// quarantined: a hand repair is plausible and `save()`'s generation check
+    /// already stops an empty index from replacing it.
+    Inconsistent(String),
+}
+
 // ── HNSW index ────────────────────────────────────────────────────────────────
 
 /// HNSW vector similarity index.
@@ -528,9 +552,12 @@ impl VectorIndex {
         )))
     }
 
-    /// Load the index from `<dir>/hnsw_<label>_<prop>.bin`.
+    /// Load the index from `<dir>/hnsw_<label>_<prop>.bin` **without modifying
+    /// anything on disk**.
     ///
-    /// Returns `Ok(None)` when the file does not exist.
+    /// Returns `Ok(None)` only when nothing exists at that path.  A file that is
+    /// present but unusable produces `Err`, and is left exactly where it was
+    /// found.
     ///
     /// # Integrity
     ///
@@ -542,33 +569,67 @@ impl VectorIndex {
     /// accept silently by ignoring the trailing bytes and returning an index
     /// with *fewer vectors than the caller wrote*.
     ///
-    /// A file that fails any of these checks is **quarantined**: it is renamed
-    /// to `<path>.corrupt.<unix_millis>` and an error is returned.  Quarantine
-    /// exists because the damaged bytes are the only surviving copy of the
-    /// vectors, and callers that treat a load failure as "no index here" would
-    /// otherwise let the next `save()` overwrite them.
+    /// # Why this is not the quarantining variant (#456)
+    ///
+    /// #442 put the quarantine rename *inside* `load`, which made every reader
+    /// destructive by inheritance — including the `hybrid_search` query path and
+    /// the read-only `vector_index_load_failures` diagnostic.  A read query
+    /// renamed the last live copy of an index aside and reported zero hits.
+    ///
+    /// Quarantine is now opt-in: callers that are about to take ownership of the
+    /// `(label, prop)` slot — i.e. the open path, which is the only place a
+    /// later `save()` could overwrite the damaged bytes — call
+    /// [`VectorIndex::load_and_quarantine`] and say so.  Every other caller uses
+    /// this method and gets the error without the side effect.
     pub fn load(dir: &Path, label: &str, prop: &str) -> std::io::Result<Option<Self>> {
         let path = Self::index_path(dir, label, prop);
-        if !path.exists() {
-            return Ok(None);
+        match Self::read_index(&path)? {
+            LoadOutcome::Absent => Ok(None),
+            LoadOutcome::Loaded(idx) => Ok(Some(*idx)),
+            LoadOutcome::Undecodable(reason) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HNSW index {} is corrupt ({reason}); the file has been left in place \
+                     for inspection.",
+                    path.display()
+                ),
+            )),
+            LoadOutcome::Inconsistent(reason) => Err(Self::inconsistent_error(&path, &reason)),
+            LoadOutcome::Unreadable(reason) => Err(Self::unreadable_error(&path, &reason)),
         }
-        let bytes = std::fs::read(&path)?;
+    }
 
-        let decoded = if bytes.len() >= HNSW_HEADER_LEN && &bytes[..8] == HNSW_MAGIC {
-            Self::decode_v2(&bytes)
-        } else {
-            Self::decode_legacy(&bytes).map(|idx| (idx, 0u64))
-        };
-
-        let (mut idx, generation) = match decoded {
-            Ok(v) => v,
-            Err(reason) => {
-                // The bytes themselves are damaged.  Move them aside: they are
-                // the only surviving copy of the vectors, and a caller that
-                // reads a load failure as "no index here" would otherwise let
-                // the next save() replace them with an empty index.
+    /// Load the index, **quarantining** bytes that fail to decode: the file is
+    /// renamed to `<path>.corrupt.<unix_millis>` before the error is returned.
+    ///
+    /// Quarantine exists because the damaged bytes are the only surviving copy
+    /// of the vectors — an HNSW index is not derived state and cannot be rebuilt
+    /// from column data — and a caller that reads a load failure as "no index
+    /// here" would otherwise let the next `save()` replace them with an empty
+    /// index.
+    ///
+    /// This is therefore for the **open path only**.  Readers and diagnostics
+    /// must use [`VectorIndex::load`]; see #456 for what happens when they do
+    /// not.
+    ///
+    /// Only *undecodable* bytes are moved.  A file that decodes cleanly and then
+    /// fails the structural check is left in place: it may well be repairable by
+    /// hand, and the generation check in `save()` already stops an empty index
+    /// from replacing it.  A directory entry whose contents cannot be read at
+    /// all (a dangling symlink) is also left alone — there are no bytes to
+    /// preserve, so renaming it would destroy evidence and protect nothing.
+    pub fn load_and_quarantine(
+        dir: &Path,
+        label: &str,
+        prop: &str,
+    ) -> std::io::Result<Option<Self>> {
+        let path = Self::index_path(dir, label, prop);
+        match Self::read_index(&path)? {
+            LoadOutcome::Absent => Ok(None),
+            LoadOutcome::Loaded(idx) => Ok(Some(*idx)),
+            LoadOutcome::Undecodable(reason) => {
                 let quarantined = Self::quarantine(&path);
-                return Err(std::io::Error::new(
+                Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
                         "HNSW index {} is corrupt ({reason}); the damaged file was preserved as {}",
@@ -578,29 +639,83 @@ impl VectorIndex {
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "<quarantine failed>".to_owned()),
                     ),
-                ));
+                ))
             }
+            LoadOutcome::Inconsistent(reason) => Err(Self::inconsistent_error(&path, &reason)),
+            LoadOutcome::Unreadable(reason) => Err(Self::unreadable_error(&path, &reason)),
+        }
+    }
+
+    fn inconsistent_error(path: &Path, reason: &str) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "HNSW index {} decoded but is internally inconsistent ({reason}); \
+                 refusing to serve it. The file has been left in place for inspection.",
+                path.display()
+            ),
+        )
+    }
+
+    fn unreadable_error(path: &Path, reason: &str) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "HNSW index {} is present but its bytes could not be read ({reason}); \
+                 refusing to treat it as absent. The entry has been left in place \
+                 for inspection.",
+                path.display()
+            ),
+        )
+    }
+
+    /// Read, decode and validate the file at `path`, touching nothing.
+    ///
+    /// The single place that knows how to turn bytes into an index; `load` and
+    /// `load_and_quarantine` differ only in what they do with the rejecting
+    /// outcomes.
+    fn read_index(path: &Path) -> std::io::Result<LoadOutcome> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // `read` follows symlinks, so a symlink whose target is gone
+                // reports NotFound even though the directory entry is sitting
+                // right there.  `symlink_metadata` does not follow, so it still
+                // sees it.  Reporting that as "absent" is exactly the
+                // present-but-treated-as-absent failure #445 exists to kill
+                // (#456, third sub-finding): the pair silently becomes "no
+                // index configured" and every write for it is dropped.
+                return Ok(match std::fs::symlink_metadata(path) {
+                    Ok(_) => LoadOutcome::Unreadable(
+                        "the directory entry exists but resolving it failed — most likely a \
+                         symbolic link whose target has been removed"
+                            .to_owned(),
+                    ),
+                    Err(_) => LoadOutcome::Absent,
+                });
+            }
+            Err(e) => return Err(e),
         };
 
-        // Structural validation.  Unlike a checksum failure this is *not*
-        // quarantined: the bytes decoded cleanly, so the file may well be
-        // recoverable by hand, and the generation check in `save()` already
-        // stops an empty index from replacing it.
+        let decoded = if bytes.len() >= HNSW_HEADER_LEN && &bytes[..8] == HNSW_MAGIC {
+            Self::decode_v2(&bytes)
+        } else {
+            Self::decode_legacy(&bytes).map(|idx| (idx, 0u64))
+        };
+
+        let (mut idx, generation) = match decoded {
+            Ok(v) => v,
+            Err(reason) => return Ok(LoadOutcome::Undecodable(reason)),
+        };
+
         if let Err(reason) = idx.validate_invariants() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "HNSW index {} decoded but is internally inconsistent ({reason}); \
-                     refusing to serve it. The file has been left in place for inspection.",
-                    path.display()
-                ),
-            ));
+            return Ok(LoadOutcome::Inconsistent(reason));
         }
 
         // Restore derived field `ml` that was skipped during serialization.
         idx.ml = 1.0 / (idx.m as f64).ln();
         idx.disk_generation.set(generation);
-        Ok(Some(idx))
+        Ok(LoadOutcome::Loaded(Box::new(idx)))
     }
 
     /// Check the structural invariants every well-formed index satisfies.
@@ -723,6 +838,8 @@ impl VectorIndex {
 
     /// Move a damaged index file aside so the bytes are not lost to the next
     /// `save()`.  Returns the quarantine path on success.
+    ///
+    /// Reached only from [`VectorIndex::load_and_quarantine`] (#456).
     fn quarantine(path: &Path) -> Option<PathBuf> {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
