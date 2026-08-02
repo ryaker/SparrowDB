@@ -926,25 +926,33 @@ impl VectorIndex {
             self.nodes[slot as usize].connections[layer] = selected.clone();
 
             // Wire selected → slot (reciprocal links), pruning if needed.
+            //
+            // `linked_back` records whether *any* neighbour ended up pointing at
+            // `slot`.  Every branch below can legitimately decline: a full
+            // neighbour keeps its m_max closest links, and `slot` is simply not
+            // one of them.  Losing every contest leaves `slot` a pure sink —
+            // full outgoing degree, zero incoming — and greedy descent only ever
+            // follows outgoing edges, so nothing can reach it.  See issue #443.
+            //
+            // `adopted` carries the nodes this call has re-homed onto `slot`
+            // (see [`Self::link_back`]).  They are by construction far from
+            // `slot` — each was somebody else's *furthest* neighbour — so
+            // without this set the next adoption evicts the previous one and
+            // strands the very node it was protecting.  That is the sequence
+            // that survived the first draft of this fix: inserting node 368
+            // removed the last inbound edge of node 194.
+            let mut adopted: HashSet<u32> = HashSet::new();
+            let mut linked_back = false;
             for &nb in &selected {
-                let nb_connections = self.nodes[nb as usize].connections[layer].clone();
-                if !nb_connections.contains(&slot) {
-                    if nb_connections.len() < m_max {
-                        self.nodes[nb as usize].connections[layer].push(slot);
-                    } else {
-                        // Prune: keep the m_max closest neighbours.
-                        let nb_vec = self.nodes[nb as usize].vector.clone();
-                        let mut all: Vec<(f32, u32)> = nb_connections
-                            .iter()
-                            .map(|&s| (self.distance_to_slot(&nb_vec, s), s))
-                            .collect();
-                        all.push((self.distance_to_slot(&nb_vec, slot), slot));
-                        all.sort_by(|a, b| {
-                            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        self.nodes[nb as usize].connections[layer] =
-                            all.iter().take(m_max).map(|&(_, s)| s).collect();
-                    }
+                linked_back |= self.link_back(nb, slot, layer, m_max, false, &mut adopted);
+            }
+
+            // Reciprocal-link guarantee (#443).  `selected` is sorted
+            // nearest-first by `select_neighbours`, so `selected[0]` is the best
+            // available anchor to force the edge through.
+            if !linked_back {
+                if let Some(&nb0) = selected.first() {
+                    self.link_back(nb0, slot, layer, m_max, true, &mut adopted);
                 }
             }
 
@@ -956,6 +964,321 @@ impl VectorIndex {
                 ep_current = best_slot;
             }
         }
+    }
+
+    /// Add the edge `nb → slot` at `layer`, evicting from `nb`'s adjacency list
+    /// if it is already at `m_max`.  Returns `true` when the edge exists
+    /// afterwards.
+    ///
+    /// `force = false` keeps the original quality rule: `slot` is admitted only
+    /// if it is closer to `nb` than `nb`'s current furthest neighbour, exactly
+    /// as "keep the `m_max` closest of `conns ∪ {slot}`" did.  `force = true`
+    /// admits it regardless — used for the last-resort reciprocal guarantee.
+    ///
+    /// # Why no eviction here can strand a node
+    ///
+    /// Dropping the edge `nb → x` is the step that silently destroys
+    /// reachability: if that was `x`'s only inbound edge, wiring one node in has
+    /// orphaned another, and nothing reports it.  Issue #443 is the accumulated
+    /// result — both the ~1–5% of inserts that end with zero incoming edges and
+    /// the closed islands of nodes that point at each other with no path back.
+    ///
+    /// The invariant restored here: **`slot` must point at whatever `slot`
+    /// displaced.**  Then every path that used `nb → x` reroutes as
+    /// `nb → slot → x`, and `slot` is reachable because `nb` is, so the set of
+    /// reachable nodes never shrinks.  Two cases:
+    ///
+    /// 1. `slot → x` already exists (the common case — `nb` is one of `slot`'s
+    ///    chosen neighbours, so they share neighbours). Nothing else to do.
+    /// 2. Otherwise `slot` adopts `x`.  If `slot`'s own list is full this
+    ///    displaces `slot`'s furthest edge `y`; `slot`'s links at this layer
+    ///    were all (re)assigned moments ago by [`Self::link_slot`], so dropping
+    ///    one cannot remove any inbound edge `y` had before this call.
+    ///
+    /// Cost: one extra adjacency scan on the eviction path.
+    fn link_back(
+        &mut self,
+        nb: u32,
+        slot: u32,
+        layer: usize,
+        m_max: usize,
+        force: bool,
+        adopted: &mut HashSet<u32>,
+    ) -> bool {
+        if nb == slot {
+            return false;
+        }
+        let conns = self.nodes[nb as usize].connections[layer].clone();
+        if conns.contains(&slot) {
+            return true;
+        }
+        if conns.len() < m_max {
+            self.nodes[nb as usize].connections[layer].push(slot);
+            return true;
+        }
+
+        // `nb`'s list is full: `slot` takes the furthest occupant's place, but
+        // only if it beats it (unless forced).
+        let nb_vec = self.nodes[nb as usize].vector.clone();
+        let d_slot = self.distance_to_slot(&nb_vec, slot);
+        let mut furthest: Option<(f32, usize)> = None;
+        for (i, &x) in conns.iter().enumerate() {
+            let d = self.distance_to_slot(&nb_vec, x);
+            if furthest.is_none_or(|(bd, _)| d > bd) {
+                furthest = Some((d, i));
+            }
+        }
+        let Some((d_worst, pos)) = furthest else {
+            return false;
+        };
+        if !force && d_slot >= d_worst {
+            return false; // `slot` lost the contest fairly; nothing changes.
+        }
+
+        // The eviction is only safe if `slot` can take `displaced` on.  When it
+        // cannot, decline rather than strand it — unless forced, where leaving
+        // `slot` itself unreachable is the worse outcome and [`Self::repair`] is
+        // the backstop.
+        // Most evictions are harmless: `displaced` keeps other inbound edges and
+        // needs no help.  Only pay the adoption — which spends one of `slot`'s
+        // own good links on a far node — when the edge being removed is the last
+        // one into `displaced`.
+        let displaced = conns[pos];
+        let needs_adoption = !self.has_other_inbound(displaced, nb, layer);
+        if needs_adoption && !force && !self.can_adopt(slot, displaced, layer, m_max, adopted) {
+            return false;
+        }
+        self.nodes[nb as usize].connections[layer][pos] = slot;
+        if needs_adoption {
+            self.adopt(slot, displaced, layer, m_max, adopted);
+        }
+        true
+    }
+
+    /// Whether `displaced` still has an inbound edge at `layer` from some node
+    /// other than `exclude`.
+    ///
+    /// Only `displaced`'s own out-neighbours are checked for a link back.  That
+    /// is a *sufficient* test, not an exhaustive one — an inbound edge from a
+    /// node `displaced` does not point at is missed and costs an unnecessary
+    /// adoption, never a stranded node.  Because the reciprocal guarantee makes
+    /// links overwhelmingly bidirectional, the first probe almost always hits,
+    /// so this is O(1) in practice and O(m_max²) at worst.
+    ///
+    /// Soundness relies on the induction this whole scheme maintains: every node
+    /// in the index is reachable, so *any* surviving inbound edge is an inbound
+    /// edge from a reachable node.
+    fn has_other_inbound(&self, displaced: u32, exclude: u32, layer: usize) -> bool {
+        for &z in &self.nodes[displaced as usize].connections[layer] {
+            if z != exclude
+                && z != displaced
+                && self.nodes[z as usize]
+                    .connections
+                    .get(layer)
+                    .is_some_and(|c| c.contains(&displaced))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether [`Self::adopt`] can take `displaced` on without evicting a node
+    /// this call already adopted (and therefore may be the last link to).
+    fn can_adopt(
+        &self,
+        slot: u32,
+        displaced: u32,
+        layer: usize,
+        m_max: usize,
+        adopted: &HashSet<u32>,
+    ) -> bool {
+        if slot == displaced {
+            return true;
+        }
+        let conns = &self.nodes[slot as usize].connections[layer];
+        conns.contains(&displaced)
+            || conns.len() < m_max
+            || conns.iter().any(|y| !adopted.contains(y))
+    }
+
+    /// Ensure `slot → displaced` exists at `layer`, so a node that just lost an
+    /// inbound edge to `slot` keeps a path in.  See [`Self::link_back`].
+    fn adopt(
+        &mut self,
+        slot: u32,
+        displaced: u32,
+        layer: usize,
+        m_max: usize,
+        adopted: &mut HashSet<u32>,
+    ) {
+        if slot == displaced {
+            return;
+        }
+        let conns = &self.nodes[slot as usize].connections[layer];
+        if conns.contains(&displaced) {
+            adopted.insert(displaced);
+            return;
+        }
+        if conns.len() < m_max {
+            self.nodes[slot as usize].connections[layer].push(displaced);
+            adopted.insert(displaced);
+            return;
+        }
+        // Evict `slot`'s furthest link, skipping anything adopted earlier in
+        // this call: those are precisely the nodes with no other inbound edge.
+        let slot_vec = self.nodes[slot as usize].vector.clone();
+        let worst = self.nodes[slot as usize].connections[layer]
+            .iter()
+            .enumerate()
+            .filter(|(_, y)| !adopted.contains(y))
+            .max_by(|a, b| {
+                let da = self.distance_to_slot(&slot_vec, *a.1);
+                let db = self.distance_to_slot(&slot_vec, *b.1);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i);
+        if let Some(i) = worst {
+            self.nodes[slot as usize].connections[layer][i] = displaced;
+            adopted.insert(displaced);
+        }
+    }
+
+    // ── Reachability ──────────────────────────────────────────────────────────
+
+    /// Mark every slot reachable from `entry_point` by following layer-0
+    /// outgoing edges.
+    ///
+    /// This is the set `search()` can actually return.  Greedy descent through
+    /// the upper layers only ever lands on nodes reachable from the entry point,
+    /// and every node exists at layer 0, so layer-0 reachability from the entry
+    /// point is the necessary condition for a vector to be findable at all.
+    ///
+    /// O(nodes + edges), no distance arithmetic.
+    fn reachable_slots(&self) -> Vec<bool> {
+        let mut seen = vec![false; self.nodes.len()];
+        let Some(ep) = self.entry_point else {
+            return seen;
+        };
+        if (ep as usize) >= self.nodes.len() {
+            return seen;
+        }
+        seen[ep as usize] = true;
+        let mut stack = vec![ep];
+        while let Some(s) = stack.pop() {
+            for &nb in &self.nodes[s as usize].connections[0] {
+                if !seen[nb as usize] {
+                    seen[nb as usize] = true;
+                    stack.push(nb);
+                }
+            }
+        }
+        seen
+    }
+
+    /// `true` when `node_id` has a vector stored in this index.
+    ///
+    /// Answers the question `search()` cannot: "not returned by a search" and
+    /// "absent from the index" are different facts, and before this existed
+    /// callers had no way to tell them apart — which is how issue #443 stayed
+    /// invisible.  O(1).
+    pub fn has_vector(&self, node_id: u64) -> bool {
+        self.id_to_slot.contains_key(&node_id)
+    }
+
+    /// Number of stored vectors that greedy search can actually reach.
+    ///
+    /// Compare against [`Self::len`]: a healthy index has
+    /// `reachable_count() == len()`.  Any gap is silent recall loss.
+    pub fn reachable_count(&self) -> usize {
+        self.reachable_slots().iter().filter(|&&r| r).count()
+    }
+
+    /// The `node_id`s that are stored but unreachable — the ones
+    /// [`Self::has_vector`] reports as present and `search` will never return.
+    pub fn unreachable_ids(&self) -> Vec<u64> {
+        let seen = self.reachable_slots();
+        let mut ids: Vec<u64> = self
+            .nodes
+            .iter()
+            .zip(seen.iter())
+            .filter(|(_, &r)| !r)
+            .map(|(n, _)| n.node_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Reconnect every stored-but-unreachable vector, returning how many nodes
+    /// were re-linked.
+    ///
+    /// Needed independently of the insert-time guarantee for two reasons: an
+    /// index written by an older build carries its orphans in the file, and a
+    /// group of former sinks can become each other's chosen neighbours and form
+    /// a closed island — non-zero in-degree, still no path from `entry_point`.
+    /// An in-degree check calls those healthy; only a traversal finds them.
+    ///
+    /// Each unreachable node is attached to its nearest *reachable* neighbour
+    /// via [`Self::link_back`], which never strands the edge it
+    /// displaces.  A repaired node makes everything hanging off it reachable
+    /// too, so the loop re-walks until it reaches a fixpoint.
+    ///
+    /// Returns 0 for a healthy index after one O(nodes + edges) walk.
+    pub fn repair(&mut self) -> usize {
+        let mut repaired = 0usize;
+        // Each pass strictly grows the reachable set, so this terminates well
+        // inside the bound; the bound only guards against a pathological index
+        // where `reconnect_slot` cannot find a candidate.
+        for _ in 0..8 {
+            let seen = self.reachable_slots();
+            let todo: Vec<u32> = (0..self.nodes.len() as u32)
+                .filter(|&s| !seen[s as usize])
+                .collect();
+            if todo.is_empty() {
+                break;
+            }
+            let before = repaired;
+            for u in todo {
+                if self.reconnect_slot(u) {
+                    repaired += 1;
+                }
+            }
+            if repaired == before {
+                break;
+            }
+        }
+        repaired
+    }
+
+    /// Attach `u` to its nearest reachable neighbour at layer 0.
+    ///
+    /// `u`'s own outgoing edges are deliberately left alone: they may be the
+    /// only inbound edges of other unreachable nodes in the same island, and
+    /// re-linking `u` makes that whole island reachable for free.
+    fn reconnect_slot(&mut self, u: u32) -> bool {
+        let Some(ep) = self.entry_point else {
+            return false;
+        };
+        if ep == u || (u as usize) >= self.nodes.len() {
+            return false;
+        }
+        let vector = self.nodes[u as usize].vector.clone();
+        let mut ep_current = ep;
+        for l in (1..=self.max_layer).rev() {
+            ep_current = self.greedy_search_layer(&vector, ep_current, l, l - 1);
+        }
+        let mut candidates = self.search_layer(&vector, &[ep_current], self.ef_construction, 0);
+        // `search_layer` walks outgoing edges from a reachable entry point, so
+        // it can only return reachable slots; `u` is unreachable by definition.
+        candidates.retain(|&(_, s)| s != u);
+        let Some(&(_, nb0)) = candidates
+            .iter()
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        else {
+            return false;
+        };
+        self.link_back(nb0, u, 0, self.m_max0, true, &mut HashSet::new());
+        true
     }
 
     /// Search for the `k` approximate nearest neighbours of `query`.
@@ -1357,6 +1680,321 @@ mod tests {
             idx.nodes[ep as usize].connections.len() > idx.max_layer,
             "entry point must exist on the top layer"
         );
+    }
+
+    // ── Issue #443: reachability invariants ───────────────────────────────────
+    //
+    // These reach into private fields on purpose: in-degree and adjacency-list
+    // capacity are exactly the things `search()` cannot show you, and not being
+    // able to see them is why #443 survived for months.
+
+    /// xorshift64 + Box–Muller.  Deterministic, dependency-free, and identical
+    /// on every platform, so these fixtures are reproducible.
+    struct TestRng(u64);
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            TestRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn unit(&mut self) -> f64 {
+            (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn normal(&mut self) -> f64 {
+            let u1 = self.unit().max(1e-12);
+            let u2 = self.unit();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        }
+    }
+
+    fn l2_normalise(v: &mut [f32]) {
+        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n > 0.0 {
+            for x in v.iter_mut() {
+                *x /= n;
+            }
+        }
+    }
+
+    fn random_direction(rng: &mut TestRng, dims: usize) -> Vec<f32> {
+        let mut v: Vec<f32> = (0..dims).map(|_| rng.normal() as f32).collect();
+        l2_normalise(&mut v);
+        v
+    }
+
+    /// A corpus with the geometry that actually triggers #443.
+    ///
+    /// Every vector is `aniso * mu + centre + noise`, L2-normalised.  The shared
+    /// `mu` term is what real sentence embeddings look like — they are not
+    /// spread over the sphere, they sit in a narrow cone, so *all* pairwise
+    /// distances are compressed and a new node inserted into a mature
+    /// neighbourhood struggles to beat the occupants of its neighbours' lists.
+    /// Isotropic random vectors (the shape most HNSW tests use) never reproduce
+    /// this, which is the other reason the defect stayed hidden.
+    fn cone_corpus(n: usize, dims: usize, clusters: usize, aniso: f32, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = TestRng::new(seed);
+        let mu = random_direction(&mut rng, dims);
+        let centres: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| random_direction(&mut rng, dims))
+            .collect();
+        (0..n)
+            .map(|i| {
+                // Cluster-by-cluster arrival, i.e. topical batches over time,
+                // not a shuffled stream.
+                let c = &centres[(i * clusters) / n];
+                let mut v: Vec<f32> = (0..dims)
+                    .map(|d| aniso * mu[d] + c[d] + (rng.normal() * 0.35) as f32)
+                    .collect();
+                l2_normalise(&mut v);
+                v
+            })
+            .collect()
+    }
+
+    /// Layer-0 in-degree of every slot.
+    fn layer0_in_degree(idx: &VectorIndex) -> Vec<usize> {
+        let mut deg = vec![0usize; idx.nodes.len()];
+        for node in &idx.nodes {
+            for &nb in &node.connections[0] {
+                deg[nb as usize] += 1;
+            }
+        }
+        deg
+    }
+
+    /// The core invariant of #443: a vector that is stored must be a vector that
+    /// greedy traversal can reach.
+    ///
+    /// Hand-derived expectations:
+    /// - 700 inserts of the distinct ids `0..700` each take the "new id" path,
+    ///   so `len() == 700`.
+    /// - `reachable_count()` counts slots reachable from `entry_point` over
+    ///   layer-0 edges. It can never exceed `len()`. A correct index has them
+    ///   equal, because a node no path leads to can never be returned by
+    ///   `search`, whatever `k` and `ef` are set to.
+    /// - Therefore `unreachable_ids()` must be empty. Not "small" — empty. The
+    ///   pre-fix code produces a non-empty list on this fixture.
+    #[test]
+    fn spa443_every_stored_vector_is_reachable() {
+        const N: usize = 700;
+        const DIMS: usize = 48;
+        let vectors = cone_corpus(N, DIMS, 9, 2.0, 0x5EED);
+
+        let mut idx = VectorIndex::new(DIMS, Metric::Cosine);
+        for (i, v) in vectors.iter().enumerate() {
+            assert_eq!(
+                idx.insert(i as u64, v),
+                InsertOutcome::Inserted,
+                "id {i} is distinct, so it must take the insert path"
+            );
+        }
+        assert_eq!(idx.len(), N, "700 distinct ids were inserted");
+
+        let stranded = idx.unreachable_ids();
+        assert!(
+            stranded.is_empty(),
+            "{} of {N} stored vectors are unreachable from the entry point and can \
+             never be returned by search: {:?}",
+            stranded.len(),
+            &stranded[..stranded.len().min(20)]
+        );
+        assert_eq!(
+            idx.reachable_count(),
+            N,
+            "every stored vector must be reachable"
+        );
+    }
+
+    /// Every node must keep at least one inbound edge at layer 0.
+    ///
+    /// Zero in-degree is the mechanism behind #443: `insert` wires
+    /// `new -> neighbours` unconditionally but `neighbours -> new` only when the
+    /// new node beats an existing occupant on distance, so a node in a saturated
+    /// neighbourhood can end up a pure sink — full outgoing degree, nothing
+    /// pointing at it, invisible to a traversal that only follows outgoing
+    /// edges.
+    ///
+    /// Hand-derived: with N >= 2, every slot other than the entry point must be
+    /// pointed at by something, and the entry point too once the graph has more
+    /// than one node, since `link_slot` always establishes an edge in both
+    /// directions for at least one neighbour. So the minimum in-degree over all
+    /// 700 slots is >= 1.
+    #[test]
+    fn spa443_no_node_has_zero_in_degree() {
+        const N: usize = 700;
+        const DIMS: usize = 48;
+        let vectors = cone_corpus(N, DIMS, 9, 2.0, 0x5EED);
+        let mut idx = VectorIndex::new(DIMS, Metric::Cosine);
+        for (i, v) in vectors.iter().enumerate() {
+            idx.insert(i as u64, v);
+        }
+
+        let deg = layer0_in_degree(&idx);
+        let sinks: Vec<usize> = (0..idx.len()).filter(|&s| deg[s] == 0).collect();
+        assert!(
+            sinks.is_empty(),
+            "{} slots have zero layer-0 in-degree (pure sinks): {:?}",
+            sinks.len(),
+            &sinks[..sinks.len().min(20)]
+        );
+    }
+
+    /// The reciprocal-link guarantee must not be bought by letting adjacency
+    /// lists grow past their cap — an unbounded list would trade a correctness
+    /// bug for a memory and latency one.
+    ///
+    /// Hand-derived from the constructor: `VectorIndex::new` calls
+    /// `with_params(.., m = 16, ..)` and `with_params` sets `m_max0 = m * 2`.
+    /// So layer 0 admits at most 32 links per node and every layer above it at
+    /// most 16.
+    #[test]
+    fn spa443_adjacency_lists_stay_within_capacity() {
+        const N: usize = 700;
+        const DIMS: usize = 48;
+        let vectors = cone_corpus(N, DIMS, 9, 2.0, 0x5EED);
+        let mut idx = VectorIndex::new(DIMS, Metric::Cosine);
+        for (i, v) in vectors.iter().enumerate() {
+            idx.insert(i as u64, v);
+        }
+        assert_eq!(idx.m, 16, "default M");
+        assert_eq!(idx.m_max0, 32, "m_max0 = 2 * M");
+
+        for (slot, node) in idx.nodes.iter().enumerate() {
+            for (layer, conns) in node.connections.iter().enumerate() {
+                let cap = if layer == 0 { idx.m_max0 } else { idx.m };
+                assert!(
+                    conns.len() <= cap,
+                    "slot {slot} layer {layer} holds {} links, cap is {cap}",
+                    conns.len()
+                );
+                // A self-link would make the node trivially "reachable" from
+                // itself while still being unreachable from the entry point.
+                assert!(
+                    !conns.contains(&(slot as u32)),
+                    "slot {slot} links to itself at layer {layer}"
+                );
+            }
+        }
+    }
+
+    /// `repair()` must reconnect a genuinely marooned node, including one that
+    /// still has inbound edges.
+    ///
+    /// This is the case an in-degree check reports as healthy and misses: a
+    /// group of former sinks that became each other's chosen neighbours forms a
+    /// closed island — non-zero in-degree, no path from `entry_point`. The live
+    /// store had 7 such nodes alongside 33 pure sinks.
+    ///
+    /// The fixture builds a healthy 200-node index, then severs every inbound
+    /// edge of slots 150 and 151 while leaving the edge between them in place.
+    /// Hand-derived expectations:
+    /// - before severing: `reachable_count() == 200`.
+    /// - after severing: slots 150 and 151 point at each other but nothing else
+    ///   points at either, so no path from the entry point reaches them —
+    ///   `reachable_count() == 198`, and in-degree is 1 for both, i.e. non-zero.
+    /// - after `repair()`: `reachable_count() == 200` again and the return value
+    ///   is the number of nodes it had to re-link, which is at least 1 (linking
+    ///   one member of the island makes the other reachable through it).
+    #[test]
+    fn spa443_repair_reconnects_a_marooned_island() {
+        const N: usize = 200;
+        const DIMS: usize = 32;
+        let vectors = cone_corpus(N, DIMS, 6, 1.5, 0xBEEF);
+        let mut idx = VectorIndex::new(DIMS, Metric::Cosine);
+        for (i, v) in vectors.iter().enumerate() {
+            idx.insert(i as u64, v);
+        }
+        assert_eq!(idx.reachable_count(), N, "fixture must start healthy");
+
+        let (a, b) = (150u32, 151u32);
+        assert_ne!(idx.entry_point, Some(a));
+        assert_ne!(idx.entry_point, Some(b));
+        // Sever every inbound edge of `a` and `b` at every layer.
+        for slot in 0..idx.nodes.len() {
+            if slot as u32 == a || slot as u32 == b {
+                continue;
+            }
+            for conns in idx.nodes[slot].connections.iter_mut() {
+                conns.retain(|&x| x != a && x != b);
+            }
+        }
+        // Leave exactly the island: a -> b and b -> a at layer 0.
+        idx.nodes[a as usize].connections[0] = vec![b];
+        idx.nodes[b as usize].connections[0] = vec![a];
+
+        let deg = layer0_in_degree(&idx);
+        assert_eq!(
+            deg[a as usize], 1,
+            "island member keeps a non-zero in-degree"
+        );
+        assert_eq!(
+            deg[b as usize], 1,
+            "island member keeps a non-zero in-degree"
+        );
+        assert_eq!(
+            idx.reachable_count(),
+            N - 2,
+            "the two island members must now be unreachable despite in-degree 1"
+        );
+
+        let repaired = idx.repair();
+        assert!(
+            repaired >= 1,
+            "repair must re-link at least one island member, re-linked {repaired}"
+        );
+        assert_eq!(
+            idx.reachable_count(),
+            N,
+            "repair must restore full reachability"
+        );
+        assert!(idx.unreachable_ids().is_empty());
+    }
+
+    /// `repair()` on a healthy index changes nothing and reports nothing.
+    /// Hand-derived: a freshly built index satisfies the invariant, so the first
+    /// walk finds no unreachable slots and the function returns 0 without
+    /// touching an edge.
+    #[test]
+    fn spa443_repair_is_a_noop_on_a_healthy_index() {
+        const N: usize = 300;
+        const DIMS: usize = 32;
+        let vectors = cone_corpus(N, DIMS, 6, 1.5, 0xF00D);
+        let mut idx = VectorIndex::new(DIMS, Metric::Cosine);
+        for (i, v) in vectors.iter().enumerate() {
+            idx.insert(i as u64, v);
+        }
+        let before: Vec<Vec<Vec<u32>>> = idx.nodes.iter().map(|n| n.connections.clone()).collect();
+        assert_eq!(idx.repair(), 0, "healthy index needs no repair");
+        let after: Vec<Vec<Vec<u32>>> = idx.nodes.iter().map(|n| n.connections.clone()).collect();
+        assert_eq!(before, after, "repair must not rewire a healthy index");
+    }
+
+    /// `has_vector` must answer from `id_to_slot`, independently of whether a
+    /// search can find the node.
+    ///
+    /// Hand-derived: ids 0..50 are inserted, so `has_vector` is true for each of
+    /// them and false for 50..60, which were never inserted.
+    #[test]
+    fn spa443_has_vector_reports_storage_not_findability() {
+        let mut idx = VectorIndex::new(8, Metric::Cosine);
+        let mut rng = TestRng::new(1);
+        for i in 0u64..50 {
+            let v = random_direction(&mut rng, 8);
+            idx.insert(i, &v);
+        }
+        for i in 0u64..50 {
+            assert!(idx.has_vector(i), "id {i} was inserted");
+        }
+        for i in 50u64..60 {
+            assert!(!idx.has_vector(i), "id {i} was never inserted");
+        }
+        assert!(!idx.has_vector(u64::MAX));
     }
 
     #[test]

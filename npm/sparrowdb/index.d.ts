@@ -42,6 +42,29 @@ export interface NodeResult {
   score: number
 }
 /**
+ * Coverage report for an HNSW index — see `SparrowDB.vectorIndexHealth`.
+ *
+ * ```typescript
+ * interface VectorIndexHealth {
+ *   stored: number;       // vectors stored in the index
+ *   reachable: number;    // vectors `vectorSearch` can actually reach
+ *   unreachable: number;  // stored - reachable; must be 0 when healthy
+ * }
+ * ```
+ *
+ * Note the `//` comments above rather than nested doc comments: a `*\/` inside
+ * a generated JSDoc block closes it early, which is why the checked-in
+ * `npm/sparrowdb/index.d.ts` does not currently parse as TypeScript.
+ */
+export interface VectorIndexHealth {
+  /** Vectors stored in the index. */
+  stored: number
+  /** Vectors reachable by greedy traversal from the entry point. */
+  reachable: number
+  /** `stored - reachable`. Non-zero means silent recall loss. */
+  unreachable: number
+}
+/**
  * Top-level database handle.
  *
  * ```typescript
@@ -163,6 +186,60 @@ export declare class SparrowDB {
    * ```
    */
   addToVectorIndex(label: string, property: string, nodeId: string, vector: Float32Array): void
+  /**
+   * Whether `node_id` currently has a vector in the `(label, property)`
+   * index.
+   *
+   * This answers the question `vectorSearch` cannot.  "Not returned by
+   * `vectorSearch`" and "absent from the index" are different facts, and
+   * with only `vectorSearch` to probe with there was no way to tell them
+   * apart — which is how issue #443 stayed invisible, and how an
+   * investigation twice concluded that writes were failing when the vectors
+   * were in fact stored and merely unreachable.
+   *
+   * Returns `false` when the node has no vector, and also when no node with
+   * that id exists.  Throws `RangeError` only if the index itself is absent.
+   *
+   * ```typescript
+   * db.hasVector('Memory', 'embedding', 'node-uuid-here')  // => true
+   * ```
+   */
+  hasVector(label: string, property: string, nodeId: string): boolean
+  /**
+   * Coverage of the `(label, property)` index: how many vectors are stored
+   * versus how many `vectorSearch` can actually reach.
+   *
+   * `stored === reachable` on a healthy index.  Any gap is silent recall
+   * loss: those vectors are in the file, `hasVector` reports them present,
+   * and no search will ever return them.  Issue #443 went unnoticed for
+   * months because this number was not observable — the live store sat at
+   * 1347 stored / 1307 reachable with nothing to surface it.
+   *
+   * Cheap: one graph walk, no distance arithmetic.
+   *
+   * ```typescript
+   * const h = db.vectorIndexHealth('Memory', 'embedding')
+   * // { stored: 1347, reachable: 1307, unreachable: 40 }
+   * ```
+   */
+  vectorIndexHealth(label: string, property: string): VectorIndexHealth
+  /**
+   * Reconnect every stored-but-unreachable vector and persist the result.
+   * Returns the number of vectors re-linked.
+   *
+   * Needed for any index written before the reciprocal-link guarantee
+   * shipped: those orphans live in the file, and nothing else repairs them —
+   * re-inserting the same node takes the "already present" path, so a
+   * backfill cannot heal it either.
+   *
+   * A no-op (returns 0) on a healthy index, so it is safe to call on
+   * startup.
+   *
+   * ```typescript
+   * const n = db.repairVectorIndex('Memory', 'embedding')  // => 40
+   * ```
+   */
+  repairVectorIndex(label: string, property: string): number
   /**
    * Search the HNSW vector index for `k` nearest neighbours.
    *
