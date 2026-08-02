@@ -103,7 +103,7 @@ impl GraphDb {
         } else {
             0
         };
-        let vector_indexes = RwLock::new(load_vector_indexes(path));
+        let vector_indexes = RwLock::new(load_vector_indexes(path)?);
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -166,7 +166,7 @@ impl GraphDb {
         } else {
             0
         };
-        let vector_indexes = RwLock::new(load_vector_indexes(path));
+        let vector_indexes = RwLock::new(load_vector_indexes(path)?);
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -2165,6 +2165,27 @@ impl GraphDb {
         let dir = self.inner.path.join("vector_indexes");
         sparrowdb_storage::VectorIndex::remove(&dir, label, prop);
         Ok(())
+    }
+
+    /// Report every persisted vector index under `path` that exists on disk but
+    /// cannot be loaded.  Each entry is `(label, prop, reason)`.
+    ///
+    /// [`GraphDb::open`] refuses to open such a database (it returns
+    /// [`Error::Corruption`]) because a damaged HNSW file is not recoverable
+    /// derived state — vectors written via `addToVectorIndex` exist nowhere
+    /// else — and opening anyway would silently drop every subsequent vector
+    /// write for that `(label, prop)`.  This function is the diagnostic side of
+    /// that policy: it never fails, so an operator or a repair tool can call it
+    /// on a database that will not open and find out exactly which files are at
+    /// fault.
+    ///
+    /// An empty result means every index file present loads cleanly, which
+    /// includes the ordinary case of a database with no vector indexes at all.
+    /// That is the distinction the loader used to collapse: an **absent** index
+    /// file means "no index configured" and is not an error, while a
+    /// **present-but-unloadable** file is reported here and blocks `open`.
+    pub fn vector_index_load_failures(path: &Path) -> Vec<(String, String, String)> {
+        crate::helpers::vector_index_load_failures(path)
     }
 
     /// Return a handle to the HNSW vector index for `(label, prop)`, if one exists.
