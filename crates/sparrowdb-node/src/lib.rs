@@ -261,14 +261,15 @@ pub struct NodeResult {
 ///
 /// ```typescript
 /// interface VectorIndexHealth {
-///   /** Vectors stored in the index. */
-///   stored: number;
-///   /** Vectors `vectorSearch` can actually reach. */
-///   reachable: number;
-///   /** `stored - reachable`; must be 0 on a healthy index. */
-///   unreachable: number;
+///   stored: number;       // vectors stored in the index
+///   reachable: number;    // vectors `vectorSearch` can actually reach
+///   unreachable: number;  // stored - reachable; must be 0 when healthy
 /// }
 /// ```
+///
+/// Note the `//` comments above rather than nested doc comments: a `*/` inside
+/// a generated JSDoc block closes it early, which is why the checked-in
+/// `npm/sparrowdb/index.d.ts` does not currently parse as TypeScript.
 #[napi(object)]
 pub struct VectorIndexHealth {
     /// Vectors stored in the index.
