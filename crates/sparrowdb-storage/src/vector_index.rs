@@ -58,6 +58,16 @@ const HNSW_CRC_OFFSET: usize = 32;
 /// it; see [`VectorIndex::is_lost_update`].
 const LOST_UPDATE_PREFIX: &str = "HNSW index generation conflict";
 
+/// Suffix shared by every staging file written by [`VectorIndex::save`].
+///
+/// The full name is `<index>.tmp.<pid>.<nonce>`; this constant is the fixed
+/// part, and is also the name a pre-#452 build used on its own (with nothing
+/// after it), which is why [`VectorIndex::sweep_staging_files`] matches both.
+const TEMP_SUFFIX: &str = ".tmp";
+
+/// Suffix of the advisory-lock file that serialises writers of one index file.
+const LOCK_SUFFIX: &str = ".lock";
+
 /// On-disk generation counter, held out of the serialised payload.
 ///
 /// Wrapped in a newtype so `VectorIndex` can keep deriving `Clone` (an
@@ -79,6 +89,83 @@ impl Generation {
 impl Clone for Generation {
     fn clone(&self) -> Self {
         Generation(std::sync::atomic::AtomicU64::new(self.get()))
+    }
+}
+
+/// An exclusive advisory lock over one index file, held for the whole of
+/// [`VectorIndex::save`].
+///
+/// # Why a lock and not a tighter check
+///
+/// `save()` reads the on-disk generation, serialises, writes a staging file and
+/// renames it.  Without exclusion, two writers that both read generation `N`
+/// both pass the check, both write, and the second rename silently discards the
+/// first writer's vectors — issue #441's failure mode, narrowed to the width of
+/// the serialise-and-write window rather than eliminated.  Re-reading the
+/// generation just before the rename shrinks that window again but never closes
+/// it: there is no way to make "check, then rename" a single atomic step in the
+/// filesystem API.  Only mutual exclusion across the whole read-modify-write
+/// removes it, and then the generation check becomes what it should have been
+/// all along — the mechanism that *reports* the conflict to the loser.
+///
+/// # Why `flock` and not an `O_EXCL` lock file
+///
+/// An `O_EXCL` lock file has to answer "what if the holder died?", and every
+/// answer is a heuristic: a pid liveness probe races with pid reuse, an age
+/// threshold either wedges the index after a crash or breaks the lock out from
+/// under a slow-but-live writer, and a broken lock is exactly the data loss the
+/// lock exists to prevent.  A `flock`-style advisory lock is released by the
+/// kernel when the file descriptor closes — including when the process is
+/// `SIGKILL`ed — so a crashed writer leaves nothing to reclaim.
+///
+/// [`std::fs::File::lock`] is `flock(2)` on Unix and `LockFileEx` on Windows.
+/// On Unix the lock belongs to the *open file description*, so two threads of
+/// one process that each open the lock file exclude each other just as two
+/// processes do; a process-wide `Mutex` would not cover the cross-process case
+/// and a `flock` alone covers both.
+///
+/// The lock file is created next to the index and is never unlinked by `save()`
+/// — unlinking a lock file is how two holders end up inside the same critical
+/// section, because the next writer creates a *new* inode and locks that.
+struct SaveLock(std::fs::File);
+
+impl SaveLock {
+    /// Block until this process owns the write lock for `index_path`.
+    ///
+    /// Blocking (rather than `try_lock`) is deliberate: a caller that is merely
+    /// second in line should be made to wait and then get a truthful answer
+    /// from the generation check, not a spurious "busy" error it would have to
+    /// interpret.  Saves are short — one serialise and one `fsync`.
+    fn acquire(index_path: &Path) -> std::io::Result<Self> {
+        let path = VectorIndex::lock_path(index_path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("cannot open HNSW save lock {}: {e}", path.display()),
+                )
+            })?;
+        file.lock().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("cannot acquire HNSW save lock {}: {e}", path.display()),
+            )
+        })?;
+        Ok(SaveLock(file))
+    }
+}
+
+impl Drop for SaveLock {
+    fn drop(&mut self) {
+        // Closing the descriptor releases the lock on its own; unlocking first
+        // keeps the release explicit and independent of when the `File` is
+        // actually dropped.
+        let _ = self.0.unlock();
     }
 }
 
@@ -275,17 +362,35 @@ impl VectorIndex {
     /// # Crash-safety protocol
     ///
     /// 1. Serialise into memory and compute the CRC32C of the payload.
-    /// 2. Write `header || payload` to `<path>.tmp` and `fsync` it, so the
-    ///    bytes are on stable storage before anything else changes.
-    /// 3. `rename(<path>.tmp, <path>)` — atomic within a filesystem, so a
-    ///    reader ever sees either the complete old file or the complete new
-    ///    one, never a partial one.
+    /// 2. Write `header || payload` to `<path>.tmp.<pid>.<nonce>` and `fsync`
+    ///    it, so the bytes are on stable storage before anything else changes.
+    /// 3. `rename(<staging>, <path>)` — atomic within a filesystem, so a
+    ///    reader only ever sees either the complete old file or the complete
+    ///    new one, never a partial one.
     /// 4. `fsync` the containing directory so the rename itself survives a
     ///    power loss (a renamed file whose directory entry was never flushed
     ///    can revert after a crash).
     ///
     /// If any step fails, `<path>` still holds the previous index and the
-    /// partial temp file is removed.
+    /// partial staging file is removed.
+    ///
+    /// The staging name carries a pid and a per-process nonce.  A fixed
+    /// `<path>.tmp` — what this function used between #442 and #452 — is a
+    /// shared mutable file: two writers both `File::create` it, the first to
+    /// rename vacates it, and the loser's rename fails with `ENOENT` and drops
+    /// its vectors on the floor.  Worse, `ENOENT` is indistinguishable from a
+    /// real disk fault, so a caller following the lost-update contract below
+    /// would not retry.  See issue #452.
+    ///
+    /// # Exclusion
+    ///
+    /// The whole read-generation → serialise → write → rename sequence runs
+    /// under an exclusive advisory lock on `<path>.lock` (see `SaveLock`).
+    /// Without it the generation check is a time-of-check/time-of-use race:
+    /// two writers that both read generation `N` both pass it.  With it, the
+    /// second writer blocks, then observes generation `N + 1` and is refused —
+    /// so a concurrent conflict surfaces as the *same* lost-update error a
+    /// sequential one does, and [`Self::is_lost_update`] recognises both.
     ///
     /// # Lost-update refusal
     ///
@@ -309,7 +414,11 @@ impl VectorIndex {
     pub fn save(&self, dir: &Path, label: &str, prop: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         let path = Self::index_path(dir, label, prop);
-        let tmp = Self::temp_path(&path);
+
+        // Held until this function returns.  Everything below — the generation
+        // read, the staging write and the rename — is one critical section; see
+        // `SaveLock` for why nothing narrower is sufficient.
+        let _lock = SaveLock::acquire(&path)?;
 
         // ── Lost-update check ────────────────────────────────────────────────
         let expected = self.disk_generation.get();
@@ -341,6 +450,12 @@ impl VectorIndex {
         let crc = crc32c::crc32c_append(crate::crc32_of(&header), &payload);
         header.extend_from_slice(&crc.to_le_bytes());
         debug_assert_eq!(header.len(), HNSW_HEADER_LEN);
+
+        // Debris from a save that was killed between `File::create` and
+        // `rename`.  Safe to delete unconditionally: the lock is held, so no
+        // other writer can own a staging file for this index right now.
+        Self::sweep_staging_files(dir, &path);
+        let tmp = Self::temp_path(&path);
 
         // Write + fsync the temp file, then rename.  Any failure removes the
         // temp file and leaves the previous index untouched.
@@ -378,6 +493,16 @@ impl VectorIndex {
 
     /// `true` when `err` is a lost-update refusal from [`Self::save`] rather
     /// than an ordinary I/O failure.
+    ///
+    /// This is the whole recovery contract: `true` means *reload the index and
+    /// retry*, `false` means the storage itself is unhappy and retrying will
+    /// not help.  It must therefore cover **every** way `save()` can refuse
+    /// because someone else got there first — including the concurrent case.
+    /// Between #442 and #452 it did not: two overlapping saves collided on a
+    /// shared staging path and the loser got `ENOENT`, which this returns
+    /// `false` for, so a correct caller read data loss as a disk fault and did
+    /// not retry.  `save()` now serialises writers, so a concurrent conflict
+    /// produces the same generation-conflict error a sequential one does.
     pub fn is_lost_update(err: &std::io::Error) -> bool {
         err.to_string().starts_with(LOST_UPDATE_PREFIX)
     }
@@ -612,10 +737,17 @@ impl VectorIndex {
         }
     }
 
-    /// Delete the persisted index file (and any leftover temp file), if any.
+    /// Delete the persisted index file, its staging files and its lock file.
+    ///
+    /// This is a teardown: it unlinks the lock file, so it must not run
+    /// concurrently with a `save()` of the same index (a new lock file would be
+    /// a different inode, and two writers could then both hold "the" lock).
+    /// Dropping an index while something is still writing to it is undefined
+    /// regardless.
     pub fn remove(dir: &Path, label: &str, prop: &str) {
         let path = Self::index_path(dir, label, prop);
-        let _ = std::fs::remove_file(Self::temp_path(&path));
+        Self::sweep_staging_files(dir, &path);
+        let _ = std::fs::remove_file(Self::lock_path(&path));
         let _ = std::fs::remove_file(path);
     }
 
@@ -663,13 +795,68 @@ impl VectorIndex {
         dir.join(format!("hnsw_{safe_label}_{safe_prop}.bin"))
     }
 
-    /// Staging path used by `save()`.  Appending (rather than replacing) the
-    /// extension keeps the temp file next to the real one so `rename` stays
-    /// within the same filesystem, where it is atomic.
+    /// Staging path used by `save()`: `<path>.tmp.<pid>.<nonce>`.
+    ///
+    /// Appending (rather than replacing) the extension keeps the staging file
+    /// next to the real one so `rename` stays within the same filesystem, where
+    /// it is atomic.
+    ///
+    /// The pid and nonce make the name unique to one in-flight save.  `save()`
+    /// already holds an exclusive lock, so under normal operation no two writers
+    /// are staging at once; uniqueness is what keeps the failure *contained*
+    /// when that assumption does not hold — an older build that predates the
+    /// lock, or a filesystem whose advisory locks are a no-op.  In those cases
+    /// the writers still collide on the destination, but each one's bytes reach
+    /// `rename` intact instead of one of them being deleted out from under the
+    /// other and reported as `ENOENT`.  See issue #452.
     fn temp_path(path: &Path) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
         let mut s = path.to_path_buf().into_os_string();
-        s.push(".tmp");
+        s.push(format!("{TEMP_SUFFIX}.{}.{nonce}", std::process::id()));
         PathBuf::from(s)
+    }
+
+    /// Path of the advisory lock that serialises writers of `path`.
+    fn lock_path(path: &Path) -> PathBuf {
+        let mut s = path.to_path_buf().into_os_string();
+        s.push(LOCK_SUFFIX);
+        PathBuf::from(s)
+    }
+
+    /// Delete every staging file belonging to `index_path`.
+    ///
+    /// Per-pid staging names mean there is no single name to look for, so this
+    /// matches the whole family: the pre-#452 fixed `<index>.tmp` as well as
+    /// `<index>.tmp.<pid>.<nonce>`.  A crashed process leaves its staging file
+    /// behind for good — nothing else ever removes it — and on a large index
+    /// each one is megabytes.
+    ///
+    /// Callers must hold the save lock (or be tearing the index down), because
+    /// a staging file that belongs to a *live* save is exactly the file whose
+    /// deletion causes the `ENOENT` data loss this sweep is cleaning up after.
+    fn sweep_staging_files(dir: &Path, index_path: &Path) {
+        let Some(index_name) = index_path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let prefix = format!("{index_name}{TEMP_SUFFIX}");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // `""` is the legacy fixed name; `".<pid>.<nonce>"` is the current
+            // one.  Anything else that merely starts with the same characters
+            // (say `hnsw_L_p.bin.tmpfoo`) is left alone.
+            match name.strip_prefix(&prefix) {
+                Some(rest) if rest.is_empty() || rest.starts_with('.') => {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+                _ => {}
+            }
+        }
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
