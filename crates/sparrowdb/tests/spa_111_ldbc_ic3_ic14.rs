@@ -30,6 +30,9 @@ fn load_mini_db() -> (tempfile::TempDir, GraphDb) {
 // ── IC3 ─────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "blocked on #421: this query uses (a)-[:knows*1..2]->(b)-[:isLocatedIn]->(c), \
+which silently returned only depth-1 matches. Now rejected outright rather than \
+answered incompletely. Un-ignore when variable-length + hop traversal is implemented."]
 fn ic3_friends_in_country() {
     let (_dir, db) = load_mini_db();
 
@@ -175,6 +178,8 @@ fn ic10_friend_recommendations() {
 // ── IC11 ────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "blocked on #421: variable-length relationship followed by additional hops. \
+Un-ignore when that traversal shape is implemented."]
 fn ic11_job_referral() {
     let (_dir, db) = load_mini_db();
 

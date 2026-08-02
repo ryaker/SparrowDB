@@ -736,6 +736,18 @@ impl Engine {
             && m.pattern[0].rels.len() == 1
             && m.pattern[0].rels[0].min_hops.is_some();
 
+        // #421: `is_var_len` only recognises a variable-length quantifier when it
+        // is the *only* relationship in the pattern. With a trailing hop —
+        // `(a)-[:R*1..2]->(b)-[:S]->(c)` — `rels.len() == 2`, so `is_two_hop`
+        // wins and `execute_two_hop` treats `*1..2` as a plain single hop,
+        // silently discarding every match at depth >= 2 and returning a
+        // plausible but incomplete result set.
+        //
+        // Executing variable-length expansion followed by further hops is not
+        // implemented. Until it is, reject the pattern loudly: a clear error is
+        // far better than quietly wrong data the caller cannot detect.
+        reject_varlen_with_trailing_hops(m)?;
+
         let column_names = extract_return_column_names(&m.return_clause.items);
 
         // SPA-136: multi-node-pattern MATCH (e.g. MATCH (a), (b) RETURN shortestPath(...))
@@ -1263,6 +1275,12 @@ impl Engine {
         };
 
         let column_names = extract_return_column_names(&om.return_clause.items);
+
+        // #421: this arm swallows InvalidArgument into a NULL row, which would
+        // turn the unsupported-pattern error below into silent nulls — exactly
+        // the silent-wrongness the guard exists to prevent. Check first so the
+        // error propagates instead of being absorbed.
+        reject_varlen_with_trailing_hops(&match_stmt)?;
 
         let result = self.execute_match(&match_stmt);
 
@@ -2709,4 +2727,39 @@ impl Engine {
             .collect();
         Value::List(label_strings)
     }
+}
+
+/// Reject `(a)-[:R*m..n]->(b)-[:S]->(c)` — a variable-length relationship
+/// followed by further hops (#421).
+///
+/// `is_var_len` in `execute_match` only recognises a variable-length quantifier
+/// when the varlen rel is the *only* relationship in the pattern. With a
+/// trailing hop `rels.len() >= 2`, so `is_two_hop`/`is_n_hop` wins and the
+/// quantifier is silently discarded — every match at depth >= 2 disappears and
+/// the caller gets a plausible but incomplete result set.
+///
+/// Executing varlen expansion followed by further hops is not implemented.
+/// Until it is, fail loudly: undetectable wrong data is worse than an error.
+///
+/// Must be called by every path that can dispatch such a pattern. In
+/// particular `execute_optional_match` has to call it *before* delegating,
+/// because that function absorbs `InvalidArgument` into a NULL row and would
+/// otherwise convert this error back into silent wrongness.
+pub(crate) fn reject_varlen_with_trailing_hops(m: &MatchStatement) -> Result<()> {
+    for pat in &m.pattern {
+        if pat.rels.len() > 1
+            && pat
+                .rels
+                .iter()
+                .any(|r| r.min_hops.is_some() || r.max_hops.is_some())
+        {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "variable-length relationship followed by additional hops is not supported \
+                 (e.g. (a)-[:R*1..2]->(b)-[:S]->(c)); split the pattern into separate \
+                 MATCH clauses — see issue #421"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
