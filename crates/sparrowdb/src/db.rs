@@ -67,6 +67,17 @@ impl GraphDb {
     }
 
     /// Open (or create) a SparrowDB database at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Besides the usual I/O and WAL-replay failures, this returns
+    /// [`Error::Corruption`] when a persisted vector index file exists under
+    /// `<path>/vector_indexes/` but cannot be loaded.  Opening anyway would
+    /// silently drop every subsequent vector write for that `(label, prop)` and
+    /// return nothing for every search, so the database refuses to open instead.
+    /// Use [`GraphDb::vector_index_load_failures`] to find out which files are
+    /// at fault.  A database with *no* vector index files is unaffected —
+    /// absent is not the same as damaged.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let wal_dir = path.join("wal");
@@ -134,7 +145,9 @@ impl GraphDb {
     /// fail with [`Error::EncryptionAuthFailed`].
     ///
     /// # Errors
-    /// Returns an error if the directory cannot be created.
+    /// Returns an error if the directory cannot be created, or
+    /// [`Error::Corruption`] if a persisted vector index file exists but cannot
+    /// be loaded — see [`GraphDb::open`] for why that is fatal.
     pub fn open_encrypted(path: &Path, key: [u8; 32]) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let wal_dir = path.join("wal");
