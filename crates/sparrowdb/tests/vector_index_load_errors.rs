@@ -20,6 +20,13 @@
 //! `GraphDb::vector_index_load_failures` names the offending files without
 //! failing, so the condition is diagnosable on a database that will not open.
 //!
+//! These tests must hold both on this branch and composed with #442, which
+//! quarantines a rejected index by renaming it to `.corrupt.<millis>` during
+//! the load attempt.  Where the two states differ they are called out inline:
+//! the assertions are written against the (label, prop) that is damaged and the
+//! path where its bytes now live, never against which of the two routes put
+//! them there.
+//!
 //! Every expected value below is derived by hand from the on-disk format; none
 //! was captured from program output.
 
@@ -137,16 +144,35 @@ fn absent_index_and_unloadable_index_are_distinguishable() {
     // The bug being guarded is precisely that these two produced the *same*
     // observable: open() -> Ok, get_vector_index() -> None.
     let failures = GraphDb::vector_index_load_failures(damaged_dir.path());
-    // Hand-derived: exactly one file was planted, for exactly one (label, prop).
+    // Hand-derived: exactly one file was planted, for exactly one (label, prop),
+    // so exactly one entry must be reported.
+    //
+    // This must hold on both integration states, and it reaches that count by
+    // two different routes.  Without #442 the `.bin` is still in place after the
+    // failed `open`, and is reported as a live unloadable index.  With #442 the
+    // failed `open` renamed it to `.bin.corrupt.<millis>`, and it is reported as
+    // a quarantine artifact.  Either way the damage is reported exactly once —
+    // asserting on the count and the (label, prop) rather than on which of the
+    // two routes produced it is what makes this guard hold across the
+    // composition.
     assert_eq!(
         failures.len(),
         1,
-        "expected exactly 1 unloadable index, got {failures:?}"
+        "expected exactly 1 damaged index, got {failures:?}"
     );
     assert_eq!(
         (failures[0].0.as_str(), failures[0].1.as_str()),
         ("Memory", "embedding"),
         "the reported failure must identify the (label, prop) pair"
+    );
+    // The reported path must point at bytes that are actually on disk.  A
+    // report naming a file that is not there is not actionable, and this is the
+    // assertion that would have caught the reported path going stale when the
+    // file is renamed out from under it.
+    assert!(
+        failures[0].2.is_file(),
+        "reported path {} must exist on disk",
+        failures[0].2.display()
     );
 }
 
@@ -202,35 +228,114 @@ fn absent_index_is_not_an_error() {
     );
     let db = GraphDb::open(dir.path()).expect("a db with no vector index must open");
     assert!(db.get_vector_index("Memory", "embedding").is_none());
-    assert!(GraphDb::vector_index_load_failures(dir.path()).is_empty());
+    assert!(
+        GraphDb::vector_index_load_failures(dir.path()).is_empty(),
+        "no files at all means no damage to report"
+    );
 }
 
 // ── 4. Interop with the #442 quarantine naming ────────────────────────────────
 
 #[test]
-fn quarantined_corrupt_file_is_not_treated_as_a_live_index() {
+fn quarantined_corrupt_file_is_not_loaded_but_is_reported() {
     let dir = tempfile::tempdir().expect("tempdir");
     let vidx = dir.path().join("vector_indexes");
     std::fs::create_dir_all(&vidx).expect("create vector_indexes dir");
 
-    // PR #442 renames a rejected index to `<path>.corrupt.<millis>`.  Such a
-    // file is deliberately no longer a live index: it must neither be loaded
-    // nor block `open`.  Hand-derived: the file name's extension is `1712345678901`,
-    // not `bin`, so it is not a candidate index file at all.
-    std::fs::write(
-        vidx.join("hnsw_Memory_embedding.bin.corrupt.1712345678901"),
-        [0xFF_u8; 32],
-    )
-    .expect("plant quarantined file");
+    // PR #442 renames a rejected index to `<path>.corrupt.<millis>`.  This
+    // plants the state a #442 database is left in *after* it has quarantined a
+    // damaged index — reproducible without #442 in the tree, because the
+    // artifact is just a file with a known name.
+    let artifact = vidx.join("hnsw_Memory_embedding.bin.corrupt.1712345678901");
+    std::fs::write(&artifact, [0xFF_u8; 32]).expect("plant quarantined file");
 
+    // Not loaded, and not fatal.  The bytes are already out of service, so
+    // holding the database shut on every subsequent start would force an
+    // operator to choose between "the store will not start" and "delete the
+    // only surviving copy of my vectors".
     let db = GraphDb::open(dir.path())
         .expect("a quarantined artifact must not prevent the database from opening");
     assert!(
         db.get_vector_index("Memory", "embedding").is_none(),
         "a quarantined file is not a live index, so no handle must be produced"
     );
+
+    // But it must be VISIBLE.  Not-loaded and not-visible are different
+    // properties; conflating them is the defect.  Once #442 has quarantined an
+    // index, this report is the only remaining evidence that the vectors for
+    // (Memory, embedding) are gone — a health check that returns empty here
+    // gives a clean bill of health to a store that is silently dropping every
+    // vector write.
+    //
+    // Hand-derived: one artifact was planted, naming exactly one (label, prop)
+    // — strip the `.bin.corrupt.<millis>` suffix from
+    // `hnsw_Memory_embedding.bin.corrupt.1712345678901` to get the stem
+    // `hnsw_Memory_embedding`, then split at the last underscore, giving
+    // label `Memory` and prop `embedding`.  So exactly one entry.
+    let failures = GraphDb::vector_index_load_failures(dir.path());
+    assert_eq!(
+        failures.len(),
+        1,
+        "the quarantine artifact must be reported, got {failures:?}"
+    );
+    assert_eq!(
+        (failures[0].0.as_str(), failures[0].1.as_str()),
+        ("Memory", "embedding"),
+        "the report must identify the (label, prop) whose vectors are gone"
+    );
+    assert_eq!(
+        failures[0].2, artifact,
+        "the report must name the quarantine path, so the bytes can be recovered"
+    );
+}
+
+#[test]
+fn healthy_and_quarantined_indexes_are_reported_separately() {
+    // A store can hold a working index and the wreckage of another at the same
+    // time.  The healthy one must not be dragged down, and the wreckage must
+    // not be hidden by the healthy one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path();
+    {
+        let db = GraphDb::open(path).expect("open fresh db");
+        db.create_vector_index("Memory", "embedding", 3, "cosine")
+            .expect("create vector index");
+        let arc = db.get_vector_index("Memory", "embedding").expect("handle");
+        arc.write()
+            .expect("write lock")
+            .insert(7, &[1.0_f32, 0.0, 0.0]);
+        arc.read()
+            .expect("read lock")
+            .save(&path.join("vector_indexes"), "Memory", "embedding")
+            .expect("persist index");
+    }
+    let artifact = path
+        .join("vector_indexes")
+        .join("hnsw_Doc_vec.bin.corrupt.1712345678901");
+    std::fs::write(&artifact, [0xFF_u8; 32]).expect("plant quarantined file");
+
+    // Hand-derived: the (Memory, embedding) file is valid and its pair is not
+    // quarantined, so it loads and contributes no failure.  The (Doc, vec)
+    // artifact contributes exactly one.  Total: 1 failure, 1 live handle.
+    let db = GraphDb::open(path).expect("a healthy index plus an artifact must still open");
     assert!(
-        GraphDb::vector_index_load_failures(dir.path()).is_empty(),
-        "a quarantined file is not a pending failure — it has already been dealt with"
+        db.get_vector_index("Memory", "embedding").is_some(),
+        "the healthy index must still load"
+    );
+    assert!(
+        db.get_vector_index("Doc", "vec").is_none(),
+        "the quarantined index must not produce a handle"
+    );
+
+    let failures = GraphDb::vector_index_load_failures(path);
+    assert_eq!(
+        failures.len(),
+        1,
+        "exactly the damaged pair must be reported, got {failures:?}"
+    );
+    assert_eq!(
+        (failures[0].0.as_str(), failures[0].1.as_str()),
+        ("Doc", "vec"),
+        "the healthy pair must not be reported as damaged"
     );
 }

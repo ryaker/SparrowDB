@@ -26,7 +26,7 @@ use sparrowdb_storage::wal::codec::WalPayload;
 use sparrowdb_storage::wal::writer::WalWriter;
 use sparrowdb_storage::wal::WalReplayer;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::{info_span, warn};
@@ -2180,24 +2180,42 @@ impl GraphDb {
         Ok(())
     }
 
-    /// Report every persisted vector index under `path` that exists on disk but
-    /// cannot be loaded.  Each entry is `(label, prop, reason)`.
+    /// Report every persisted vector index under `path` whose bytes are
+    /// damaged.  Each entry is `(label, prop, path, reason)`, sorted for
+    /// determinism.
     ///
-    /// [`GraphDb::open`] refuses to open such a database (it returns
-    /// [`Error::Corruption`]) because a damaged HNSW file is not recoverable
-    /// derived state — vectors written via `addToVectorIndex` exist nowhere
-    /// else — and opening anyway would silently drop every subsequent vector
-    /// write for that `(label, prop)`.  This function is the diagnostic side of
-    /// that policy: it never fails, so an operator or a repair tool can call it
-    /// on a database that will not open and find out exactly which files are at
-    /// fault.
-    ///
-    /// An empty result means every index file present loads cleanly, which
+    /// This never returns `Err`, so it can be called on a database that refuses
+    /// to open — it is the diagnostic side of the fail-closed policy in
+    /// [`GraphDb::open`]. An empty result means no damage is present, which
     /// includes the ordinary case of a database with no vector indexes at all.
     /// That is the distinction the loader used to collapse: an **absent** index
-    /// file means "no index configured" and is not an error, while a
-    /// **present-but-unloadable** file is reported here and blocks `open`.
-    pub fn vector_index_load_failures(path: &Path) -> Vec<(String, String, String)> {
+    /// file means "no index configured" and is not an error, while a damaged
+    /// one is reported here.
+    ///
+    /// Damage is reported in both the places it can live:
+    ///
+    /// * a live `hnsw_<label>_<prop>.bin` that will not load — these also make
+    ///   `open` fail;
+    /// * a `hnsw_<label>_<prop>.bin.corrupt.<millis>` artifact that a previous
+    ///   load attempt rejected and moved aside (#442) — `open` succeeds once a
+    ///   file has been quarantined, so this is the *only* remaining signal that
+    ///   the vectors for that `(label, prop)` are gone.
+    ///
+    /// Reporting only the first kind would mean a health check built on this
+    /// call returns "no problems" for a store whose index has been quarantined
+    /// and whose vector writes are therefore being dropped — the same silent
+    /// failure this API exists to eliminate.
+    ///
+    /// The `path` is exact. The `reason` for a quarantine artifact is
+    /// reconstructed rather than recovered: the original decode failure is
+    /// reported only in the error returned at quarantine time and is not
+    /// persisted to disk.
+    ///
+    /// Note that this is not a read-only call when composed with #442: probing
+    /// a live entry may quarantine it. See the crate-internal
+    /// `helpers::vector_index_load_failures` for why that does not change the
+    /// result you observe.
+    pub fn vector_index_load_failures(path: &Path) -> Vec<(String, String, PathBuf, String)> {
         crate::helpers::vector_index_load_failures(path)
     }
 
