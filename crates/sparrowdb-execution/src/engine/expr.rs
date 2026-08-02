@@ -1,6 +1,70 @@
 //! Auto-generated submodule — see engine/mod.rs for context.
 use super::*;
 
+/// Key of the process-global `hybrid_search` index cache: which database
+/// directory, which `(label, prop)` pair.
+type HybridCacheKey = (std::path::PathBuf, String, String);
+
+/// A cached verdict about one on-disk HNSW index, together with the fingerprint
+/// it was derived from.
+type HybridCacheEntry = ((u64, u64), CachedIndex);
+
+/// What the last look at an index file concluded — valid for exactly as long as
+/// that file's fingerprint is unchanged.
+enum CachedIndex {
+    /// The file loaded; this is the shared deserialised copy.
+    Ready(std::sync::Arc<sparrowdb_storage::vector_index::VectorIndex>),
+    /// The file is present and cannot be served, for this reason.
+    ///
+    /// # Why the negative is cached too (#456)
+    ///
+    /// `hybrid_search` is a scalar function: it is evaluated once per candidate
+    /// row.  Caching only the success meant a damaged index was re-read and
+    /// re-decoded on *every* row — for KMSmcp's 8 MB `Knowledge.embedding`
+    /// index that is N x 8 MB of I/O for an N-row scan, and a file that decodes
+    /// cleanly but then fails `validate_invariants` paid a full `bincode`
+    /// decode each time.  It also emitted one identical warning per row.
+    ///
+    /// Both arrive at the moment the store is already degraded and someone is
+    /// reading the logs to find out why, which is the worst possible time to
+    /// add an I/O storm and bury the signal.  A fix whose purpose is "behave
+    /// well when the index is damaged" must not amplify the incident.
+    Damaged(String),
+}
+
+/// A damaged-index verdict handed back to the caller.
+struct HybridIndexDamage {
+    /// The loader's own error text.
+    reason: String,
+    /// True only on the evaluation that first observed this damage for the
+    /// current fingerprint.  Every later row reuses the cached verdict and sets
+    /// this to `false`, so one damaged index produces one log line rather than
+    /// one per row.
+    first_observation: bool,
+}
+
+/// Insert into the `hybrid_search` index cache, keeping it bounded.
+///
+/// The cache is process-global and keyed by `(dir, label, prop)`, so without a
+/// bound a long-running process — an MCP server that opens many databases over
+/// its lifetime is the realistic case — would retain one entry for every pair it
+/// had ever queried, and each `Ready` entry pins a fully deserialised index that
+/// can be megabytes.  Eight is chosen to comfortably cover the pairs one query
+/// touches while keeping the retained set small; the eviction is a wholesale
+/// clear rather than an LRU because there is no access-recency information worth
+/// tracking here and a cleared cache costs one reload, not a wrong answer.
+fn hybrid_cache_insert(
+    map: &mut HashMap<HybridCacheKey, HybridCacheEntry>,
+    key: HybridCacheKey,
+    entry: HybridCacheEntry,
+) {
+    const MAX_CACHED_INDEXES: usize = 8;
+    if map.len() >= MAX_CACHED_INDEXES && !map.contains_key(&key) {
+        map.clear();
+    }
+    map.insert(key, entry);
+}
+
 impl Engine {
     // ── FTS scalar functions ──────────────────────────────────────────────────
 
@@ -162,50 +226,135 @@ impl Engine {
     /// same write lock that mutates it, a matching fingerprint means the cached
     /// copy is byte-identical to what the current writer would hand us.
     ///
-    /// Returns `None` when the index does not exist or fails to load; the
-    /// caller then falls back to full-text-only results, exactly as before.
+    /// # Absent is not damaged (#456)
+    ///
+    /// `Ok(None)` means no index is configured for the pair — a legitimate
+    /// state, and the caller degrades to full-text-only results exactly as
+    /// before.  `Err(..)` means a file *is* there and cannot be served.
+    ///
+    /// Collapsing those two into `None` is what made this a data-loss path: the
+    /// loader used to be `VectorIndex::load(..).ok().flatten()?`, and since #442
+    /// had moved the quarantine rename inside `load`, a plain read query
+    /// renamed the last live copy of the index aside, then reported success
+    /// with zero vector hits.  This function now calls the non-destructive
+    /// `load` and keeps the two outcomes apart.
+    ///
+    /// # Both verdicts are cached, under the same token
+    ///
+    /// A damaged file is remembered as [`CachedIndex::Damaged`] against the same
+    /// fingerprint the successful load is cached against, so an N-row scan reads
+    /// and decodes it once rather than N times, and warns once rather than N
+    /// times.
+    ///
+    /// The invalidation is therefore identical for both: rebuild the index and
+    /// its fingerprint changes, the cached entry stops matching, and the next
+    /// row re-probes and sees the repair.  A negative verdict that outlived its
+    /// repair would recreate, one layer down, exactly the "fixed but still
+    /// reports broken" failure this PR removes from the diagnostic.
+    ///
+    /// A verdict is only cached when a fingerprint exists, because the
+    /// fingerprint *is* the invalidation token and there is nothing safe to do
+    /// without one.  That costs nothing in practice: `fingerprint` fails only
+    /// when the file cannot be opened at all (a dangling symlink, a permission
+    /// block), and those re-probe for one failed `open` plus one `lstat` with no
+    /// payload read — never the full decode this cache exists to avoid.
     fn hybrid_vector_index(
         vec_dir: &std::path::Path,
         label: &str,
         prop: &str,
-    ) -> Option<std::sync::Arc<sparrowdb_storage::vector_index::VectorIndex>> {
-        type Key = (std::path::PathBuf, String, String);
-        type Entry = (
-            (u64, u64),
-            std::sync::Arc<sparrowdb_storage::vector_index::VectorIndex>,
-        );
-        static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<Key, Entry>>> =
-            std::sync::OnceLock::new();
+    ) -> std::result::Result<
+        Option<std::sync::Arc<sparrowdb_storage::vector_index::VectorIndex>>,
+        HybridIndexDamage,
+    > {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<HashMap<HybridCacheKey, HybridCacheEntry>>,
+        > = std::sync::OnceLock::new();
 
-        // Missing file / unreadable header → nothing to search.
+        // The fingerprint is a cache-validity token, not an existence test.
+        // `fingerprint` opens the path, so a dangling symlink reports NotFound
+        // and a damaged header reports an error — neither of which means "no
+        // index here".  When it yields nothing we fall through to `load`, which
+        // is the one place that distinguishes absent from unreadable.  That
+        // costs two extra syscalls per row in the no-index-configured case,
+        // against the full `FtsIndex::open` the same row already performs.
         let fingerprint =
             sparrowdb_storage::vector_index::VectorIndex::fingerprint(vec_dir, label, prop)
-                .ok()
-                .flatten()?;
+                .unwrap_or_default();
 
+        let key: HybridCacheKey = (vec_dir.to_path_buf(), label.to_owned(), prop.to_owned());
         let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-        let mut guard = cache.lock().ok()?;
-        let key: Key = (vec_dir.to_path_buf(), label.to_owned(), prop.to_owned());
+        let mut guard = match cache.lock() {
+            Ok(g) => g,
+            // A poisoned cache mutex is not evidence about the index file.
+            // Skip the cache rather than claim the index is missing; with no
+            // cache to consult, every evaluation is a first observation.
+            Err(_) => {
+                return match sparrowdb_storage::vector_index::VectorIndex::load(
+                    vec_dir, label, prop,
+                ) {
+                    Ok(idx) => Ok(idx.map(std::sync::Arc::new)),
+                    Err(e) => Err(HybridIndexDamage {
+                        reason: e.to_string(),
+                        first_observation: true,
+                    }),
+                }
+            }
+        };
 
-        if let Some((cached_fp, idx)) = guard.get(&key) {
-            if *cached_fp == fingerprint {
-                return Some(std::sync::Arc::clone(idx));
+        if let Some(fp) = fingerprint {
+            if let Some((cached_fp, verdict)) = guard.get(&key) {
+                if *cached_fp == fp {
+                    return match verdict {
+                        CachedIndex::Ready(idx) => Ok(Some(std::sync::Arc::clone(idx))),
+                        CachedIndex::Damaged(reason) => Err(HybridIndexDamage {
+                            reason: reason.clone(),
+                            first_observation: false,
+                        }),
+                    };
+                }
             }
         }
 
-        let loaded = sparrowdb_storage::vector_index::VectorIndex::load(vec_dir, label, prop)
-            .ok()
-            .flatten()?;
+        let loaded = match sparrowdb_storage::vector_index::VectorIndex::load(vec_dir, label, prop)
+        {
+            Ok(Some(idx)) => idx,
+            // The pair no longer has a usable index.  Drop any cached copy
+            // rather than keeping an 8 MB deserialised graph — or a stale
+            // damage verdict — alive for a key that is now simply absent.
+            Ok(None) => {
+                guard.remove(&key);
+                return Ok(None);
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                match fingerprint {
+                    Some(fp) => hybrid_cache_insert(
+                        &mut guard,
+                        key,
+                        (fp, CachedIndex::Damaged(reason.clone())),
+                    ),
+                    // No token to invalidate against, so nothing may be
+                    // remembered.  See the note on this function.
+                    None => {
+                        guard.remove(&key);
+                    }
+                }
+                return Err(HybridIndexDamage {
+                    reason,
+                    first_observation: true,
+                });
+            }
+        };
         let idx = std::sync::Arc::new(loaded);
 
-        // Bound the cache: a process that opens many databases should not
-        // retain every index it has ever queried.
-        const MAX_CACHED_INDEXES: usize = 8;
-        if guard.len() >= MAX_CACHED_INDEXES && !guard.contains_key(&key) {
-            guard.clear();
+        if let Some(fp) = fingerprint {
+            hybrid_cache_insert(
+                &mut guard,
+                key,
+                (fp, CachedIndex::Ready(std::sync::Arc::clone(&idx))),
+            );
         }
-        guard.insert(key, (fingerprint, std::sync::Arc::clone(&idx)));
-        Some(idx)
+        Ok(Some(idx))
     }
 
     /// Evaluate `hybrid_search(label, emb_prop, text_prop, query_vec, query_text, k[, alpha])`.
@@ -273,13 +422,51 @@ impl Engine {
         };
 
         // ── 1. Vector search ────────────────────────────────────────────────
+        //
+        // A damaged index does NOT degrade to full-text-only here (#456).
+        //
+        // The three candidate behaviours were: return an error, quietly fall
+        // back to FTS, or refuse to answer.  Returning an error is not
+        // reachable from a scalar function — `eval_expr_graph` and every
+        // function it dispatches are infallible by signature, and making them
+        // fallible is an engine-wide change well outside this fix.  That leaves
+        // fall-back or refusal, and fall-back is the wrong one: it produces the
+        // *same* observable as a legitimately absent index, which is precisely
+        // the absent-vs-damaged confusion #445 exists to eliminate.  A caller
+        // who asked for a fusion of vector and text results, and silently got
+        // text only, has been told the store is healthy by a store that is not.
+        //
+        // So: absent → FTS-only, unchanged.  Damaged → `Value::Null`, which is
+        // already this function's failure signal (bad arity, bad argument
+        // types, fusion failure), plus a warning naming the file and the
+        // decode reason.  Null is a shape the caller cannot mistake for an
+        // empty result list.
         let vec_dir = self.snapshot.db_root.join("vector_indexes");
-        let vec_results: Vec<(u64, f32)> =
-            match Self::hybrid_vector_index(&vec_dir, &label, &emb_prop) {
-                // ef = max(k*2, 50) gives a reasonable exploration budget.
-                Some(idx) => idx.search(&query_vec, k * 2, (k * 2).max(50)),
-                None => vec![],
-            };
+        let vec_results: Vec<(u64, f32)> = match Self::hybrid_vector_index(
+            &vec_dir, &label, &emb_prop,
+        ) {
+            // ef = max(k*2, 50) gives a reasonable exploration budget.
+            Ok(Some(idx)) => idx.search(&query_vec, k * 2, (k * 2).max(50)),
+            // No index configured for this pair: full-text-only is the
+            // honest answer and always has been.
+            Ok(None) => vec![],
+            Err(damage) => {
+                // Once per damaged index, not once per row.  An N-row scan
+                // against a damaged index used to emit N identical lines,
+                // burying the signal at the exact moment someone is reading
+                // the logs to find out what broke.
+                if damage.first_observation {
+                    tracing::warn!(
+                        label = %label,
+                        property = %emb_prop,
+                        reason = %damage.reason,
+                        "hybrid_search: the vector index for this pair is present but unusable; \
+                         returning NULL rather than silently degrading to full-text-only results"
+                    );
+                }
+                return Value::Null;
+            }
+        };
 
         // ── 2. Full-text (BM25) search ───────────────────────────────────────
         let fts_results: Vec<(u64, f32)> = match sparrowdb_storage::fts_index::FtsIndex::open(

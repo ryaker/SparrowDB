@@ -104,6 +104,67 @@ export interface VectorIndexLoadFailure {
   reason: string
 }
 /**
+ * What an inspection of a database's `vector_indexes/` observed — see
+ * `SparrowDB.vectorIndexLoadFailures` and `SparrowDB.vectorIndexDamageScan`.
+ *
+ * ```typescript
+ * interface VectorIndexDamageReport {
+ *   unscannable?: string;                  // present when the directory could not be listed
+ *   active: VectorIndexLoadFailure[];      // unrecovered damage — alert on this
+ *   historical: VectorIndexLoadFailure[];  // recovered-from damage — forensics only
+ *   healthy: boolean;                      // !unscannable && active.length === 0
+ * }
+ * ```
+ *
+ * Not to be confused with the instance method `db.vectorIndexHealth(label,
+ * prop)`, which returns per-index vector reachability counts. This type is
+ * about which index FILES are in service; that one is about how many vectors
+ * inside one healthy file a search can reach.
+ *
+ * Three fields, because a report has three things to say (#456). Before #456
+ * this was a bare `VectorIndexLoadFailure[]`, and `[]` meant all three at once:
+ *
+ * - `unscannable` — `[]` also meant "I could not read the directory". A
+ *   `chmod 000` on `vector_indexes/`, a bad mount during a poll, or a
+ *   misconfigured service account produced output byte-identical to a healthy
+ *   store, so a monitor could not tell green from blind. When this is non-null,
+ *   `active` and `historical` are empty FOR LACK OF OBSERVATION, not lack of
+ *   damage. Check it before concluding anything.
+ * - `historical` — a quarantine artifact whose `(label, prop)` is served again
+ *   by a working index. It used to stay in the one array forever, because #442
+ *   never cleans artifacts up, so a repaired store could go green to red and
+ *   never back. An alert that will not clear after the problem is fixed gets
+ *   muted, and a muted alert is worse than none. Reported rather than
+ *   suppressed because #442 records no reason at quarantine time and writes no
+ *   sidecar: the artifact file is the only surviving evidence of the incident.
+ * - `healthy` — computed natively as `!unscannable && active.length === 0`, so
+ *   a caller cannot get the composition wrong. An unscannable report is NOT
+ *   healthy: not knowing is not the same as being fine.
+ */
+export interface VectorIndexDamageReport {
+  /**
+   * Present when `vector_indexes/` could not be listed; the string says why.
+   * ABSENT (not null) when the scan succeeded — the native layer omits the
+   * property rather than setting it, so test it for truthiness.
+   *
+   * While set, `active` and `historical` are empty because nothing was
+   * observed — not because nothing is wrong.
+   */
+  unscannable?: string
+  /**
+   * Damage that is still unrecovered. The vectors for these pairs are not in
+   * service and writes to them are being dropped. This is the alert.
+   */
+  active: Array<VectorIndexLoadFailure>
+  /**
+   * Quarantine artifacts whose `(label, prop)` a working index now serves.
+   * Forensics for an operator; a monitor ignores this.
+   */
+  historical: Array<VectorIndexLoadFailure>
+  /** `!unscannable && active.length === 0`. Computed natively. */
+  healthy: boolean
+}
+/**
  * Top-level database handle.
  *
  * ```typescript
@@ -125,7 +186,8 @@ export declare class SparrowDB {
    */
   static open(path: string): SparrowDB
   /**
-   * Report every vector index at `path` whose bytes are damaged.
+   * Deep damage report for the vector indexes at `path`: reads and validates
+   * every live index file.
    *
    * **Static**, and deliberately so: the database this diagnoses is usually
    * one that will not open. `open` fails with a `Corruption` error when a
@@ -133,16 +195,20 @@ export declare class SparrowDB {
    * *which* files caused it — so requiring an instance would make it
    * unreachable in the exact situation it exists for.
    *
-   * **Never throws.** An unreadable or absent directory yields `[]`; there
-   * is no configuration of the filesystem that turns the diagnostic itself
-   * into a second failure to diagnose. An empty array therefore means "no
-   * damage found", which includes the ordinary case of a database with no
-   * vector indexes at all.
+   * **Never throws.** There is no configuration of the filesystem that turns
+   * the diagnostic itself into a second failure to diagnose. A directory it
+   * cannot list is reported in `unscannable` rather than raised.
    *
-   * Two kinds of damage are reported:
+   * **Not for a poll loop.** This deserialises every HEALTHY index it finds —
+   * for an 8 MB `Knowledge.embedding` index polled hourly, 8 MB of I/O and a
+   * complete HNSW graph rebuild an hour, spent confirming that nothing is
+   * wrong. Use `SparrowDB.vectorIndexDamageScan` for monitoring and this for
+   * "why will my database not open?".
    *
-   * - **live but unloadable** — `hnsw_<label>_<prop>.bin` is present and
-   *   rejected; `open` fails on these;
+   * Damage is reported in both places it can live:
+   *
+   * - **live but not serving** — `hnsw_<label>_<prop>.bin` is present and
+   *   either does not resolve or does not load; `open` fails on these;
    * - **already quarantined** — `hnsw_<label>_<prop>.bin.corrupt.<millis>`,
    *   bytes a previous load attempt moved aside (#442).
    *
@@ -152,19 +218,54 @@ export declare class SparrowDB {
    * so vector writes for that pair are dropped and searches return nothing.
    * Nothing else distinguishes that store from a healthy one.
    *
-   * Not read-only when composed with #442: probing a live entry may
-   * quarantine it. The observable result is unchanged — a file quarantined
-   * during one call is reported as a quarantine artifact by the next.
+   * **Read-only since #456.** It used to quarantine the live entries it
+   * probed, so a second call answered differently from the first and the
+   * `path` it reported had already been renamed away by the time you read it.
+   * Both are fixed: run it as often as you like, and `path` resolves.
    *
    * ```typescript
-   * const failures = SparrowDB.vectorIndexLoadFailures('/path/to/my.db')
-   * // [{ label: 'Memory', prop: 'embedding',
-   * //    path: '/path/to/my.db/vector_indexes/hnsw_Memory_embedding.bin',
-   * //    reason: 'HNSW index ... is corrupt ...' }]
-   * if (failures.length > 0) alert(failures.map(f => f.path))
+   * const report = SparrowDB.vectorIndexLoadFailures('/path/to/my.db')
+   * if (report.unscannable) throw new Error(`cannot inspect: ${report.unscannable}`)
+   * if (!report.healthy) alert(report.active.map(f => f.path))
+   * // report.historical — damage already recovered from; do not alert
    * ```
    */
-  static vectorIndexLoadFailures(path: string): Array<VectorIndexLoadFailure>
+  static vectorIndexLoadFailures(path: string): VectorIndexDamageReport
+  /**
+   * Cheap damage report for the vector indexes at `path`: directory metadata
+   * only, no index file contents read.
+   *
+   * **This is the call for a monitor.** Its cost is one directory listing plus
+   * one `stat` per live index, independent of index size, so it is safe at any
+   * poll frequency. `SparrowDB.vectorIndexLoadFailures` is the deep
+   * counterpart and deserialises every healthy index on every call.
+   *
+   * **Static** and **never throws**, for the same reasons.
+   *
+   * What it sees: quarantine artifacts, split into `active` and `historical`
+   * by whether a live index now serves the pair, and live entries that do not
+   * resolve. What it does not: whether a live index still DECODES.
+   *
+   * That is sound for a RUNNING store, and the reason is structural rather
+   * than convenient: `open` loads and validates every live index and refuses
+   * to start when one fails, so a store that is up has had every live file
+   * verified already. The question a monitor is left asking is "did we
+   * quarantine something and lose vectors?", which is exactly what this
+   * answers without reading a payload byte.
+   *
+   * It cannot tell you why a database refuses to OPEN. Use
+   * `SparrowDB.vectorIndexLoadFailures` for that.
+   *
+   * Not to be confused with the instance method `db.vectorIndexHealth(label,
+   * prop)`, which counts reachable vectors inside one healthy index.
+   *
+   * ```typescript
+   * const report = SparrowDB.vectorIndexDamageScan('/path/to/my.db')
+   * if (report.unscannable) page('cannot read the index directory')
+   * else if (!report.healthy) page(report.active.map(f => `${f.label}.${f.prop}`))
+   * ```
+   */
+  static vectorIndexDamageScan(path: string): VectorIndexDamageReport
   /**
    * Execute a Cypher query and return `{ columns, rows }`.
    *

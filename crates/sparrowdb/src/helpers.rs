@@ -364,23 +364,69 @@ enum IndexFile {
 
 /// Take one snapshot of `<dir>` and classify every recognised entry.
 ///
-/// A single `read_dir` pass matters. `VectorIndex::load` quarantines the file
-/// it rejects, so probing a live entry can *create* a quarantine artifact while
-/// we are working; snapshotting first means such an artifact cannot also be
-/// picked up in the same call and reported twice.
+/// A single `read_dir` pass matters on the open path: `load_and_quarantine`
+/// renames the file it rejects, so probing a live entry can *create* a
+/// quarantine artifact while we are working; snapshotting first means such an
+/// artifact cannot also be picked up in the same call and reported twice.
+/// (Since #456 the diagnostic uses the non-destructive `load` and cannot create
+/// artifacts at all, but the open path still can.)
 ///
 /// Results are sorted so callers get a deterministic order regardless of
 /// directory iteration order.
 ///
-/// Returns an empty vector when the directory does not exist (a database that
-/// has never had a vector index created).
-fn scan_vector_index_dir(dir: &Path) -> Vec<IndexFile> {
-    let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return found;
+/// # "Nothing here" and "cannot tell" are different answers (#456)
+///
+/// `Ok(vec![])` means the directory was read and holds no recognised entry —
+/// including the ordinary case of a database that never created a vector index,
+/// where the directory does not exist at all.
+///
+/// `Err(reason)` means the directory could **not** be listed: a permission
+/// block, a plain file or dangling symlink sitting where the directory belongs,
+/// an I/O error.  This used to collapse into the same empty vector, so a
+/// `chmod 000` on `vector_indexes/` produced a result byte-identical to a
+/// genuinely healthy store.  A monitor could not distinguish green from blind,
+/// and a misconfigured service account or a transient mount failure during a
+/// poll reported "healthy".
+fn scan_vector_index_dir(dir: &Path) -> std::result::Result<Vec<IndexFile>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // An absent directory is the ordinary "no vector index was ever
+        // created" state.  `symlink_metadata` does not follow links, so a
+        // dangling symlink in the directory's place is *not* absent — it lands
+        // in the arm below, where it belongs.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(dir).is_err() =>
+        {
+            return Ok(Vec::new())
+        }
+        Err(e) => {
+            return Err(format!(
+                "{} could not be listed ({e}); the contents of this database's vector \
+                 index directory are unknown, so the absence of reported damage means \
+                 nothing was observed, not that nothing is wrong",
+                dir.display()
+            ))
+        }
     };
-    for entry in entries.flatten() {
+    let mut found = Vec::new();
+    for entry in entries {
+        // A per-entry error is the same blindness at a finer grain: we know
+        // something is there and cannot say what.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                return Err(format!(
+                    "an entry in {} could not be read ({e}); the listing is incomplete, \
+                     so no conclusion about damage can be drawn from it",
+                    dir.display()
+                ))
+            }
+        };
         let name = entry.file_name();
+        // Our own names are ASCII by construction (`index_path` sanitises), so a
+        // non-UTF-8 name cannot be an index of ours and is genuinely not ours to
+        // report on.
         let Some(name) = name.to_str() else { continue };
         if let Some(stem) = name.strip_suffix(".bin") {
             if let Some((label, prop)) = parse_index_stem(stem) {
@@ -397,7 +443,7 @@ fn scan_vector_index_dir(dir: &Path) -> Vec<IndexFile> {
         }
     }
     found.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
-    found
+    Ok(found)
 }
 
 fn sort_key(f: &IndexFile) -> (&str, &str, &Path) {
@@ -440,17 +486,33 @@ fn sort_key(f: &IndexFile) -> (&str, &str, &Path) {
 /// taken out of service, so they must not hold the database hostage on every
 /// subsequent start.  They stay visible through
 /// [`vector_index_load_failures`] instead.
+///
+/// # Every damaged file is probed, not just the first (#456)
+///
+/// This used to `return` on the first `Err`, so exactly one bad file was probed
+/// — and therefore quarantined — per `open()`.  With two damaged indexes that
+/// cost three restarts to reach a database that opens, and the operator saw one
+/// index named per attempt while the other stayed invisible.  The loop now runs
+/// to completion and reports every failure in one error, so a single failed
+/// `open` tells the operator the full extent of the damage.
 pub(crate) fn load_vector_indexes(db_root: &Path) -> crate::Result<crate::types::VectorIndexMap> {
     let dir = db_root.join("vector_indexes");
     let mut map: crate::types::VectorIndexMap = HashMap::new();
-    for (label, prop) in scan_vector_index_dir(&dir)
-        .into_iter()
-        .filter_map(|f| match f {
-            IndexFile::Live { label, prop } => Some((label, prop)),
-            IndexFile::Quarantined { .. } => None,
-        })
-    {
-        match sparrowdb_storage::VectorIndex::load(&dir, &label, &prop) {
+    let mut failures: Vec<String> = Vec::new();
+    // A directory we cannot list is not a directory we can declare empty.
+    // Opening anyway would mean "no index configured" for every pair that might
+    // be in there, and every vector write for them dropped on the floor — the
+    // silent outage this whole path is fail-closed to prevent (#456).
+    let entries = scan_vector_index_dir(&dir).map_err(Error::Corruption)?;
+    for (label, prop) in entries.into_iter().filter_map(|f| match f {
+        IndexFile::Live { label, prop } => Some((label, prop)),
+        IndexFile::Quarantined { .. } => None,
+    }) {
+        // The open path is the one caller entitled to quarantine: it is about to
+        // take ownership of this `(label, prop)` slot, so a later `save()` here
+        // is what would overwrite the damaged bytes.  Readers use the
+        // non-destructive `load` (#456).
+        match sparrowdb_storage::VectorIndex::load_and_quarantine(&dir, &label, &prop) {
             Ok(Some(idx)) => {
                 map.insert((label, prop), Arc::new(RwLock::new(idx)));
             }
@@ -458,83 +520,323 @@ pub(crate) fn load_vector_indexes(db_root: &Path) -> crate::Result<crate::types:
             // gone — it was removed between the scan and the read.  Nothing was
             // lost that we can observe, so treat it as absent.
             Ok(None) => continue,
-            Err(e) => {
-                return Err(Error::Corruption(format!(
-                    "vector index for ({label}, {prop}) exists at {} but could not be loaded: {e}. \
-                     Refusing to open: continuing would silently drop every vector write for this \
-                     index and return no results for every search. Move the file aside and re-open \
-                     to run without it, then rebuild the index.",
-                    dir.join(format!("hnsw_{label}_{prop}.bin")).display(),
-                )));
-            }
+            Err(e) => failures.push(format!(
+                "({label}, {prop}) at {}: {e}",
+                dir.join(format!("hnsw_{label}_{prop}.bin")).display(),
+            )),
         }
+    }
+    if !failures.is_empty() {
+        return Err(Error::Corruption(format!(
+            "{} vector index file(s) exist but could not be loaded: {}. \
+             Refusing to open: continuing would silently drop every vector write for these \
+             indexes and return no results for every search. Move the files aside and re-open \
+             to run without them, then rebuild the indexes.",
+            failures.len(),
+            failures.join("; "),
+        )));
     }
     Ok(map)
 }
 
-/// Report every vector index whose bytes are damaged, whether they are still
-/// in place or have already been moved aside.  Each entry is
-/// `(label, prop, path, reason)`, sorted for determinism.
+/// One vector index that is not in service, and why.
 ///
-/// Diagnostic counterpart to [`load_vector_indexes`]: it never returns `Err`,
-/// so it can be called on a database that refuses to open in order to find out
-/// *which* files are the problem.  An empty result means no damage is present —
-/// including the ordinary case of a database with no vector indexes at all.
+/// `path` names bytes that are actually on disk when the report is handed to
+/// you — the machine-readable field, and the one a caller can act on.  `reason`
+/// is prose: for a live file it is the loader's own error, for a quarantine
+/// artifact it is reconstructed, because #442 records the decode failure only in
+/// the `io::Error` it returns at quarantine time and writes no sidecar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorIndexFailure {
+    /// Node label the index belongs to.
+    pub label: String,
+    /// Property the index is built on.
+    pub prop: String,
+    /// The file these findings are about.  Exact, and it resolves.
+    pub path: PathBuf,
+    /// Human-readable explanation.  Not machine-parseable; not stable.
+    pub reason: String,
+}
+
+/// What an inspection of `<db_root>/vector_indexes/` observed.
 ///
-/// Two kinds of damage are reported, because #442 leaves damage in two
-/// different places and reporting only one of them recreates the very defect
-/// this function exists to prevent:
+/// The three fields exist because a health report has three distinct things to
+/// say and collapsing any two of them has already cost this project an incident:
 ///
-/// * **Live but unloadable** — `hnsw_<label>_<prop>.bin` is present and
-///   `VectorIndex::load` rejects it.  `open` fails on these.  #442 quarantines
-///   *some* of them (bad magic/length/CRC) but deliberately not all: a file
-///   that decodes cleanly and then fails `validate_invariants` is left in place
-///   for inspection, so it stays visible here as a live entry.
-/// * **Already quarantined** — `hnsw_<label>_<prop>.bin.corrupt.<millis>`, the
-///   bytes a previous load attempt rejected and renamed aside (#442).  `open`
-///   succeeds once a file has been quarantined, because the damaged bytes are
-///   out of service; without this arm the *only* remaining evidence of the
-///   damage would be invisible, and a health check built on this call would
-///   report a clean bill on exactly the database whose vectors are gone.
+/// * `unscannable` — "I could not look."  Distinct from "I looked and found
+///   nothing," which is what the old `Vec` return said in both cases.
+/// * `active` — unrecovered damage.  This is what a monitor should alert on.
+/// * `historical` — damage that has since been recovered from.  Forensics, not
+///   an alarm.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VectorIndexHealth {
+    /// `Some(reason)` when `vector_indexes/` could not be listed at all, in
+    /// which case `active` and `historical` are empty **for lack of
+    /// observation, not lack of damage**.
+    ///
+    /// A `chmod 000` on the directory, a plain file where the directory belongs,
+    /// a dangling symlink, a transient mount failure during a poll: each used to
+    /// return an empty vector byte-identical to a genuinely healthy store, so a
+    /// monitor could not tell green from blind.  Check this field before
+    /// concluding anything from the other two.
+    pub unscannable: Option<String>,
+    /// Damage that is still unrecovered: the vectors for these pairs are not in
+    /// service, and writes to them are being dropped.  Alert on this.
+    pub active: Vec<VectorIndexFailure>,
+    /// Quarantine artifacts whose `(label, prop)` has since been rebuilt — a
+    /// working index now serves the pair, so the artifact is debris.
+    ///
+    /// Reported separately rather than suppressed because #442 records no reason
+    /// at quarantine time, which makes the artifact the only surviving evidence
+    /// that the incident happened at all.  A monitor ignores this field; an
+    /// operator investigating "when did we lose vectors for this pair?" needs it.
+    ///
+    /// This is the field that decides whether the report is usable as an alarm.
+    /// Artifacts are never cleaned up automatically, so a report that keeps
+    /// naming a repaired pair can only ever go from green to red with no path
+    /// back — and an alert that never clears after the problem is fixed trains
+    /// people to ignore it, which is worse than no alert, because the attention
+    /// has been spent and nothing was bought with it.
+    pub historical: Vec<VectorIndexFailure>,
+}
+
+impl VectorIndexHealth {
+    /// True only when the directory was successfully scanned **and** no
+    /// unrecovered damage was found.
+    ///
+    /// An `unscannable` report is never healthy: not knowing is not the same as
+    /// being fine.
+    pub fn is_healthy(&self) -> bool {
+        self.unscannable.is_none() && self.active.is_empty()
+    }
+}
+
+/// How hard to look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Depth {
+    /// Directory metadata only: names, plus one `stat` per live entry to
+    /// confirm it resolves.  No file *contents* are ever read, so the cost is
+    /// independent of index size.
+    Names,
+    /// Additionally deserialise and structurally validate every live index.
+    Contents,
+}
+
+/// Cheap health report: directory metadata only, no index contents read.
 ///
-/// The `reason` for a quarantined artifact is reconstructed, not recovered:
-/// #442 records the decode failure only in the `io::Error` it returns at
-/// quarantine time and writes no sidecar, so the original message is not
-/// recoverable from disk afterwards.  The path is exact.
+/// # Why the cheap tier exists (#456)
+///
+/// The deep tier fully deserialises every **healthy** index on every call.  For
+/// KMSmcp's 8 MB `Knowledge.embedding` index, polled hourly, that is 8 MB of
+/// I/O and a complete HNSW graph rebuild an hour spent to confirm that nothing
+/// is wrong.  The mutation this issue is named for was a correctness problem in
+/// an edge case; this is a permanent cost in the common case, and it is the
+/// reason the split holds even for someone who thinks the mutation was
+/// acceptable.
+///
+/// This tier is safe at any poll frequency: zero mutation, zero content I/O.
+///
+/// # What it can and cannot see
+///
+/// It reports quarantine artifacts (reconciled against live files, see
+/// [`VectorIndexHealth::historical`]) and live entries that do not resolve.  It
+/// does **not** verify that a live index still decodes.
+///
+/// That is the right trade for monitoring a *running* store, and the reason is
+/// structural rather than convenient: `open` loads and validates every live
+/// index, and refuses to start when one fails.  A store that is up has already
+/// had every live file verified, and the residual question a monitor is asking
+/// is "did we quarantine something and lose vectors?" — which is exactly what
+/// this answers, without reading a byte of payload.
+///
+/// It cannot tell you why a database refuses to *open*.  `open`'s own error
+/// names every damaged file and its reason; [`vector_index_load_failures`]
+/// re-derives the same thing without opening.
+pub(crate) fn vector_index_health(db_root: &Path) -> VectorIndexHealth {
+    health(db_root, Depth::Names)
+}
+
+/// Deep health report: everything [`vector_index_health`] reports, plus a real
+/// load and structural validation of every live index file.
+///
+/// This is the "why will this database not open, and which file is it?" call.
+/// Use it from an operator's hands, from a failed-start path, or from a
+/// deliberate integrity check — not from a poll loop, because it deserialises
+/// every healthy index it finds.
+///
+/// It never returns `Err`, so it can be called on a database that refuses to
+/// open.
 ///
 /// # Side effects
 ///
-/// Not read-only when composed with #442: probing a live entry calls
-/// `VectorIndex::load`, which quarantines the file it rejects.  That is the
-/// intended behaviour of quarantine — it protects the only surviving copy of
-/// the vectors from the next `save()` — and the observable result of this
-/// function is unchanged by it, since a file that is quarantined during one
-/// call is reported as a quarantine artifact by the next.
-pub(crate) fn vector_index_load_failures(db_root: &Path) -> Vec<(String, String, PathBuf, String)> {
+/// None.  Read-only since #456: live entries are probed with the
+/// non-destructive [`sparrowdb_storage::VectorIndex::load`], and the
+/// quarantining variant is reserved for the open path.  Two consequences:
+///
+/// * A health check that runs twice gets the same answer as one that runs once,
+///   and neither run changes the store.  It used to quarantine on the first
+///   call, so the second call answered differently — and the first call was the
+///   one that caused the change.
+/// * The `path` of a live-arm entry still resolves when the caller receives it
+///   (#455).  It used to name the `.bin` that the same probe had already
+///   renamed away, so `exists(path)` — the obvious sanity check, and the one a
+///   health check would use to confirm damage is real — was `false` on the very
+///   first, most-acted-on report.
+///
+/// For the record, the pre-#456 mutation was idempotent: a given damaged file
+/// was quarantined once and repeat polls did no further I/O.  It destroyed
+/// exactly once per incident — silently, from something shaped like a getter.
+pub(crate) fn vector_index_load_failures(db_root: &Path) -> VectorIndexHealth {
+    health(db_root, Depth::Contents)
+}
+
+/// Shared implementation of both tiers.
+///
+/// Damage is reported in two places because #442 leaves it in two places, and
+/// reporting only one of them recreates the very defect this exists to prevent:
+///
+/// * **Live but not serving** — `hnsw_<label>_<prop>.bin` is present and either
+///   does not resolve (a dangling symlink) or, at `Depth::Contents`, does not
+///   load.  `open` fails on these.  #442 quarantines *some* of them (bad
+///   magic/length/CRC) but deliberately not all: a file that decodes cleanly and
+///   then fails `validate_invariants` is left in place for inspection, so it
+///   stays visible here as a live entry.
+/// * **Quarantined** — `hnsw_<label>_<prop>.bin.corrupt.<millis>`, the bytes a
+///   previous load attempt rejected and renamed aside (#442).  `open` succeeds
+///   once a file has been quarantined, because the damaged bytes are out of
+///   service; without this arm the *only* remaining evidence of the damage would
+///   be invisible, and a health check built on this call would report a clean
+///   bill on exactly the database whose vectors are gone (#450).
+///
+/// An artifact is `active` while its pair has nothing serving it and
+/// `historical` once something does.  #450 is the case where the artifact is
+/// the *only* file for the pair — still `active`, still alarming.  What changed
+/// is only the case where a working index sits beside it.
+///
+/// The limit, stated plainly: neither tier can tell whether a rebuilt index
+/// contains everything the artifact held.  Nothing can — the artifact does not
+/// decode, which is why it is an artifact.  Completeness after a deliberate
+/// rebuild is not a property this call is able to assert, and staying red
+/// forever would not have asserted it either.
+fn health(db_root: &Path, depth: Depth) -> VectorIndexHealth {
     let dir = db_root.join("vector_indexes");
-    let mut failures = Vec::new();
-    for entry in scan_vector_index_dir(&dir) {
-        match entry {
-            IndexFile::Live { label, prop } => {
-                if let Err(e) = sparrowdb_storage::VectorIndex::load(&dir, &label, &prop) {
-                    let path = dir.join(format!("hnsw_{label}_{prop}.bin"));
-                    failures.push((label, prop, path, e.to_string()));
-                }
-            }
-            IndexFile::Quarantined { label, prop, path } => {
-                let reason = format!(
-                    "index file was rejected by a previous load attempt and preserved as {} \
-                     (#442 quarantine). The vectors it held are not in service and cannot be \
-                     rebuilt from column data; the original decode failure is not recorded on \
-                     disk. Recover from these bytes or rebuild the index deliberately, then \
-                     remove the artifact to clear this report.",
-                    path.display(),
-                );
-                failures.push((label, prop, path, reason));
+    let entries = match scan_vector_index_dir(&dir) {
+        Ok(entries) => entries,
+        Err(reason) => {
+            return VectorIndexHealth {
+                unscannable: Some(reason),
+                ..Default::default()
             }
         }
+    };
+
+    // Pass 1 — live entries.  Nothing here renames anything, at either depth.
+    let mut serving: HashSet<(String, String)> = HashSet::new();
+    let mut active: Vec<VectorIndexFailure> = Vec::new();
+    for entry in &entries {
+        let IndexFile::Live { label, prop } = entry else {
+            continue;
+        };
+        let path = dir.join(format!("hnsw_{label}_{prop}.bin"));
+
+        // One `stat`, no contents.  `read_dir` listed this name, so the entry is
+        // there; `exists` follows symlinks, so a `false` here means the entry
+        // resolves to nothing.  Classifying that as "absent" — which is what the
+        // loader's old `if !path.exists()` did — is the present-but-treated-as-
+        // absent failure #445 exists to kill: the pair silently becomes "no
+        // index configured" and every write for it is dropped.
+        if !path.exists() {
+            active.push(VectorIndexFailure {
+                label: label.clone(),
+                prop: prop.clone(),
+                path,
+                reason: "a directory entry with this name exists but does not resolve to a \
+                         readable file — most likely a symbolic link whose target has been \
+                         removed. It is not an absent index: the pair is configured, and \
+                         treating it as unconfigured would silently drop every vector write \
+                         for it."
+                    .to_owned(),
+            });
+            continue;
+        }
+
+        match depth {
+            // Present and resolving is as much as this tier claims.  Enough to
+            // reconcile artifacts against, and honest about being no more.
+            Depth::Names => {
+                serving.insert((label.clone(), prop.clone()));
+            }
+            Depth::Contents => match sparrowdb_storage::VectorIndex::load(&dir, label, prop) {
+                Ok(Some(_)) => {
+                    serving.insert((label.clone(), prop.clone()));
+                }
+                // Listed by the scan but gone by the time we read it — removed
+                // underneath us.  Neither serving nor damaged; deliberately not
+                // counted as serving, so an artifact for the same pair is still
+                // reported as active below.
+                Ok(None) => {}
+                Err(e) => active.push(VectorIndexFailure {
+                    label: label.clone(),
+                    prop: prop.clone(),
+                    path,
+                    reason: e.to_string(),
+                }),
+            },
+        }
     }
-    failures
+
+    // Pass 2 — artifacts, split on whether the pair has since been rebuilt.
+    let mut historical: Vec<VectorIndexFailure> = Vec::new();
+    for entry in entries {
+        let IndexFile::Quarantined { label, prop, path } = entry else {
+            continue;
+        };
+        let superseded = serving.contains(&(label.clone(), prop.clone()));
+        let reason = if superseded {
+            format!(
+                "index file was rejected by a previous load attempt and preserved as {} \
+                 (#442 quarantine). A working index now serves this (label, prop), so the \
+                 pair is back in service and these bytes are debris — kept because they are \
+                 the only surviving evidence that the incident happened. Whether the \
+                 rebuilt index holds everything these bytes held cannot be determined: they \
+                 do not decode. Remove the artifact when you are done with it.",
+                path.display(),
+            )
+        } else {
+            format!(
+                "index file was rejected by a previous load attempt and preserved as {} \
+                 (#442 quarantine). The vectors it held are not in service and cannot be \
+                 rebuilt from column data; the original decode failure is not recorded on \
+                 disk. Recover from these bytes or rebuild the index deliberately, then \
+                 remove the artifact to clear this report.",
+                path.display(),
+            )
+        };
+        let failure = VectorIndexFailure {
+            label,
+            prop,
+            path,
+            reason,
+        };
+        if superseded {
+            historical.push(failure);
+        } else {
+            active.push(failure);
+        }
+    }
+
+    // Sorted for determinism: the two passes above would otherwise group all
+    // live failures ahead of all artifacts regardless of name.
+    let by_name = |a: &VectorIndexFailure, b: &VectorIndexFailure| {
+        (&a.label, &a.prop, &a.path).cmp(&(&b.label, &b.prop, &b.path))
+    };
+    active.sort_by(by_name);
+    historical.sort_by(by_name);
+    VectorIndexHealth {
+        unscannable: None,
+        active,
+        historical,
+    }
 }
 
 // ── Storage-size helpers (SPA-171) ────────────────────────────────────────────

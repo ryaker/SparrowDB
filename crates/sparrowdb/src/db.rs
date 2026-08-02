@@ -9,7 +9,7 @@ use crate::helpers::{
     build_label_row_counts_from_disk, collect_maintenance_params, dir_size_bytes, eval_expr_merge,
     expr_to_value, expr_to_value_with_params, fnv1a_col_id, is_edge_delete_mutation,
     is_reserved_label, literal_to_value, load_constraints, load_vector_indexes, open_csr_map,
-    save_constraints, storage_value_to_exec, try_open_csr_map,
+    save_constraints, storage_value_to_exec, try_open_csr_map, VectorIndexHealth,
 };
 use crate::read_tx::ReadTx;
 use crate::types::{DbInner, NodeVersions, PendingOp, VersionStore, WriteBuffer, WriteGuard};
@@ -26,7 +26,7 @@ use sparrowdb_storage::wal::codec::WalPayload;
 use sparrowdb_storage::wal::writer::WalWriter;
 use sparrowdb_storage::wal::WalReplayer;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::{info_span, warn};
@@ -72,12 +72,17 @@ impl GraphDb {
     ///
     /// Besides the usual I/O and WAL-replay failures, this returns
     /// [`Error::Corruption`] when a persisted vector index file exists under
-    /// `<path>/vector_indexes/` but cannot be loaded.  Opening anyway would
-    /// silently drop every subsequent vector write for that `(label, prop)` and
-    /// return nothing for every search, so the database refuses to open instead.
-    /// Use [`GraphDb::vector_index_load_failures`] to find out which files are
-    /// at fault.  A database with *no* vector index files is unaffected —
-    /// absent is not the same as damaged.
+    /// `<path>/vector_indexes/` but cannot be loaded — or when that directory
+    /// exists and cannot be listed at all, which is the same condition seen
+    /// from further away.  Opening anyway would silently drop every subsequent
+    /// vector write for that `(label, prop)` and return nothing for every
+    /// search, so the database refuses to open instead.
+    ///
+    /// The error names **every** file at fault, not just the first: two damaged
+    /// indexes used to cost three restarts to get past, each naming only one of
+    /// them (#456).  [`GraphDb::vector_index_load_failures`] re-derives the same
+    /// report without opening.  A database with *no* vector index files is
+    /// unaffected — absent is not the same as damaged.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let wal_dir = path.join("wal");
@@ -2180,22 +2185,43 @@ impl GraphDb {
         Ok(())
     }
 
-    /// Report every persisted vector index under `path` whose bytes are
-    /// damaged.  Each entry is `(label, prop, path, reason)`, sorted for
-    /// determinism.
+    /// Cheap health report for the vector indexes under `path`: directory
+    /// metadata only, no index contents read, nothing mutated.
+    ///
+    /// This is the call for a poll loop.  Its cost is independent of index size,
+    /// so it is safe at any frequency.  [`GraphDb::vector_index_load_failures`]
+    /// is the deep counterpart: it additionally deserialises and validates every
+    /// live index, which for an 8 MB index polled hourly is 8 MB of I/O and a
+    /// full HNSW graph rebuild an hour spent confirming that nothing is wrong.
+    ///
+    /// Check [`VectorIndexHealth::unscannable`] before drawing any conclusion
+    /// from the result: a directory that could not be listed reports no damage
+    /// because nothing was observed, not because nothing is wrong.
+    /// [`VectorIndexHealth::is_healthy`] already accounts for that.
+    ///
+    /// What this tier sees: quarantine artifacts (split into `active` and
+    /// `historical` by whether something now serves the pair) and live entries
+    /// that do not resolve.  What it does not: whether a live index still
+    /// decodes.  That is sound for a *running* store, because [`GraphDb::open`]
+    /// loads and validates every live index and refuses to start when one fails
+    /// — a store that is up has had every live file verified already.
+    pub fn vector_index_health(path: &Path) -> VectorIndexHealth {
+        crate::helpers::vector_index_health(path)
+    }
+
+    /// Deep health report for the vector indexes under `path`: everything
+    /// [`GraphDb::vector_index_health`] reports, plus a real load and structural
+    /// validation of every live index file.
     ///
     /// This never returns `Err`, so it can be called on a database that refuses
     /// to open — it is the diagnostic side of the fail-closed policy in
-    /// [`GraphDb::open`]. An empty result means no damage is present, which
-    /// includes the ordinary case of a database with no vector indexes at all.
-    /// That is the distinction the loader used to collapse: an **absent** index
-    /// file means "no index configured" and is not an error, while a damaged
-    /// one is reported here.
+    /// [`GraphDb::open`], and answers "which file is the problem, and why?".
+    /// Use it from an operator's hands or a failed-start path, not a poll loop.
     ///
     /// Damage is reported in both the places it can live:
     ///
-    /// * a live `hnsw_<label>_<prop>.bin` that will not load — these also make
-    ///   `open` fail;
+    /// * a live `hnsw_<label>_<prop>.bin` that will not resolve or will not load
+    ///   — these also make `open` fail;
     /// * a `hnsw_<label>_<prop>.bin.corrupt.<millis>` artifact that a previous
     ///   load attempt rejected and moved aside (#442) — `open` succeeds once a
     ///   file has been quarantined, so this is the *only* remaining signal that
@@ -2206,16 +2232,16 @@ impl GraphDb {
     /// and whose vector writes are therefore being dropped — the same silent
     /// failure this API exists to eliminate.
     ///
-    /// The `path` is exact. The `reason` for a quarantine artifact is
-    /// reconstructed rather than recovered: the original decode failure is
-    /// reported only in the error returned at quarantine time and is not
-    /// persisted to disk.
+    /// The `path` of every entry is exact and resolves.  The `reason` for a
+    /// quarantine artifact is reconstructed rather than recovered: the original
+    /// decode failure is reported only in the error returned at quarantine time
+    /// and is not persisted to disk.
     ///
-    /// Note that this is not a read-only call when composed with #442: probing
-    /// a live entry may quarantine it. See the crate-internal
-    /// `helpers::vector_index_load_failures` for why that does not change the
-    /// result you observe.
-    pub fn vector_index_load_failures(path: &Path) -> Vec<(String, String, PathBuf, String)> {
+    /// This call is **read-only** (#456). It probes live entries without
+    /// quarantining them, so running it twice gives the same answer as running
+    /// it once, and the `path` it reports still resolves when you receive it
+    /// (#455).
+    pub fn vector_index_load_failures(path: &Path) -> VectorIndexHealth {
         crate::helpers::vector_index_load_failures(path)
     }
 

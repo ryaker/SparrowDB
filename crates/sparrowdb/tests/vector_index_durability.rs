@@ -112,6 +112,11 @@ fn shorter_index_written_over_longer_file_is_rejected_not_silently_truncated() {
 ///
 /// Expected: exactly one `*.corrupt.*` sibling exists afterwards, and it is
 /// byte-identical to the damaged image we wrote.
+///
+/// Since #456 quarantine is opt-in: it belongs to `load_and_quarantine`, the
+/// open path's loader, because that is the caller whose later `save()` would
+/// overwrite the damaged bytes.  Plain `load` is non-destructive — see
+/// `regression_456_load_is_not_destructive.rs`.
 #[test]
 fn rejected_index_file_is_quarantined_rather_than_left_to_be_overwritten() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -129,7 +134,7 @@ fn rejected_index_file_is_quarantined_rather_than_left_to_be_overwritten() {
     damaged[victim] ^= 0xFF;
     std::fs::write(&path, &damaged).expect("write damaged");
 
-    let err = VectorIndex::load(dir.path(), "L", "p")
+    let err = VectorIndex::load_and_quarantine(dir.path(), "L", "p")
         .expect_err("a single flipped payload byte must be detected");
     assert!(
         err.to_string().contains("corrupt"),

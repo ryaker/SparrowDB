@@ -31,6 +31,9 @@ serde_json      = { workspace = true }
 criterion       = { workspace = true }
 crc32fast       = { workspace = true }
 sparrowdb-bench = { path = "../sparrowdb-bench" }
+# Test-only: regression_456 counts `tracing::warn!` events to prove a damaged
+# index warns once per incident rather than once per scanned row.
+tracing-subscriber = { workspace = true }
 
 [[bin]]
 name = "sparrowdb-mcp"

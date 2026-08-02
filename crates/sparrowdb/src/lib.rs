@@ -97,6 +97,10 @@ pub use helpers::fnv1a_col_id;
 /// Escape a Rust `&str` for safe interpolation inside a Cypher single-quoted string.
 pub use helpers::cypher_escape_string;
 
+/// Vector index health reporting — see [`GraphDb::vector_index_health`] and
+/// [`GraphDb::vector_index_load_failures`].
+pub use helpers::{VectorIndexFailure, VectorIndexHealth};
+
 // ── Legacy alias ──────────────────────────────────────────────────────────────
 
 /// Legacy alias kept for backward compatibility with Phase 0 tests.
