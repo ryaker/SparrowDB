@@ -76,23 +76,11 @@ pub(crate) fn delta_neighbors_from_index(
         .unwrap_or_default()
 }
 
-/// Look up delta neighbors for a given `(src_label_id, src_slot)` and return
-/// `(dst_slot, dst_label_id)` pairs extracted from the full dst `NodeId`.
-pub(crate) fn delta_neighbors_labeled_from_index(
-    index: &DeltaIndex,
-    src_label_id: u32,
-    src_slot: u64,
-) -> impl Iterator<Item = (u64, u32)> + '_ {
-    index
-        .get(&(src_label_id, src_slot))
-        .into_iter()
-        .flat_map(|recs| {
-            recs.iter().map(|r| {
-                let (dst_label, dst_slot) = node_id_parts(r.dst.0);
-                (dst_slot, dst_label)
-            })
-        })
-}
+// NOTE (#427): `delta_neighbors_labeled_from_index` was removed here.  Its only
+// caller was `bfs_shortest_path`, which used it to guess a neighbour's label
+// *after* the label had already been thrown away by a slot-only lookup.
+// `Engine::get_node_neighbors_labeled` keeps the label attached throughout and
+// is the correct entry point.
 
 // ── DegreeCache (SPA-272) ─────────────────────────────────────────────────────
 

@@ -758,20 +758,39 @@ impl Engine {
                 }
             };
 
-        let dst_slot = if let Some(nid) = self.resolve_node_id_from_var(&sp.dst_var, vals) {
-            nid.0 & 0xFFFF_FFFF
-        } else {
-            let dst_label_id = match self.snapshot.catalog.get_label(&sp.dst_label) {
-                Ok(Some(id)) => id as u32,
-                _ => return Value::Null,
+        // #427: the destination's label is part of its identity — a `NodeId` is
+        // `(label_id << 32) | slot`, so slot 0 exists once per label. Carrying
+        // only the slot let a `City` stand in for a `Person`.
+        let (dst_label_id, dst_slot) =
+            if let Some(nid) = self.resolve_node_id_from_var(&sp.dst_var, vals) {
+                (((nid.0 >> 32) as u32), nid.0 & 0xFFFF_FFFF)
+            } else {
+                let dst_label_id = match self.snapshot.catalog.get_label(&sp.dst_label) {
+                    Ok(Some(id)) => id as u32,
+                    _ => return Value::Null,
+                };
+                match self.find_node_by_props(dst_label_id, &sp.dst_props) {
+                    Some(slot) => (dst_label_id, slot),
+                    None => return Value::Null,
+                }
             };
-            match self.find_node_by_props(dst_label_id, &sp.dst_props) {
-                Some(slot) => slot,
-                None => return Value::Null,
-            }
-        };
 
-        match self.bfs_shortest_path(src_slot, src_label_id, dst_slot, 10) {
+        // #427: honour the pattern's relationship type. An empty `rel_ids` means
+        // "no type constraint" to the neighbour lookups, so a named type that is
+        // absent from the catalog must short-circuit rather than fall through to
+        // an unfiltered traversal of every edge type in the graph.
+        let rel_ids = self.resolve_rel_ids_for_type(&sp.rel_type);
+        if !sp.rel_type.is_empty() && rel_ids.is_empty() {
+            // No relationship table of that type exists, so no edge of that type
+            // can exist. The only reachable node is the source itself.
+            return if (src_label_id, src_slot) == (dst_label_id, dst_slot) {
+                Value::Int64(0)
+            } else {
+                Value::Null
+            };
+        }
+
+        match self.bfs_shortest_path(src_slot, src_label_id, dst_slot, dst_label_id, &rel_ids, 10) {
             Some(hops) => Value::Int64(hops as i64),
             None => Value::Null,
         }
@@ -800,53 +819,78 @@ impl Engine {
         None
     }
 
-    /// BFS from `src_slot` to `dst_slot`, returning the hop count or None.
+    /// BFS from `(src_slot, src_label_id)` to `(dst_slot, dst_label_id)`,
+    /// returning the hop count or `None` when no path exists.
     ///
-    /// Each frontier node carries its own `label_id` so that delta-log edge
-    /// lookups use the correct `(label_id, slot)` key at every hop.  Without
-    /// this, BFS through heterogeneous graphs would use the source label for
-    /// all intermediate nodes, missing WAL edges on label-boundary crossings.
+    /// Every node is identified by the **pair** `(slot, label_id)`, never by the
+    /// slot alone.  A `NodeId` is `(label_id << 32) | slot`, so slots are only
+    /// unique within a label: `Person` slot 0, `City` slot 0 and `Post` slot 0
+    /// are three different nodes.  Issue #427 was caused by comparing bare slots
+    /// in the zero-hop shortcut, in the destination test and in `visited`, which
+    /// both invented paths that did not exist and pruned real ones.
+    ///
+    /// `rel_ids` restricts the traversal to those relationship-table IDs; an
+    /// empty slice means "any type".  Callers that parsed an explicit type must
+    /// resolve it (see [`Engine::resolve_rel_ids_for_type`]) and pass the result
+    /// — issue #427 also covered the BFS passing `&[]` unconditionally, which
+    /// made `[:KNOWS*]` walk every edge type in the graph.
     pub(crate) fn bfs_shortest_path(
         &self,
         src_slot: u64,
         src_label_id: u32,
         dst_slot: u64,
+        dst_label_id: u32,
+        rel_ids: &[u32],
         max_hops: u32,
     ) -> Option<u32> {
-        if src_slot == dst_slot {
+        if (src_slot, src_label_id) == (dst_slot, dst_label_id) {
             return Some(0);
         }
         // Hoist delta read out of the BFS loop to avoid repeated I/O.
         let delta_all = self.read_delta_all();
         // SPA-283: build HashMap index for O(1) per-node delta lookups.
         let delta_idx = build_delta_index(&delta_all);
+
+        // Label hints for CSR-only destinations, mirroring `execute_variable_length`:
+        // the delta log carries full NodeIds, so every (slot, label) pair it
+        // mentions is authoritative.
+        let mut node_label: std::collections::HashSet<(u64, u32)> =
+            std::collections::HashSet::new();
+        for r in &delta_all {
+            let (src_l, src_s) = node_id_parts(r.src.0);
+            node_label.insert((src_s, src_l));
+            let (dst_l, dst_s) = node_id_parts(r.dst.0);
+            node_label.insert((dst_s, dst_l));
+        }
+        let mut all_label_ids: Vec<u32> = node_label.iter().map(|&(_, l)| l).collect();
+        all_label_ids.sort_unstable();
+        all_label_ids.dedup();
+
         // Frontier carries (slot, label_id) so each hop uses the correct label
         // when probing the delta index.
-        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        visited.insert(src_slot);
+        let mut visited: std::collections::HashSet<(u64, u32)> = std::collections::HashSet::new();
+        visited.insert((src_slot, src_label_id));
         let mut frontier: Vec<(u64, u32)> = vec![(src_slot, src_label_id)];
+        let mut neighbors_buf: std::collections::HashSet<(u64, u32)> =
+            std::collections::HashSet::new();
 
         for depth in 1..=max_hops {
             let mut next_frontier: Vec<(u64, u32)> = Vec::new();
             for &(node_slot, node_label_id) in &frontier {
-                let neighbors =
-                    self.get_node_neighbors_by_slot(node_slot, node_label_id, &delta_idx, &[]);
-                for nb_slot in neighbors {
-                    if nb_slot == dst_slot {
+                self.get_node_neighbors_labeled(
+                    node_slot,
+                    node_label_id,
+                    &delta_idx,
+                    &node_label,
+                    &all_label_ids,
+                    &mut neighbors_buf,
+                    rel_ids,
+                );
+                for &(nb_slot, nb_label) in neighbors_buf.iter() {
+                    if (nb_slot, nb_label) == (dst_slot, dst_label_id) {
                         return Some(depth);
                     }
-                    if visited.insert(nb_slot) {
-                        // Recover the neighbor's label from the delta index; fall
-                        // back to node_label_id for CSR-only nodes in homogeneous
-                        // graphs (the same conservative default used elsewhere).
-                        let nb_label = delta_neighbors_labeled_from_index(
-                            &delta_idx,
-                            node_label_id,
-                            node_slot,
-                        )
-                        .find(|&(s, _)| s == nb_slot)
-                        .map(|(_, l)| l)
-                        .unwrap_or(node_label_id);
+                    if visited.insert((nb_slot, nb_label)) {
                         next_frontier.push((nb_slot, nb_label));
                     }
                 }
