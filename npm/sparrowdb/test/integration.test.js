@@ -557,14 +557,17 @@ describe('anonymous relationship patterns — issue #406 regression', () => {
       .map(e => path.join(nodesDir, e.name))
     assert.ok(labelDirs.length > 0, 'expected at least one label directory under nodes/')
 
+    //    Plant unconditionally. A fresh DB names columns by FNV hash of the
+    //    property (col_2369371622, …), so col_0.bin does not normally exist and
+    //    a conditional write happens to fire — but making the fixture depend on
+    //    that is fragile: if col_0.bin ever did exist, a conditional write would
+    //    skip it and this guard would silently stop guarding.
     let planted = 0
     for (const labelDir of labelDirs) {
       const col0 = path.join(labelDir, 'col_0.bin')
-      if (!fs.existsSync(col0)) {
-        // 8 bytes = 1 slot, while the label HWM is 4 → slots 1..3 are past EOF.
-        fs.writeFileSync(col0, Buffer.alloc(8))
-        planted++
-      }
+      // 8 bytes = 1 slot, while the label HWM is 4 → slots 1..3 are past EOF.
+      fs.writeFileSync(col0, Buffer.alloc(8))
+      planted++
     }
     assert.ok(planted > 0, 'expected to plant at least one short col_0.bin fixture')
 
