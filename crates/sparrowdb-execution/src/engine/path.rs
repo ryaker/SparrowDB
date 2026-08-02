@@ -4,37 +4,42 @@ use super::*;
 impl Engine {
     // ── Variable-length path traversal: (a)-[:R*M..N]->(b) ──────────────────
 
-    /// Collect all neighbor slot-ids reachable from `src_slot` via the delta
-    /// log and CSR adjacency.  src_label_id is used to filter delta records.
+    /// Return the labeled outgoing neighbours of `(src_slot, src_label_id)`
+    /// into `out`, each entry a `(dst_slot, dst_label_id)` pair.
     ///
-    /// SPA-185: reads across all rel types (used by variable-length path
-    /// traversal which does not currently filter on rel_type).
-    /// Return the labeled outgoing neighbors of `(src_slot, src_label_id)`.
+    /// Both edge sources agree on where the destination's label comes from, and
+    /// neither guesses:
     ///
-    /// Each entry is `(dst_slot, dst_label_id)`.  The delta log encodes the full
-    /// NodeId in `r.dst`, so label_id is recovered precisely.  For CSR-only
-    /// destinations the label is looked up in the `node_label` hint map (built
-    /// from the delta by the caller); if absent, `src_label_id` is used as a
-    /// conservative fallback (correct for homogeneous graphs).
-    #[allow(clippy::too_many_arguments)]
+    /// * **Checkpointed edges** live in a CSR, one per relationship table, and
+    ///   the catalog registers every table as `(id, src_label_id, dst_label_id,
+    ///   rel_type)`.  So a CSR hit's label is *known* — see
+    ///   [`Engine::csr_neighbors_labeled`], which also skips tables whose
+    ///   `src_label_id` does not match, because their CSR is not indexed by this
+    ///   node's slot.
+    /// * **Uncheckpointed edges** live in the delta log, which stores full
+    ///   `NodeId`s, so the label is read straight off `r.dst`.
+    ///
+    /// Issue #431: this used to recover CSR neighbour labels from hints built
+    /// out of `read_delta_all()`, falling back to `src_label_id` when no hint
+    /// existed.  `checkpoint()` truncates the delta log, so every hint vanished
+    /// and every CSR neighbour silently took the source's label — making
+    /// cross-label variable-length traversal return correct results before a
+    /// checkpoint and empty ones after.
     pub(crate) fn get_node_neighbors_labeled(
         &self,
         src_slot: u64,
         src_label_id: u32,
         delta_idx: &DeltaIndex,
-        node_label: &std::collections::HashSet<(u64, u32)>,
-        all_label_ids: &[u32],
         out: &mut std::collections::HashSet<(u64, u32)>,
         rel_ids: &[u32],
     ) {
         out.clear();
 
-        // ── CSR neighbors (slot only; label recovered by scanning all label HWMs
-        //    or falling back to src_label_id for homogeneous graphs) ────────────
-        // SPA-284: use filtered CSR lookup when rel type IDs are provided.
-        let csr_slots: Vec<u64> = self.csr_neighbors_filtered(src_slot, rel_ids);
+        // ── CSR neighbours: label from the catalog ────────────────────────────
+        // SPA-284: `rel_ids` restricts the lookup to the requested types.
+        out.extend(self.csr_neighbors_labeled(src_slot, src_label_id, rel_ids));
 
-        // ── Delta neighbors (full NodeId available) ───────────────────────────
+        // ── Delta neighbours: label from the stored NodeId ────────────────────
         // SPA-283: O(1) indexed lookup instead of linear scan.
         // SPA-284: filter by relation-table IDs when a type constraint exists.
         if let Some(recs) = delta_idx.get(&(src_label_id, src_slot)) {
@@ -42,37 +47,8 @@ impl Engine {
                 if !rel_ids.is_empty() && !rel_ids.contains(&r.rel_id.0) {
                     continue;
                 }
-                let dst_slot = r.dst.0 & 0xFFFF_FFFF;
-                let dst_label = (r.dst.0 >> 32) as u32;
+                let (dst_label, dst_slot) = node_id_parts(r.dst.0);
                 out.insert((dst_slot, dst_label));
-            }
-        }
-
-        // For each CSR slot, determine label: prefer a delta-confirmed label,
-        // else scan all known label ids to find one whose HWM covers that slot.
-        // If no label confirms it, fall back to src_label_id.
-        'csr: for dst_slot in csr_slots {
-            // Check if delta already gave us a label for this slot.
-            for &lid in all_label_ids {
-                if out.contains(&(dst_slot, lid)) {
-                    continue 'csr; // already recorded with correct label
-                }
-            }
-            // Try to determine the dst label from the delta node_label registry.
-            // node_label contains (slot, label_id) pairs seen anywhere in delta.
-            let mut found = false;
-            for &lid in all_label_ids {
-                if node_label.contains(&(dst_slot, lid)) {
-                    out.insert((dst_slot, lid));
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                // No label info available — fallback to src_label_id (correct for
-                // homogeneous graphs, gracefully wrong for unmapped CSR-only nodes
-                // in heterogeneous graphs with no delta activity on those nodes).
-                out.insert((dst_slot, src_label_id));
             }
         }
     }
@@ -105,8 +81,6 @@ impl Engine {
         min_hops: u32,
         max_hops: u32,
         delta_idx: &DeltaIndex,
-        node_label: &std::collections::HashSet<(u64, u32)>,
-        all_label_ids: &[u32],
         neighbors_buf: &mut std::collections::HashSet<(u64, u32)>,
         use_reachability: bool,
         result_limit: usize,
@@ -152,8 +126,6 @@ impl Engine {
                     cur_slot,
                     cur_label,
                     delta_idx,
-                    node_label,
-                    all_label_ids,
                     neighbors_buf,
                     rel_ids,
                 );
@@ -200,8 +172,6 @@ impl Engine {
                 src_slot,
                 src_label_id,
                 delta_idx,
-                node_label,
-                all_label_ids,
                 neighbors_buf,
                 rel_ids,
             );
@@ -251,8 +221,6 @@ impl Engine {
                                 nb_slot,
                                 nb_label,
                                 delta_idx,
-                                node_label,
-                                all_label_ids,
                                 neighbors_buf,
                                 rel_ids,
                             );
@@ -377,26 +345,17 @@ impl Engine {
             .into_iter()
             .collect();
 
-        // SPA-275: hoist delta read and node_label map out of the per-source loop.
-        // Previously execute_variable_hops rebuilt these on every call — O(sources)
-        // delta reads and O(sources × delta_records) HashMap insertions per query.
-        // Now we build them once and pass references into the BFS.
+        // SPA-275: hoist the delta read out of the per-source loop.  Previously
+        // execute_variable_hops rebuilt it on every call — O(sources) delta reads
+        // per query.  Now we build it once and pass a reference into the BFS.
+        //
+        // #431: the `node_label` hint set and `all_label_ids` that used to be
+        // built here are gone.  They existed only to guess a CSR neighbour's
+        // label, and they were derived from the delta log, so `checkpoint()`
+        // erased them.  Neighbour labels now come from the catalog.
         let delta_all = self.read_delta_all();
         // SPA-283: build HashMap index for O(1) per-node delta lookups.
         let delta_idx = build_delta_index(&delta_all);
-        let mut node_label: std::collections::HashSet<(u64, u32)> =
-            std::collections::HashSet::new();
-        for r in &delta_all {
-            let src_s = r.src.0 & 0xFFFF_FFFF;
-            let src_l = (r.src.0 >> 32) as u32;
-            node_label.insert((src_s, src_l));
-            let dst_s = r.dst.0 & 0xFFFF_FFFF;
-            let dst_l = (r.dst.0 >> 32) as u32;
-            node_label.insert((dst_s, dst_l));
-        }
-        let mut all_label_ids: Vec<u32> = node_label.iter().map(|&(_, l)| l).collect();
-        all_label_ids.sort_unstable();
-        all_label_ids.dedup();
 
         // SPA-284: pre-resolve rel-type IDs so the BFS/DFS uses filtered CSR lookups.
         let rel_ids = self.resolve_rel_ids_for_type(&rel_pat.rel_type);
@@ -487,8 +446,8 @@ impl Engine {
                 }
 
                 // BFS to find all reachable (slot, label_id) pairs within [min_hops, max_hops].
-                // delta_all, node_label, all_label_ids, and neighbors_buf are hoisted out of
-                // this loop (SPA-275) and reused across all source nodes.
+                // delta_idx and neighbors_buf are hoisted out of this loop (SPA-275)
+                // and reused across all source nodes.
                 // Use reachability BFS when RETURN DISTINCT is present and no path variable
                 // is bound (issue #165). Otherwise use enumerative DFS for full path semantics.
                 let use_reachability = m.distinct && rel_pat.var.is_empty();
@@ -500,8 +459,6 @@ impl Engine {
                     min_hops,
                     max_hops,
                     &delta_idx,
-                    &node_label,
-                    &all_label_ids,
                     &mut neighbors_buf,
                     use_reachability,
                     remaining,

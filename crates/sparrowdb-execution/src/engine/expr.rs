@@ -656,7 +656,13 @@ impl Engine {
         let csr_nb: Vec<u64> = match rel_lookup {
             RelTableLookup::Found(rtid) => self.csr_neighbors(rtid, src_slot),
             RelTableLookup::NotFound => return false,
-            RelTableLookup::All => self.csr_neighbors_all(src_slot),
+            // Untyped edge: every table whose source label is this node's, and
+            // whose destination label is the one the pattern asks for.  A bare
+            // slot would otherwise let a neighbour of any label answer for one
+            // of `dst_label_id_opt`.
+            RelTableLookup::All => {
+                self.csr_neighbor_slots_to_label(src_slot, src_label_id, dst_label_id_opt, &[])
+            }
         };
         let delta_nb: Vec<u64> = self
             .read_delta_all()
@@ -851,28 +857,8 @@ impl Engine {
         // SPA-283: build HashMap index for O(1) per-node delta lookups.
         let delta_idx = build_delta_index(&delta_all);
 
-        // #427: derive CSR neighbour labels from the catalog rather than guessing.
-        //
-        // A relationship table is registered as `(rel_table_id, src_label_id,
-        // dst_label_id, rel_type)` and its CSR holds only that table's edges.  So
-        // for a CSR hit we know the destination's label exactly — it is the
-        // table's `dst_label_id` — and we know the table only applies to sources
-        // of its `src_label_id`.  Both matter: the shared
-        // `get_node_neighbors_labeled` helper instead falls back to the *source's*
-        // label whenever the delta log carries no hint, which is always true once
-        // a graph has been checkpointed, and it probes every CSR with the raw slot
-        // regardless of the source's label.
-        let rel_tables: Vec<(u32, u32, u32)> = self
-            .snapshot
-            .catalog
-            .list_rel_tables_with_ids()
-            .into_iter()
-            .filter(|(id, _, _, _)| rel_ids.is_empty() || rel_ids.contains(&(*id as u32)))
-            .map(|(id, s_lid, d_lid, _)| (id as u32, s_lid as u32, d_lid as u32))
-            .collect();
-
         // Frontier carries (slot, label_id) so each hop uses the correct label
-        // when probing the delta index.
+        // when looking up neighbours.
         let mut visited: std::collections::HashSet<(u64, u32)> = std::collections::HashSet::new();
         visited.insert((src_slot, src_label_id));
         let mut frontier: Vec<(u64, u32)> = vec![(src_slot, src_label_id)];
@@ -881,31 +867,18 @@ impl Engine {
         for depth in 1..=max_hops {
             let mut next_frontier: Vec<(u64, u32)> = Vec::new();
             for &(node_slot, node_label_id) in &frontier {
-                neighbors.clear();
-
-                // Checkpointed edges: one CSR per relationship table.
-                for &(rel_id, s_lid, d_lid) in &rel_tables {
-                    if s_lid != node_label_id {
-                        continue;
-                    }
-                    if let Some(csr) = self.snapshot.csrs.get(&rel_id) {
-                        for &nb_slot in csr.neighbors(node_slot) {
-                            neighbors.insert((nb_slot, d_lid));
-                        }
-                    }
-                }
-
-                // Uncheckpointed edges: the delta log carries full NodeIds, so
-                // the destination label is read off directly.
-                if let Some(recs) = delta_idx.get(&(node_label_id, node_slot)) {
-                    for r in recs {
-                        if !rel_ids.is_empty() && !rel_ids.contains(&r.rel_id.0) {
-                            continue;
-                        }
-                        let (nb_label, nb_slot) = node_id_parts(r.dst.0);
-                        neighbors.insert((nb_slot, nb_label));
-                    }
-                }
+                // #427/#431: both edge sources report the neighbour's label
+                // rather than leaving it to be guessed — the catalog's
+                // `dst_label_id` for checkpointed edges, the stored `NodeId` for
+                // delta edges.  This loop used to inline that logic; it now
+                // shares the one implementation with variable-length traversal.
+                self.get_node_neighbors_labeled(
+                    node_slot,
+                    node_label_id,
+                    &delta_idx,
+                    &mut neighbors,
+                    rel_ids,
+                );
 
                 for &(nb_slot, nb_label) in neighbors.iter() {
                     if (nb_slot, nb_label) == (dst_slot, dst_label_id) {

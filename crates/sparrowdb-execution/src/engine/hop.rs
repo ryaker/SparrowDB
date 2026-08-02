@@ -1898,21 +1898,18 @@ impl Engine {
             }
         }
 
-        // Delta index + label registry used by the variable-length expansion.
-        // Built once (not per source node) and only when a varlen hop exists.
-        let (delta_idx, node_label, all_label_ids) = if has_varlen {
-            let idx = build_delta_index(&delta_all);
-            let mut labels: HashSet<(u64, u32)> = HashSet::new();
-            for r in &delta_all {
-                labels.insert((r.src.0 & 0xFFFF_FFFF, (r.src.0 >> 32) as u32));
-                labels.insert((r.dst.0 & 0xFFFF_FFFF, (r.dst.0 >> 32) as u32));
-            }
-            let mut ids: Vec<u32> = labels.iter().map(|&(_, l)| l).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            (idx, labels, ids)
+        // Delta index used by the variable-length expansion. Built once (not
+        // per source node) and only when a varlen hop exists.
+        //
+        // #431: neighbour labels for the varlen expansion are no longer read
+        // from a registry built here — `execute_variable_hops` resolves each
+        // neighbour's label straight from the catalog/CSR or the delta
+        // record's own NodeId (`get_node_neighbors_labeled`), so there is
+        // nothing left for this function to precompute or hand it.
+        let delta_idx = if has_varlen {
+            build_delta_index(&delta_all)
         } else {
-            (DeltaIndex::new(), HashSet::new(), Vec::new())
+            DeltaIndex::new()
         };
         // Reusable neighbor buffer for the variable-length traversal.
         let mut neighbors_buf: HashSet<(u64, u32)> = HashSet::new();
@@ -1947,23 +1944,36 @@ impl Engine {
                 }
             }
 
-            // `frontier` holds (slot, accumulated_vals) pairs for the current
-            // boundary of the traversal.  Each entry represents one in-progress
-            // path; cloning ensures bindings are isolated across branches.
-            let mut frontier: Vec<(u64, HashMap<String, Value>)> = vec![(src_slot, row_vals)];
+            // `frontier` holds (slot, label_id, accumulated_vals) triples for the
+            // current boundary of the traversal.  Each entry represents one
+            // in-progress path; cloning ensures bindings are isolated across
+            // branches.
+            //
+            // #429: the label is carried, not re-derived.  It used to be taken
+            // from the *pattern* (`label_ids_per_node[hop_idx]`, falling back to
+            // the source's label when the position was unlabeled), so an
+            // unlabeled intermediate node was addressed as label 0 and every hop
+            // probed CSRs with a bare slot.  With `isLocatedIn` registered for
+            // both (Person)->(Place) and (Organisation)->(Place), that let
+            // Person slot 2 inherit Organisation slot 2's edges.
+            let mut frontier: Vec<(u64, u32, HashMap<String, Value>)> =
+                vec![(src_slot, src_label_id, row_vals)];
 
             for hop_idx in 0..n_rels {
                 let next_node_pat = &pat.nodes[hop_idx + 1];
                 let next_label_id_opt = label_ids_per_node[hop_idx + 1];
                 let next_col_ids = &col_ids_per_node[hop_idx + 1];
-                let cur_label_id = label_ids_per_node[hop_idx].unwrap_or(src_label_id);
 
-                let mut next_frontier: Vec<(u64, HashMap<String, Value>)> = Vec::new();
+                let mut next_frontier: Vec<(u64, u32, HashMap<String, Value>)> = Vec::new();
 
-                for (cur_slot, cur_vals) in frontier {
+                for (cur_slot, cur_label_id, cur_vals) in frontier {
                     let hop_rel_ids = &rel_ids_per_hop[hop_idx];
 
-                    // `(slot, resolved_label_id)` candidates for this hop.
+                    // `(slot, resolved_label_id)` candidates for this hop, each
+                    // carrying the neighbour's *actual* label — read from the
+                    // catalog/CSR or the stored NodeId, never guessed from the
+                    // pattern or assumed from the source's label. A bare slot
+                    // is not a safe node identity: see #427, #429, #431.
                     let all_nb: Vec<(u64, u32)> = match varlen_per_hop[hop_idx] {
                         // ── #421: variable-length hop ────────────────────────
                         Some((min_hops, max_hops)) => {
@@ -1978,8 +1988,6 @@ impl Engine {
                                 min_hops,
                                 max_hops,
                                 &delta_idx,
-                                &node_label,
-                                &all_label_ids,
                                 &mut neighbors_buf,
                                 use_reachability,
                                 usize::MAX,
@@ -2000,35 +2008,48 @@ impl Engine {
                         }
                         // ── fixed single hop ─────────────────────────────────
                         None => {
-                            // Gather neighbors from CSR + delta for this hop.
-                            // SPA-284: use filtered CSR lookup when rel type is specified.
-                            let csr_nb: Vec<u64> =
-                                self.csr_neighbors_filtered(cur_slot, hop_rel_ids);
-                            let delta_nb: Vec<u64> = delta_all
-                                .iter()
-                                .filter(|r| {
-                                    let r_src_label = (r.src.0 >> 32) as u32;
-                                    let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                                    if r_src_label != cur_label_id || r_src_slot != cur_slot {
-                                        return false;
-                                    }
-                                    // Filter by relation-table IDs when a type constraint exists.
-                                    hop_rel_ids.is_empty() || hop_rel_ids.contains(&r.rel_id.0)
-                                })
-                                .map(|r| r.dst.0 & 0xFFFF_FFFF)
-                                .collect();
-
-                            let mut seen: HashSet<u64> = HashSet::new();
-                            csr_nb
+                            // Gather neighbours from CSR + delta for this hop.
+                            // Both sources report the neighbour's own label:
+                            // the catalog's `dst_label_id` for checkpointed
+                            // edges, the stored NodeId for delta edges.
+                            // SPA-284: `rel_ids` restricts the lookup to the requested types.
+                            // `seen` deduplicates on the full identity
+                            // `(slot, label)`; `nb` keeps insertion order so
+                            // row order stays deterministic for queries with
+                            // no ORDER BY.
+                            let mut seen: HashSet<(u64, u32)> = HashSet::new();
+                            let mut nb: Vec<(u64, u32)> = self
+                                .csr_neighbors_labeled(cur_slot, cur_label_id, hop_rel_ids)
                                 .into_iter()
-                                .chain(delta_nb)
-                                .filter(|&nb| seen.insert(nb))
-                                .map(|nb| (nb, next_label_id_opt.unwrap_or(0)))
-                                .collect()
+                                .filter(|nb| seen.insert(*nb))
+                                .collect();
+                            for r in delta_all.iter() {
+                                let (r_src_label, r_src_slot) = node_id_parts(r.src.0);
+                                if r_src_label != cur_label_id || r_src_slot != cur_slot {
+                                    continue;
+                                }
+                                // Filter by relation-table IDs when a type constraint exists.
+                                if !hop_rel_ids.is_empty() && !hop_rel_ids.contains(&r.rel_id.0) {
+                                    continue;
+                                }
+                                let (r_dst_label, r_dst_slot) = node_id_parts(r.dst.0);
+                                if seen.insert((r_dst_slot, r_dst_label)) {
+                                    nb.push((r_dst_slot, r_dst_label));
+                                }
+                            }
+                            nb
                         }
                     };
 
                     for (next_slot, next_label_id) in all_nb {
+                        // When this position carries a label, the neighbour must
+                        // actually have it — matching on the slot alone would
+                        // admit the same-numbered node of any other label.
+                        if let Some(required) = next_label_id_opt {
+                            if next_label_id != required {
+                                continue;
+                            }
+                        }
                         let next_node_id = NodeId(((next_label_id as u64) << 32) | next_slot);
 
                         let next_props =
@@ -2049,7 +2070,7 @@ impl Engine {
                             }
                         }
 
-                        next_frontier.push((next_slot, new_vals));
+                        next_frontier.push((next_slot, next_label_id, new_vals));
                     }
                 }
 
@@ -2057,7 +2078,7 @@ impl Engine {
             }
 
             // `frontier` now contains complete paths.  Project result rows.
-            for (_final_slot, path_vals) in frontier {
+            for (_final_slot, _final_label_id, path_vals) in frontier {
                 // Apply WHERE clause using the full accumulated binding map.
                 if let Some(ref where_expr) = m.where_clause {
                     let mut eval_vals = path_vals.clone();
