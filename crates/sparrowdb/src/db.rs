@@ -26,7 +26,7 @@ use sparrowdb_storage::wal::codec::WalPayload;
 use sparrowdb_storage::wal::writer::WalWriter;
 use sparrowdb_storage::wal::WalReplayer;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::{info_span, warn};
@@ -67,6 +67,17 @@ impl GraphDb {
     }
 
     /// Open (or create) a SparrowDB database at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Besides the usual I/O and WAL-replay failures, this returns
+    /// [`Error::Corruption`] when a persisted vector index file exists under
+    /// `<path>/vector_indexes/` but cannot be loaded.  Opening anyway would
+    /// silently drop every subsequent vector write for that `(label, prop)` and
+    /// return nothing for every search, so the database refuses to open instead.
+    /// Use [`GraphDb::vector_index_load_failures`] to find out which files are
+    /// at fault.  A database with *no* vector index files is unaffected —
+    /// absent is not the same as damaged.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let wal_dir = path.join("wal");
@@ -103,7 +114,7 @@ impl GraphDb {
         } else {
             0
         };
-        let vector_indexes = RwLock::new(load_vector_indexes(path));
+        let vector_indexes = RwLock::new(load_vector_indexes(path)?);
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -134,7 +145,9 @@ impl GraphDb {
     /// fail with [`Error::EncryptionAuthFailed`].
     ///
     /// # Errors
-    /// Returns an error if the directory cannot be created.
+    /// Returns an error if the directory cannot be created, or
+    /// [`Error::Corruption`] if a persisted vector index file exists but cannot
+    /// be loaded — see [`GraphDb::open`] for why that is fatal.
     pub fn open_encrypted(path: &Path, key: [u8; 32]) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let wal_dir = path.join("wal");
@@ -166,7 +179,7 @@ impl GraphDb {
         } else {
             0
         };
-        let vector_indexes = RwLock::new(load_vector_indexes(path));
+        let vector_indexes = RwLock::new(load_vector_indexes(path)?);
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -2165,6 +2178,45 @@ impl GraphDb {
         let dir = self.inner.path.join("vector_indexes");
         sparrowdb_storage::VectorIndex::remove(&dir, label, prop);
         Ok(())
+    }
+
+    /// Report every persisted vector index under `path` whose bytes are
+    /// damaged.  Each entry is `(label, prop, path, reason)`, sorted for
+    /// determinism.
+    ///
+    /// This never returns `Err`, so it can be called on a database that refuses
+    /// to open — it is the diagnostic side of the fail-closed policy in
+    /// [`GraphDb::open`]. An empty result means no damage is present, which
+    /// includes the ordinary case of a database with no vector indexes at all.
+    /// That is the distinction the loader used to collapse: an **absent** index
+    /// file means "no index configured" and is not an error, while a damaged
+    /// one is reported here.
+    ///
+    /// Damage is reported in both the places it can live:
+    ///
+    /// * a live `hnsw_<label>_<prop>.bin` that will not load — these also make
+    ///   `open` fail;
+    /// * a `hnsw_<label>_<prop>.bin.corrupt.<millis>` artifact that a previous
+    ///   load attempt rejected and moved aside (#442) — `open` succeeds once a
+    ///   file has been quarantined, so this is the *only* remaining signal that
+    ///   the vectors for that `(label, prop)` are gone.
+    ///
+    /// Reporting only the first kind would mean a health check built on this
+    /// call returns "no problems" for a store whose index has been quarantined
+    /// and whose vector writes are therefore being dropped — the same silent
+    /// failure this API exists to eliminate.
+    ///
+    /// The `path` is exact. The `reason` for a quarantine artifact is
+    /// reconstructed rather than recovered: the original decode failure is
+    /// reported only in the error returned at quarantine time and is not
+    /// persisted to disk.
+    ///
+    /// Note that this is not a read-only call when composed with #442: probing
+    /// a live entry may quarantine it. See the crate-internal
+    /// `helpers::vector_index_load_failures` for why that does not change the
+    /// result you observe.
+    pub fn vector_index_load_failures(path: &Path) -> Vec<(String, String, PathBuf, String)> {
+        crate::helpers::vector_index_load_failures(path)
     }
 
     /// Return a handle to the HNSW vector index for `(label, prop)`, if one exists.

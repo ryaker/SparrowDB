@@ -3,12 +3,12 @@
 // Utility functions used across multiple submodules.
 
 use sparrowdb_catalog::catalog::Catalog;
-use sparrowdb_common::col_id_of;
+use sparrowdb_common::{col_id_of, Error};
 use sparrowdb_storage::csr::CsrForward;
 use sparrowdb_storage::edge_store::{EdgeStore, RelTableId};
 use sparrowdb_storage::node_store::{NodeStore, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 // ── FNV-1a col_id derivation ─────────────────────────────────────────────────
@@ -334,46 +334,207 @@ pub(crate) fn try_open_csr_map(path: &Path) -> crate::Result<HashMap<u32, CsrFor
 
 // ── Vector index helpers (issue #394) ────────────────────────────────────────
 
-/// Scan `<db_root>/vector_indexes/` and load all persisted HNSW indexes.
+/// Recover the `(label, prop)` pair from an `hnsw_<label>_<prop>` file stem.
 ///
-/// The directory contains files named `hnsw_<label>_<prop>.bin`. This function
-/// loads each one and reconstructs the `(label, prop)` key from the file name.
-/// Unreadable files are silently skipped.
-pub(crate) fn load_vector_indexes(db_root: &Path) -> crate::types::VectorIndexMap {
-    let dir = db_root.join("vector_indexes");
-    let mut map: crate::types::VectorIndexMap = HashMap::new();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return map,
+/// Labels may contain underscores, so the *last* underscore is the separator.
+fn parse_index_stem(stem: &str) -> Option<(String, String)> {
+    let rest = stem.strip_prefix("hnsw_")?;
+    let sep = rest.rfind('_')?;
+    let (label, prop) = (&rest[..sep], &rest[sep + 1..]);
+    if label.is_empty() || prop.is_empty() {
+        return None;
+    }
+    Some((label.to_string(), prop.to_string()))
+}
+
+/// One recognised entry in `<db_root>/vector_indexes/`.
+enum IndexFile {
+    /// `hnsw_<label>_<prop>.bin` — a live index the loader will try to read.
+    Live { label: String, prop: String },
+    /// `hnsw_<label>_<prop>.bin.corrupt.<millis>` — bytes a previous load
+    /// attempt rejected and moved aside (#442).  Deliberately *not* live: it
+    /// must never be loaded, and it must never block `open`.  It is still
+    /// evidence of damage, so it must remain visible to the diagnostic.
+    Quarantined {
+        label: String,
+        prop: String,
+        path: PathBuf,
+    },
+}
+
+/// Take one snapshot of `<dir>` and classify every recognised entry.
+///
+/// A single `read_dir` pass matters. `VectorIndex::load` quarantines the file
+/// it rejects, so probing a live entry can *create* a quarantine artifact while
+/// we are working; snapshotting first means such an artifact cannot also be
+/// picked up in the same call and reported twice.
+///
+/// Results are sorted so callers get a deterministic order regardless of
+/// directory iteration order.
+///
+/// Returns an empty vector when the directory does not exist (a database that
+/// has never had a vector index created).
+fn scan_vector_index_dir(dir: &Path) -> Vec<IndexFile> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        let fname = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        // Expected format: "hnsw_<label>_<prop>"
-        if !fname.starts_with("hnsw_") {
-            continue;
-        }
-        let rest = &fname[5..]; // strip "hnsw_"
-                                // Split on the first '_' to recover label and prop.
-                                // Labels can contain underscores, so we use the *last* underscore as separator.
-        if let Some(sep) = rest.rfind('_') {
-            let label = &rest[..sep];
-            let prop = &rest[sep + 1..];
-            if label.is_empty() || prop.is_empty() {
-                continue;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(stem) = name.strip_suffix(".bin") {
+            if let Some((label, prop)) = parse_index_stem(stem) {
+                found.push(IndexFile::Live { label, prop });
             }
-            if let Ok(Some(idx)) = sparrowdb_storage::VectorIndex::load(&dir, label, prop) {
-                map.insert(
-                    (label.to_string(), prop.to_string()),
-                    Arc::new(RwLock::new(idx)),
-                );
+        } else if let Some((head, _stamp)) = name.split_once(".bin.corrupt.") {
+            if let Some((label, prop)) = parse_index_stem(head) {
+                found.push(IndexFile::Quarantined {
+                    label,
+                    prop,
+                    path: entry.path(),
+                });
             }
         }
     }
-    map
+    found.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+    found
+}
+
+fn sort_key(f: &IndexFile) -> (&str, &str, &Path) {
+    match f {
+        IndexFile::Live { label, prop } => (label, prop, Path::new("")),
+        IndexFile::Quarantined { label, prop, path } => (label, prop, path.as_path()),
+    }
+}
+
+/// Scan `<db_root>/vector_indexes/` and load all persisted HNSW indexes.
+///
+/// The directory contains files named `hnsw_<label>_<prop>.bin`; the
+/// `(label, prop)` key is reconstructed from the file name.
+///
+/// # Errors
+///
+/// Returns [`Error::Corruption`] if an index file **exists but cannot be
+/// loaded** (truncated, corrupt, unreadable, or rejected by the header/CRC
+/// validation added in #442).
+///
+/// This is deliberately fail-closed, and deliberately different from the
+/// stance taken for [`PropertyIndex`](sparrowdb_storage::property_index::PropertyIndex),
+/// whose load failures are *not* fatal because that index is derived state —
+/// the next `Engine` simply rebuilds it from the column files.  An HNSW index
+/// is **not** derived state: vectors added through `addToVectorIndex` (#441)
+/// live only in this file and cannot be rebuilt from anything else.
+///
+/// Swallowing the error here is what turned one damaged file into a silent
+/// total outage: a missing key in the map means "no index configured", so
+/// every later vector write for that `(label, prop)` is dropped on the floor
+/// and every `vectorSearch` returns nothing, while the engine reports "no
+/// vector index; call createVectorIndex first" — indistinguishable from an
+/// operator configuration mistake.  Refusing to open is louder, recoverable
+/// (move the file aside and re-open, then rebuild deliberately) and never
+/// destroys data that a running-but-broken database would have discarded.
+///
+/// An *absent* file is not an error: it legitimately means no index is
+/// configured for that `(label, prop)`, and the map simply has no entry.
+/// Neither is a quarantine artifact (#442) — those bytes have already been
+/// taken out of service, so they must not hold the database hostage on every
+/// subsequent start.  They stay visible through
+/// [`vector_index_load_failures`] instead.
+pub(crate) fn load_vector_indexes(db_root: &Path) -> crate::Result<crate::types::VectorIndexMap> {
+    let dir = db_root.join("vector_indexes");
+    let mut map: crate::types::VectorIndexMap = HashMap::new();
+    for (label, prop) in scan_vector_index_dir(&dir)
+        .into_iter()
+        .filter_map(|f| match f {
+            IndexFile::Live { label, prop } => Some((label, prop)),
+            IndexFile::Quarantined { .. } => None,
+        })
+    {
+        match sparrowdb_storage::VectorIndex::load(&dir, &label, &prop) {
+            Ok(Some(idx)) => {
+                map.insert((label, prop), Arc::new(RwLock::new(idx)));
+            }
+            // The directory listing said the file was there but `load` found it
+            // gone — it was removed between the scan and the read.  Nothing was
+            // lost that we can observe, so treat it as absent.
+            Ok(None) => continue,
+            Err(e) => {
+                return Err(Error::Corruption(format!(
+                    "vector index for ({label}, {prop}) exists at {} but could not be loaded: {e}. \
+                     Refusing to open: continuing would silently drop every vector write for this \
+                     index and return no results for every search. Move the file aside and re-open \
+                     to run without it, then rebuild the index.",
+                    dir.join(format!("hnsw_{label}_{prop}.bin")).display(),
+                )));
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Report every vector index whose bytes are damaged, whether they are still
+/// in place or have already been moved aside.  Each entry is
+/// `(label, prop, path, reason)`, sorted for determinism.
+///
+/// Diagnostic counterpart to [`load_vector_indexes`]: it never returns `Err`,
+/// so it can be called on a database that refuses to open in order to find out
+/// *which* files are the problem.  An empty result means no damage is present —
+/// including the ordinary case of a database with no vector indexes at all.
+///
+/// Two kinds of damage are reported, because #442 leaves damage in two
+/// different places and reporting only one of them recreates the very defect
+/// this function exists to prevent:
+///
+/// * **Live but unloadable** — `hnsw_<label>_<prop>.bin` is present and
+///   `VectorIndex::load` rejects it.  `open` fails on these.  #442 quarantines
+///   *some* of them (bad magic/length/CRC) but deliberately not all: a file
+///   that decodes cleanly and then fails `validate_invariants` is left in place
+///   for inspection, so it stays visible here as a live entry.
+/// * **Already quarantined** — `hnsw_<label>_<prop>.bin.corrupt.<millis>`, the
+///   bytes a previous load attempt rejected and renamed aside (#442).  `open`
+///   succeeds once a file has been quarantined, because the damaged bytes are
+///   out of service; without this arm the *only* remaining evidence of the
+///   damage would be invisible, and a health check built on this call would
+///   report a clean bill on exactly the database whose vectors are gone.
+///
+/// The `reason` for a quarantined artifact is reconstructed, not recovered:
+/// #442 records the decode failure only in the `io::Error` it returns at
+/// quarantine time and writes no sidecar, so the original message is not
+/// recoverable from disk afterwards.  The path is exact.
+///
+/// # Side effects
+///
+/// Not read-only when composed with #442: probing a live entry calls
+/// `VectorIndex::load`, which quarantines the file it rejects.  That is the
+/// intended behaviour of quarantine — it protects the only surviving copy of
+/// the vectors from the next `save()` — and the observable result of this
+/// function is unchanged by it, since a file that is quarantined during one
+/// call is reported as a quarantine artifact by the next.
+pub(crate) fn vector_index_load_failures(db_root: &Path) -> Vec<(String, String, PathBuf, String)> {
+    let dir = db_root.join("vector_indexes");
+    let mut failures = Vec::new();
+    for entry in scan_vector_index_dir(&dir) {
+        match entry {
+            IndexFile::Live { label, prop } => {
+                if let Err(e) = sparrowdb_storage::VectorIndex::load(&dir, &label, &prop) {
+                    let path = dir.join(format!("hnsw_{label}_{prop}.bin"));
+                    failures.push((label, prop, path, e.to_string()));
+                }
+            }
+            IndexFile::Quarantined { label, prop, path } => {
+                let reason = format!(
+                    "index file was rejected by a previous load attempt and preserved as {} \
+                     (#442 quarantine). The vectors it held are not in service and cannot be \
+                     rebuilt from column data; the original decode failure is not recorded on \
+                     disk. Recover from these bytes or rebuild the index deliberately, then \
+                     remove the artifact to clear this report.",
+                    path.display(),
+                );
+                failures.push((label, prop, path, reason));
+            }
+        }
+    }
+    failures
 }
 
 // ── Storage-size helpers (SPA-171) ────────────────────────────────────────────
