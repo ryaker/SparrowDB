@@ -147,6 +147,67 @@ impl Engine {
 
     // ── Hybrid search (issue #396) ────────────────────────────────────────────
 
+    /// Return the HNSW index for `(label, prop)` under `vec_dir`, reusing an
+    /// already-deserialised copy whenever the file on disk has not changed.
+    ///
+    /// `hybrid_search` is a scalar function: it is evaluated once per candidate
+    /// row.  The previous implementation called `VectorIndex::load()` on every
+    /// evaluation, so a query over N rows performed N full reads and `bincode`
+    /// decodes of the index file — for KMSmcp's 8 MB `Knowledge.embedding`
+    /// index that is 8 MB of I/O and a complete graph rebuild *per row*.
+    ///
+    /// Staleness is handled by validating the cheap on-disk fingerprint
+    /// (generation + CRC32C, read from the file's 36-byte header — no payload
+    /// I/O) before each reuse.  Because every writer persists the index in the
+    /// same write lock that mutates it, a matching fingerprint means the cached
+    /// copy is byte-identical to what the current writer would hand us.
+    ///
+    /// Returns `None` when the index does not exist or fails to load; the
+    /// caller then falls back to full-text-only results, exactly as before.
+    fn hybrid_vector_index(
+        vec_dir: &std::path::Path,
+        label: &str,
+        prop: &str,
+    ) -> Option<std::sync::Arc<sparrowdb_storage::vector_index::VectorIndex>> {
+        type Key = (std::path::PathBuf, String, String);
+        type Entry = (
+            (u64, u64),
+            std::sync::Arc<sparrowdb_storage::vector_index::VectorIndex>,
+        );
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<Key, Entry>>> =
+            std::sync::OnceLock::new();
+
+        // Missing file / unreadable header → nothing to search.
+        let fingerprint =
+            sparrowdb_storage::vector_index::VectorIndex::fingerprint(vec_dir, label, prop)
+                .ok()
+                .flatten()?;
+
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut guard = cache.lock().ok()?;
+        let key: Key = (vec_dir.to_path_buf(), label.to_owned(), prop.to_owned());
+
+        if let Some((cached_fp, idx)) = guard.get(&key) {
+            if *cached_fp == fingerprint {
+                return Some(std::sync::Arc::clone(idx));
+            }
+        }
+
+        let loaded = sparrowdb_storage::vector_index::VectorIndex::load(vec_dir, label, prop)
+            .ok()
+            .flatten()?;
+        let idx = std::sync::Arc::new(loaded);
+
+        // Bound the cache: a process that opens many databases should not
+        // retain every index it has ever queried.
+        const MAX_CACHED_INDEXES: usize = 8;
+        if guard.len() >= MAX_CACHED_INDEXES && !guard.contains_key(&key) {
+            guard.clear();
+        }
+        guard.insert(key, (fingerprint, std::sync::Arc::clone(&idx)));
+        Some(idx)
+    }
+
     /// Evaluate `hybrid_search(label, emb_prop, text_prop, query_vec, query_text, k[, alpha])`.
     ///
     /// Runs vector search (HNSW) + BM25 full-text search independently, then
@@ -214,10 +275,10 @@ impl Engine {
         // ── 1. Vector search ────────────────────────────────────────────────
         let vec_dir = self.snapshot.db_root.join("vector_indexes");
         let vec_results: Vec<(u64, f32)> =
-            match sparrowdb_storage::vector_index::VectorIndex::load(&vec_dir, &label, &emb_prop) {
+            match Self::hybrid_vector_index(&vec_dir, &label, &emb_prop) {
                 // ef = max(k*2, 50) gives a reasonable exploration budget.
-                Ok(Some(idx)) => idx.search(&query_vec, k * 2, (k * 2).max(50)),
-                _ => vec![],
+                Some(idx) => idx.search(&query_vec, k * 2, (k * 2).max(50)),
+                None => vec![],
             };
 
         // ── 2. Full-text (BM25) search ───────────────────────────────────────
