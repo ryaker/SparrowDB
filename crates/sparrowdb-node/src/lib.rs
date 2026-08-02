@@ -280,6 +280,43 @@ pub struct VectorIndexHealth {
     pub unreachable: u32,
 }
 
+// ── VectorIndexLoadFailure ───────────────────────────────────────────────────
+
+/// One damaged HNSW index file — see `SparrowDB.vectorIndexLoadFailures`.
+///
+/// ```typescript
+/// interface VectorIndexLoadFailure {
+///   label: string;   // node label the index was built on
+///   prop: string;    // vector property the index was built on
+///   path: string;    // exact file on disk; the machine-readable field
+///   reason: string;  // human-readable; see the caveat below
+/// }
+/// ```
+///
+/// `path` is exact and is the field to key alerts and remediation on. `reason`
+/// is a message for a human to read: for a quarantine artifact it is
+/// RECONSTRUCTED rather than recovered, because #442 reports the original
+/// decode failure only in the error it returns at quarantine time and writes no
+/// sidecar. Do not parse it and do not present it as the authoritative cause.
+///
+/// The `//` comments above are deliberate rather than nested doc comments: a
+/// close-comment marker inside a generated JSDoc block ends it early, which is
+/// part of why the checked-in `npm/sparrowdb/index.d.ts` does not currently
+/// parse as TypeScript (issue #449).
+#[napi(object)]
+pub struct VectorIndexLoadFailure {
+    /// Node label the damaged index was built on.
+    pub label: String,
+    /// Vector property the damaged index was built on.
+    pub prop: String,
+    /// Exact path of the damaged bytes on disk — live `.bin` or
+    /// `.bin.corrupt.<millis>` quarantine artifact.
+    pub path: String,
+    /// Human-readable description. Reconstructed for quarantine artifacts;
+    /// not authoritative and not machine-parseable.
+    pub reason: String,
+}
+
 // ── SparrowDB ─────────────────────────────────────────────────────────────────
 
 /// Top-level database handle.
@@ -317,6 +354,60 @@ impl SparrowDB {
     pub fn open(path: String) -> napi::Result<Self> {
         let db = ::sparrowdb::GraphDb::open(std::path::Path::new(&path)).map_err(to_napi)?;
         Ok(SparrowDB { inner: db })
+    }
+
+    /// Report every vector index at `path` whose bytes are damaged.
+    ///
+    /// **Static**, and deliberately so: the database this diagnoses is usually
+    /// one that will not open. `open` fails with a `Corruption` error when a
+    /// live index file cannot be loaded, and this is the call that answers
+    /// *which* files caused it — so requiring an instance would make it
+    /// unreachable in the exact situation it exists for.
+    ///
+    /// **Never throws.** An unreadable or absent directory yields `[]`; there
+    /// is no configuration of the filesystem that turns the diagnostic itself
+    /// into a second failure to diagnose. An empty array therefore means "no
+    /// damage found", which includes the ordinary case of a database with no
+    /// vector indexes at all.
+    ///
+    /// Two kinds of damage are reported:
+    ///
+    /// - **live but unloadable** — `hnsw_<label>_<prop>.bin` is present and
+    ///   rejected; `open` fails on these;
+    /// - **already quarantined** — `hnsw_<label>_<prop>.bin.corrupt.<millis>`,
+    ///   bytes a previous load attempt moved aside (#442).
+    ///
+    /// The second arm is why this is the only usable health signal for #451:
+    /// once a damaged file has been quarantined, the *first* `open` has already
+    /// thrown and every later `open` succeeds with the index silently absent,
+    /// so vector writes for that pair are dropped and searches return nothing.
+    /// Nothing else distinguishes that store from a healthy one.
+    ///
+    /// Not read-only when composed with #442: probing a live entry may
+    /// quarantine it. The observable result is unchanged — a file quarantined
+    /// during one call is reported as a quarantine artifact by the next.
+    ///
+    /// ```typescript
+    /// const failures = SparrowDB.vectorIndexLoadFailures('/path/to/my.db')
+    /// // [{ label: 'Memory', prop: 'embedding',
+    /// //    path: '/path/to/my.db/vector_indexes/hnsw_Memory_embedding.bin',
+    /// //    reason: 'HNSW index ... is corrupt ...' }]
+    /// if (failures.length > 0) alert(failures.map(f => f.path))
+    /// ```
+    #[napi]
+    pub fn vector_index_load_failures(path: String) -> Vec<VectorIndexLoadFailure> {
+        ::sparrowdb::GraphDb::vector_index_load_failures(std::path::Path::new(&path))
+            .into_iter()
+            .map(|(label, prop, file, reason)| VectorIndexLoadFailure {
+                label,
+                prop,
+                // `to_string_lossy` rather than a fallible conversion: a path
+                // that is not valid UTF-8 must still be reported, and this
+                // function has no error channel by design.
+                path: file.to_string_lossy().into_owned(),
+                reason,
+            })
+            .collect()
     }
 
     /// Execute a Cypher query and return `{ columns, rows }`.
