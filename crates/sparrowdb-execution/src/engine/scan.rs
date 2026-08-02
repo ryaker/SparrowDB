@@ -517,16 +517,28 @@ impl Engine {
             let dst_slots: Vec<u64> = match &rel_table_id {
                 RelTableLookup::Found(rtid) => self.csr_neighbors(*rtid, src_slot),
                 RelTableLookup::NotFound => continue,
-                RelTableLookup::All => self.csr_neighbors_all(src_slot),
+                // Untyped edge: restrict to tables that run from this node's
+                // label to `dst_label_id`, which is the label the destination
+                // NodeId is built from a few lines below.
+                RelTableLookup::All => self.csr_neighbor_slots_to_label(
+                    src_slot,
+                    src_label_id,
+                    Some(dst_label_id),
+                    &[],
+                ),
             };
-            // Also check the delta.
+            // Also check the delta.  Slots are label-relative, so an edge that
+            // lands on a different label must not be read as `dst_label_id`.
             let delta_slots: Vec<u64> = self
                 .read_delta_all()
                 .into_iter()
                 .filter(|r| {
                     let r_src_label = (r.src.0 >> 32) as u32;
                     let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                    r_src_label == src_label_id && r_src_slot == src_slot
+                    let r_dst_label = (r.dst.0 >> 32) as u32;
+                    r_src_label == src_label_id
+                        && r_src_slot == src_slot
+                        && r_dst_label == dst_label_id
                 })
                 .map(|r| r.dst.0 & 0xFFFF_FFFF)
                 .collect();
@@ -1542,7 +1554,12 @@ impl Engine {
                 .filter(|r| {
                     let r_src_label = (r.src.0 >> 32) as u32;
                     let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                    r_src_label == src_label_id && r_src_slot == src_slot
+                    let r_dst_label = (r.dst.0 >> 32) as u32;
+                    // Slots are label-relative: an edge landing on another label
+                    // must not be read as a `dst_label_id` node.
+                    r_src_label == src_label_id
+                        && r_src_slot == src_slot
+                        && r_dst_label == dst_label_id
                 })
                 .map(|r| r.dst.0 & 0xFFFF_FFFF)
                 .collect()
@@ -1550,7 +1567,7 @@ impl Engine {
 
         let csr_neighbors = match rel_lookup {
             RelTableLookup::Found(rtid) => self.csr_neighbors(rtid, src_slot),
-            _ => self.csr_neighbors_all(src_slot),
+            _ => self.csr_neighbor_slots_to_label(src_slot, src_label_id, Some(dst_label_id), &[]),
         };
         let all_neighbors: Vec<u64> = csr_neighbors.into_iter().chain(delta_neighbors).collect();
 
