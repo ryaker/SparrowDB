@@ -35,6 +35,10 @@ function removeDir(dir) {
   fs.rmSync(dir, { recursive: true, force: true })
 }
 
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 // ── Test suites ──────────────────────────────────────────────────────────────
 
 describe('SparrowDB.open', () => {
@@ -617,6 +621,303 @@ describe('anonymous relationship patterns — issue #406 regression', () => {
     assert.equal(r.rows.length, EXPECTED_DIRECTED_EDGES)
     for (const row of r.rows) {
       assert.equal(row['r'].$type, 'edge', 'each row must carry an edge handle')
+    }
+  })
+})
+
+describe('SparrowDB.vectorIndexLoadFailures — issues #446 / #451', () => {
+  // #446 made a damaged HNSW index fail `open()` loudly instead of silently
+  // degrading to "no index configured", and added
+  // `GraphDb::vector_index_load_failures(path)` as the call an operator makes
+  // to find out WHICH files are the problem.  It had no napi binding, so the
+  // documented remediation was unreachable from JavaScript.
+  //
+  // #451 is why this is the only usable health signal: once a damaged file has
+  // been quarantined to `<name>.bin.corrupt.<millis>`, the FIRST `open()` has
+  // already thrown and every subsequent `open()` succeeds with the index
+  // silently absent.  Vector writes for that (label, prop) are dropped and
+  // every search returns nothing, and nothing else on the API surface
+  // distinguishes that store from a healthy one.
+  //
+  // ── Hand-derived fixture facts (from the on-disk format, not from output) ──
+  //
+  // File name: `VectorIndex::index_path` formats `hnsw_{label}_{prop}.bin`
+  //   under `<db_root>/vector_indexes/`.  With label `Memory` and prop
+  //   `embedding` that is
+  //   `<dbPath>/vector_indexes/hnsw_Memory_embedding.bin`.
+  //
+  // Damage: the file is truncated to 4 bytes.  A v2 file carries a 36-byte
+  //   header (8 magic + 4 version + 4 reserved + 8 payload_len + 8 generation
+  //   + 4 crc32c), so a 4-byte file is too short to be read as v2 and falls to
+  //   the legacy bincode path.  bincode encodes the struct's first field,
+  //   `nodes: Vec<HnswNode>`, as an 8-byte little-endian length prefix — 4
+  //   bytes cannot even supply that prefix, so decoding hits end-of-input.
+  //   There is no 4-byte string that decodes to a VectorIndex, so this does
+  //   not depend on which 4 bytes survive or on any field values.
+  //
+  // Count: exactly one index is created, for exactly one (label, prop), so
+  //   exactly ONE entry must be reported — 1, not 0 and not 2.  It reaches 1
+  //   by two different routes (live-unloadable before anything probes it,
+  //   quarantine artifact afterwards); asserting the count and the pair rather
+  //   than which route produced it is what makes this hold across #442.
+
+  const LABEL = 'Memory'
+  const PROP = 'embedding'
+  const DIMENSIONS = 3
+  const EXPECTED_FAILURES = 1
+  const TRUNCATE_TO_BYTES = 4
+
+  // Build a database whose one persisted vector index has been truncated to 4
+  // bytes.  Nothing has probed the damaged file yet, so it is still LIVE.
+  function makeDamagedDb() {
+    const dir = makeTempDir()
+    const dbPath = path.join(dir, 'graph.db')
+
+    const seed = SparrowDB.open(dbPath)
+    seed.createVectorIndex(LABEL, PROP, DIMENSIONS, 'cosine')
+
+    const indexFile = path.join(
+      dbPath, 'vector_indexes', `hnsw_${LABEL}_${PROP}.bin`
+    )
+    assert.ok(
+      fs.existsSync(indexFile),
+      `fixture precondition: createVectorIndex must persist ${indexFile}`
+    )
+    const size = fs.statSync(indexFile).size
+    assert.ok(
+      size > TRUNCATE_TO_BYTES,
+      `fixture precondition: a persisted index must be longer than the ` +
+      `${TRUNCATE_TO_BYTES}-byte truncation point, got ${size} bytes`
+    )
+    fs.truncateSync(indexFile, TRUNCATE_TO_BYTES)
+    assert.equal(
+      fs.statSync(indexFile).size,
+      TRUNCATE_TO_BYTES,
+      'fixture precondition: truncation must have taken effect'
+    )
+
+    return { dir, dbPath, indexFile }
+  }
+
+  function assertFailureShape(entry, indexFile) {
+    // Named fields, not tuple positions — a consumer building an alert needs
+    // to read `entry.path`, not `entry[2]`.
+    assert.deepEqual(
+      Object.keys(entry).sort(),
+      ['label', 'path', 'prop', 'reason'],
+      'entry must expose exactly { label, prop, path, reason }'
+    )
+    for (const field of ['label', 'prop', 'path', 'reason']) {
+      assert.equal(
+        typeof entry[field], 'string',
+        `${field} must be a string, got ${typeof entry[field]}`
+      )
+      assert.ok(entry[field].length > 0, `${field} must not be empty`)
+    }
+    assert.equal(entry.label, LABEL, 'must name the damaged label')
+    assert.equal(entry.prop, PROP, 'must name the damaged property')
+    // The path must belong to the index we damaged: either the live .bin or
+    // its quarantine artifact.
+    assert.ok(
+      entry.path === indexFile || entry.path.startsWith(`${indexFile}.corrupt.`),
+      `path must name the damaged index (${indexFile} or its .corrupt.* ` +
+      `artifact); got ${entry.path}`
+    )
+  }
+
+  it('is a static method on the class, not an instance method', () => {
+    // Non-negotiable: the database this diagnoses is the one that will not
+    // open, so an instance method would be unreachable exactly when it is
+    // needed.  `SparrowDB.prototype` must NOT carry it.
+    assert.equal(
+      typeof SparrowDB.vectorIndexLoadFailures, 'function',
+      'vectorIndexLoadFailures must exist as a static on SparrowDB'
+    )
+    assert.equal(
+      typeof SparrowDB.prototype.vectorIndexLoadFailures, 'undefined',
+      'vectorIndexLoadFailures must NOT be an instance method'
+    )
+  })
+
+  it('never throws: unreadable / absent / invalid paths return []', () => {
+    // The diagnostic must not itself become a failure path.  Each of these is
+    // hand-derived as "no vector_indexes/ directory can be listed", therefore
+    // "no damage found", therefore an empty array — never an exception.
+    const dir = makeTempDir()
+    try {
+      for (const p of [
+        path.join(dir, 'does-not-exist'),   // absent directory
+        dir,                                // a directory that is not a db
+        '/tmp/sparrowdb-\0-bad-path',       // invalid at the OS path layer
+        '',                                 // empty string
+      ]) {
+        let out
+        assert.doesNotThrow(
+          () => { out = SparrowDB.vectorIndexLoadFailures(p) },
+          `vectorIndexLoadFailures(${JSON.stringify(p)}) must not throw`
+        )
+        assert.ok(Array.isArray(out), 'must return an array')
+        assert.equal(
+          out.length, 0,
+          `expected 0 failures for ${JSON.stringify(p)}, got ${JSON.stringify(out)}`
+        )
+      }
+    } finally {
+      removeDir(dir)
+    }
+  })
+
+  it('returns [] for a healthy database with a healthy vector index', () => {
+    // Control.  One index is created and left intact, so the hand-derived
+    // expectation is 0 failures — an always-non-empty report would be useless
+    // as a health check.
+    const dir = makeTempDir()
+    try {
+      const dbPath = path.join(dir, 'graph.db')
+      const db = SparrowDB.open(dbPath)
+      db.createVectorIndex(LABEL, PROP, DIMENSIONS, 'cosine')
+      db.execute(`CREATE (n:${LABEL} {id: 'ok-1'})`)
+      db.addToVectorIndex(
+        LABEL, PROP, 'ok-1', new Float32Array([0.1, 0.2, 0.3])
+      )
+
+      const failures = SparrowDB.vectorIndexLoadFailures(dbPath)
+      assert.ok(Array.isArray(failures))
+      assert.equal(
+        failures.length, 0,
+        `a healthy index must report no failures, got ${JSON.stringify(failures)}`
+      )
+    } finally {
+      removeDir(dir)
+    }
+  })
+
+  it('reports live damage on an index nothing has probed yet', () => {
+    // First observer of the damage.  The file is still in place, so the
+    // reported (label, prop) is the live entry.
+    const { dir, indexFile, dbPath } = makeDamagedDb()
+    try {
+      const failures = SparrowDB.vectorIndexLoadFailures(dbPath)
+      assert.equal(
+        failures.length, EXPECTED_FAILURES,
+        `expected exactly ${EXPECTED_FAILURES} damaged index, got ` +
+        JSON.stringify(failures)
+      )
+      assertFailureShape(failures[0], indexFile)
+      assert.equal(
+        failures[0].path, indexFile,
+        'the live arm reports the .bin path it scanned'
+      )
+      // Caveat worth encoding: probing a live entry is not read-only when
+      // composed with #442 — `VectorIndex::load` quarantines the bytes it
+      // rejects, so by the time this call returns the .bin has been renamed
+      // aside and the reported .bin path no longer resolves.  The surviving
+      // bytes are named in `reason`, and the NEXT call reports the artifact
+      // path (see the following test).  Asserting this rather than glossing
+      // it is the point: a consumer must not assume `path` is still there
+      // after a live-arm report.
+      assert.ok(
+        /corrupt/i.test(failures[0].reason),
+        `reason must describe the damage, got: ${failures[0].reason}`
+      )
+      const artifacts = fs
+        .readdirSync(path.join(dbPath, 'vector_indexes'))
+        .filter(n => n.startsWith(`hnsw_${LABEL}_${PROP}.bin.corrupt.`))
+      assert.equal(
+        artifacts.length, 1,
+        `#442 must have quarantined the probed file exactly once, got ` +
+        JSON.stringify(artifacts)
+      )
+    } finally {
+      removeDir(dir)
+    }
+  })
+
+  it('is callable on a database that refuses to open, and keeps reporting after it starts opening "clean" (#451)', () => {
+    const { dir, dbPath, indexFile } = makeDamagedDb()
+    try {
+      // ── Phase 1: the state #446 created. `open()` refuses. ───────────────
+      assert.throws(
+        () => SparrowDB.open(dbPath),
+        err => {
+          assert.ok(
+            new RegExp(`${LABEL}`).test(err.message) &&
+            new RegExp(`${PROP}`).test(err.message),
+            `open() must name the (label, prop) pair, got: ${err.message}`
+          )
+          return true
+        },
+        'a live damaged index must make open() fail'
+      )
+
+      // The whole reason this is static: there is no instance to hang it off.
+      const duringOutage = SparrowDB.vectorIndexLoadFailures(dbPath)
+      assert.equal(
+        duringOutage.length, EXPECTED_FAILURES,
+        `expected exactly ${EXPECTED_FAILURES} damaged index while open() is ` +
+        `failing, got ${JSON.stringify(duringOutage)}`
+      )
+      assertFailureShape(duringOutage[0], indexFile)
+
+      // The failed open() quarantined the bytes, so the reported path is now
+      // the artifact: `<indexFile>.corrupt.<unix_millis>`.  The stem is
+      // hand-derived; only the millisecond stamp is matched loosely because it
+      // is a wall-clock value and cannot be derived.
+      const artifactPattern = new RegExp(
+        `^${escapeRegExp(indexFile)}\\.corrupt\\.\\d+$`
+      )
+      assert.match(
+        duringOutage[0].path, artifactPattern,
+        'the reported path must be the quarantine artifact'
+      )
+      // A report naming a file that is not on disk is not actionable.
+      assert.ok(
+        fs.existsSync(duringOutage[0].path),
+        `reported path ${duringOutage[0].path} must exist on disk`
+      )
+      assert.ok(
+        fs.statSync(duringOutage[0].path).isFile(),
+        'the reported path must be a regular file'
+      )
+      assert.ok(
+        /quarantine/i.test(duringOutage[0].reason),
+        `reason must identify this as a quarantine artifact, got: ` +
+        duringOutage[0].reason
+      )
+
+      // ── Phase 2: #451. The .bin is gone, so this is now the "absent" case
+      //    and open() succeeds — with the index silently missing. ───────────
+      const db = SparrowDB.open(dbPath)
+      assert.ok(
+        db instanceof SparrowDB,
+        'after quarantine the second open() succeeds — that is #451'
+      )
+      // Confirm the index really is absent from the reopened database: the
+      // vectors are gone and nothing on the instance API says so.
+      assert.throws(
+        () => db.vectorIndexHealth(LABEL, PROP),
+        /RangeError/,
+        'the quarantined index must be absent from the reopened database'
+      )
+
+      // ── Phase 3: the diagnostic is the ONLY remaining signal. ────────────
+      const afterReopen = SparrowDB.vectorIndexLoadFailures(dbPath)
+      assert.equal(
+        afterReopen.length, EXPECTED_FAILURES,
+        `the quarantine must remain visible after the database reopens ` +
+        `"clean"; got ${JSON.stringify(afterReopen)}`
+      )
+      assertFailureShape(afterReopen[0], indexFile)
+      assert.equal(
+        afterReopen[0].path, duringOutage[0].path,
+        'the artifact path must be stable across calls'
+      )
+      assert.ok(
+        fs.existsSync(afterReopen[0].path),
+        `reported path ${afterReopen[0].path} must exist on disk`
+      )
+    } finally {
+      removeDir(dir)
     }
   })
 })
