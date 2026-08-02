@@ -12,7 +12,9 @@
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBool, PyDict, PyList};
+#[cfg(feature = "python")]
+use std::collections::HashMap;
 
 // ── Value → Python conversion ─────────────────────────────────────────────────
 
@@ -54,6 +56,74 @@ fn value_to_py(py: Python<'_>, v: &sparrowdb_execution::Value) -> PyObject {
             py_list.into()
         }
     }
+}
+
+// ── Python → Value conversion (for execute_with_params) ──────────────────────
+
+/// Convert a Python object into a `sparrowdb_execution::Value` for use as a
+/// bound query parameter.
+///
+/// `bool` is checked before `int` because Python's `bool` is a subclass of
+/// `int` — extracting `True`/`False` as `i64` would otherwise silently widen
+/// them to `1`/`0` instead of `Value::Bool`.
+#[cfg(feature = "python")]
+fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<sparrowdb_execution::Value> {
+    use sparrowdb_execution::Value;
+
+    if obj.is_none() {
+        return Ok(Value::Null);
+    }
+    if let Ok(b) = obj.downcast::<PyBool>() {
+        return Ok(Value::Bool(b.is_true()));
+    }
+    if let Ok(i) = obj.extract::<i64>() {
+        return Ok(Value::Int64(i));
+    }
+    if let Ok(f) = obj.extract::<f64>() {
+        return Ok(Value::Float64(f));
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(Value::String(s));
+    }
+    if let Ok(list) = obj.downcast::<PyList>() {
+        let mut out = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            out.push(py_to_value(&item)?);
+        }
+        return Ok(Value::List(out));
+    }
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut entries = Vec::with_capacity(dict.len());
+        for (k, v) in dict.iter() {
+            let key: String = k.extract().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err("parameter dict keys must be strings")
+            })?;
+            entries.push((key, py_to_value(&v)?));
+        }
+        return Ok(Value::Map(entries));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "unsupported parameter type: {}",
+        obj.get_type().name()?
+    )))
+}
+
+/// Convert an optional Python `dict` of query parameters into the
+/// `HashMap<String, Value>` shape that `GraphDb::execute_with_params` expects.
+#[cfg(feature = "python")]
+fn py_params_to_map(
+    params: Option<&Bound<'_, PyDict>>,
+) -> PyResult<HashMap<String, sparrowdb_execution::Value>> {
+    let mut map = HashMap::new();
+    if let Some(dict) = params {
+        for (k, v) in dict.iter() {
+            let key: String = k.extract().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err("parameter dict keys must be strings")
+            })?;
+            map.insert(key, py_to_value(&v)?);
+        }
+    }
+    Ok(map)
 }
 
 // ── PyGraphDb ─────────────────────────────────────────────────────────────────
@@ -170,6 +240,45 @@ impl PyGraphDb {
         // other Python threads (e.g. a thread pool) can run concurrently.
         let result = py
             .allow_threads(|| self.inner.execute(cypher))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let list = PyList::empty_bound(py);
+        for row in &result.rows {
+            let dict = PyDict::new_bound(py);
+            for (col, val) in result.columns.iter().zip(row.iter()) {
+                dict.set_item(col, value_to_py(py, val))?;
+            }
+            list.append(dict)?;
+        }
+        Ok(list.into())
+    }
+
+    /// Execute a Cypher query with bound parameters and return a list of
+    /// row-dicts.
+    ///
+    /// *params* is a plain Python ``dict`` mapping ``$name`` → value.
+    /// Supported parameter value types: ``None``, ``bool``, ``int``, ``float``,
+    /// ``str``, ``list``, and ``dict`` (nesting allowed). Values are available
+    /// inside *cypher* as ``$name`` expressions.
+    ///
+    /// The GIL is released while the query executes (SPA-256).
+    ///
+    /// Example::
+    ///
+    ///     results = db.execute_with_params(
+    ///         "MATCH (n:Person {id: $id}) RETURN n.name", {"id": "p1"}
+    ///     )
+    #[pyo3(signature = (cypher, params=None))]
+    fn execute_with_params(
+        &self,
+        py: Python<'_>,
+        cypher: &str,
+        params: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        let param_map = py_params_to_map(params)?;
+
+        let result = py
+            .allow_threads(|| self.inner.execute_with_params(cypher, param_map))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let list = PyList::empty_bound(py);
