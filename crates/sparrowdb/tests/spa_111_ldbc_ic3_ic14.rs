@@ -75,7 +75,8 @@ fn ic3_friends_in_germany_includes_depth_two_match() {
 
     // Germany is place 3; its residents are persons 4, 6 and 9.
     // Within Alice's 1..2-hop set {2, 3, 4, 5, 6, 7}: person 4 (Dave Brown,
-    // depth 2) and person 6 (Frank Miller, depth 1). Person 9 is 5 hops away.
+    // depth 2) and person 6 (Frank Miller, depth 1). Person 9 is 4 hops away
+    // (1→6→7→8→9).
     // ORDER BY lastName → Brown, Miller.
     let results = ic_queries::ic3_friends_in_countries(&db, 1, "Germany", "France", 14).unwrap();
 
