@@ -10,6 +10,14 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Every `run:` step uses `bash --noprofile --norc -eo pipefail {0}`.
+# Without this, GitHub's default `bash -e {0}` has no pipefail, so any step
+# ending in `| tee …` exits with tee's status (always 0) and test failures
+# are silently reported as green.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # ── Unit + Integration tests ───────────────────────────────────────────────
   test:
@@ -197,10 +205,18 @@ jobs:
           cargo build --release -p sparrowdb-node
           # Rename the platform artifact to the generic sparrowdb.node that
           # index.js's fallback chain looks for.
-          ARTIFACT=$(ls target/release/libsparrowdb_node.so \
-                        target/release/libsparrowdb_node.dylib \
-                        target/release/sparrowdb_node.dll \
-                        2>/dev/null | head -1)
+          #
+          # Pick the first candidate that exists without relying on `ls`'s
+          # exit status: `ls a b c 2>/dev/null | head -1` intentionally
+          # tolerates two of the three paths being missing, but under
+          # pipefail `ls`'s non-zero status now propagates and aborts the
+          # step before the artifact-existence check below ever runs.
+          ARTIFACT=""
+          for f in target/release/libsparrowdb_node.so \
+                   target/release/libsparrowdb_node.dylib \
+                   target/release/sparrowdb_node.dll; do
+            [ -f "$f" ] && ARTIFACT="$f" && break
+          done
           if [ -z "$ARTIFACT" ]; then
             echo "ERROR: could not find compiled sparrowdb-node artifact" >&2
             ls target/release/ >&2
@@ -211,21 +227,6 @@ jobs:
 
       - name: Run Node.js integration tests
         run: node --test npm/sparrowdb/test/integration.test.js
-
-  # ── Golden fixture integrity ───────────────────────────────────────────────
-  fixtures:
-    name: Golden fixture round-trips
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Fixture round-trip tests
-        run: |
-          cargo test --workspace --test fixtures -- --nocapture \
-            2>&1 || echo "No fixture tests yet — will add per phase"
 
   # ── Ruby bindings (compile check) ─────────────────────────────────────────
   ruby-bindings:
