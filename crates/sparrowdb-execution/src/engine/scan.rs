@@ -808,19 +808,30 @@ impl Engine {
         // Replaces the cascade of `can_use_*` boolean guards with a single
         // typed plan selector.  Each variant dispatches to the matching
         // `execute_*_chunked` entry point.
-        if let Some(plan) = self.try_plan_chunked_match(m) {
-            match plan {
-                crate::engine::pipeline_exec::ChunkedPlan::MutualNeighbors => {
-                    return self.execute_mutual_neighbors_chunked(m, &column_names);
-                }
-                crate::engine::pipeline_exec::ChunkedPlan::TwoHop => {
-                    return self.execute_two_hop_chunked(m, &column_names);
-                }
-                crate::engine::pipeline_exec::ChunkedPlan::OneHop => {
-                    return self.execute_one_hop_chunked(m, &column_names);
-                }
-                crate::engine::pipeline_exec::ChunkedPlan::Scan => {
-                    return self.execute_scan_chunked(m, &column_names);
+        //
+        // Skip entirely for a varlen-plus-hop chain. Every `can_use_*_chunked`
+        // guard already rejects `min_hops.is_some()`, and the parser only ever
+        // produces `max_hops: Some(_)` alongside `min_hops: Some(_)` — there is
+        // no `*..N` quantifier syntax that leaves min unset (see the `*min..max`
+        // parsing in `sparrowdb-cypher`'s parser) — so no chunked plan can
+        // currently match this shape regardless. Gating on `is_var_len_chain`
+        // here removes the dependency on that invariant holding across three
+        // separate guard functions rather than one.
+        if !is_var_len_chain {
+            if let Some(plan) = self.try_plan_chunked_match(m) {
+                match plan {
+                    crate::engine::pipeline_exec::ChunkedPlan::MutualNeighbors => {
+                        return self.execute_mutual_neighbors_chunked(m, &column_names);
+                    }
+                    crate::engine::pipeline_exec::ChunkedPlan::TwoHop => {
+                        return self.execute_two_hop_chunked(m, &column_names);
+                    }
+                    crate::engine::pipeline_exec::ChunkedPlan::OneHop => {
+                        return self.execute_one_hop_chunked(m, &column_names);
+                    }
+                    crate::engine::pipeline_exec::ChunkedPlan::Scan => {
+                        return self.execute_scan_chunked(m, &column_names);
+                    }
                 }
             }
         }
