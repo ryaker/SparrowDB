@@ -726,13 +726,28 @@ impl VectorIndex {
     /// Test-only rendezvous point, exercised by
     /// `regression_464_quarantine_race.rs`.
     ///
-    /// Unconditionally compiled rather than `#[cfg(test)]`: the race it lets
+    /// Unconditionally *present* rather than `#[cfg(test)]`: the race it lets
     /// the test force spans a process boundary, so the test binary links
     /// this crate as an ordinary dependency, not under `cfg(test)` — a
-    /// `#[cfg(test)]` item here would simply not exist in that build. It is
-    /// inert everywhere else: `SPARROWDB_TEST_QUARANTINE_PAUSE_DIR` is set
-    /// nowhere except that one test's child process, so every real caller,
-    /// and every other test, returns from this on the first line.
+    /// `#[cfg(test)]` item here would simply not exist in that build.
+    ///
+    /// It is gated on `debug_assertions` instead, which is the property that
+    /// actually matters: absent from every release build this crate ships,
+    /// present in the debug/dev-profile build the integration test binary
+    /// links (Cargo's default `[profile.test]` inherits `debug-assertions =
+    /// true` from `[profile.dev]`, and this workspace does not override
+    /// that). A `#[cfg(not(debug_assertions))]` build sees the no-op stub
+    /// below, which the optimiser deletes entirely — so this test does not
+    /// run, and must not be relied on, under `cargo test --release`.
+    ///
+    /// This distinction is not cosmetic. Even gated to the corrupt-file path
+    /// and requiring an env var, an unconditionally-compiled version of this
+    /// hook would ship to every consumer of this crate: anything able to set
+    /// `SPARROWDB_TEST_QUARANTINE_PAUSE_DIR` in a release process's
+    /// environment could stall it for up to 60 seconds inside
+    /// `load_and_quarantine` and cause a file write to a directory of its
+    /// choosing. `debug_assertions` removes that surface from what actually
+    /// ships, rather than merely making it hard to trigger.
     ///
     /// # Why this exists at all
     ///
@@ -749,6 +764,7 @@ impl VectorIndex {
     /// here, on request, lets the test hold this function open for as long
     /// as it needs to let a real `save()` complete, then release it, so the
     /// interleaving is forced rather than hoped for.
+    #[cfg(debug_assertions)]
     fn test_pause_before_quarantine_lock() {
         let Ok(dir) = std::env::var("SPARROWDB_TEST_QUARANTINE_PAUSE_DIR") else {
             return;
@@ -766,6 +782,13 @@ impl VectorIndex {
             std::thread::yield_now();
         }
     }
+
+    /// Release-build stand-in for the hook above: always a no-op, and small
+    /// enough that the optimiser removes the call entirely. See the doc
+    /// comment on the `debug_assertions` version for why the two must not be
+    /// merged into one unconditionally-compiled function.
+    #[cfg(not(debug_assertions))]
+    fn test_pause_before_quarantine_lock() {}
 
     fn inconsistent_error(path: &Path, reason: &str) -> std::io::Error {
         std::io::Error::new(
