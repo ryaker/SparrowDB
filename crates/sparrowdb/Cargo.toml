@@ -34,6 +34,14 @@ sparrowdb-bench = { path = "../sparrowdb-bench" }
 # Test-only: regression_456 counts `tracing::warn!` events to prove a damaged
 # index warns once per incident rather than once per scanned row.
 tracing-subscriber = { workspace = true }
+# Re-declares sparrowdb-storage (already a normal dependency above) with its
+# `test-hooks` feature enabled. Cargo unifies the two entries only for this
+# crate's own test/bench targets; the library and bin targets above still
+# build against the plain [dependencies] entry, so `test-hooks` never reaches
+# a downstream consumer of the published `sparrowdb` crate. Needed by
+# regression_464_quarantine_race.rs — see that file and
+# VectorIndex::test_pause_before_quarantine_lock's doc comment.
+sparrowdb-storage = { workspace = true, features = ["test-hooks"] }
 
 [[bin]]
 name = "sparrowdb-mcp"

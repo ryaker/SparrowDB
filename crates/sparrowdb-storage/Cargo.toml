@@ -26,6 +26,23 @@ serde             = { workspace = true }
 tempfile  = { workspace = true }
 criterion = { workspace = true }
 
+[features]
+# Off by default, and not enabled by anything else in this workspace's
+# dependency graph. Compiles in VectorIndex::test_pause_before_quarantine_lock
+# — a rendezvous hook the multi-process regression test in
+# crates/sparrowdb/tests/regression_464_quarantine_race.rs uses to force a
+# deterministic interleaving with quarantine_after_recheck(). See that
+# function's doc comment for why an unconditionally-compiled or
+# `debug_assertions`-gated version is not acceptable here: a published,
+# embedded database is linked into other people's binaries, including their
+# own debug builds, and this hook can stall the quarantine path for up to 60
+# seconds and write into an environment-named directory. A non-default
+# feature is never enabled by a downstream consumer's ordinary `cargo build`
+# — debug or release — only by something that explicitly asks for
+# `sparrowdb-storage/test-hooks` by name, which nothing in this workspace's
+# published dependency graph does.
+test-hooks = []
+
 [[bench]]
 name = "storage_benchmarks"
 harness = false
