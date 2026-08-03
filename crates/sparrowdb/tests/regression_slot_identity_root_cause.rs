@@ -305,6 +305,158 @@ fn homogeneous_varlen_is_unchanged() {
     );
 }
 
+// ── #421 × #429/#431: varlen hop + trailing hop must not inherit a colliding
+// slot's edges ───────────────────────────────────────────────────────────
+
+/// Collect two string columns as a sorted `Vec<(String, String)>`.
+fn sorted_pairs(result: &QueryResult, col_a: usize, col_b: usize) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let a = match &row[col_a] {
+                Value::String(s) => s.clone(),
+                other => panic!("expected a string in column {col_a}, got {other:?}"),
+            };
+            let b = match &row[col_b] {
+                Value::String(s) => s.clone(),
+                other => panic!("expected a string in column {col_b}, got {other:?}"),
+            };
+            (a, b)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// #421 taught `execute_n_hop` to answer a variable-length hop followed by a
+/// further hop instead of rejecting it. The root fix in this file made every
+/// fixed-hop neighbour lookup label-aware. Neither guards the intersection on
+/// its own: #421's tests predate this fixture, and before #421 this exact
+/// shape was rejected outright rather than executed (see
+/// `regression_421_varlen_plus_hop::pipeline_match_stage_rejects_varlen`), so
+/// nothing exercises the trailing hop of a varlen chain landing on a
+/// colliding slot except this.
+///
+/// `b` is deliberately **unlabeled**. `rel_ids_per_hop` narrows a fixed hop to
+/// a single catalog table when *both* its endpoint labels are declared — see
+/// the comment above that code, which names this exact fixture (Carol /
+/// TechStart) as the case it exists to head off. With `(b:Person)` the
+/// narrowing hides the bug before the neighbour lookup ever runs; with `(b)`
+/// unlabeled there is nothing to narrow against, so both LOCATED_IN tables
+/// (T2 Person->Place, T3 Org->Place) stay live and the neighbour lookup
+/// itself has to be the thing that filters by source label.
+///
+/// Derivation: Alice's KNOWS chain is Alice(P0) -> Bob(P1) -> Carol(P2) (e1,
+/// e2), so `[:KNOWS*1..2]` binds `b` to {Bob, Carol} — Bob at depth 1, Carol
+/// at depth 2. Bob's only LOCATED_IN edge is e4, to Springfield. Carol's only
+/// LOCATED_IN edge is e5, to Kyoto. So exactly two rows:
+/// `(Bob, Springfield)`, `(Carol, Kyoto)`.
+///
+/// The trap is Carol: she is Person slot 2, the same slot number as TechStart
+/// (Org slot 2), and both have an outgoing LOCATED_IN edge registered under
+/// different catalog tables (T2 via e5, T3 via e6, TechStart -> Berlin). A
+/// trailing-hop neighbour lookup that filtered by bare slot alone, without
+/// checking which table's `src_label_id` actually matches Carol, would pick
+/// up e6 too and add a spurious third row, `(Carol, Berlin)` — after
+/// `checkpoint()` moves the edges into per-table CSRs, exactly where
+/// #429/#431 lived.
+#[test]
+fn varlen_plus_trailing_hop_does_not_read_a_colliding_slot() {
+    let (_dir, db) = build_graph();
+    let q = "MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(b)\
+             -[:LOCATED_IN]->(pl:Place) RETURN DISTINCT b.name, pl.name";
+
+    // Uncheckpointed (delta-backed) — the delta log stores full NodeIds and
+    // was never subject to the bare-slot bug, so this must already be right.
+    let before = query(&db, q);
+    assert_eq!(
+        sorted_pairs(&before, 0, 1),
+        vec![
+            ("Bob".to_string(), "Springfield".to_string()),
+            ("Carol".to_string(), "Kyoto".to_string()),
+        ],
+        "Bob lives in Springfield (e4); Carol lives in Kyoto (e5); Berlin \
+         belongs to TechStart (Org slot 2), not to Carol (Person slot 2)"
+    );
+
+    // Checkpointed (CSR-backed) — the answer must not change.
+    db.checkpoint().expect("checkpoint");
+    let after = query(&db, q);
+    assert_eq!(
+        sorted_pairs(&after, 0, 1),
+        vec![
+            ("Bob".to_string(), "Springfield".to_string()),
+            ("Carol".to_string(), "Kyoto".to_string()),
+        ],
+        "after checkpoint the edges live in per-table CSRs indexed by source \
+         slot; Carol (Person slot 2) must not read TechStart's (Org slot 2) \
+         row just because the numeric slot matches"
+    );
+}
+
+/// CodeRabbit (#432 review): the fixed-hop branch used to encode an unlabeled
+/// destination's neighbour label as `next_label_id_opt.unwrap_or(0)`. Label id
+/// `0` is a real label — the catalog hands out ids starting at 0, and in this
+/// fixture `Person` (the *first* label `build_graph` creates) **is** label 0
+/// — so `unwrap_or(0)` is not "no label", it is "silently relabel this
+/// neighbour as Person". `read_node_props` then reads whatever Person happens
+/// to occupy the destination's numeric slot instead of the real destination.
+///
+/// Every existing test above resolves its unlabeled positions to Person
+/// nodes, so the wrong default and the right answer coincide by accident and
+/// the bug never surfaces. This test forces the unlabeled destination to
+/// resolve to `Place` (label 1, not 0) so `unwrap_or(0)` and reality diverge.
+///
+/// Derivation, same KNOWS chain as above: `b` ∈ {Bob (P1), Carol (P2)}. Both
+/// `b` and `pl` are unlabeled, so LOCATED_IN stays type-wide (T2 and T3).
+/// Bob's only LOCATED_IN edge is e4, to Springfield (**Place slot 0**).
+/// Carol's only LOCATED_IN edge is e5, to Kyoto (**Place slot 2**). So
+/// exactly two rows: `(Bob, Springfield)`, `(Carol, Kyoto)`.
+///
+/// Under the old code every candidate slot — from either table, delta or CSR
+/// — got relabelled Person (`unwrap_or(0)`), so `pl` would resolve to
+/// whichever Person occupies that slot number instead of the real Place:
+/// Bob's candidate slot is 0 (Springfield's slot), which as a *Person* is
+/// Alice; Carol's candidate slots are 2 from T2 (Kyoto's slot, which as a
+/// Person is Carol herself) and 1 from T3 (Berlin's slot, which as a Person
+/// is Bob). `pl.name` would read "Alice", "Carol" or "Bob" — never a Place at
+/// all. This is not checkpoint-specific: the delta path threw the label away
+/// exactly the same way (`r.dst.0 & 0xFFFF_FFFF` keeps only the slot), so the
+/// bug is present before `checkpoint()` too.
+#[test]
+fn varlen_plus_trailing_hop_unlabeled_destination_does_not_default_to_label_zero() {
+    let (_dir, db) = build_graph();
+    let q = "MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(b)\
+             -[:LOCATED_IN]->(pl) RETURN DISTINCT b.name, pl.name";
+
+    // Uncheckpointed (delta-backed) — the old bug lived here too: the delta
+    // branch discarded `r.dst`'s label just as thoroughly as the CSR branch.
+    let before = query(&db, q);
+    assert_eq!(
+        sorted_pairs(&before, 0, 1),
+        vec![
+            ("Bob".to_string(), "Springfield".to_string()),
+            ("Carol".to_string(), "Kyoto".to_string()),
+        ],
+        "pl must resolve to the real Place destination, not to whichever \
+         Person happens to occupy the same numeric slot"
+    );
+
+    // Checkpointed (CSR-backed) — the answer must not change.
+    db.checkpoint().expect("checkpoint");
+    let after = query(&db, q);
+    assert_eq!(
+        sorted_pairs(&after, 0, 1),
+        vec![
+            ("Bob".to_string(), "Springfield".to_string()),
+            ("Carol".to_string(), "Kyoto".to_string()),
+        ],
+        "an unlabeled destination must never default to label 0; it must \
+         carry the neighbour's real discovered label"
+    );
+}
+
 // ── #427: shortestPath, re-asserted against the shared neighbour lookup ─────
 
 /// `bfs_shortest_path` grew its own catalog-driven neighbour loop in the #427
