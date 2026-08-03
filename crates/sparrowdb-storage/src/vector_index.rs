@@ -731,23 +731,36 @@ impl VectorIndex {
     /// this crate as an ordinary dependency, not under `cfg(test)` — a
     /// `#[cfg(test)]` item here would simply not exist in that build.
     ///
-    /// It is gated on `debug_assertions` instead, which is the property that
-    /// actually matters: absent from every release build this crate ships,
-    /// present in the debug/dev-profile build the integration test binary
-    /// links (Cargo's default `[profile.test]` inherits `debug-assertions =
-    /// true` from `[profile.dev]`, and this workspace does not override
-    /// that). A `#[cfg(not(debug_assertions))]` build sees the no-op stub
-    /// below, which the optimiser deletes entirely — so this test does not
-    /// run, and must not be relied on, under `cargo test --release`.
+    /// It is gated on the non-default `test-hooks` Cargo feature instead —
+    /// deliberately not `debug_assertions`, which was this crate's first
+    /// attempt and has a real gap: `debug_assertions` is on for *every*
+    /// debug build, including a downstream consumer's own `cargo build` of
+    /// their application that happens to link this crate. This is an
+    /// embedded, published database other people's binaries link directly,
+    /// so "off in release" is not the same bar as "off unless something
+    /// explicitly asks for it by name". A non-default feature clears that
+    /// bar: nobody gets `test-hooks` — debug or release — without an
+    /// explicit `features = ["test-hooks"]` naming it, and nothing else in
+    /// this workspace's published dependency graph does that. The only
+    /// enabler is `crates/sparrowdb/Cargo.toml`'s `[dev-dependencies]`
+    /// re-declaration of this crate, which Cargo unifies in only for
+    /// `sparrowdb`'s own test/bench targets — never for its library or
+    /// binary targets, and never for a downstream consumer of the published
+    /// `sparrowdb` crate. A `#[cfg(not(feature = "test-hooks"))]` build sees
+    /// the no-op stub below, which the optimiser deletes entirely — so this
+    /// test does not run, and must not be relied on, under a build that
+    /// does not pass `--features test-hooks` (in particular, an ordinary
+    /// `cargo test --release` at the workspace root does not enable it
+    /// either, unless invoked with that flag).
     ///
     /// This distinction is not cosmetic. Even gated to the corrupt-file path
-    /// and requiring an env var, an unconditionally-compiled version of this
-    /// hook would ship to every consumer of this crate: anything able to set
-    /// `SPARROWDB_TEST_QUARANTINE_PAUSE_DIR` in a release process's
-    /// environment could stall it for up to 60 seconds inside
-    /// `load_and_quarantine` and cause a file write to a directory of its
-    /// choosing. `debug_assertions` removes that surface from what actually
-    /// ships, rather than merely making it hard to trigger.
+    /// and requiring an env var, a version of this hook compiled into
+    /// anything a consumer might link would let anything able to set
+    /// `SPARROWDB_TEST_QUARANTINE_PAUSE_DIR` in that process's environment
+    /// stall it for up to 60 seconds inside `load_and_quarantine` and cause
+    /// a file write to a directory of its choosing. The feature gate removes
+    /// that surface from what actually ships, rather than merely making it
+    /// hard to trigger.
     ///
     /// # Why this exists at all
     ///
@@ -764,13 +777,37 @@ impl VectorIndex {
     /// here, on request, lets the test hold this function open for as long
     /// as it needs to let a real `save()` complete, then release it, so the
     /// interleaving is forced rather than hoped for.
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-hooks")]
     fn test_pause_before_quarantine_lock() {
         let Ok(dir) = std::env::var("SPARROWDB_TEST_QUARANTINE_PAUSE_DIR") else {
             return;
         };
         let dir = std::path::PathBuf::from(dir);
-        let _ = std::fs::write(dir.join("paused"), b"1");
+
+        // `create_new` refuses to open an existing directory entry — file or
+        // symlink — rather than following it. A plain `fs::write` here would
+        // follow a pre-existing `paused` symlink and clobber whatever it
+        // points at; this test-only path has no business writing anywhere
+        // but the fresh flag file the caller's scratch directory expects.
+        let mut flag = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join("paused"))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "test_pause_before_quarantine_lock: could not create {} ({e}); refusing to \
+                     follow a pre-existing entry (symlink or otherwise) at that path",
+                    dir.join("paused").display()
+                )
+            });
+        flag.write_all(b"1").unwrap_or_else(|e| {
+            panic!(
+                "test_pause_before_quarantine_lock: could not write to {} ({e})",
+                dir.join("paused").display()
+            )
+        });
+        drop(flag);
+
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !dir.join("resume").exists() {
             assert!(
@@ -783,11 +820,13 @@ impl VectorIndex {
         }
     }
 
-    /// Release-build stand-in for the hook above: always a no-op, and small
-    /// enough that the optimiser removes the call entirely. See the doc
-    /// comment on the `debug_assertions` version for why the two must not be
+    /// Stand-in for the hook above when the `test-hooks` feature is not
+    /// enabled — the default for every build, including this crate's own
+    /// release profile and every downstream consumer. Always a no-op, and
+    /// small enough that the optimiser removes the call entirely. See the
+    /// doc comment on the feature-gated version for why the two must not be
     /// merged into one unconditionally-compiled function.
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(feature = "test-hooks"))]
     fn test_pause_before_quarantine_lock() {}
 
     fn inconsistent_error(path: &Path, reason: &str) -> std::io::Error {

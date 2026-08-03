@@ -28,20 +28,29 @@
 //! relying on luck would make this test flaky at best and, at worst, quietly
 //! never hit the window and pass against the unfixed code for the wrong
 //! reason — the exact failure mode `regression_406.rs` shipped with. Instead,
-//! this drives `VectorIndex::test_pause_before_quarantine_lock` (present
-//! only under `debug_assertions`, inert unless
-//! `SPARROWDB_TEST_QUARANTINE_PAUSE_DIR` is also set — see its doc comment in
-//! `vector_index.rs`) to hold the opener process open at exactly the point
-//! issue #464 named: immediately before it would acquire `SaveLock`, i.e.
-//! between the unlocked judgement and the quarantine.
+//! this drives `VectorIndex::test_pause_before_quarantine_lock` (present only
+//! when `sparrowdb-storage`'s non-default `test-hooks` feature is enabled,
+//! inert unless `SPARROWDB_TEST_QUARANTINE_PAUSE_DIR` is also set — see its
+//! doc comment in `vector_index.rs`) to hold the opener process open at
+//! exactly the point issue #464 named: immediately before it would acquire
+//! `SaveLock`, i.e. between the unlocked judgement and the quarantine.
 //!
-//! Because the hook is compiled out under `#[cfg(not(debug_assertions))]`,
-//! **this test does not exercise anything under `cargo test --release`**: the
-//! opener never pauses, so it either quarantines before the repairer can act
-//! or the parent times out waiting for a pause that will never come. That is
-//! expected, not a bug in the test — see the hook's doc comment in
-//! `vector_index.rs` for why leaving it compiled into release builds is the
-//! actual risk being traded away.
+//! `crates/sparrowdb/Cargo.toml` enables `test-hooks` only via a
+//! `[dev-dependencies]` re-declaration of `sparrowdb-storage`, which Cargo
+//! unifies in for this crate's test/bench targets and nowhere else — so an
+//! ordinary `cargo test` picks it up automatically, but the feature reaches
+//! neither this crate's own release build nor a downstream consumer's.
+//!
+//! One consequence: **this test does not exercise anything when the feature
+//! is off** — in particular, `cargo test --release` at the workspace root
+//! does not enable it (features are opt-in per invocation; `--release` alone
+//! does not imply `--features test-hooks`). Without the hook, the opener
+//! never pauses, so it either quarantines before the repairer can act or the
+//! parent times out waiting for a pause that will never come. That is
+//! expected, not a bug in the test — see `test_pause_before_quarantine_lock`'s
+//! doc comment in `vector_index.rs` for why shipping it reachable by anything
+//! other than this crate's own test build is the actual risk being traded
+//! away.
 //!
 //! # The interleaving this forces, across two real processes
 //!
