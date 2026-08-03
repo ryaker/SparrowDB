@@ -205,10 +205,18 @@ jobs:
           cargo build --release -p sparrowdb-node
           # Rename the platform artifact to the generic sparrowdb.node that
           # index.js's fallback chain looks for.
-          ARTIFACT=$(ls target/release/libsparrowdb_node.so \
-                        target/release/libsparrowdb_node.dylib \
-                        target/release/sparrowdb_node.dll \
-                        2>/dev/null | head -1)
+          #
+          # Pick the first candidate that exists without relying on `ls`'s
+          # exit status: `ls a b c 2>/dev/null | head -1` intentionally
+          # tolerates two of the three paths being missing, but under
+          # pipefail `ls`'s non-zero status now propagates and aborts the
+          # step before the artifact-existence check below ever runs.
+          ARTIFACT=""
+          for f in target/release/libsparrowdb_node.so \
+                   target/release/libsparrowdb_node.dylib \
+                   target/release/sparrowdb_node.dll; do
+            [ -f "$f" ] && ARTIFACT="$f" && break
+          done
           if [ -z "$ARTIFACT" ]; then
             echo "ERROR: could not find compiled sparrowdb-node artifact" >&2
             ls target/release/ >&2
