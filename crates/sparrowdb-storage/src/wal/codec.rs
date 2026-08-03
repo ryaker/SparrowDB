@@ -185,6 +185,17 @@ fn decode_props(bytes: &[u8], offset: usize) -> Result<(Vec<WalProp>, usize)> {
     }
     let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
+    // `count` is read straight from the (possibly corrupt/mis-decrypted) buffer
+    // and must be bounded before it drives an allocation. Every prop needs at
+    // least 8 bytes on the wire (key_len + val_len), so a count implying more
+    // props than could possibly fit in the remaining bytes is provably corrupt
+    // — reject it here rather than trusting it to size a `Vec`.
+    let remaining = bytes.len() - pos;
+    if count > remaining / 8 {
+        return Err(Error::Corruption(format!(
+            "props count {count} exceeds remaining bytes ({remaining})"
+        )));
+    }
     let mut props = Vec::with_capacity(count);
     for _ in 0..count {
         if bytes.len() < pos + 4 {
@@ -865,6 +876,79 @@ mod tests {
                 assert_eq!(image.len(), 4096);
             }
             _ => panic!("wrong payload"),
+        }
+    }
+
+    #[test]
+    fn test_decode_props_rejects_bogus_count_before_allocating() {
+        // count = u32::MAX, followed by only 4 trailing bytes.
+        //
+        // Hand-derived expected outcome (not captured from running the code):
+        // - offset = 0, so after reading the 4-byte count, pos = 4.
+        // - remaining = bytes.len() - pos = 8 - 4 = 4.
+        // - Each prop needs >= 8 bytes on the wire (key_len(4) + val_len(4)),
+        //   so the maximum count that could possibly fit is remaining / 8 = 0.
+        // - count (u32::MAX = 4294967295) > 0, so this must be rejected as
+        //   corrupt *before* `Vec::with_capacity(count)` ever runs — that
+        //   capacity would be ~4.29e9 * size_of::<WalProp>() bytes, the same
+        //   class of allocation that aborts the process on #461.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // count
+        bytes.extend_from_slice(&[0u8; 4]); // far too little data to follow
+
+        let result = decode_props(&bytes, 0);
+        match result {
+            Err(Error::Corruption(msg)) => {
+                assert!(
+                    msg.contains("props count") && msg.contains("4294967295"),
+                    "unexpected corruption message: {msg}"
+                );
+            }
+            other => panic!("expected Err(Error::Corruption(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_node_create_round_trip_with_props() {
+        // Sanity check that the new bound in decode_props doesn't reject
+        // legitimate encodings: a real prop list is always >= 8 bytes/entry
+        // on the wire, so count <= remaining / 8 always holds for genuine data.
+        let payload = WalPayload::NodeCreate {
+            node_id: 7,
+            label_id: 3,
+            props: vec![
+                ("name".to_string(), vec![1, 2, 3]),
+                ("age".to_string(), vec![42]),
+            ],
+        };
+        let encoded = payload.encode();
+        let decoded = WalPayload::decode_plaintext(WalRecordKind::NodeCreate, &encoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_node_create_rejects_bogus_props_count_via_public_entry_point() {
+        // Same corruption as test_decode_props_rejects_bogus_count_before_allocating,
+        // but exercised through the public WalPayload::decode_plaintext entry
+        // point (the one WAL replay actually calls) with a NodeCreate payload:
+        // node_id(8) + label_id(4) + count(4)=u32::MAX + 4 trailing bytes.
+        // remaining after count = 4, 4 / 8 = 0, so u32::MAX is rejected before
+        // any allocation is attempted.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&7u64.to_le_bytes()); // node_id
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // label_id
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // bogus props count
+        bytes.extend_from_slice(&[0u8; 4]); // far too little data to follow
+
+        let result = WalPayload::decode_plaintext(WalRecordKind::NodeCreate, &bytes);
+        match result {
+            Err(Error::Corruption(msg)) => {
+                assert!(
+                    msg.contains("props count") && msg.contains("4294967295"),
+                    "unexpected corruption message: {msg}"
+                );
+            }
+            other => panic!("expected Err(Error::Corruption(_)), got {other:?}"),
         }
     }
 
