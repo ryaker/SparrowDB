@@ -627,8 +627,85 @@ impl VectorIndex {
         match Self::read_index(&path)? {
             LoadOutcome::Absent => Ok(None),
             LoadOutcome::Loaded(idx) => Ok(Some(*idx)),
+            LoadOutcome::Undecodable(reason) => Self::quarantine_after_recheck(&path, reason),
+            LoadOutcome::Inconsistent(reason) => Err(Self::inconsistent_error(&path, &reason)),
+            LoadOutcome::Unreadable(reason) => Err(Self::unreadable_error(&path, &reason)),
+        }
+    }
+
+    /// Handle an `Undecodable` verdict from the unlocked judgement in
+    /// [`Self::load_and_quarantine`] by re-validating under [`SaveLock`]
+    /// before anything is renamed. See issue #464.
+    ///
+    /// # The race this closes
+    ///
+    /// The common case is a healthy index, so `load_and_quarantine`'s first
+    /// `read_index` runs lock-free — taking `SaveLock` on every open would
+    /// serialise every reader against every writer for no reason. Only once a
+    /// file looks corrupt does this function pay for the lock, and it is
+    /// exactly the gap between that first read and the rename in
+    /// [`Self::quarantine`] where issue #464 lived: a concurrent `save()` can
+    /// complete a repair in that window, and the rename would then move the
+    /// *new, good* file aside instead of the damaged one, taking the repair
+    /// down with it and leaving a perfectly healthy file sitting in
+    /// quarantine as the "evidence".
+    ///
+    /// Taking the lock alone does not close the window — this call can still
+    /// block on `SaveLock::acquire` and be granted it *right after* the
+    /// repairing `save()` releases it, in which case the verdict it is
+    /// holding (`Undecodable`, from before the repair) is already stale.
+    /// Closing the window means never trusting that verdict past the point
+    /// where it could have gone stale: once the lock is held, `save()` is
+    /// excluded for the rest of this function (it takes the same lock for
+    /// its whole read-modify-write), so re-running the judgement *here*,
+    /// under the lock, is guaranteed to still be true a few lines down when
+    /// [`Self::quarantine`] performs the rename. A full re-read is simplest —
+    /// it reuses [`Self::read_index`], the one place that decides what
+    /// "corrupt" means, instead of introducing a second, narrower notion of
+    /// "unchanged" (e.g. a header fingerprint) that would have to be proven
+    /// to agree with it. If the repair landed in the window, the fresh read
+    /// now returns `Loaded`, and this returns that index exactly as
+    /// `load_and_quarantine` would have if the repair had landed a moment
+    /// earlier — the repair survives, and the caller sees it immediately
+    /// instead of falling through to "index absent".
+    ///
+    /// # Lock ordering
+    ///
+    /// This acquires exactly one lock — `SaveLock` on `<path>.lock` — and
+    /// holds it for no longer than one `read_index` plus one `rename`. It
+    /// never acquires a second `SaveLock` (for this or any other index file)
+    /// while holding this one, and nothing this function calls acquires a
+    /// lock of its own, so there is no cycle for a deadlock to form on. This
+    /// makes `quarantine_after_recheck` symmetric with `save`: both take the
+    /// same single lock for the same file, hold it for one bounded critical
+    /// section, and release it via `SaveLock`'s `Drop` on every return path
+    /// (including the `?` above and the early returns below).
+    fn quarantine_after_recheck(
+        path: &Path,
+        first_reason: String,
+    ) -> std::io::Result<Option<Self>> {
+        Self::test_pause_before_quarantine_lock();
+
+        let _lock = SaveLock::acquire(path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "HNSW index {} is corrupt ({first_reason}); could not acquire the save lock \
+                     to quarantine it safely ({e}). The file has been left in place for \
+                     inspection.",
+                    path.display()
+                ),
+            )
+        })?;
+
+        // Re-judge from scratch. `save()` cannot be mid-write while we hold
+        // this lock, so whatever this read sees now cannot change again
+        // before the rename below.
+        match Self::read_index(path)? {
+            LoadOutcome::Absent => Ok(None),
+            LoadOutcome::Loaded(idx) => Ok(Some(*idx)),
             LoadOutcome::Undecodable(reason) => {
-                let quarantined = Self::quarantine(&path);
+                let quarantined = Self::quarantine(path);
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -641,8 +718,52 @@ impl VectorIndex {
                     ),
                 ))
             }
-            LoadOutcome::Inconsistent(reason) => Err(Self::inconsistent_error(&path, &reason)),
-            LoadOutcome::Unreadable(reason) => Err(Self::unreadable_error(&path, &reason)),
+            LoadOutcome::Inconsistent(reason) => Err(Self::inconsistent_error(path, &reason)),
+            LoadOutcome::Unreadable(reason) => Err(Self::unreadable_error(path, &reason)),
+        }
+    }
+
+    /// Test-only rendezvous point, exercised by
+    /// `regression_464_quarantine_race.rs`.
+    ///
+    /// Unconditionally compiled rather than `#[cfg(test)]`: the race it lets
+    /// the test force spans a process boundary, so the test binary links
+    /// this crate as an ordinary dependency, not under `cfg(test)` — a
+    /// `#[cfg(test)]` item here would simply not exist in that build. It is
+    /// inert everywhere else: `SPARROWDB_TEST_QUARANTINE_PAUSE_DIR` is set
+    /// nowhere except that one test's child process, so every real caller,
+    /// and every other test, returns from this on the first line.
+    ///
+    /// # Why this exists at all
+    ///
+    /// The window issue #464 lived in — between `load_and_quarantine`'s
+    /// unlocked judgement and the rename in [`Self::quarantine`] — is a
+    /// handful of CPU instructions with no syscall in between; closing it is
+    /// exactly what [`Self::quarantine_after_recheck`] does. But that same
+    /// narrowness makes the *race* impossible to hit reliably by scheduling
+    /// luck: a concurrent `save()` would have to land its whole
+    /// write-fsync-rename inside a sub-microsecond gap. A test that waited on
+    /// luck would either flake, or — worse — silently never hit the window
+    /// and pass against the unfixed code for the wrong reason, which is
+    /// exactly the failure mode `regression_406.rs` shipped with. Pausing
+    /// here, on request, lets the test hold this function open for as long
+    /// as it needs to let a real `save()` complete, then release it, so the
+    /// interleaving is forced rather than hoped for.
+    fn test_pause_before_quarantine_lock() {
+        let Ok(dir) = std::env::var("SPARROWDB_TEST_QUARANTINE_PAUSE_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::write(dir.join("paused"), b"1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !dir.join("resume").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test_pause_before_quarantine_lock: 'resume' flag never appeared within 60s \
+                 under {}",
+                dir.display()
+            );
+            std::thread::yield_now();
         }
     }
 
@@ -839,7 +960,12 @@ impl VectorIndex {
     /// Move a damaged index file aside so the bytes are not lost to the next
     /// `save()`.  Returns the quarantine path on success.
     ///
-    /// Reached only from [`VectorIndex::load_and_quarantine`] (#456).
+    /// Reached only from [`VectorIndex::quarantine_after_recheck`] (#456,
+    /// #464), which must hold `SaveLock` for `path` and must have just
+    /// re-read and re-judged the file under that lock. This function does no
+    /// locking or re-validation of its own — by the time it runs, the caller
+    /// has already established that the bytes at `path` are corrupt *and*
+    /// that nothing else can rename them out from under this rename.
     fn quarantine(path: &Path) -> Option<PathBuf> {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
