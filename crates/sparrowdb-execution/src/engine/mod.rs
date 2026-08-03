@@ -76,23 +76,11 @@ pub(crate) fn delta_neighbors_from_index(
         .unwrap_or_default()
 }
 
-/// Look up delta neighbors for a given `(src_label_id, src_slot)` and return
-/// `(dst_slot, dst_label_id)` pairs extracted from the full dst `NodeId`.
-pub(crate) fn delta_neighbors_labeled_from_index(
-    index: &DeltaIndex,
-    src_label_id: u32,
-    src_slot: u64,
-) -> impl Iterator<Item = (u64, u32)> + '_ {
-    index
-        .get(&(src_label_id, src_slot))
-        .into_iter()
-        .flat_map(|recs| {
-            recs.iter().map(|r| {
-                let (dst_label, dst_slot) = node_id_parts(r.dst.0);
-                (dst_slot, dst_label)
-            })
-        })
-}
+// NOTE (#427): `delta_neighbors_labeled_from_index` was removed here.  Its only
+// caller was `bfs_shortest_path`, which used it to guess a neighbour's label
+// *after* the label had already been thrown away by a slot-only lookup.
+// `Engine::get_node_neighbors_labeled` keeps the label attached throughout and
+// is the correct entry point.
 
 // ── DegreeCache (SPA-272) ─────────────────────────────────────────────────────
 
@@ -249,9 +237,62 @@ pub struct ReadSnapshot {
     /// decode of the index file.  With it the file is read at most once per
     /// `(label, property)` pair per query.
     fts_cache: std::sync::Mutex<HashMap<(String, String), sparrowdb_storage::fts_index::FtsIndex>>,
+    /// Lazily-built CSR topology: which relationship tables exist and what
+    /// labels their endpoints carry.  See [`CsrTopology`].
+    ///
+    /// Built on first neighbour lookup.  `list_rel_tables_with_ids()` clones a
+    /// `String` per table, so calling it once per node in a traversal loop was
+    /// not an option; this caches the label triples the traversal actually
+    /// needs.  `OnceLock` (not `OnceCell`) keeps `ReadSnapshot: Sync`.
+    csr_topology: std::sync::OnceLock<CsrTopology>,
+}
+
+/// Which relationship tables a traversal may follow, and what labels their
+/// endpoints carry.
+///
+/// Derived from the catalog, which registers every relationship table as
+/// `(rel_table_id, src_label_id, dst_label_id, rel_type)`.  A `CsrForward` holds
+/// exactly one table's edges and is indexed by the source slot *of that table's
+/// source label*, so these triples are what make a CSR hit interpretable: they
+/// say which node the slot belongs to and which node the neighbour is.
+#[derive(Debug, Default)]
+struct CsrTopology {
+    /// `(rel_table_id, src_label_id, dst_label_id)` for every catalogued
+    /// relationship table that has a loaded CSR.
+    tables: Vec<(u32, u32, u32)>,
+    /// CSRs loaded without a catalog entry, so with no label metadata.
+    ///
+    /// `open_csr_map` always attempts `RelTableId(0)` so that CSRs checkpointed
+    /// before the catalog carried rel-table entries (pre-SPA-185 data, and
+    /// `Engine::with_single_csr`) remain readable.  Such graphs are
+    /// single-label by construction — the catalog gained rel tables in the same
+    /// release that made more than one label reachable — so the source label is
+    /// the only label there is, and is used for both endpoints.
+    unlabeled: Vec<u32>,
 }
 
 impl ReadSnapshot {
+    /// Return the CSR topology, building it from the catalog on first use.
+    fn csr_topology(&self) -> &CsrTopology {
+        self.csr_topology.get_or_init(|| {
+            let mut topo = CsrTopology::default();
+            let mut catalogued: HashSet<u32> = HashSet::new();
+            for (id, src_lid, dst_lid, _) in self.catalog.list_rel_tables_with_ids() {
+                let rid = id as u32;
+                catalogued.insert(rid);
+                if self.csrs.contains_key(&rid) {
+                    topo.tables.push((rid, src_lid as u32, dst_lid as u32));
+                }
+            }
+            for rid in self.csrs.keys() {
+                if !catalogued.contains(rid) {
+                    topo.unlabeled.push(*rid);
+                }
+            }
+            topo
+        })
+    }
+
     /// Return a reference to the FTS index for `(label, property)`, loading
     /// it from disk the first time it is requested within this query.
     ///
@@ -517,6 +558,7 @@ impl Engine {
             edge_props_cache: shared_edge_props_cache
                 .unwrap_or_else(|| std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()))),
             fts_cache: std::sync::Mutex::new(HashMap::new()),
+            csr_topology: std::sync::OnceLock::new(),
         };
 
         // If a shared cached index was provided, clone it out so we start
@@ -712,32 +754,84 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    /// Return neighbor slots merged across **all** registered rel types.
-    fn csr_neighbors_all(&self, src_slot: u64) -> Vec<u64> {
-        let mut out: Vec<u64> = Vec::new();
-        for csr in self.snapshot.csrs.values() {
-            out.extend_from_slice(csr.neighbors(src_slot));
+    /// Return the outgoing CSR neighbours of the node `(src_slot, src_label_id)`
+    /// as `(dst_slot, dst_label_id)` pairs.
+    ///
+    /// # Why the source label is a parameter
+    ///
+    /// A `NodeId` is `(label_id << 32) | slot`, so a slot number alone does not
+    /// identify a node: `Person` slot 2, `Place` slot 2 and `Post` slot 2 are
+    /// three different nodes.  A `CsrForward` is indexed by the source slot of
+    /// **one** relationship table, and a relationship table is registered in the
+    /// catalog as `(rel_table_id, src_label_id, dst_label_id, rel_type)`.
+    ///
+    /// The previous slot-only helpers (`csr_neighbors_all` /
+    /// `csr_neighbors_filtered`) probed every CSR with a bare slot, so a node of
+    /// label A inherited the edges of the node of label B that happened to
+    /// occupy the same slot number (#429), and returned bare slots, so callers
+    /// had to reconstruct the destination label by guesswork (#431) or drop it
+    /// entirely (#427).
+    ///
+    /// Consulting the catalog fixes both halves at once:
+    /// * skip any table whose `src_label_id` differs from the caller's — that
+    ///   table's CSR is not indexed by this node's slot at all;
+    /// * tag every hit with that table's `dst_label_id` — for a CSR hit the
+    ///   destination label is *known*, never inferred.
+    ///
+    /// `rel_ids` restricts the traversal to those relationship-table IDs; an
+    /// empty slice means "any type".
+    fn csr_neighbors_labeled(
+        &self,
+        src_slot: u64,
+        src_label_id: u32,
+        rel_ids: &[u32],
+    ) -> Vec<(u64, u32)> {
+        let topo = self.snapshot.csr_topology();
+        let mut out: Vec<(u64, u32)> = Vec::new();
+        for &(rid, tbl_src_lid, tbl_dst_lid) in &topo.tables {
+            if !rel_ids.is_empty() && !rel_ids.contains(&rid) {
+                continue;
+            }
+            if tbl_src_lid != src_label_id {
+                continue;
+            }
+            if let Some(csr) = self.snapshot.csrs.get(&rid) {
+                out.extend(csr.neighbors(src_slot).iter().map(|&s| (s, tbl_dst_lid)));
+            }
+        }
+        // Legacy CSRs with no catalog entry carry no label metadata; see
+        // [`CsrTopology::unlabeled`].  A type filter can never select one
+        // because a type name is exactly what they lack.
+        if rel_ids.is_empty() {
+            for rid in &topo.unlabeled {
+                if let Some(csr) = self.snapshot.csrs.get(rid) {
+                    out.extend(csr.neighbors(src_slot).iter().map(|&s| (s, src_label_id)));
+                }
+            }
         }
         out
     }
 
-    /// Return neighbor slots from the CSR, filtered to a specific set of
-    /// relation-type IDs.  When `rel_ids` is empty, falls back to scanning
-    /// all CSR tables (equivalent to [`csr_neighbors_all`]).
+    /// Destination **slots** of the outgoing CSR edges of `(src_slot,
+    /// src_label_id)`, restricted to edges that land on `dst_label_id` when it
+    /// is `Some`.
     ///
-    /// This avoids the overhead of merging neighbors from irrelevant relation
-    /// types on heterogeneous graphs where only one or a few types are needed.
-    fn csr_neighbors_filtered(&self, src_slot: u64, rel_ids: &[u32]) -> Vec<u64> {
-        if rel_ids.is_empty() {
-            return self.csr_neighbors_all(src_slot);
-        }
-        let mut out: Vec<u64> = Vec::new();
-        for &rid in rel_ids {
-            if let Some(csr) = self.snapshot.csrs.get(&rid) {
-                out.extend_from_slice(csr.neighbors(src_slot));
-            }
-        }
-        out
+    /// For callers that already know the destination's label because they build
+    /// the destination `NodeId` from it.  Filtering here rather than after the
+    /// `NodeId` is built is what stops a `Place` slot from being read as the
+    /// `Person` in the same slot.  See [`Engine::csr_neighbors_labeled`].
+    fn csr_neighbor_slots_to_label(
+        &self,
+        src_slot: u64,
+        src_label_id: u32,
+        dst_label_id: Option<u32>,
+        rel_ids: &[u32],
+    ) -> Vec<u64> {
+        self.csr_neighbors_labeled(src_slot, src_label_id, rel_ids)
+            .into_iter()
+            .filter(|(_, lid)| dst_label_id.is_none_or(|want| *lid == want))
+            .map(|(slot, _)| slot)
+            .collect()
     }
 
     /// Resolve all rel-table IDs whose type name matches `rel_type`.

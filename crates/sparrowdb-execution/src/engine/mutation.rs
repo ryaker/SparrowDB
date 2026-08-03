@@ -612,7 +612,10 @@ impl Engine {
                     for r in records {
                         let s = r.src.0;
                         let s_label = (s >> 32) as u32;
-                        if s_label == src_label_id {
+                        let d_label = (r.dst.0 >> 32) as u32;
+                        // Slots are label-relative: an edge landing on another
+                        // label must not be read as a `dst_label_id` node.
+                        if s_label == src_label_id && d_label == dst_label_id {
                             let s_slot = s & 0xFFFF_FFFF;
                             adj.entry(s_slot).or_default().push(r.dst.0 & 0xFFFF_FFFF);
                         }
@@ -645,7 +648,12 @@ impl Engine {
                     // Collect outgoing neighbours (CSR + delta adjacency map).
                     let csr_neighbors_vec: Vec<u64> = match rel_lookup {
                         RelTableLookup::Found(rtid) => self.csr_neighbors(rtid, src_slot),
-                        _ => self.csr_neighbors_all(src_slot),
+                        _ => self.csr_neighbor_slots_to_label(
+                            src_slot,
+                            src_label_id,
+                            Some(dst_label_id),
+                            &[],
+                        ),
                     };
                     let empty: Vec<u64> = Vec::new();
                     let delta_neighbors: &[u64] =

@@ -418,6 +418,30 @@ impl Engine {
         if pat.nodes.len() < 2 || pat.rels.is_empty() {
             return Ok(vec![]);
         }
+
+        // #421: this executor takes a single step along `rels[0]` and ignores
+        // any quantifier on it.  A variable-length relationship inside a
+        // pipeline MATCH stage (`WITH … MATCH (a)-[:R*1..2]->(b) …`) would
+        // therefore be answered with depth-1 matches only — the same silent
+        // truncation #421 fixed in the top-level MATCH path.  Reject instead:
+        // an error the caller can see beats data they cannot check.
+        //
+        // It also drops `rels[1..]` of any multi-hop pattern, which is the same
+        // failure without a quantifier; that is tracked separately as #430 and
+        // deliberately left alone here.
+        if pat
+            .rels
+            .iter()
+            .any(|r| r.min_hops.is_some() || r.max_hops.is_some())
+        {
+            return Err(sparrowdb_common::Error::InvalidArgument(
+                "variable-length relationships are not supported inside a pipeline \
+                 MATCH stage (after WITH); run the variable-length pattern in the \
+                 leading MATCH instead — see issue #421"
+                    .to_string(),
+            ));
+        }
+
         let src_pat = &pat.nodes[0];
         let dst_pat = &pat.nodes[1];
         let rel_pat = &pat.rels[0];
@@ -517,16 +541,28 @@ impl Engine {
             let dst_slots: Vec<u64> = match &rel_table_id {
                 RelTableLookup::Found(rtid) => self.csr_neighbors(*rtid, src_slot),
                 RelTableLookup::NotFound => continue,
-                RelTableLookup::All => self.csr_neighbors_all(src_slot),
+                // Untyped edge: restrict to tables that run from this node's
+                // label to `dst_label_id`, which is the label the destination
+                // NodeId is built from a few lines below.
+                RelTableLookup::All => self.csr_neighbor_slots_to_label(
+                    src_slot,
+                    src_label_id,
+                    Some(dst_label_id),
+                    &[],
+                ),
             };
-            // Also check the delta.
+            // Also check the delta.  Slots are label-relative, so an edge that
+            // lands on a different label must not be read as `dst_label_id`.
             let delta_slots: Vec<u64> = self
                 .read_delta_all()
                 .into_iter()
                 .filter(|r| {
                     let r_src_label = (r.src.0 >> 32) as u32;
                     let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                    r_src_label == src_label_id && r_src_slot == src_slot
+                    let r_dst_label = (r.dst.0 >> 32) as u32;
+                    r_src_label == src_label_id
+                        && r_src_slot == src_slot
+                        && r_dst_label == dst_label_id
                 })
                 .map(|r| r.dst.0 & 0xFFFF_FFFF)
                 .collect();
@@ -726,27 +762,29 @@ impl Engine {
             });
         }
 
+        // #421: a variable-length quantifier combined with further hops —
+        // `(a)-[:R*1..2]->(b)-[:S]->(c)` — is executed by the chain traversal in
+        // `execute_n_hop`, which expands each varlen hop with
+        // `execute_variable_hops` and joins the result against the remaining
+        // fixed hops.  It must be tested *before* `is_two_hop`/`is_n_hop`:
+        // dispatching on rel count alone is what made `execute_two_hop` demote
+        // `*1..2` to a plain single hop and silently drop every depth >= 2 match.
+        let is_var_len_chain = m.pattern.len() == 1
+            && m.pattern[0].rels.len() > 1
+            && m.pattern[0]
+                .rels
+                .iter()
+                .any(|r| r.min_hops.is_some() || r.max_hops.is_some());
+
         // Determine if this is a 2-hop query.
-        let is_two_hop = m.pattern.len() == 1 && m.pattern[0].rels.len() == 2;
+        let is_two_hop = !is_var_len_chain && m.pattern.len() == 1 && m.pattern[0].rels.len() == 2;
         let is_one_hop = m.pattern.len() == 1 && m.pattern[0].rels.len() == 1;
         // N-hop (3+): generalised iterative traversal (SPA-252).
-        let is_n_hop = m.pattern.len() == 1 && m.pattern[0].rels.len() >= 3;
+        let is_n_hop = !is_var_len_chain && m.pattern.len() == 1 && m.pattern[0].rels.len() >= 3;
         // Detect variable-length path: single pattern with exactly 1 rel that has min_hops set.
         let is_var_len = m.pattern.len() == 1
             && m.pattern[0].rels.len() == 1
             && m.pattern[0].rels[0].min_hops.is_some();
-
-        // #421: `is_var_len` only recognises a variable-length quantifier when it
-        // is the *only* relationship in the pattern. With a trailing hop —
-        // `(a)-[:R*1..2]->(b)-[:S]->(c)` — `rels.len() == 2`, so `is_two_hop`
-        // wins and `execute_two_hop` treats `*1..2` as a plain single hop,
-        // silently discarding every match at depth >= 2 and returning a
-        // plausible but incomplete result set.
-        //
-        // Executing variable-length expansion followed by further hops is not
-        // implemented. Until it is, reject the pattern loudly: a clear error is
-        // far better than quietly wrong data the caller cannot detect.
-        reject_varlen_with_trailing_hops(m)?;
 
         let column_names = extract_return_column_names(&m.return_clause.items);
 
@@ -782,25 +820,39 @@ impl Engine {
         // Replaces the cascade of `can_use_*` boolean guards with a single
         // typed plan selector.  Each variant dispatches to the matching
         // `execute_*_chunked` entry point.
-        if let Some(plan) = self.try_plan_chunked_match(m) {
-            match plan {
-                crate::engine::pipeline_exec::ChunkedPlan::MutualNeighbors => {
-                    return self.execute_mutual_neighbors_chunked(m, &column_names);
-                }
-                crate::engine::pipeline_exec::ChunkedPlan::TwoHop => {
-                    return self.execute_two_hop_chunked(m, &column_names);
-                }
-                crate::engine::pipeline_exec::ChunkedPlan::OneHop => {
-                    return self.execute_one_hop_chunked(m, &column_names);
-                }
-                crate::engine::pipeline_exec::ChunkedPlan::Scan => {
-                    return self.execute_scan_chunked(m, &column_names);
+        //
+        // Skip entirely for a varlen-plus-hop chain. Every `can_use_*_chunked`
+        // guard already rejects `min_hops.is_some()`, and the parser only ever
+        // produces `max_hops: Some(_)` alongside `min_hops: Some(_)` — there is
+        // no `*..N` quantifier syntax that leaves min unset (see the `*min..max`
+        // parsing in `sparrowdb-cypher`'s parser) — so no chunked plan can
+        // currently match this shape regardless. Gating on `is_var_len_chain`
+        // here removes the dependency on that invariant holding across three
+        // separate guard functions rather than one.
+        if !is_var_len_chain {
+            if let Some(plan) = self.try_plan_chunked_match(m) {
+                match plan {
+                    crate::engine::pipeline_exec::ChunkedPlan::MutualNeighbors => {
+                        return self.execute_mutual_neighbors_chunked(m, &column_names);
+                    }
+                    crate::engine::pipeline_exec::ChunkedPlan::TwoHop => {
+                        return self.execute_two_hop_chunked(m, &column_names);
+                    }
+                    crate::engine::pipeline_exec::ChunkedPlan::OneHop => {
+                        return self.execute_one_hop_chunked(m, &column_names);
+                    }
+                    crate::engine::pipeline_exec::ChunkedPlan::Scan => {
+                        return self.execute_scan_chunked(m, &column_names);
+                    }
                 }
             }
         }
 
         if is_var_len {
             self.execute_variable_length(m, &column_names)
+        } else if is_var_len_chain {
+            // #421: varlen expansion + trailing/leading fixed hops.
+            self.execute_n_hop(m, &column_names)
         } else if is_two_hop {
             self.execute_two_hop(m, &column_names)
         } else if is_one_hop {
@@ -1276,12 +1328,6 @@ impl Engine {
 
         let column_names = extract_return_column_names(&om.return_clause.items);
 
-        // #421: this arm swallows InvalidArgument into a NULL row, which would
-        // turn the unsupported-pattern error below into silent nulls — exactly
-        // the silent-wrongness the guard exists to prevent. Check first so the
-        // error propagates instead of being absorbed.
-        reject_varlen_with_trailing_hops(&match_stmt)?;
-
         let result = self.execute_match(&match_stmt);
 
         match result {
@@ -1560,7 +1606,12 @@ impl Engine {
                 .filter(|r| {
                     let r_src_label = (r.src.0 >> 32) as u32;
                     let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                    r_src_label == src_label_id && r_src_slot == src_slot
+                    let r_dst_label = (r.dst.0 >> 32) as u32;
+                    // Slots are label-relative: an edge landing on another label
+                    // must not be read as a `dst_label_id` node.
+                    r_src_label == src_label_id
+                        && r_src_slot == src_slot
+                        && r_dst_label == dst_label_id
                 })
                 .map(|r| r.dst.0 & 0xFFFF_FFFF)
                 .collect()
@@ -1568,7 +1619,7 @@ impl Engine {
 
         let csr_neighbors = match rel_lookup {
             RelTableLookup::Found(rtid) => self.csr_neighbors(rtid, src_slot),
-            _ => self.csr_neighbors_all(src_slot),
+            _ => self.csr_neighbor_slots_to_label(src_slot, src_label_id, Some(dst_label_id), &[]),
         };
         let all_neighbors: Vec<u64> = csr_neighbors.into_iter().chain(delta_neighbors).collect();
 
@@ -2727,39 +2778,4 @@ impl Engine {
             .collect();
         Value::List(label_strings)
     }
-}
-
-/// Reject `(a)-[:R*m..n]->(b)-[:S]->(c)` — a variable-length relationship
-/// followed by further hops (#421).
-///
-/// `is_var_len` in `execute_match` only recognises a variable-length quantifier
-/// when the varlen rel is the *only* relationship in the pattern. With a
-/// trailing hop `rels.len() >= 2`, so `is_two_hop`/`is_n_hop` wins and the
-/// quantifier is silently discarded — every match at depth >= 2 disappears and
-/// the caller gets a plausible but incomplete result set.
-///
-/// Executing varlen expansion followed by further hops is not implemented.
-/// Until it is, fail loudly: undetectable wrong data is worse than an error.
-///
-/// Must be called by every path that can dispatch such a pattern. In
-/// particular `execute_optional_match` has to call it *before* delegating,
-/// because that function absorbs `InvalidArgument` into a NULL row and would
-/// otherwise convert this error back into silent wrongness.
-pub(crate) fn reject_varlen_with_trailing_hops(m: &MatchStatement) -> Result<()> {
-    for pat in &m.pattern {
-        if pat.rels.len() > 1
-            && pat
-                .rels
-                .iter()
-                .any(|r| r.min_hops.is_some() || r.max_hops.is_some())
-        {
-            return Err(sparrowdb_common::Error::InvalidArgument(
-                "variable-length relationship followed by additional hops is not supported \
-                 (e.g. (a)-[:R*1..2]->(b)-[:S]->(c)); split the pattern into separate \
-                 MATCH clauses — see issue #421"
-                    .to_string(),
-            ));
-        }
-    }
-    Ok(())
 }
