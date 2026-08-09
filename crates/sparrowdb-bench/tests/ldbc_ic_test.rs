@@ -126,11 +126,10 @@ fn ic2_unknown_person_returns_empty() {
 //   forums:       1 "Graph Databases" {1,2,3}; 2 "Rust Programming" {4,5};
 //                 3 "Social Networks" {1,6}
 
+// Un-ignored once #421 shipped (6254f91): a variable-length path followed by
+// another hop now returns depth-2 matches instead of silently truncating to
+// depth 1. Dave Brown is the depth-2 match this used to lose.
 #[test]
-#[ignore = "blocked on #421: ic3 uses (p)-[:knows*1..2]->(f)-[:isLocatedIn]->(place), \
-a variable-length path followed by another hop, which is now rejected rather than \
-silently answered with depth-1 matches only. Correct result for (1, Germany) is \
-[Dave Brown, Frank Miller]. Un-ignore when #421 is implemented."]
 fn ic3_friends_in_countries_returns_both_germans() {
     let (_dir, db) = db_with_mini_fixture();
     let r = ic_queries::ic3_friends_in_countries(&db, 1, "Germany", "France", 14)
@@ -320,9 +319,8 @@ fn ic12_expert_search_by_tag_class() {
     assert!(off.is_empty(), "IC12: no expert for OffTopic; got {off:?}");
 }
 
+// Un-ignored once #421 shipped (6254f91) — see ic3 above.
 #[test]
-#[ignore = "blocked on #421: ic11 uses a variable-length path followed by another hop. \
-Un-ignore when #421 is implemented."]
 fn ic11_job_referral() {
     let (_dir, db) = db_with_mini_fixture();
     let r = ic_queries::ic11_job_referral(&db, 1, "Germany", 2005).expect("IC11 should not error");
