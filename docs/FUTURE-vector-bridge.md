@@ -225,11 +225,21 @@ Note that "deferred" here does not mean "no vector code" — the substrate alrea
 means no new vector _surface area_. The highest-value use of the deferral is to make what
 exists correct rather than to extend it. In order:
 
-1. Close out #400 and document HNSW / `hybrid_search` in `docs/` — today there is zero
+1. **Correct the authoritative `NodeId` encoding first (#474)** — this gates everything below
+   that crosses the index boundary. Three contracts currently disagree: production packs
+   `label_id << 32`, while the `NodeId` doc comment and `node_id_packing_roundtrip` both
+   describe `<< 48`, and `VectorIndex::insert` takes a bare `u64` that accepts either. Adding
+   a `VectorKey(NodeId)` newtype only at the `similar()` boundary would leave every existing
+   caller free to pass a raw slot. Fix the comment, rewrite the test to assert against the
+   production packing helper rather than re-implementing the shift, then tighten the
+   `VectorIndex` boundary and migrate its callers. A slot and a full `NodeId` are both `u64`,
+   so getting this wrong is a silent wrong-answer bug rather than a type error — the same
+   root cause as #427, #415, and the `execute_n_hop` cross-label edge bug.
+2. Close out #400 and document HNSW / `hybrid_search` in `docs/` — today there is zero
    user-facing coverage of a shipped feature.
-2. Upsert and delete semantics in `VectorIndex` (§3 items 3–4). Silent stale results are worse
+3. Upsert and delete semantics in `VectorIndex` (§3 items 3–4). Silent stale results are worse
    than a missing feature.
-3. Atomic `save()` (temp file + rename) and the LSN stamp from §5.
-4. Make `hybrid_search` use the in-memory index instead of reloading from disk (§3 item 6).
-5. Only then `similar()` in Cypher — landing with an integration test that actually joins its
-   output back to nodes, which no test does today.
+4. Atomic `save()` (temp file + rename) and the LSN stamp from §5.
+5. Make `hybrid_search` use the in-memory index instead of reloading from disk (§3 item 6).
+6. Only then `similar()` in Cypher — landing with an integration test that actually joins its
+   output back to nodes, which no test does today, and with §7's three questions answered.
