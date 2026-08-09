@@ -58,6 +58,41 @@ fn corrupt_fts_index_file(db_root: &std::path::Path, label: &str, property: &str
     std::fs::write(&path, [0xFFu8, 0xFF, 0xFF]).expect("truncate fts index file to 3 bytes");
 }
 
+/// Force `FtsIndex::save` (not `open`) to fail, without touching permission
+/// bits — chmod behaves differently under CI's root containers, and by the
+/// time `save` runs, `open` must already have succeeded (otherwise this
+/// would just be exercising the `open` failure again).
+///
+/// `FtsIndex::save` (`fts_index.rs`) writes new bytes to a *temp* file next
+/// to the real one — `{label}__{property}.bin` becomes
+/// `{label}__{property}.fts.tmp` via `Path::with_extension("fts.tmp")` — then
+/// renames it over the original. Pre-creating that exact temp path *as a
+/// directory* makes `std::fs::write(&tmp, &bytes)` fail with "is a
+/// directory": a real, permission-independent conflict, and one that
+/// deliberately leaves `fts/registry.json` and the original
+/// `{label}__{property}.bin` untouched.
+///
+/// That matters for the open-must-succeed precondition: `open()` loads the
+/// pre-existing, still-valid `{label}__{property}.bin` written by the
+/// `CREATE FULLTEXT INDEX` the caller already ran, so it succeeds
+/// normally — unlike `corrupt_fts_index_file`, this does not touch the file
+/// `open()` reads at all, only the file `save()` is about to write.
+fn make_fts_save_fail(db_root: &std::path::Path, label: &str, property: &str) {
+    let bin_path = db_root.join("fts").join(format!("{label}__{property}.bin"));
+    assert!(
+        bin_path.is_file(),
+        "expected {} to already exist as a valid file from CREATE FULLTEXT INDEX",
+        bin_path.display()
+    );
+    let tmp_path = bin_path.with_extension("fts.tmp");
+    std::fs::create_dir(&tmp_path).unwrap_or_else(|e| {
+        panic!(
+            "failed to pre-create {} as a directory: {e}",
+            tmp_path.display()
+        )
+    });
+}
+
 /// The core regression: a CREATE against a corrupt, registered FTS index must
 /// now fail loudly instead of silently succeeding with the text unindexed.
 #[test]
@@ -93,6 +128,54 @@ fn create_fails_when_fts_index_is_corrupt() {
     // statement, not leave a node persisted with a silently-skipped index
     // entry (which would just be a differently-shaped version of the same
     // bug). Nothing with label Doc should exist.
+    let rows = db
+        .execute("MATCH (n:Doc) RETURN n.text")
+        .expect("read-only MATCH should still succeed");
+    assert_eq!(
+        rows.rows.len(),
+        0,
+        "the failed CREATE must not leave a half-written node behind"
+    );
+}
+
+/// The second half of #462: `open()` succeeding and `insert()` succeeding
+/// (both in-memory) are not enough — a failed `save()` used to be logged and
+/// ignored, so the write still reported success while the on-disk index
+/// never gained the entry. This is a distinct code path from `open()`
+/// failing (asserted above): `save()` cannot be reached without `open()`
+/// having already succeeded, so a fix that only covers `open()` leaves this
+/// half of the bug in place.
+#[test]
+fn create_fails_when_fts_index_cannot_be_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path());
+
+    db.execute("CREATE FULLTEXT INDEX FOR (n:Doc) ON (n.text)")
+        .expect("CREATE FULLTEXT INDEX should succeed");
+
+    make_fts_save_fail(dir.path(), "Doc", "text");
+
+    // Before this fix: this returned Ok(..) — open() took the "no file yet"
+    // branch (Ok, empty index), insert() succeeded in memory, save() failed
+    // and was only warn!-logged, so the CREATE still reported success with
+    // the text never reaching disk.
+    let result = db.execute("CREATE (:Doc {text: 'hello searchable world'})");
+
+    assert!(
+        result.is_err(),
+        "CREATE must fail when the FTS index cannot be saved to disk, not \
+         silently succeed with the text unindexed (issue #462); got {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("FTS index") && msg.contains("saved"),
+        "error should name the failure as a save failure (distinct from an \
+         open failure) so an operator can tell which half of the write broke; \
+         got: {msg}"
+    );
+
+    // Same atomicity expectation as the open-failure case: the FTS block
+    // runs before `tx.commit()`, so nothing should be persisted.
     let rows = db
         .execute("MATCH (n:Doc) RETURN n.text")
         .expect("read-only MATCH should still succeed");

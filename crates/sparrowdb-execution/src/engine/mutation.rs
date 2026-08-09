@@ -953,6 +953,22 @@ impl Engine {
             // `sparrowdb::db::execute_create_standalone` and the existing
             // partial-application precedent in this same loop (a unique
             // constraint violation above also aborts mid-statement).
+            //
+            // `save()` gets the identical treatment: `insert` only updates the
+            // in-memory index, so a failed `save` leaves this node's text on
+            // disk in the node store but never in the FTS index, and warning
+            // instead of failing reported the write as a success anyway — the
+            // second half of #462, `open` being the reported half.
+            //
+            // Note on atomicity: unlike `db.rs`'s `WriteTx`-backed path, this
+            // function has no transaction boundary — `self.snapshot.store
+            // .create_node` above already wrote the node directly, and there is
+            // no `tx.commit()`/rollback here to abort. A failure at this point
+            // does not undo that node, exactly as a unique-constraint violation
+            // a few lines up already does not undo nodes created by earlier
+            // iterations of this same loop. This fix does not change that
+            // pre-existing non-atomicity; it only makes the FTS failure as loud
+            // as those other failures already are, instead of silent.
             {
                 use sparrowdb_storage::fts_index::FtsIndex;
                 for entry in &node.props {
@@ -971,12 +987,15 @@ impl Engine {
                                     ))
                                     })?;
                             idx.insert(node_id.0, &text);
-                            if let Err(e) = idx.save() {
-                                tracing::warn!(
-                                    "FTS index save failed for ({label}, {}): {e}",
+                            idx.save().map_err(|e| {
+                                sparrowdb_common::Error::Corruption(format!(
+                                    "FTS index for ({label}, {}) could not be saved: {e}. \
+                                     Refusing to report this write as successful: the insert \
+                                     only happened in memory and this node's text would \
+                                     silently never reach disk.",
                                     entry.key
-                                );
-                            }
+                                ))
+                            })?;
                         }
                     }
                 }

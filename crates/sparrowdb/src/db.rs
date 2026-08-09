@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tracing::{info_span, warn};
+use tracing::info_span;
 
 // ── DbStats ───────────────────────────────────────────────────────────────────
 
@@ -987,6 +987,15 @@ impl GraphDb {
             // below (`idx.save(...).map_err(Error::Io)?`): a registered index is
             // not optional decoration, so a write that cannot maintain it fails
             // loudly rather than silently drifting out of sync.
+            //
+            // `save()` gets the identical treatment for the identical reason: a
+            // failed save leaves the insert only in memory, so `open` succeeding
+            // and `insert` succeeding are not enough on their own — the disk
+            // write is what makes the index entry real. Warning-and-continuing
+            // here was the second half of #462 (open was the reported half):
+            // the write still reported success while the on-disk index never
+            // gained this node. Propagating aborts before `tx.commit()`, same as
+            // the open failure above.
             {
                 use sparrowdb_storage::fts_index::FtsIndex;
                 use sparrowdb_storage::node_store::Value as StorageValue;
@@ -1008,9 +1017,14 @@ impl GraphDb {
                                     ))
                                 })?;
                                 idx.insert(node_id.0, text);
-                                if let Err(e) = idx.save() {
-                                    warn!("FTS index save failed for ({label}, {prop_name}): {e}");
-                                }
+                                idx.save().map_err(|e| {
+                                    Error::Corruption(format!(
+                                        "FTS index for ({label}, {prop_name}) could not be \
+                                         saved: {e}. Refusing to report this write as \
+                                         successful: the insert only happened in memory and \
+                                         this node's text would silently never reach disk."
+                                    ))
+                                })?;
                             }
                         }
                     }
