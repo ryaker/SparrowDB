@@ -642,16 +642,16 @@ impl GraphDb {
             // Mutations don't use the read pipeline — fall through to the
             // standard mutation paths (write transactions are unaffected).
             match bound.inner {
-            Statement::Merge(ref m) => self.execute_merge(m),
-            Statement::MatchMergeRel(ref mm) => self.execute_match_merge_rel(mm),
-            Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
-            Statement::UnwindMatchMutate(ref umm) => self.execute_unwind_match_mutate(umm),
-            Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
-            Statement::Create(ref c) => self.execute_create_standalone(c),
-            _ => unreachable!(),
-        }
-    } else {
-        let _span = info_span!("sparrowdb.query_chunked").entered();
+                Statement::Merge(ref m) => self.execute_merge(m),
+                Statement::MatchMergeRel(ref mm) => self.execute_match_merge_rel(mm),
+                Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
+                Statement::UnwindMatchMutate(ref umm) => self.execute_unwind_match_mutate(umm),
+                Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
+                Statement::Create(ref c) => self.execute_create_standalone(c),
+                _ => unreachable!(),
+            }
+        } else {
+            let _span = info_span!("sparrowdb.query_chunked").entered();
 
             let mut engine = {
                 let _open_span = info_span!("sparrowdb.open_engine").entered();
@@ -3258,7 +3258,7 @@ fn resolve_pattern_props(
     alias: &str,
     row: &[(String, sparrowdb_execution::Value)],
 ) -> sparrowdb_cypher::ast::PathPattern {
-    use sparrowdb_cypher::ast::{Expr, Literal, NodePattern, PropEntry};
+    use sparrowdb_cypher::ast::{NodePattern, PropEntry};
 
     let nodes: Vec<NodePattern> = pat
         .nodes
@@ -3298,7 +3298,7 @@ fn row_expr_to_literal(
     alias: &str,
     row: &[(String, sparrowdb_execution::Value)],
 ) -> sparrowdb_cypher::ast::Expr {
-    use sparrowdb_cypher::ast::{Expr, Literal};
+    use sparrowdb_cypher::ast::Expr;
     if let Expr::PropAccess { var, prop } = expr {
         if var == alias {
             for (key, val) in row {
