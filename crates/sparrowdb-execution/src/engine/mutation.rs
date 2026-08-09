@@ -943,23 +943,59 @@ impl Engine {
             // FTS auto-indexing: if a fulltext index is registered for any
             // (label, property) pair of this node, insert the string value
             // into the BM25 index so it is searchable immediately.
+            //
+            // `FtsIndex::open` only errs when the on-disk file exists but cannot
+            // be read — a missing file is `Ok` with a fresh empty index (issue
+            // #462), so `Err` here always means the index is present but broken,
+            // never "unconfigured". Swallowing it used to report the write as a
+            // success while silently dropping this node's text from the index
+            // forever. Propagate instead, matching the CREATE path in
+            // `sparrowdb::db::execute_create_standalone` and the existing
+            // partial-application precedent in this same loop (a unique
+            // constraint violation above also aborts mid-statement).
+            //
+            // `save()` gets the identical treatment: `insert` only updates the
+            // in-memory index, so a failed `save` leaves this node's text on
+            // disk in the node store but never in the FTS index, and warning
+            // instead of failing reported the write as a success anyway — the
+            // second half of #462, `open` being the reported half.
+            //
+            // Note on atomicity: unlike `db.rs`'s `WriteTx`-backed path, this
+            // function has no transaction boundary — `self.snapshot.store
+            // .create_node` above already wrote the node directly, and there is
+            // no `tx.commit()`/rollback here to abort. A failure at this point
+            // does not undo that node, exactly as a unique-constraint violation
+            // a few lines up already does not undo nodes created by earlier
+            // iterations of this same loop. This fix does not change that
+            // pre-existing non-atomicity; it only makes the FTS failure as loud
+            // as those other failures already are, instead of silent.
             {
                 use sparrowdb_storage::fts_index::FtsIndex;
                 for entry in &node.props {
                     if fts_registry.contains(&label, &entry.key) {
                         let val = eval_expr(&entry.value, &HashMap::new());
                         if let Value::String(text) = val {
-                            if let Ok(mut idx) =
+                            let mut idx =
                                 FtsIndex::open(&self.snapshot.db_root, &label, &entry.key)
-                            {
-                                idx.insert(node_id.0, &text);
-                                if let Err(e) = idx.save() {
-                                    tracing::warn!(
-                                        "FTS index save failed for ({label}, {}): {e}",
+                                    .map_err(|e| {
+                                        sparrowdb_common::Error::Corruption(format!(
+                                        "FTS index for ({label}, {}) could not be opened: {e}. \
+                                         Refusing to write: continuing would silently drop this \
+                                         node's text from the index. Move the index file aside \
+                                         and re-open, then rebuild it.",
                                         entry.key
-                                    );
-                                }
-                            }
+                                    ))
+                                    })?;
+                            idx.insert(node_id.0, &text);
+                            idx.save().map_err(|e| {
+                                sparrowdb_common::Error::Corruption(format!(
+                                    "FTS index for ({label}, {}) could not be saved: {e}. \
+                                     Refusing to report this write as successful: the insert \
+                                     only happened in memory and this node's text would \
+                                     silently never reach disk.",
+                                    entry.key
+                                ))
+                            })?;
                         }
                     }
                 }

@@ -148,7 +148,13 @@ impl Engine {
                 // check instead of computing and sorting all BM25 scores.
                 Value::Bool(idx.matches_query(node_id, &query))
             }
-            None => Value::Bool(false),
+            // `fts_index()` only returns `None` when a registered index exists
+            // on disk but could not be opened (an absent/unconfigured index is
+            // `Some(empty index)`, and correctly yields `false` above) — so this
+            // is corruption, not "no match". `Null` reports that distinctly
+            // rather than reusing `false`, which a caller cannot tell apart
+            // from a genuine non-match (issue #462).
+            None => Value::Null,
         }
     }
 
@@ -205,7 +211,10 @@ impl Engine {
                 let score = idx.score(node_id, &query);
                 Value::Float64(score as f64)
             }
-            None => Value::Float64(0.0),
+            // See the matching comment in `eval_full_text_search`: `None` here
+            // means the index is present but broken, never "unconfigured", so
+            // it must not read the same as a genuine score of 0.0 (issue #462).
+            None => Value::Null,
         }
     }
 
@@ -469,13 +478,23 @@ impl Engine {
         };
 
         // ── 2. Full-text (BM25) search ───────────────────────────────────────
-        let fts_results: Vec<(u64, f32)> = match sparrowdb_storage::fts_index::FtsIndex::open(
-            &self.snapshot.db_root,
-            &label,
-            &text_prop,
-        ) {
-            Ok(idx) => idx.search(&query_text, k * 2),
-            Err(_) => vec![],
+        //
+        // Same absent-vs-damaged distinction as the vector arm above:
+        // `fts_index()` only returns `None` when a registered index is present
+        // but broken — an absent/unconfigured index comes back as
+        // `Some(empty index)` and correctly yields no results — so silently
+        // treating `None` as "no matches" would reproduce the exact
+        // vector-only-degrade bug #456 fixed on the vector arm, just for FTS
+        // (issue #462). Routed through the shared per-query cache so the
+        // open and its corruption warning happen at most once per pair
+        // regardless of how many rows call this function.
+        let fts_results: Vec<(u64, f32)> = match self.snapshot.fts_index(&label, &text_prop) {
+            Some(cache) => {
+                let key = (label.clone(), text_prop.clone());
+                let idx = cache.get(&key).expect("key was just inserted");
+                idx.search(&query_text, k * 2)
+            }
+            None => return Value::Null,
         };
 
         // ── 3. Build Value::List inputs for fusion functions ─────────────────

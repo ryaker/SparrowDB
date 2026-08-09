@@ -1244,8 +1244,12 @@ impl SparrowDB {
     /// Hybrid vector + full-text search using Reciprocal Rank Fusion (RRF).
     ///
     /// Runs HNSW vector search and BM25 full-text search independently, then
-    /// fuses the ranked lists.  Missing indexes are treated as empty — so if
-    /// only a vector index exists the call degrades gracefully to vector-only.
+    /// fuses the ranked lists.  A genuinely *unconfigured* index is treated as
+    /// empty — so if only a vector index exists the call degrades gracefully
+    /// to vector-only.  A *present but damaged* FTS index instead rejects the
+    /// call (issue #462): the two are distinguishable (an absent file opens
+    /// fine as an empty index; only a broken one errs), and collapsing them
+    /// would silently mask index corruption as a normal vector-only result.
     ///
     /// `label`           — node label (e.g. `"Memory"`)
     /// `text_property`   — property holding the text content (for BM25)
@@ -1297,11 +1301,19 @@ impl SparrowDB {
             };
 
         // ── 2. Full-text (BM25) search ───────────────────────────────────────
+        //
+        // `FtsIndex::open` only errs when the file exists but cannot be read —
+        // a missing index is `Ok` with an empty index, so `Err` here always
+        // means "present but broken", never "not configured" (issue #462).
+        // Silently degrading to `vec![]` made a damaged index indistinguishable
+        // from the genuinely-absent case the doc comment above describes, so a
+        // caller who asked for vector+text fusion could get vector-only results
+        // with no signal anything was wrong. Propagate instead, matching
+        // `fulltext_search`'s existing convention a few lines above.
         let db_path = self.inner.path();
-        let fts_results: Vec<(u64, f32)> = match FtsIndex::open(db_path, &label, &text_property) {
-            Ok(idx) => idx.search(&text_query, fetch_k),
-            Err(_) => vec![],
-        };
+        let fts_results: Vec<(u64, f32)> = FtsIndex::open(db_path, &label, &text_property)
+            .map_err(to_napi)?
+            .search(&text_query, fetch_k);
 
         // ── 3. Fuse ──────────────────────────────────────────────────────────
         let mut scores: HashMap<u64, f64> = HashMap::new();

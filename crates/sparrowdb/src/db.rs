@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tracing::{info_span, warn};
+use tracing::info_span;
 
 // ── DbStats ───────────────────────────────────────────────────────────────────
 
@@ -973,24 +973,58 @@ impl GraphDb {
 
             // FTS auto-indexing: if a fulltext index is registered for this
             // (label, property) pair, insert the string value into the BM25 index.
+            //
+            // `FtsIndex::open` only errs when the on-disk file exists but cannot
+            // be read (corrupt, truncated, permission denied) — a missing file is
+            // `Ok` with a fresh empty index (issue #462). So `Err` here always
+            // means "this pair's index is present but broken", never "no index
+            // configured", and swallowing it silently drops `text` from the index
+            // forever: the node write reports success while every future
+            // `full_text_search`/`bm25_score` over this pair silently omits it.
+            // Propagate the error instead — the whole CREATE aborts before
+            // `tx.commit()` runs, so nothing is left half-indexed. This mirrors
+            // the write-path stance already taken for HNSW inserts a few lines
+            // below (`idx.save(...).map_err(Error::Io)?`): a registered index is
+            // not optional decoration, so a write that cannot maintain it fails
+            // loudly rather than silently drifting out of sync.
+            //
+            // `save()` gets the identical treatment for the identical reason: a
+            // failed save leaves the insert only in memory, so `open` succeeding
+            // and `insert` succeeding are not enough on their own — the disk
+            // write is what makes the index entry real. Warning-and-continuing
+            // here was the second half of #462 (open was the reported half):
+            // the write still reported success while the on-disk index never
+            // gained this node. Propagating aborts before `tx.commit()`, same as
+            // the open failure above.
             {
                 use sparrowdb_storage::fts_index::FtsIndex;
                 use sparrowdb_storage::node_store::Value as StorageValue;
                 for (prop_name, val) in &named_props {
                     if fts_registry.contains(&label, prop_name) {
                         if let StorageValue::Bytes(ref bytes) = val {
-                            // Decode the string from the stored bytes.
+                            // A non-UTF-8 byte string is not text the FTS index
+                            // can tokenize; this is a data-shape mismatch, not an
+                            // index failure, so it is skipped rather than failing
+                            // the write.
                             if let Ok(text) = std::str::from_utf8(bytes) {
-                                if let Ok(mut idx) =
-                                    FtsIndex::open(&self.inner.path, &label, prop_name)
-                                {
-                                    idx.insert(node_id.0, text);
-                                    if let Err(e) = idx.save() {
-                                        warn!(
-                                            "FTS index save failed for ({label}, {prop_name}): {e}"
-                                        );
-                                    }
-                                }
+                                let mut idx = FtsIndex::open(&self.inner.path, &label, prop_name)
+                                    .map_err(|e| {
+                                    Error::Corruption(format!(
+                                        "FTS index for ({label}, {prop_name}) could not be \
+                                             opened: {e}. Refusing to write: continuing would \
+                                             silently drop this node's text from the index. Move \
+                                             the index file aside and re-open, then rebuild it."
+                                    ))
+                                })?;
+                                idx.insert(node_id.0, text);
+                                idx.save().map_err(|e| {
+                                    Error::Corruption(format!(
+                                        "FTS index for ({label}, {prop_name}) could not be \
+                                         saved: {e}. Refusing to report this write as \
+                                         successful: the insert only happened in memory and \
+                                         this node's text would silently never reach disk."
+                                    ))
+                                })?;
                             }
                         }
                     }
