@@ -1136,6 +1136,54 @@ mod subquery;
 
 // ── Free-standing prop-filter helper (usable without &self) ───────────────────
 
+/// Returns `true` when `expr` can be fully resolved against `params` — i.e.
+/// every leaf is a literal, or a `$param` that is actually present in the
+/// params map.
+///
+/// `params` here is always a `dollar_params()`-shaped map: every call site of
+/// `matches_prop_filter_static` (and the `matches_prop_filter` wrapper) passes
+/// only `$`-prefixed runtime parameters, never row-scope bindings.  That means
+/// a bare `Expr::Var` or `Expr::PropAccess` referencing a pattern variable —
+/// including a correlated variable from an outer `MATCH`/`WITH` or an
+/// `UNWIND` alias — can *never* be resolved through this map today, no matter
+/// how the query is written.  Treating that as "unresolvable" (rather than
+/// silently defaulting to `Value::Null`) is what lets the caller fail closed
+/// instead of degrading a pattern-property filter into "match everything"
+/// (issue #467).
+///
+/// A missing `$param` is unresolvable for the same reason: it means the
+/// query referenced a parameter the caller never supplied, not that the
+/// caller deliberately bound it to null.
+fn is_filter_expr_resolvable(expr: &Expr, params: &HashMap<String, Value>) -> bool {
+    match expr {
+        // A literal `$name` — resolvable only if the caller actually supplied it.
+        Expr::Literal(Literal::Param(p)) => params.contains_key(&format!("${p}")),
+        // Constant literals (including an explicit `null` written in the query)
+        // are always resolvable.
+        Expr::Literal(_) => true,
+        // Function calls / arithmetic are resolvable iff every argument is.
+        Expr::FnCall { args, .. } => args.iter().all(|a| is_filter_expr_resolvable(a, params)),
+        Expr::BinOp { left, right, .. } => {
+            is_filter_expr_resolvable(left, params) && is_filter_expr_resolvable(right, params)
+        }
+        Expr::List(items) => items.iter().all(|e| is_filter_expr_resolvable(e, params)),
+        Expr::InList { expr, list, .. } => {
+            is_filter_expr_resolvable(expr, params)
+                && list.iter().all(|e| is_filter_expr_resolvable(e, params))
+        }
+        Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => is_filter_expr_resolvable(e, params),
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            is_filter_expr_resolvable(a, params) && is_filter_expr_resolvable(b, params)
+        }
+        // A bare variable or property access can never be resolved from a
+        // params-only map — see the doc comment above.  Everything else
+        // (CASE, EXISTS, shortestPath, CountStar, list predicates, …) is not
+        // meaningful in a pattern-property position and is conservatively
+        // treated as unresolvable too.
+        _ => false,
+    }
+}
+
 fn matches_prop_filter_static(
     props: &[(u32, u64)],
     filters: &[sparrowdb_cypher::ast::PropEntry],
@@ -1143,6 +1191,14 @@ fn matches_prop_filter_static(
     store: &NodeStore,
 ) -> bool {
     for f in filters {
+        // Fail closed: an unresolvable filter value (unbound variable, a
+        // `$param` the caller never supplied, property access on a var not in
+        // scope, …) must never widen a pattern-property filter into "match
+        // every node of the label" (issue #467). Bail out before evaluating.
+        if !is_filter_expr_resolvable(&f.value, params) {
+            return false;
+        }
+
         let col_id = prop_name_to_col_id(&f.key);
         let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
 
@@ -1173,7 +1229,13 @@ fn matches_prop_filter_static(
                     matches!(store.decode_raw_value(raw), StoreValue::Float(stored_f) if stored_f == f)
                 })
             }
-            Value::Null => true, // null filter passes (param-like behaviour)
+            // A *resolved* null (an explicit `null` literal, or a `$param`
+            // the caller genuinely bound to null) only matches a node whose
+            // own property is likewise absent — mirroring the `Null == Null`
+            // convention `values_equal` already uses for WHERE-clause
+            // equality elsewhere in this file, rather than matching every
+            // node regardless of its stored value.
+            Value::Null => stored_val.is_none(),
             _ => false,
         };
         if !matches {
