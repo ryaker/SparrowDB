@@ -1175,11 +1175,31 @@ fn is_filter_expr_resolvable(expr: &Expr, params: &HashMap<String, Value>) -> bo
         Expr::And(a, b) | Expr::Or(a, b) => {
             is_filter_expr_resolvable(a, params) && is_filter_expr_resolvable(b, params)
         }
+        // `CASE WHEN <cond> THEN <val> … [ELSE <val>]` is resolvable iff every
+        // condition, every branch value, and the ELSE are.  This one is NOT
+        // merely conservative: `MATCH (n:Item {id: CASE WHEN true THEN 1 ELSE 2 END})`
+        // matched correctly before this guard existed, so lumping it in with the
+        // catch-all below silently dropped a legitimate row (SPA-138).
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
+            branches.iter().all(|(cond, val)| {
+                is_filter_expr_resolvable(cond, params) && is_filter_expr_resolvable(val, params)
+            }) && else_expr
+                .as_ref()
+                .is_none_or(|e| is_filter_expr_resolvable(e, params))
+        }
         // A bare variable or property access can never be resolved from a
         // params-only map — see the doc comment above.  Everything else
-        // (CASE, EXISTS, shortestPath, CountStar, list predicates, …) is not
+        // (EXISTS, shortestPath, CountStar, list predicates, …) is not
         // meaningful in a pattern-property position and is conservatively
         // treated as unresolvable too.
+        //
+        // Adding a variant here is only correct when it genuinely cannot be
+        // evaluated from literals and params; anything statically evaluable that
+        // lands in this arm becomes a silent under-match, which is harder to
+        // notice than the over-match this function exists to prevent.
         _ => false,
     }
 }

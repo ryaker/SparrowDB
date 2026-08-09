@@ -204,3 +204,56 @@ fn genuinely_null_bound_param_matches_none_when_prop_always_present() {
         r.rows
     );
 }
+
+/// A `CASE WHEN` whose conditions and branch values are all literals IS
+/// statically resolvable, and matched correctly before the fail-closed guard
+/// existed. The first version of that guard had no `CaseWhen` arm, so it fell
+/// into the catch-all and silently dropped the row — an under-match, which is
+/// harder to spot than the over-match the guard exists to prevent.
+///
+/// Expected value derived by hand: `CASE WHEN true THEN 1 ELSE 2 END` is 1, and
+/// exactly one `:Item` has `id = 1`.
+#[test]
+fn case_when_literal_in_pattern_prop_still_matches() {
+    let (db, _dir) = open_db();
+    db.execute("CREATE (:Item {id: 1})").unwrap();
+    db.execute("CREATE (:Item {id: 2})").unwrap();
+
+    let r = db
+        .execute("MATCH (n:Item {id: CASE WHEN true THEN 1 ELSE 2 END}) RETURN n.id")
+        .expect("a fully-literal CASE WHEN must be resolvable in a pattern-property position");
+
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Int64(1)]],
+        "CASE WHEN true THEN 1 ELSE 2 END is 1, so exactly the id=1 node must match"
+    );
+
+    // The ELSE branch must be reached, and must not be treated as unresolvable.
+    let r2 = db
+        .execute("MATCH (n:Item {id: CASE WHEN false THEN 1 ELSE 2 END}) RETURN n.id")
+        .expect("the ELSE branch must resolve too");
+    assert_eq!(
+        r2.rows,
+        vec![vec![Value::Int64(2)]],
+        "the ELSE value 2 must select the id=2 node"
+    );
+}
+
+/// The other direction: a CASE carrying an unresolvable sub-expression must
+/// still fail closed rather than widening to every node of the label.
+#[test]
+fn case_when_with_unresolvable_branch_fails_closed() {
+    let (db, _dir) = open_db();
+    db.execute("CREATE (:Item {id: 1})").unwrap();
+    db.execute("CREATE (:Item {id: 2})").unwrap();
+
+    let r = db
+        .execute("MATCH (n:Item {id: CASE WHEN true THEN unbound_var ELSE 2 END}) RETURN n.id")
+        .expect("should not error");
+    assert!(
+        r.rows.is_empty(),
+        "an unresolvable branch value must fail closed, not match every node; got {:?}",
+        r.rows
+    );
+}
