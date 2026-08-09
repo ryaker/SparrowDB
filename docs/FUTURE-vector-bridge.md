@@ -43,8 +43,14 @@ That means every published release through v0.1.21 — and 0.1.22 as of the fix 
 HNSW index whose only DDL entry point could not be invoked from Cypher. It was reachable
 solely through the Rust and Node APIs.
 
-Relatedly: `grep -rl 'HNSW\|VECTOR INDEX\|hybrid_search' docs/ README.md` returns nothing.
-The feature has no user-facing documentation at all.
+Relatedly, there is no user-facing documentation for the feature at all — only this
+design note, which documents its absence rather than its use:
+
+```console
+$ grep -rl 'HNSW\|VECTOR INDEX\|hybrid_search' docs/ README.md \
+    --exclude=FUTURE-vector-bridge.md
+$   # no matches
+```
 
 A feature that could not be invoked and was never documented has not been validated by
 users. Treat all demand signal for "more vectors" accordingly.
@@ -81,7 +87,7 @@ scope, and they are the reason a `similar()` function alone would not be enough.
 
 ## 4. API sketch
 
-```
+```text
 similar(label, prop, query_vector, k [, ef]) -> List<Map{node_id, score}>
 ```
 
@@ -94,8 +100,14 @@ RETURN n.title, hit.score
 ORDER BY hit.score DESC
 ```
 
+`ORDER BY … DESC` above assumes higher-is-better, which is **not** true for every metric the
+existing binding already supports. `crates/sparrowdb-node/src/lib.rs:1123-1181` offers cosine,
+Euclidean, and dot product; Euclidean yields a *distance*, where lower is more similar. Sorting
+it descending returns the least similar rows first. Resolving this is a prerequisite for the
+signature above, not a detail to settle during implementation — see §7.
+
 **No `similar(text, k)` overload.** Embedding text requires a model, which means a network
-or model dependency, which violates directive ground rule §2.6 ("everything must keep
+or model dependency, which violates the integration directive's ground rule §2.6 ("everything must keep
 working offline and embedded"). Callers embed; Sparrow indexes. The text-in convenience
 belongs in the LangChain layer (WS3), where a model is already configured.
 
@@ -158,7 +170,7 @@ Reading the existing code changed my view here, so I will state it rather than l
 **Delegation is now clearly the worse choice for the primary path.** The in-process index is
 already written, dependency-free, and durable enough for read-mostly workloads. Removing it
 would not shrink the codebase — BM25 and the fusion functions stay regardless — it would only
-add a required network dependency, which ground rule §2.6 forbids outright. Worse,
+add a required network dependency, which the directive's ground rule §2.6 forbids outright. Worse,
 delegation cannot do the one thing that makes graph+vector interesting here: fuse a vector
 ranking with a BM25 ranking computed in the same process over the same `NodeId` space.
 Cross-process fusion means shipping ids and scores over a wire and reconciling two id
@@ -170,7 +182,39 @@ expands the graph around them, and the two meet in the LangChain layer (WS3). Th
 in `langchain-sparrowdb`'s docs, not a Rust abstraction. Do not build a pluggable vector
 backend trait inside SparrowDB to serve it.
 
-## 7. Trigger to revisit, and what to do first
+## 7. Open questions that must be answered before `similar()` is specified
+
+This note deliberately records open questions rather than inventing answers for a deferred
+workstream. These three are load-bearing: each one changes the API's shape, so none can be
+deferred to implementation time.
+
+1. **Score direction across metrics.** Does `similar()` expose the index's native metric, or
+   normalise every result to higher-is-better? Exposing it makes `ORDER BY` metric-dependent
+   and quietly wrong when the index is rebuilt with a different metric; normalising loses the
+   raw distance some callers want. Whichever is chosen needs coverage per supported metric —
+   cosine, Euclidean, and dot product all reach this path today.
+
+2. **Query behaviour during a rebuild, and rejecting incompatible sidecars.** An LSN stamp
+   (§5) establishes *staleness* but says nothing about *compatibility*: vector dimension,
+   metric, and index format can all differ while the LSN looks current. Two decisions are
+   needed — what a query does while a background rebuild is in flight (block, fail, or serve
+   the old index), and what metadata is stored so an incompatible index is rejected rather
+   than silently queried. Claiming stale-or-torn indexes are handled is not true until both
+   exist.
+
+3. **The external-ID mapping contract.** §6's pgvector/Pinecone path assumes the external
+   store's ids can be joined back with `id(n) = external_id`. That is only safe if the
+   external store holds packed `NodeId` values, or WS3 maintains a validated mapping. Neither
+   is specified. The contract must also define behaviour for ids whose node has been deleted
+   or never existed — silently dropping them and returning fewer than `k` rows is a different
+   failure from raising.
+
+Note that (3) compounds the identity hazard in §3: a bare slot and a full `NodeId` are both
+`u64`, so a wrong mapping is a silent wrong-answer bug, not a type error. See #474 — the
+`NodeId` doc comment and its unit test currently describe a 48-bit layout while production
+uses 32, which must be corrected before any external mapping is defined against it.
+
+## 8. Trigger to revisit, and what to do first
 
 Revisit when a named user hits a retrieval-quality ceiling that external-store-plus-graph-
 expansion at the LangChain layer cannot fix. KMSmcp, the consumer named in #400, is the
@@ -183,9 +227,9 @@ exists correct rather than to extend it. In order:
 
 1. Close out #400 and document HNSW / `hybrid_search` in `docs/` — today there is zero
    user-facing coverage of a shipped feature.
-2. Upsert and delete semantics in `VectorIndex` (§3.3, §3.4). Silent stale results are worse
+2. Upsert and delete semantics in `VectorIndex` (§3 items 3–4). Silent stale results are worse
    than a missing feature.
 3. Atomic `save()` (temp file + rename) and the LSN stamp from §5.
-4. Make `hybrid_search` use the in-memory index instead of reloading from disk (§3.6).
+4. Make `hybrid_search` use the in-memory index instead of reloading from disk (§3 item 6).
 5. Only then `similar()` in Cypher — landing with an integration test that actually joins its
    output back to nodes, which no test does today.
