@@ -126,11 +126,10 @@ fn ic2_unknown_person_returns_empty() {
 //   forums:       1 "Graph Databases" {1,2,3}; 2 "Rust Programming" {4,5};
 //                 3 "Social Networks" {1,6}
 
+// Un-ignored once #421 shipped (6254f91): a variable-length path followed by
+// another hop now returns depth-2 matches instead of silently truncating to
+// depth 1. Dave Brown is the depth-2 match this used to lose.
 #[test]
-#[ignore = "blocked on #421: ic3 uses (p)-[:knows*1..2]->(f)-[:isLocatedIn]->(place), \
-a variable-length path followed by another hop, which is now rejected rather than \
-silently answered with depth-1 matches only. Correct result for (1, Germany) is \
-[Dave Brown, Frank Miller]. Un-ignore when #421 is implemented."]
 fn ic3_friends_in_countries_returns_both_germans() {
     let (_dir, db) = db_with_mini_fixture();
     let r = ic_queries::ic3_friends_in_countries(&db, 1, "Germany", "France", 14)
@@ -174,24 +173,62 @@ fn ic5_forums_ranked_by_friend_membership() {
 }
 
 #[test]
-#[ignore = "blocked on #422: ic6 never restricts to posts carrying the input tag — it \
-only excludes that tag from the output, so a tag absent from the graph still returns \
-every friend tag. Un-ignore when #422 is fixed."]
 fn ic6_co_occurring_tags() {
     let (_dir, db) = db_with_mini_fixture();
-    // Only post 2 (Bob, a friend) carries Rust, and it carries no other tag,
-    // so nothing co-occurs with Rust among friends' posts.
+
+    // Alice's friend posts are 2 (Bob, {Rust}) and 3 (Carol, {SocialNetworks});
+    // Frank has none. Every expectation below follows from those two posts.
+
+    // Only post 2 carries Rust, and it carries no other tag, so nothing
+    // co-occurs with Rust among friends' posts.
     let r = ic_queries::ic6_tag_co_occurrence(&db, 1, "Rust").expect("IC6 should not error");
     assert!(
         r.is_empty(),
         "IC6: post 2 is the only friend post tagged Rust and has no other tag; got {r:?}"
     );
+
+    // Symmetric case: only post 3 carries SocialNetworks, and it too is
+    // single-tagged.
+    let sn =
+        ic_queries::ic6_tag_co_occurrence(&db, 1, "SocialNetworks").expect("IC6 should not error");
+    assert!(
+        sn.is_empty(),
+        "IC6: post 3 is the only friend post tagged SocialNetworks and has no other tag; got {sn:?}"
+    );
+
+    // The #422 headline case. Databases sits on posts 1 and 4, both created by
+    // Alice herself — no *friend* post carries it, so no friend post survives
+    // the restriction and nothing can co-occur. Before the fix this returned
+    // [(Rust,1), (SocialNetworks,1)]: every friend tag except the input one.
+    let db_tag =
+        ic_queries::ic6_tag_co_occurrence(&db, 1, "Databases").expect("IC6 should not error");
+    assert!(
+        db_tag.is_empty(),
+        "IC6: Databases is only on Alice's own posts 1 and 4, never a friend's; got {db_tag:?}"
+    );
+
     // A tag no post carries must yield nothing.
     let none = ic_queries::ic6_tag_co_occurrence(&db, 1, "ZZZ_nonexistent")
         .expect("IC6 unknown tag should not error");
     assert!(
         none.is_empty(),
         "IC6: unknown tag must return empty; got {none:?}"
+    );
+
+    // Liveness guard. Every IC6 expectation the mini fixture can express is
+    // empty: the only multi-tag post is 1 ({Databases, GraphTheory}), it belongs
+    // to Alice, and nobody `knows` Alice (person 1 is never a knows target), so
+    // post 1 is never anyone's friend post. That makes the assertions above
+    // satisfiable by an ic6 that always returns empty. IC4 walks the same
+    // friend→post→tag pipeline without the tag restriction, so its non-emptiness
+    // proves the empties are the restriction at work, not a dead query.
+    // Tracked in #428 — a friend-owned multi-tag post would let IC6 be asserted
+    // positively and retire this guard.
+    let ic4 = ic_queries::ic4_top_tags(&db, 1, "2012-01-01", 30).expect("IC4 should not error");
+    assert!(
+        !ic4.is_empty(),
+        "IC6 liveness: IC4 shares IC6's friend→post→tag pipeline and must be non-empty, \
+         otherwise IC6's empty results prove nothing; got {ic4:?}"
     );
 }
 
@@ -282,9 +319,8 @@ fn ic12_expert_search_by_tag_class() {
     assert!(off.is_empty(), "IC12: no expert for OffTopic; got {off:?}");
 }
 
+// Un-ignored once #421 shipped (6254f91) — see ic3 above.
 #[test]
-#[ignore = "blocked on #421: ic11 uses a variable-length path followed by another hop. \
-Un-ignore when #421 is implemented."]
 fn ic11_job_referral() {
     let (_dir, db) = db_with_mini_fixture();
     let r = ic_queries::ic11_job_referral(&db, 1, "Germany", 2005).expect("IC11 should not error");
@@ -301,16 +337,60 @@ fn ic13_shortest_path_alice_to_jack() {
 }
 
 #[test]
-#[ignore = "blocked on #423: ic13 documents \"-1 if no path exists\" but returns 1 for \
-unreachable pairs. Un-ignore when #423 is fixed."]
 fn ic13_unreachable_returns_negative_one() {
     let (_dir, db) = db_with_mini_fixture();
-    // knows edges are directed and no path leads back to Alice.
+    // knows edges are directed and no path leads back to Alice. Person 10
+    // appears only as a target (9→10) and has no outgoing knows edge at all.
     let hops = ic_queries::ic13_shortest_path(&db, 10, 1).expect("IC13 should not error");
     assert_eq!(
         hops, -1,
         "IC13: 10→1 is unreachable, expected -1; got {hops}"
     );
+
+    // Person 2 does have outgoing knows edges (2→4, 2→5), but none of them lead
+    // back to 1 — 1 is never a knows target. This separates "source is a dead
+    // end" from "genuinely unreachable"; the pre-fix engine reported 1 hop here
+    // too, via 2 -[:likes]-> Post slot 0 colliding with Person slot 0.
+    let back = ic_queries::ic13_shortest_path(&db, 2, 1).expect("IC13 should not error");
+    assert_eq!(
+        back, -1,
+        "IC13: 2→1 is unreachable (1 is never a knows target); got {back}"
+    );
+
+    // A person absent from the fixture is unreachable in both directions.
+    let missing_dst = ic_queries::ic13_shortest_path(&db, 1, 9999).expect("IC13 should not error");
+    assert_eq!(
+        missing_dst, -1,
+        "IC13: person 9999 does not exist; got {missing_dst}"
+    );
+    let missing_src = ic_queries::ic13_shortest_path(&db, 9999, 1).expect("IC13 should not error");
+    assert_eq!(
+        missing_src, -1,
+        "IC13: person 9999 does not exist; got {missing_src}"
+    );
+}
+
+#[test]
+fn ic13_directed_and_self_paths() {
+    let (_dir, db) = db_with_mini_fixture();
+    // 1→2 is a stored knows edge, so exactly 1 hop forward...
+    let fwd = ic_queries::ic13_shortest_path(&db, 1, 2).expect("IC13 should not error");
+    assert_eq!(fwd, 1, "IC13: 1→2 is a direct knows edge; got {fwd}");
+    // ...and 0 hops to oneself.
+    let same = ic_queries::ic13_shortest_path(&db, 1, 1).expect("IC13 should not error");
+    assert_eq!(
+        same, 0,
+        "IC13: a person is 0 hops from themselves; got {same}"
+    );
+    // A person who does not exist is not 0 hops from themselves.
+    let ghost = ic_queries::ic13_shortest_path(&db, 9999, 9999).expect("IC13 should not error");
+    assert_eq!(
+        ghost, -1,
+        "IC13: person 9999 does not exist, so there is no path; got {ghost}"
+    );
+    // 1→6→7→8→9 is 4 hops (1→3→5→7→8→9 is 5, 1→2→4→6→7→8→9 is 6).
+    let iris = ic_queries::ic13_shortest_path(&db, 1, 9).expect("IC13 should not error");
+    assert_eq!(iris, 4, "IC13: shortest path 1→9 is 4 hops; got {iris}");
 }
 
 #[test]

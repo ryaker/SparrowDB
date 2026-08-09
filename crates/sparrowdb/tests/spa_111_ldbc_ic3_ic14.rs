@@ -1,7 +1,10 @@
 //! Integration tests for LDBC SNB IC3-IC14 queries (SPA-111 phase 2).
 //!
 //! Uses the mini LDBC fixture data loaded via the sparrowdb-bench loader.
-//! Each test asserts non-empty results on the synthetic dataset.
+//!
+//! Most tests assert non-empty results on the synthetic dataset, but non-empty
+//! is not the goal — correctness is. IC6 asserts *empty*, because empty is the
+//! right answer there and asserting otherwise is what let #422 hide.
 
 use sparrowdb::GraphDb;
 use sparrowdb_bench::ic_queries;
@@ -136,19 +139,49 @@ fn ic5_forums_with_friends() {
 fn ic6_tag_co_occurrence() {
     let (_dir, db) = load_mini_db();
 
-    // Alice (1) knows Bob (2) and Carol (3).
-    // Bob created post 2 tagged with Rust.
-    // Carol created post 3 tagged with SocialNetworks.
-    // Exclude "Rust" — should find other tags on friend posts.
+    // IC6 asks which OTHER tags appear on the posts that carry the given tag and
+    // were created by the person's friends. It is not "every friend tag except
+    // this one" — that was #422, and this test used to assert it: it expected a
+    // non-empty result for "Rust" under the comment "should find other tags on
+    // friend posts", which is the bug written down as the expectation.
+    //
+    // Alice (1) knows Bob (2), Carol (3) and Frank (6).
+    // Bob created post 2, tagged {Rust}. Carol created post 3, tagged
+    // {SocialNetworks}. Frank created nothing.
+    //
+    // So post 2 is the only friend post carrying Rust, and it carries no other
+    // tag — nothing co-occurs. SocialNetworks is on post 3, which is not tagged
+    // Rust, so it must not appear.
     let results = ic_queries::ic6_tag_co_occurrence(&db, 1, "Rust").unwrap();
-
     assert!(
-        !results.is_empty(),
-        "IC6 should find co-occurring tags; got empty"
+        results.is_empty(),
+        "IC6: post 2 is the only friend post tagged Rust and carries no other tag; got {results:?}"
     );
-    for (name, _count) in &results {
-        assert_ne!(name, "Rust", "should not include the excluded tag");
-    }
+
+    // A tag no post carries must yield nothing. Before #422 this returned every
+    // friend tag, because the tag was only ever excluded from the output and
+    // never used to select posts.
+    let unknown = ic_queries::ic6_tag_co_occurrence(&db, 1, "ZZZ_nonexistent").unwrap();
+    assert!(
+        unknown.is_empty(),
+        "IC6: a tag absent from the graph must return empty; got {unknown:?}"
+    );
+
+    // Liveness guard. Every IC6 expectation this fixture can express is empty:
+    // the only multi-tag post is 1 ({Databases, GraphTheory}), it belongs to
+    // Alice, and nobody `knows` Alice (person 1 is never a knows target), so
+    // post 1 is never anyone's friend post. That makes both assertions above
+    // satisfiable by an ic6 that always returns empty. IC4 walks the same
+    // friend→post→tag pipeline without the tag restriction, so its non-emptiness
+    // proves the empties are the restriction at work, not a dead query.
+    // Tracked in #428 — a friend-owned multi-tag post would let IC6 be asserted
+    // positively and retire this guard.
+    let ic4 = ic_queries::ic4_top_tags(&db, 1, "2010-01-01", 365).unwrap();
+    assert!(
+        !ic4.is_empty(),
+        "IC6 liveness: IC4 shares IC6's friend→post→tag pipeline and must be non-empty, \
+         otherwise IC6's empty results prove nothing; got {ic4:?}"
+    );
 }
 
 // ── IC7 ─────────────────────────────────────────────────────────────────────
