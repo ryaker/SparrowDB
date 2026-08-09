@@ -14,8 +14,8 @@ use sparrowdb_catalog::catalog::Catalog;
 use sparrowdb_common::Result;
 
 use crate::ast::{
-    MatchMergeRelStatement, MatchOptionalMatchStatement, MatchStatement,
-    MatchWithStatement, PathPattern, Statement, UnwindMatchMutateStatement,
+    MatchMergeRelStatement, MatchOptionalMatchStatement, MatchStatement, MatchWithStatement,
+    PathPattern, Statement, UnwindMatchMutateStatement,
 };
 
 /// A bound statement — the AST annotated with resolved catalog IDs.

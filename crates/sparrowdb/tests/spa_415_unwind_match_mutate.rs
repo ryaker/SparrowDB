@@ -657,3 +657,61 @@ fn unwind_pattern_prop_bare_alias_var_must_not_match_every_node() {
         "BUG: the property filter degraded to match-all and mutated every node"
     );
 }
+
+// ── #468: the read pipeline must survive the SPA-415 dispatch ───────────────
+//
+// `parse_unwind` pre-consumes MATCH (and now WHERE) to look ahead for
+// SET/DELETE. Two ways that broke the read path, both regressions against
+// behaviour that worked on 6254f91:
+//
+//   1. The patterns were handed to `parse_pipeline_continuation` as
+//      `leading_match` while `leading_unwind` was also set.
+//      `execute_pipeline_inner` picks the leading clause with an `if / else if`
+//      chain testing `leading_unwind` first, so the MATCH arm was unreachable
+//      and the pattern was dropped silently — every row projected NULL.
+//   2. Dispatching on `Token::Where` sent every read carrying a predicate into
+//      the mutation tail, which rejected it outright.
+//
+// Both are asserted on values derived by hand from the fixture below, not from
+// what the engine currently returns.
+
+#[test]
+fn unwind_match_return_binds_the_pattern_variable() {
+    let (db, _dir) = open_db();
+    db.execute("CREATE (:Item {id: 'a', v: 5})").unwrap();
+    db.execute("CREATE (:Item {id: 'b', v: 1})").unwrap();
+    db.execute("CREATE (:Item {id: 'c', v: 9})").unwrap();
+
+    // 'c' is the control: never named, so it must not appear.
+    let r = db
+        .execute("UNWIND ['a', 'b'] AS x MATCH (n:Item {id: x}) RETURN n.id")
+        .expect("UNWIND ... MATCH ... RETURN must parse and execute");
+
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::String("a".into())],
+            vec![Value::String("b".into())],
+        ],
+        "#468: MATCH was dropped — rows project NULL when the pattern variable never binds"
+    );
+}
+
+#[test]
+fn unwind_match_where_return_applies_the_predicate() {
+    let (db, _dir) = open_db();
+    db.execute("CREATE (:Item {id: 'a', v: 5})").unwrap();
+    db.execute("CREATE (:Item {id: 'b', v: 1})").unwrap();
+
+    // Both ids are named; only 'a' has v > 3, so the predicate is what
+    // distinguishes a working WHERE from one that was never applied.
+    let r = db
+        .execute("UNWIND ['a', 'b'] AS x MATCH (n:Item {id: x}) WHERE n.v > 3 RETURN n.id")
+        .expect("#468: a read pipeline with WHERE must not be routed to the mutation tail");
+
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::String("a".into())]],
+        "#468: WHERE must filter the read pipeline; 'b' has v=1 and must not survive"
+    );
+}

@@ -1658,18 +1658,50 @@ impl Parser {
             self.advance(); // consume MATCH
             let patterns = self.parse_pattern_list()?;
 
-            // Peek ahead to decide: mutation (SET/DELETE/WHERE) or read pipeline?
+            // A WHERE here belongs to the MATCH and is legal in *both* shapes:
+            //   UNWIND … MATCH … WHERE … SET/DELETE   (mutation)
+            //   UNWIND … MATCH … WHERE … RETURN       (read)
+            // Parse it once, up front, so the read/mutate decision is made on
+            // the token that actually distinguishes them. Dispatching on WHERE
+            // itself sent every read with a predicate into the mutation tail,
+            // which then rejected it (#468).
+            let where_clause = if matches!(self.peek(), Token::Where) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+
             match self.peek().clone() {
-                Token::Set | Token::Delete | Token::Detach | Token::Where => {
-                    return self.parse_unwind_match_mutate_tail(expr, alias, patterns);
+                Token::Set | Token::Delete | Token::Detach => {
+                    return self.parse_unwind_match_mutate_tail(
+                        expr,
+                        alias,
+                        patterns,
+                        where_clause,
+                    );
                 }
                 _ => {
                     // Read pipeline: UNWIND ... MATCH ... RETURN/WITH/...
+                    //
+                    // The MATCH is handed over as a pipeline *stage*, not as
+                    // `leading_match`. `execute_pipeline_inner` picks the leading
+                    // clause with an `if / else if` chain that tests
+                    // `leading_unwind` before `leading_match`, so setting both
+                    // makes the MATCH arm unreachable and the pattern is dropped
+                    // silently — rows come back with no binding and project as
+                    // NULL (#468). Before SPA-415 this MATCH was consumed by
+                    // `parse_pipeline_continuation`'s own loop as a stage; we
+                    // only pre-consumed it here to look ahead for SET/DELETE, so
+                    // hand it back in the shape that loop would have produced.
                     return self.parse_pipeline_continuation(
-                        Some(patterns),
+                        None,
                         None,
                         Some((expr, alias)),
-                        vec![],
+                        vec![PipelineStage::Match {
+                            patterns,
+                            where_clause,
+                        }],
                     );
                 }
             }
@@ -1728,66 +1760,39 @@ impl Parser {
 
     // ── UNWIND … MATCH … SET/DELETE (SPA-415) ────────────────────────────────
 
-    /// Parse the mutation tail after `UNWIND … AS alias MATCH patterns`
-    /// have already been consumed by the caller.  The caller is responsible
-    /// for peeking at the token after `patterns` to decide whether this is
-    /// a mutation (SET/DELETE/DETACH/WHERE) or a read pipeline.
+    /// Parse the mutation tail after `UNWIND … AS alias MATCH patterns
+    /// [WHERE pred]` have already been consumed by the caller.  The caller
+    /// parses any WHERE and passes it in, then dispatches on SET / DELETE /
+    /// DETACH — the tokens that actually distinguish a mutation from a read
+    /// pipeline.
     fn parse_unwind_match_mutate_tail(
         &mut self,
         expr: Expr,
         alias: String,
         patterns: Vec<PathPattern>,
+        where_clause: Option<Expr>,
     ) -> Result<Statement> {
-
         // Dispatch on the next token to determine the mutation type, reusing
         // the same logic as parse_match_or_match_mutate.
-        let (where_clause, mutations) = match self.peek().clone() {
+        let mutations = match self.peek().clone() {
             Token::Set => {
                 self.advance();
-                (None, self.parse_set_items_allow_prop()?)
+                self.parse_set_items_allow_prop()?
             }
             Token::Detach => {
                 self.advance();
                 self.expect_tok(&Token::Delete)?;
                 let var = self.expect_ident()?;
-                (None, vec![Mutation::Delete { var, detach: true }])
+                vec![Mutation::Delete { var, detach: true }]
             }
             Token::Delete => {
                 self.advance();
                 let var = self.expect_ident()?;
-                (None, vec![Mutation::Delete { var, detach: false }])
-            }
-            Token::Where => {
-                self.advance();
-                let where_expr = self.parse_expr()?;
-                let mutations = match self.peek().clone() {
-                    Token::Set => {
-                        self.advance();
-                        self.parse_set_items_allow_prop()?
-                    }
-                    Token::Detach => {
-                        self.advance();
-                        self.expect_tok(&Token::Delete)?;
-                        let var = self.expect_ident()?;
-                        vec![Mutation::Delete { var, detach: true }]
-                    }
-                    Token::Delete => {
-                        self.advance();
-                        let var = self.expect_ident()?;
-                        vec![Mutation::Delete { var, detach: false }]
-                    }
-                    other => {
-                        return Err(Error::InvalidArgument(format!(
-                            "expected SET, DELETE, or DETACH DELETE after WHERE in UNWIND MATCH, got {:?}",
-                            other
-                        )));
-                    }
-                };
-                (Some(where_expr), mutations)
+                vec![Mutation::Delete { var, detach: false }]
             }
             other => {
                 return Err(Error::InvalidArgument(format!(
-                    "expected SET, DELETE, DETACH DELETE, or WHERE after UNWIND MATCH patterns, got {:?}",
+                    "expected SET, DELETE, or DETACH DELETE after UNWIND MATCH patterns, got {:?}",
                     other
                 )));
             }
@@ -1797,14 +1802,13 @@ impl Parser {
         let return_clause = self.parse_optional_return()?;
 
         Ok(Statement::UnwindMatchMutate(UnwindMatchMutateStatement {
-                expr,
-                alias,
-                match_patterns: patterns,
-                where_clause,
-                mutations,
-                return_clause,
-            },
-        ))
+            expr,
+            alias,
+            match_patterns: patterns,
+            where_clause,
+            mutations,
+            return_clause,
+        }))
     }
 
     fn parse_create_body(&mut self) -> Result<CreateStatement> {
