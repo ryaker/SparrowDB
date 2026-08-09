@@ -943,22 +943,39 @@ impl Engine {
             // FTS auto-indexing: if a fulltext index is registered for any
             // (label, property) pair of this node, insert the string value
             // into the BM25 index so it is searchable immediately.
+            //
+            // `FtsIndex::open` only errs when the on-disk file exists but cannot
+            // be read — a missing file is `Ok` with a fresh empty index (issue
+            // #462), so `Err` here always means the index is present but broken,
+            // never "unconfigured". Swallowing it used to report the write as a
+            // success while silently dropping this node's text from the index
+            // forever. Propagate instead, matching the CREATE path in
+            // `sparrowdb::db::execute_create_standalone` and the existing
+            // partial-application precedent in this same loop (a unique
+            // constraint violation above also aborts mid-statement).
             {
                 use sparrowdb_storage::fts_index::FtsIndex;
                 for entry in &node.props {
                     if fts_registry.contains(&label, &entry.key) {
                         let val = eval_expr(&entry.value, &HashMap::new());
                         if let Value::String(text) = val {
-                            if let Ok(mut idx) =
+                            let mut idx =
                                 FtsIndex::open(&self.snapshot.db_root, &label, &entry.key)
-                            {
-                                idx.insert(node_id.0, &text);
-                                if let Err(e) = idx.save() {
-                                    tracing::warn!(
-                                        "FTS index save failed for ({label}, {}): {e}",
+                                    .map_err(|e| {
+                                        sparrowdb_common::Error::Corruption(format!(
+                                        "FTS index for ({label}, {}) could not be opened: {e}. \
+                                         Refusing to write: continuing would silently drop this \
+                                         node's text from the index. Move the index file aside \
+                                         and re-open, then rebuild it.",
                                         entry.key
-                                    );
-                                }
+                                    ))
+                                    })?;
+                            idx.insert(node_id.0, &text);
+                            if let Err(e) = idx.save() {
+                                tracing::warn!(
+                                    "FTS index save failed for ({label}, {}): {e}",
+                                    entry.key
+                                );
                             }
                         }
                     }

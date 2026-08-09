@@ -301,6 +301,14 @@ impl ReadSnapshot {
     /// for N rows only deserialises the index file once.
     ///
     /// Returns `None` if the index file does not exist or cannot be opened.
+    ///
+    /// `FtsIndex::open` only errs when a file is present but unreadable
+    /// (corrupt, truncated, permission denied) — an absent file is `Ok` with a
+    /// fresh empty index, so an `Err` here always means "this pair's index is
+    /// broken", never "unconfigured" (issue #462). Callers must not treat the
+    /// resulting `None` as equivalent to "no index registered": they should log
+    /// or surface it distinctly rather than silently falling back to an
+    /// empty-result default, or corruption looks identical to "no matches".
     pub fn fts_index(
         &self,
         label: &str,
@@ -318,7 +326,18 @@ impl ReadSnapshot {
                 Ok(idx) => {
                     cache.insert(key.clone(), idx);
                 }
-                Err(_) => return None,
+                Err(e) => {
+                    // Logged once per (label, property) per query: this branch
+                    // only runs on cache miss, and a miss is never retried for
+                    // the same pair within one query.
+                    tracing::warn!(
+                        "FTS index for ({label}, {property}) is present but could not be \
+                         opened: {e}. Treating full_text_search()/bm25_score() calls against \
+                         it as unavailable for this query rather than silently returning \
+                         false/0.0, which would be indistinguishable from a genuine no-match."
+                    );
+                    return None;
+                }
             }
         }
         // Return the guard so callers can borrow the cached index.
