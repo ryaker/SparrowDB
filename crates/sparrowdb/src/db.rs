@@ -1807,6 +1807,67 @@ impl GraphDb {
                         for node_id in &matching_ids {
                             tx.set_property(*node_id, prop, sv.clone())?;
                         }
+
+                        // Vector index write-path — the same maintenance
+                        // `execute_match_mutate_with_params` performs, which this
+                        // entry point must not skip. Without it,
+                        // `UNWIND $rows AS row MATCH (n:L {id: row.id}) SET n.emb = $vec`
+                        // would store the property and leave the HNSW file
+                        // untouched: the vector becomes invisible to search
+                        // forever, with the write reporting success. That is the
+                        // #410 silent-data-loss shape (KMSmcp ch#202), reached
+                        // through a second entry point.
+                        //
+                        // Only the `$param` form is handled, matching the
+                        // MATCH…SET path: a vector cannot survive
+                        // `resolve_set_value`'s storage-layer round trip, so
+                        // `SET n.emb = row.emb` cannot carry one today (see #475,
+                        // where that coercion silently yields Int64(0)).
+                        //
+                        // Label is derived per matched NodeId rather than from the
+                        // AST, so anonymous and multi-label UNWIND patterns resolve
+                        // correctly.
+                        if let sparrowdb_cypher::ast::Expr::Literal(
+                            sparrowdb_cypher::ast::Literal::Param(p),
+                        ) = value
+                        {
+                            if let Some(vec) = params
+                                .and_then(|m| m.get(p.as_str()))
+                                .and_then(|v| v.as_vector())
+                            {
+                                let vidx_dir = self.inner.path.join("vector_indexes");
+                                let cat = self.catalog_snapshot();
+                                let label_id_to_name: std::collections::HashMap<u16, String> =
+                                    cat.list_labels().unwrap_or_default().into_iter().collect();
+                                let vidx_guard =
+                                    self.inner.vector_indexes.read().expect("vector_indexes");
+
+                                let mut label_to_raw_ids: std::collections::HashMap<
+                                    &str,
+                                    Vec<u64>,
+                                > = std::collections::HashMap::new();
+                                for node_id in &matching_ids {
+                                    let lid = (node_id.0 >> 32) as u16;
+                                    if let Some(name) = label_id_to_name.get(&lid) {
+                                        label_to_raw_ids
+                                            .entry(name.as_str())
+                                            .or_default()
+                                            .push(node_id.0);
+                                    }
+                                }
+                                for (label, raw_ids) in &label_to_raw_ids {
+                                    let key = (label.to_string(), prop.clone());
+                                    if let Some(arc_idx) = vidx_guard.get(&key) {
+                                        let mut idx = arc_idx.write().expect("vector_index write");
+                                        for &raw_id in raw_ids {
+                                            idx.insert(raw_id, &vec);
+                                        }
+                                        // Persist once per (label, prop) pair.
+                                        idx.save(&vidx_dir, label, prop).map_err(Error::Io)?;
+                                    }
+                                }
+                            }
+                        }
                     }
                     sparrowdb_cypher::ast::Mutation::Delete { detach: true, .. } => {
                         has_detach_delete = true;
