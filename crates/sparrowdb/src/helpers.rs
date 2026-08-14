@@ -249,8 +249,18 @@ pub(crate) fn load_constraints(db_root: &Path) -> HashSet<(u32, u32)> {
     set
 }
 
-/// Build a `LabelId → node count` map by reading each label's HWM from disk
-/// (SPA-190).  Called at `GraphDb::open()` and after node-mutating writes.
+/// Build a `LabelId → live node count` map by reading each label's HWM and
+/// tombstone column from disk (SPA-190, fixed for #485). Called at
+/// `GraphDb::open()` and after node-mutating writes.
+///
+/// #485: this used to return the raw HWM, which is a high-water mark of
+/// slots ever allocated and is never decremented by `delete_node` /
+/// `detach_delete_node`. That made `COUNT(n)` (SPA-197's O(1) fast-path
+/// reads straight from this map) permanently overcount once any node of the
+/// label was deleted — including across checkpoint and reopen, since this
+/// function is also the source of the count on `GraphDb::open()`.
+/// `NodeStore::live_count_for_label` subtracts tombstoned slots so the
+/// cached count matches what an ordinary tombstone-aware scan would return.
 pub(crate) fn build_label_row_counts_from_disk(
     catalog: &Catalog,
     db_root: &Path,
@@ -264,9 +274,9 @@ pub(crate) fn build_label_row_counts_from_disk(
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(lid, _name)| {
-            let hwm = store.hwm_for_label(lid as u32).unwrap_or(0);
-            if hwm > 0 {
-                Some((lid, hwm as usize))
+            let live = store.live_count_for_label(lid as u32).unwrap_or(0);
+            if live > 0 {
+                Some((lid, live as usize))
             } else {
                 None
             }
