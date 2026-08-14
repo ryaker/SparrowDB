@@ -940,14 +940,28 @@ impl Engine {
         // SPA-263: per-hop CSRs and delta adjacency maps.
         let rel1 = &pat.rels[0];
         let rel2 = &pat.rels[1];
+        // #487: the first hop's direction was never read anywhere in this
+        // function — only the second hop's (`second_hop_incoming` below, the
+        // SPA-201/#294 fix) was. A left-pointing first hop (`(a)<-[:R]-(m)`)
+        // was silently treated as if it had been written `(a)-[:R]->(m)`,
+        // the same failure mode #486 fixed in `execute_one_hop`.
+        let first_hop_incoming = rel1.dir == sparrowdb_cypher::ast::EdgeDir::Incoming;
         let all_rel_tables_2hop = self.snapshot.catalog.list_rel_tables_with_ids();
         let hop1_rel_ids: Vec<u64> = all_rel_tables_2hop
             .iter()
             .filter(|(_, sid, did, rt)| {
                 let type_ok = rel1.rel_type.is_empty() || rt == &rel1.rel_type;
-                let src_ok = *sid as u32 == src_label_id;
-                let dst_ok = *did as u32 == mid_label_id;
-                type_ok && src_ok && dst_ok
+                if first_hop_incoming {
+                    // (src)<-[:R]-(mid): the physical edge runs mid -> src,
+                    // so the catalog table is keyed (src=mid, dst=src).
+                    let src_ok = *sid as u32 == mid_label_id;
+                    let dst_ok = *did as u32 == src_label_id;
+                    type_ok && src_ok && dst_ok
+                } else {
+                    let src_ok = *sid as u32 == src_label_id;
+                    let dst_ok = *did as u32 == mid_label_id;
+                    type_ok && src_ok && dst_ok
+                }
             })
             .map(|(id, _, _, _)| *id)
             .collect();
@@ -1088,6 +1102,79 @@ impl Engine {
             HashMap::new()
         };
 
+        // #487: mirror of `merged_bwd_csr` / `delta_adj_bwd` above, but for
+        // the FIRST hop. For `(src)<-[:R]-(mid)` the physical edge runs
+        // mid -> src, so finding mid-candidates for a given src_slot means
+        // walking `hop1_csr` (built from the swapped `hop1_rel_ids` above,
+        // so it already holds the mid -> src physical edges) *backward*.
+        let hop1_bwd_csr: Option<CsrBackward> = if first_hop_incoming {
+            let mut max_nodes: u64 = 0;
+            let mut fwd_edges: Vec<(u64, u64)> = Vec::new();
+            for &rid in &hop1_rel_ids {
+                if let Some(csr) = self.snapshot.csrs.get(&(rid as u32)) {
+                    if csr.n_nodes() > max_nodes {
+                        max_nodes = csr.n_nodes();
+                    }
+                    for src in 0..csr.n_nodes() {
+                        for &dst in csr.neighbors(src) {
+                            fwd_edges.push((src, dst));
+                        }
+                    }
+                }
+            }
+            fwd_edges.sort_unstable();
+            fwd_edges.dedup();
+            if fwd_edges.is_empty() {
+                None
+            } else {
+                Some(CsrBackward::build(max_nodes, &fwd_edges))
+            }
+        } else {
+            None
+        };
+        let delta_adj_hop1_bwd: HashMap<u64, Vec<u64>> = if first_hop_incoming {
+            let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+            for &rid in &hop1_rel_ids {
+                for r in self.read_delta_for(rid as u32) {
+                    let ds = r.dst.0 & 0xFFFF_FFFF;
+                    let ss = r.src.0 & 0xFFFF_FFFF;
+                    adj.entry(ds).or_default().push(ss);
+                }
+            }
+            adj
+        } else {
+            HashMap::new()
+        };
+        // Candidate mid-slots for a given src_slot, respecting hop1's
+        // direction: forward CSR/delta neighbours when Outgoing, backward
+        // CSR/delta predecessors when Incoming.
+        let hop1_mid_candidates = |src_slot: u64| -> Vec<u64> {
+            if first_hop_incoming {
+                let mut v: Vec<u64> = hop1_bwd_csr
+                    .as_ref()
+                    .map(|b| b.predecessors(src_slot).to_vec())
+                    .unwrap_or_default();
+                if let Some(delta_preds) = delta_adj_hop1_bwd.get(&src_slot) {
+                    for &mid in delta_preds {
+                        if !v.contains(&mid) {
+                            v.push(mid);
+                        }
+                    }
+                }
+                v
+            } else {
+                let mut v: Vec<u64> = hop1_csr.neighbors(src_slot).to_vec();
+                if let Some(df) = delta_adj_hop1.get(&src_slot) {
+                    for &mid in df {
+                        if !v.contains(&mid) {
+                            v.push(mid);
+                        }
+                    }
+                }
+                v
+            }
+        };
+
         let mut rows = Vec::new();
         // SPA-263: detect aggregates early so we can build proper HashMap rows
         // instead of projecting through project_three_var_row (which returns Null
@@ -1172,17 +1259,9 @@ impl Engine {
                 // b matches the fof_node_pat filter.  The result rows project M
                 // (the common neighbor / mutual friend), not B.
 
-                // Collect all candidate M slots from the forward first hop.
-                let neighbors_a: HashSet<u64> = {
-                    let mut set: HashSet<u64> =
-                        hop1_csr.neighbors(src_slot).iter().copied().collect();
-                    if let Some(delta_first) = delta_adj_hop1.get(&src_slot) {
-                        for &mid in delta_first {
-                            set.insert(mid);
-                        }
-                    }
-                    set
-                };
+                // Collect all candidate M slots from the first hop, respecting
+                // its direction (#487 — this used to always assume Outgoing).
+                let neighbors_a: HashSet<u64> = hop1_mid_candidates(src_slot).into_iter().collect();
 
                 // ── #287 fast path: HashSet intersection ──────────────────────
                 if let Some(ref b_sets) = b_neighbor_sets {
@@ -1490,20 +1569,16 @@ impl Engine {
                 continue;
             }
 
-            // ── Forward-forward path (both hops Outgoing) ─────────────────────
+            // ── src->mid (either direction) then mid->fof forward ─────────────
             // SPA-241: use factorized join to preserve mid_slot→fof_slots mapping.
             // The previous flat two_hop() call discarded which mid node connected
             // src to each fof, making it impossible to read or return mid properties.
+            // #487: this branch runs whenever the second hop is Outgoing; the
+            // first hop's direction is resolved via `hop1_mid_candidates`
+            // rather than assumed Outgoing.
             let mut mid_fof_pairs: Vec<(u64, Vec<u64>)> = Vec::new();
             {
-                let mut mid_slots: Vec<u64> = hop1_csr.neighbors(src_slot).to_vec();
-                if let Some(df) = delta_adj_hop1.get(&src_slot) {
-                    for &m in df {
-                        if !mid_slots.contains(&m) {
-                            mid_slots.push(m);
-                        }
-                    }
-                }
+                let mid_slots: Vec<u64> = hop1_mid_candidates(src_slot);
                 for mid_slot in mid_slots {
                     let mut fof_set: HashSet<u64> = HashSet::new();
                     for &f in hop2_csr.neighbors(mid_slot) {
@@ -1872,16 +1947,30 @@ impl Engine {
                     return type_wide;
                 }
                 match (label_ids_per_node[i], label_ids_per_node[i + 1]) {
-                    (Some(src), Some(dst)) => self
-                        .snapshot
-                        .catalog
-                        .get_rel_table(src as u16, dst as u16, &pat.rels[i].rel_type)
-                        .ok()
-                        .flatten()
-                        .map(|id| vec![id as u32])
-                        // No table for this (src, dst, type) triple: the hop
-                        // cannot match anything.
-                        .unwrap_or_default(),
+                    (Some(pattern_src), Some(pattern_dst)) => {
+                        // #487/#488: the catalog keys a rel table by the
+                        // edge's PHYSICAL (src, dst), not by pattern
+                        // position. For an Incoming hop (`<-`) the pattern's
+                        // right-hand node is the physical source, so the
+                        // lookup must be swapped or it silently resolves to
+                        // no table whenever the two labels differ and more
+                        // than one table shares this rel type (#429).
+                        let incoming = pat.rels[i].dir == sparrowdb_cypher::ast::EdgeDir::Incoming;
+                        let (phys_src, phys_dst) = if incoming {
+                            (pattern_dst, pattern_src)
+                        } else {
+                            (pattern_src, pattern_dst)
+                        };
+                        self.snapshot
+                            .catalog
+                            .get_rel_table(phys_src as u16, phys_dst as u16, &pat.rels[i].rel_type)
+                            .ok()
+                            .flatten()
+                            .map(|id| vec![id as u32])
+                            // No table for this (src, dst, type) triple: the hop
+                            // cannot match anything.
+                            .unwrap_or_default()
+                    }
                     _ => type_wide,
                 }
             })
@@ -2017,31 +2106,57 @@ impl Engine {
                         None => {
                             // Gather neighbours from CSR + delta for this hop.
                             // Both sources report the neighbour's own label:
-                            // the catalog's `dst_label_id` for checkpointed
-                            // edges, the stored NodeId for delta edges.
+                            // the catalog's label for checkpointed edges, the
+                            // stored NodeId for delta edges.
                             // SPA-284: `rel_ids` restricts the lookup to the requested types.
                             // `seen` deduplicates on the full identity
                             // `(slot, label)`; `nb` keeps insertion order so
                             // row order stays deterministic for queries with
                             // no ORDER BY.
+                            //
+                            // #487/#488: a left-pointing hop (`<-`) means
+                            // `cur_slot` is the PHYSICAL destination, not the
+                            // source — walking the forward CSR/delta from it
+                            // silently answered the outbound question
+                            // instead of the inbound one asked. Mirror
+                            // `execute_one_hop`'s fix by branching on the
+                            // hop's direction rather than assuming Outgoing.
+                            let incoming =
+                                pat.rels[hop_idx].dir == sparrowdb_cypher::ast::EdgeDir::Incoming;
                             let mut seen: HashSet<(u64, u32)> = HashSet::new();
-                            let mut nb: Vec<(u64, u32)> = self
-                                .csr_neighbors_labeled(cur_slot, cur_label_id, hop_rel_ids)
-                                .into_iter()
-                                .filter(|nb| seen.insert(*nb))
-                                .collect();
+                            let mut nb: Vec<(u64, u32)> = if incoming {
+                                self.csr_predecessors_labeled(cur_slot, cur_label_id, hop_rel_ids)
+                            } else {
+                                self.csr_neighbors_labeled(cur_slot, cur_label_id, hop_rel_ids)
+                            }
+                            .into_iter()
+                            .filter(|nb| seen.insert(*nb))
+                            .collect();
                             for r in delta_all.iter() {
-                                let (r_src_label, r_src_slot) = node_id_parts(r.src.0);
-                                if r_src_label != cur_label_id || r_src_slot != cur_slot {
-                                    continue;
-                                }
                                 // Filter by relation-table IDs when a type constraint exists.
                                 if !hop_rel_ids.is_empty() && !hop_rel_ids.contains(&r.rel_id.0) {
                                     continue;
                                 }
-                                let (r_dst_label, r_dst_slot) = node_id_parts(r.dst.0);
-                                if seen.insert((r_dst_slot, r_dst_label)) {
-                                    nb.push((r_dst_slot, r_dst_label));
+                                if incoming {
+                                    // cur is the edge's destination; the
+                                    // neighbour is its physical source.
+                                    let (r_dst_label, r_dst_slot) = node_id_parts(r.dst.0);
+                                    if r_dst_label != cur_label_id || r_dst_slot != cur_slot {
+                                        continue;
+                                    }
+                                    let (r_src_label, r_src_slot) = node_id_parts(r.src.0);
+                                    if seen.insert((r_src_slot, r_src_label)) {
+                                        nb.push((r_src_slot, r_src_label));
+                                    }
+                                } else {
+                                    let (r_src_label, r_src_slot) = node_id_parts(r.src.0);
+                                    if r_src_label != cur_label_id || r_src_slot != cur_slot {
+                                        continue;
+                                    }
+                                    let (r_dst_label, r_dst_slot) = node_id_parts(r.dst.0);
+                                    if seen.insert((r_dst_slot, r_dst_label)) {
+                                        nb.push((r_dst_slot, r_dst_label));
+                                    }
                                 }
                             }
                             nb
