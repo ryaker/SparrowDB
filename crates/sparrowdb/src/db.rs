@@ -2194,7 +2194,27 @@ impl GraphDb {
         }
         let idx = VectorIndex::new(dimensions, metric);
         let dir = self.inner.path.join("vector_indexes");
-        idx.save(&dir, label, prop).map_err(Error::Io)?;
+        if let Err(e) = idx.save(&dir, label, prop) {
+            // A generation conflict is *proof* the index exists: the file's
+            // counter has advanced past what this handle loaded, which only
+            // happens when another writer created and populated it. The
+            // documented contract for that case is a no-op, so honour it
+            // rather than surfacing an error the caller cannot act on.
+            //
+            // The `contains_key` check above cannot see this — a handle opened
+            // before the index existed has an empty map — so this is the branch
+            // that keeps the contract true across handles.
+            //
+            // Deliberately does NOT insert into the map. This handle's view is
+            // stale, and inserting a fresh empty index here would discard the
+            // other writer's vectors in memory — exactly the data loss the
+            // generation guard just prevented on disk. Leave the map alone and
+            // let the next `GraphDb::open` load the real index.
+            if VectorIndex::is_lost_update(&e) {
+                return Ok(());
+            }
+            return Err(Error::Io(e));
+        }
         self.inner
             .vector_indexes
             .write()
