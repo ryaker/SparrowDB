@@ -257,3 +257,49 @@ fn case_when_with_unresolvable_branch_fails_closed() {
         r.rows
     );
 }
+
+/// The parser accepts any identifier as a function name, and `eval_expr` turns a
+/// dispatcher error into `Value::Null`. Combined with the `Value::Null =>
+/// stored_val.is_none()` arm, an unknown function in a pattern-property filter
+/// matched every node *lacking* that property.
+///
+/// Fixture: node `a` has `id`, node `b` deliberately does not. An unresolvable
+/// function must match neither — pre-fix it returned `b`.
+#[test]
+fn unknown_function_in_prop_filter_matches_nothing() {
+    let (db, _dir) = open_db();
+    db.execute("CREATE (:Item {id: 1, other: 10})").unwrap();
+    db.execute("CREATE (:Item {other: 20})").unwrap();
+
+    for q in [
+        "MATCH (n:Item {id: bogus_fn(1)}) RETURN n.other",
+        "MATCH (n:Item {id: nosuchfunction()}) RETURN n.other",
+    ] {
+        let r = db.execute(q).expect("should not error");
+        assert!(
+            r.rows.is_empty(),
+            "{q}: a function the dispatcher rejects must fail closed, not match \
+             the node whose property is absent; got {:?}",
+            r.rows
+        );
+    }
+}
+
+/// The counterpart: a function the dispatcher DOES accept must still resolve and
+/// match normally, so the check above cannot be satisfied by rejecting all calls.
+/// `abs(-1)` is 1, and exactly one `:Item` has `id = 1`.
+#[test]
+fn known_function_in_prop_filter_still_matches() {
+    let (db, _dir) = open_db();
+    db.execute("CREATE (:Item {id: 1, other: 10})").unwrap();
+    db.execute("CREATE (:Item {id: 2, other: 20})").unwrap();
+
+    let r = db
+        .execute("MATCH (n:Item {id: abs(-1)}) RETURN n.other")
+        .expect("a dispatchable function must resolve");
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Int64(10)]],
+        "abs(-1) is 1, so only the id=1 node must match"
+    );
+}

@@ -1162,7 +1162,24 @@ fn is_filter_expr_resolvable(expr: &Expr, params: &HashMap<String, Value>) -> bo
         // are always resolvable.
         Expr::Literal(_) => true,
         // Function calls / arithmetic are resolvable iff every argument is.
-        Expr::FnCall { args, .. } => args.iter().all(|a| is_filter_expr_resolvable(a, params)),
+        // A function call is resolvable iff every argument is AND the dispatcher
+        // actually accepts the call. Checking the arguments alone is not enough:
+        // the parser accepts any identifier as a function name, and
+        // `eval_expr` turns a dispatcher error into `Value::Null`
+        // (`dispatch_function(...).unwrap_or(Value::Null)`). That Null then hits
+        // the `Value::Null => stored_val.is_none()` arm below, so
+        // `MATCH (n:Item {id: bogus_fn(1)})` matched every node *lacking* `id`
+        // instead of matching nothing.
+        //
+        // The dispatcher itself is the source of truth here rather than a
+        // duplicated list of known names, which would silently drift as
+        // functions are added.
+        Expr::FnCall { name, args } => {
+            args.iter().all(|a| is_filter_expr_resolvable(a, params)) && {
+                let evaluated: Vec<Value> = args.iter().map(|a| eval_expr(a, params)).collect();
+                crate::functions::dispatch_function(name, evaluated).is_ok()
+            }
+        }
         Expr::BinOp { left, right, .. } => {
             is_filter_expr_resolvable(left, params) && is_filter_expr_resolvable(right, params)
         }
