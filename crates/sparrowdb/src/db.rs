@@ -1843,11 +1843,21 @@ impl GraphDb {
                                 .and_then(|m| m.get(p.as_str()))
                                 .and_then(|v| v.as_vector())
                             {
-                                pending_vectors
+                                // LAST write wins, matching `tx.set_property`
+                                // and the MATCH…SET vector path (which calls
+                                // idx.insert per mutation, in order). A
+                                // first-write-wins accumulator would leave the
+                                // stored property as the last value while the
+                                // index held the first — property and index
+                                // silently disagreeing is the #410 class this
+                                // block exists to prevent. `SET n.e = $a, n.e = $b`
+                                // reaches this: parse_set_items_inner is a bare
+                                // comma loop with no duplicate-prop guard.
+                                let entry = pending_vectors
                                     .entry(prop.clone())
-                                    .or_insert_with(|| (vec.clone(), Vec::new()))
-                                    .1
-                                    .extend(matching_ids.iter().map(|n| n.0));
+                                    .or_insert_with(|| (vec.clone(), Vec::new()));
+                                entry.0 = vec.clone();
+                                entry.1.extend(matching_ids.iter().map(|n| n.0));
                             }
                         }
                     }
@@ -1878,9 +1888,15 @@ impl GraphDb {
                 cat.list_labels().unwrap_or_default().into_iter().collect();
             let vidx_guard = self.inner.vector_indexes.read().expect("vector_indexes");
             for (prop, (vec, raw_ids)) in &pending_vectors {
+                // A node accumulates once per matching row and again per
+                // duplicate SET on the same prop, so dedup before inserting.
+                let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
                 let mut label_to_raw: std::collections::HashMap<&str, Vec<u64>> =
                     std::collections::HashMap::new();
                 for &raw in raw_ids {
+                    if !seen.insert(raw) {
+                        continue;
+                    }
                     let lid = (raw >> 32) as u16;
                     if let Some(name) = label_id_to_name.get(&lid) {
                         label_to_raw.entry(name.as_str()).or_default().push(raw);
