@@ -73,6 +73,12 @@ const TAG_FLOAT: u8 = 0x03;
 /// Maximum bytes that fit inline in the 7-byte payload (one byte is the tag).
 const MAX_INLINE_BYTES: usize = 7;
 
+/// Deletion tombstone sentinel written into `col_0` by `tombstone_node`.
+/// Mirrors the private `TOMBSTONE` constant in `property_index.rs` /
+/// `text_index.rs` — kept separate because those modules read the value
+/// back out of `NodeStore` rather than defining it themselves.
+const TOMBSTONE_SENTINEL: u64 = u64::MAX;
+
 impl Value {
     /// Encode as a packed `u64` for column storage.
     ///
@@ -641,11 +647,39 @@ impl NodeStore {
     /// Return the high-water mark (slot count) for a label.
     ///
     /// Returns `0` if no nodes have been created for that label yet.
+    ///
+    /// This is the number of slots ever *allocated* for the label — it is
+    /// never decremented by [`tombstone_node`](Self::tombstone_node), so it
+    /// overcounts once any node of this label has been deleted. Use
+    /// [`live_count_for_label`](Self::live_count_for_label) when the answer
+    /// needs to reflect deletions (e.g. `COUNT(n)`).
     pub fn hwm_for_label(&self, label_id: u32) -> Result<u64> {
         if let Some(&h) = self.hwm.get(&label_id) {
             return Ok(h);
         }
         self.load_hwm(label_id)
+    }
+
+    /// Return the number of *live* (non-deleted) nodes for a label (#485).
+    ///
+    /// `hwm_for_label` counts every slot ever allocated; deleted nodes are
+    /// tombstoned in place (`col_0` slot set to `u64::MAX`) rather than
+    /// freeing the slot, so the HWM alone overcounts once deletions have
+    /// happened. This reads `col_0` once and subtracts the tombstoned slots
+    /// from the HWM, matching the row-visibility rule `is_node_tombstoned`
+    /// already applies to ordinary scans.
+    pub fn live_count_for_label(&self, label_id: u32) -> Result<u64> {
+        let hwm = self.hwm_for_label(label_id)?;
+        if hwm == 0 {
+            return Ok(0);
+        }
+        let col0 = self.read_col_all(label_id, 0)?;
+        let tombstones = col0
+            .iter()
+            .take(hwm as usize)
+            .filter(|&&v| v == TOMBSTONE_SENTINEL)
+            .count() as u64;
+        Ok(hwm.saturating_sub(tombstones))
     }
 
     /// Discover all column IDs that currently exist on disk for `label_id`.
@@ -1168,7 +1202,8 @@ impl NodeStore {
         // Seek to the slot and write the tombstone value.
         f.seek(SeekFrom::Start(slot as u64 * 8))
             .map_err(Error::Io)?;
-        f.write_all(&u64::MAX.to_le_bytes()).map_err(Error::Io)
+        f.write_all(&TOMBSTONE_SENTINEL.to_le_bytes())
+            .map_err(Error::Io)
     }
 
     /// Overwrite the value of a single column for an existing node.
