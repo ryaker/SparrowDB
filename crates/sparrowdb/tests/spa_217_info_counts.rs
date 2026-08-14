@@ -76,13 +76,19 @@ fn db_counts_survives_reopen() {
     }
 }
 
-/// node_count is a HWM and includes soft-deleted nodes until compaction/GC runs.
+/// `db_counts()` must reflect deletions, not the raw HWM (#491).
 ///
-/// This test documents the current behaviour: deleting a node does **not**
-/// decrease the node count reported by `db_counts()` because the underlying
-/// store uses a high-water mark (slot index) rather than a live-node counter.
+/// This used to assert the opposite — that `node_count` stayed at the
+/// pre-delete total — as documented, "expected" behaviour, guarded behind
+/// `if delete_result.is_ok()` so the assertion never actually ran unless
+/// DELETE happened to succeed. That made a real defect look intentional and
+/// gave no signal if DELETE silently failed. The real contract is that a
+/// deleted node must not be counted, unconditionally: DELETE is asserted to
+/// succeed, and the resulting count is asserted to be exactly 0. There is no
+/// compaction/GC step that reconciles this later — `live_count_for_label`
+/// subtracts tombstoned slots directly, so the count is correct immediately.
 #[test]
-fn db_counts_hwm_includes_deleted_nodes() {
+fn db_counts_excludes_deleted_nodes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("test.sparrow");
     let db = GraphDb::open(&db_path).expect("open");
@@ -93,19 +99,15 @@ fn db_counts_hwm_includes_deleted_nodes() {
     let (node_count_before, _) = db.db_counts().expect("counts before delete");
     assert_eq!(node_count_before, 1, "one node created");
 
-    // Attempt DELETE — if the engine does not yet support it, skip the assertion.
-    let delete_result = db.execute("MATCH (n:Temp {name: 'ToDelete'}) DELETE n");
+    db.execute("MATCH (n:Temp {name: 'ToDelete'}) DELETE n")
+        .expect("DELETE must succeed");
 
-    if delete_result.is_ok() {
-        let (node_count_after, _) = db.db_counts().expect("counts after delete");
-        // HWM semantics: the slot is soft-deleted but the high-water mark is
-        // unchanged, so db_counts() still reports 1 until compaction/GC runs.
-        assert_eq!(
-            node_count_after, 1,
-            "node_count should still be 1 (HWM includes soft-deleted slots)"
-        );
-    }
-    // If DELETE is not yet implemented the test passes as a documentation stub.
+    let (node_count_after, _) = db.db_counts().expect("counts after delete");
+    // Expected by hand: 1 created - 1 deleted = 0 live nodes.
+    assert_eq!(
+        node_count_after, 0,
+        "node_count must be 0 after the sole node of the label is deleted"
+    );
 }
 
 /// Multiple node labels: counts correctly sum across all labels.

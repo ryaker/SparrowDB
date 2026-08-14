@@ -3075,28 +3075,37 @@ impl GraphDb {
         }
     }
 
-    /// Return `(node_count, edge_count)` by summing the high-water marks
+    /// Return `(node_count, edge_count)` by summing the live node count
     /// across all catalog labels (nodes) and delta-log record counts across
     /// all registered relationship tables (edges).
     ///
     /// Both counts reflect committed storage state; in-flight write
     /// transactions are not visible.
     ///
-    /// **Note:** `node_count` is based on per-label high-water marks and
-    /// therefore includes soft-deleted nodes whose slots have not yet been
-    /// reclaimed.  The count will converge to the true live-node count once
-    /// compaction / GC is implemented.
+    /// #491: previously summed `hwm_for_label` (the high-water mark of node
+    /// slots ever allocated), so `node_count` never dropped after a delete —
+    /// the same defect as #485's stale Cypher `COUNT(n)`, reached through the
+    /// `sparrowdb info` CLI / `db_counts()` API instead. There is no
+    /// compaction/GC path that reconciles the HWM against deletions, so the
+    /// old "converges once compaction runs" note above was never true — it
+    /// stayed wrong until the process restarted (`GraphDb::open()` reseeds
+    /// from the same HWM) and stayed wrong after that too. Now uses
+    /// `NodeStore::live_count_for_label`, which subtracts tombstoned slots.
     pub fn db_counts(&self) -> Result<(u64, u64)> {
         let path = &self.inner.path;
         let catalog = self.catalog_snapshot();
         let node_store = NodeStore::open(path)?;
 
-        // Node count: sum hwm_for_label across every registered label.
+        // Node count: sum live_count_for_label across every registered label.
         let node_count: u64 = catalog
             .list_labels()
             .unwrap_or_default()
             .iter()
-            .map(|(label_id, _name)| node_store.hwm_for_label(*label_id as u32).unwrap_or(0))
+            .map(|(label_id, _name)| {
+                node_store
+                    .live_count_for_label(*label_id as u32)
+                    .unwrap_or(0)
+            })
             .sum();
 
         // Edge count: for each registered rel table, sum CSR base edges (post-checkpoint)
