@@ -1233,10 +1233,24 @@ fn is_filter_expr_resolvable_scoped(
         // meaningful in a pattern-property position and is conservatively
         // treated as unresolvable too.
         //
-        // Adding a variant here is only correct when it genuinely cannot be
-        // evaluated from literals and params; anything statically evaluable that
-        // lands in this arm becomes a silent under-match, which is harder to
-        // notice than the over-match this function exists to prevent.
+        // THE RULE FOR ADDING A VARIANT HERE: a variant belongs in this arm iff
+        // it has **no all-literal instantiation**. Anything statically evaluable
+        // that lands here becomes a silent under-match — no error, just a
+        // missing row — which is harder to notice than the over-match this
+        // function exists to prevent.
+        //
+        // Three variants have already been fixed after wrongly landing here
+        // (CaseWhen, undispatchable FnCall, ListPredicate). All three were
+        // COMPOUND expressions whose sub-expressions can all be literals, so a
+        // fully-static form exists. The variants that remain are safe for a
+        // structural reason, not a judgement call:
+        //   • PropAccess is `{ var: String, prop: String }` — the base is a bare
+        //     identifier, not an expression, so `$param.field` is not
+        //     representable in the AST at all.
+        //   • Var (non-local) is a leaf that by definition is not in params.
+        //   • NotExists / ExistsSubquery / ShortestPath need graph traversal and
+        //     CountStar needs aggregation; none has a static form.
+        // Check that property when adding variant 19.
         _ => false,
     }
 }
