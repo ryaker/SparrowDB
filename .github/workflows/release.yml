@@ -293,3 +293,78 @@ jobs:
           git add Formula/sparrowdb.rb
           git commit -m "chore: update formula to v${VER}"
           git push
+
+  # ── Publish Rust crates to crates.io ──────────────────────────────────────
+  #
+  # Six crates publish in dependency order, and each must be INDEXED on
+  # crates.io before the next one resolves it — `cargo publish` for a dependent
+  # fails if its dependency is not yet queryable. `--no-verify` is deliberately
+  # NOT used: the verify build is what catches a crate that compiles in the
+  # workspace but not standalone (a path dependency left unversioned, say).
+  #
+  # Idempotent by design: a crate already published at this version is skipped
+  # rather than failing the job, so a re-run after a partial failure resumes
+  # instead of starting over. That matters because crates.io publishes cannot
+  # be undone — only yanked.
+  publish-crates:
+    name: Publish to crates.io
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set — add it as a repository secret."
+            exit 1
+          fi
+
+          # Order derived from the internal dependency graph:
+          #   common <- storage <- catalog <- cypher <- execution <- sparrowdb
+          # sparrowdb-ruby depends on common + execution and is published last.
+          # sparrowdb-bench is a dev-dependency of sparrowdb and is not published;
+          # cargo publish ignores dev-dependencies.
+          CRATES="sparrowdb-common sparrowdb-storage sparrowdb-catalog sparrowdb-cypher sparrowdb-execution sparrowdb sparrowdb-ruby"
+
+          for crate in $CRATES; do
+            echo "── $crate ──"
+
+            # Skip if this exact version is already on crates.io. Uses the index
+            # rather than `cargo publish`'s error text, which is not stable.
+            PUBLISHED=$(curl -s -H "User-Agent: sparrowdb-release" \
+              "https://crates.io/api/v1/crates/${crate}/${VERSION}" \
+              | grep -c "\"num\":\"${VERSION}\"" || true)
+            if [ "$PUBLISHED" -gt 0 ]; then
+              echo "  already published at ${VERSION} — skipping"
+              continue
+            fi
+
+            cargo publish -p "$crate"
+
+            # Wait for the index to serve it before publishing a dependent.
+            # Polling beats a fixed sleep: it is faster when the index is quick
+            # and does not silently proceed when it is slow.
+            echo "  waiting for crates.io to index ${crate} ${VERSION}"
+            for i in $(seq 1 60); do
+              READY=$(curl -s -H "User-Agent: sparrowdb-release" \
+                "https://crates.io/api/v1/crates/${crate}/${VERSION}" \
+                | grep -c "\"num\":\"${VERSION}\"" || true)
+              if [ "$READY" -gt 0 ]; then
+                echo "  indexed after ${i} poll(s)"
+                break
+              fi
+              if [ "$i" = "60" ]; then
+                echo "::error::${crate} ${VERSION} did not appear on crates.io within 10 minutes."
+                exit 1
+              fi
+              sleep 10
+            done
+          done
+
+          echo "All crates published at ${VERSION}."
