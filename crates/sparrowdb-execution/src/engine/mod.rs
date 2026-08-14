@@ -1155,6 +1155,125 @@ mod subquery;
 
 // ── Free-standing prop-filter helper (usable without &self) ───────────────────
 
+/// Returns `true` when `expr` can be fully resolved against `params` — i.e.
+/// every leaf is a literal, or a `$param` that is actually present in the
+/// params map.
+///
+/// `params` here is always a `dollar_params()`-shaped map: every call site of
+/// `matches_prop_filter_static` (and the `matches_prop_filter` wrapper) passes
+/// only `$`-prefixed runtime parameters, never row-scope bindings.  That means
+/// a bare `Expr::Var` or `Expr::PropAccess` referencing a pattern variable —
+/// including a correlated variable from an outer `MATCH`/`WITH` or an
+/// `UNWIND` alias — can *never* be resolved through this map today, no matter
+/// how the query is written.  Treating that as "unresolvable" (rather than
+/// silently defaulting to `Value::Null`) is what lets the caller fail closed
+/// instead of degrading a pattern-property filter into "match everything"
+/// (issue #467).
+///
+/// A missing `$param` is unresolvable for the same reason: it means the
+/// query referenced a parameter the caller never supplied, not that the
+/// caller deliberately bound it to null.
+fn is_filter_expr_resolvable(expr: &Expr, params: &HashMap<String, Value>) -> bool {
+    is_filter_expr_resolvable_scoped(expr, params, &[])
+}
+
+/// As [`is_filter_expr_resolvable`], but with a set of locally-bound variable
+/// names — the loop variable of a list predicate (`ANY(x IN … WHERE …)`) is
+/// bound by the comprehension itself, not by the params map, so a bare
+/// `Expr::Var("x")` inside the predicate is legitimately resolvable.
+fn is_filter_expr_resolvable_scoped(
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    locals: &[&str],
+) -> bool {
+    let rec = |e: &Expr| is_filter_expr_resolvable_scoped(e, params, locals);
+    match expr {
+        // A literal `$name` — resolvable only if the caller actually supplied it.
+        Expr::Literal(Literal::Param(p)) => params.contains_key(&format!("${p}")),
+        // Constant literals (including an explicit `null` written in the query)
+        // are always resolvable.
+        Expr::Literal(_) => true,
+        // Function calls / arithmetic are resolvable iff every argument is.
+        // A function call is resolvable iff every argument is AND the dispatcher
+        // actually accepts the call. Checking the arguments alone is not enough:
+        // the parser accepts any identifier as a function name, and
+        // `eval_expr` turns a dispatcher error into `Value::Null`
+        // (`dispatch_function(...).unwrap_or(Value::Null)`). That Null then hits
+        // the `Value::Null => stored_val.is_none()` arm below, so
+        // `MATCH (n:Item {id: bogus_fn(1)})` matched every node *lacking* `id`
+        // instead of matching nothing.
+        //
+        // The dispatcher itself is the source of truth here rather than a
+        // duplicated list of known names, which would silently drift as
+        // functions are added.
+        Expr::FnCall { name, args } => {
+            args.iter().all(&rec) && {
+                let evaluated: Vec<Value> = args.iter().map(|a| eval_expr(a, params)).collect();
+                crate::functions::dispatch_function(name, evaluated).is_ok()
+            }
+        }
+        Expr::BinOp { left, right, .. } => rec(left) && rec(right),
+        Expr::List(items) => items.iter().all(&rec),
+        Expr::InList { expr, list, .. } => rec(expr) && list.iter().all(&rec),
+        Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => rec(e),
+        Expr::And(a, b) | Expr::Or(a, b) => rec(a) && rec(b),
+        // `CASE WHEN <cond> THEN <val> … [ELSE <val>]` is resolvable iff every
+        // condition, every branch value, and the ELSE are.  This one is NOT
+        // merely conservative: `MATCH (n:Item {id: CASE WHEN true THEN 1 ELSE 2 END})`
+        // matched correctly before this guard existed, so lumping it in with the
+        // catch-all below silently dropped a legitimate row (SPA-138).
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
+            branches.iter().all(|(cond, val)| rec(cond) && rec(val))
+                && else_expr.as_ref().is_none_or(|e| rec(e))
+        }
+        // `ANY/ALL/NONE/SINGLE (x IN <list> WHERE <pred>)` binds `x` itself, so
+        // the predicate is resolvable even though it names a variable absent
+        // from the params map. Omitting this arm dropped the whole expression
+        // into the catch-all below, silently discarding a legitimate row — the
+        // same symptom-free under-match as the CASE WHEN gap above.
+        Expr::ListPredicate {
+            variable,
+            list_expr,
+            predicate,
+            ..
+        } => {
+            let mut inner: Vec<&str> = locals.to_vec();
+            inner.push(variable.as_str());
+            rec(list_expr) && is_filter_expr_resolvable_scoped(predicate, params, &inner)
+        }
+        // A comprehension-bound loop variable is resolvable inside its own body.
+        Expr::Var(v) if locals.contains(&v.as_str()) => true,
+        // A bare variable or property access can never be resolved from a
+        // params-only map — see the doc comment above.  Everything else
+        // (EXISTS, shortestPath, CountStar, list predicates, …) is not
+        // meaningful in a pattern-property position and is conservatively
+        // treated as unresolvable too.
+        //
+        // THE RULE FOR ADDING A VARIANT HERE: a variant belongs in this arm iff
+        // it has **no all-literal instantiation**. Anything statically evaluable
+        // that lands here becomes a silent under-match — no error, just a
+        // missing row — which is harder to notice than the over-match this
+        // function exists to prevent.
+        //
+        // Three variants have already been fixed after wrongly landing here
+        // (CaseWhen, undispatchable FnCall, ListPredicate). All three were
+        // COMPOUND expressions whose sub-expressions can all be literals, so a
+        // fully-static form exists. The variants that remain are safe for a
+        // structural reason, not a judgement call:
+        //   • PropAccess is `{ var: String, prop: String }` — the base is a bare
+        //     identifier, not an expression, so `$param.field` is not
+        //     representable in the AST at all.
+        //   • Var (non-local) is a leaf that by definition is not in params.
+        //   • NotExists / ExistsSubquery / ShortestPath need graph traversal and
+        //     CountStar needs aggregation; none has a static form.
+        // Check that property when adding variant 19.
+        _ => false,
+    }
+}
+
 fn matches_prop_filter_static(
     props: &[(u32, u64)],
     filters: &[sparrowdb_cypher::ast::PropEntry],
@@ -1162,6 +1281,14 @@ fn matches_prop_filter_static(
     store: &NodeStore,
 ) -> bool {
     for f in filters {
+        // Fail closed: an unresolvable filter value (unbound variable, a
+        // `$param` the caller never supplied, property access on a var not in
+        // scope, …) must never widen a pattern-property filter into "match
+        // every node of the label" (issue #467). Bail out before evaluating.
+        if !is_filter_expr_resolvable(&f.value, params) {
+            return false;
+        }
+
         let col_id = prop_name_to_col_id(&f.key);
         let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
 
@@ -1192,7 +1319,13 @@ fn matches_prop_filter_static(
                     matches!(store.decode_raw_value(raw), StoreValue::Float(stored_f) if stored_f == f)
                 })
             }
-            Value::Null => true, // null filter passes (param-like behaviour)
+            // A *resolved* null (an explicit `null` literal, or a `$param`
+            // the caller genuinely bound to null) only matches a node whose
+            // own property is likewise absent — mirroring the `Null == Null`
+            // convention `values_equal` already uses for WHERE-clause
+            // equality elsewhere in this file, rather than matching every
+            // node regardless of its stored value.
+            Value::Null => stored_val.is_none(),
             _ => false,
         };
         if !matches {
