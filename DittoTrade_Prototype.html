@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html class="dark" lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+    <title>DittoTrade Prototype</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    
+    <!-- Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@200;300;400;500;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet"/>
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
+    
+    <!-- React & Router Dependencies -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script crossorigin src="https://unpkg.com/history@5/umd/history.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-router@6.3.0/umd/react-router.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-router-dom@6.3.0/umd/react-router-dom.development.js"></script>
+    <script crossorigin src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+
+    <!-- Tailwind Config -->
+    <script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        "error": "#ffb4ab",
+                        "on-error": "#690005",
+                        "inverse-primary": "#494bd6",
+                        "surface-dim": "#0b1326",
+                        "inverse-on-surface": "#283044",
+                        "surface-bright": "#31394d",
+                        "surface-container-highest": "#2d3449",
+                        "primary-fixed": "#e1e0ff",
+                        "on-tertiary": "#4f2500",
+                        "on-tertiary-container": "#452000",
+                        "outline": "#908fa0",
+                        "secondary-container": "#42447b",
+                        "tertiary-fixed": "#ffdcc5",
+                        "on-background": "#dae2fd",
+                        "primary-fixed-dim": "#c0c1ff",
+                        "secondary-fixed-dim": "#c0c1ff",
+                        "secondary-fixed": "#e1e0ff",
+                        "error-container": "#93000a",
+                        "surface-tint": "#c0c1ff",
+                        "surface-container-low": "#131b2e",
+                        "outline-variant": "#464554",
+                        "on-primary": "#1000a9",
+                        "on-error-container": "#ffdad6",
+                        "secondary": "#c0c1ff",
+                        "surface": "#0b1326",
+                        "on-surface": "#dae2fd",
+                        "on-secondary-fixed": "#13144a",
+                        "on-secondary": "#292a60",
+                        "on-secondary-container": "#b2b3f2",
+                        "inverse-surface": "#dae2fd",
+                        "tertiary": "#ffb783",
+                        "surface-variant": "#2d3449",
+                        "primary": "#6366F1", // Applied primary color instruction
+                        "on-tertiary-fixed-variant": "#703700",
+                        "surface-container-lowest": "#060e20",
+                        "primary-container": "#8083ff",
+                        "on-surface-variant": "#c7c4d7",
+                        "on-tertiary-fixed": "#301400",
+                        "on-secondary-fixed-variant": "#404178",
+                        "on-primary-fixed": "#07006c",
+                        "tertiary-fixed-dim": "#ffb783",
+                        "on-primary-container": "#0d0096",
+                        "surface-container-high": "#222a3d",
+                        "tertiary-container": "#d97721",
+                        "background": "#0b1326",
+                        "surface-container": "#171f33",
+                        "on-primary-fixed-variant": "#2f2ebe"
+                    },
+                    fontFamily: {
+                        "headline": ["Manrope", "sans-serif"],
+                        "body": ["Manrope", "sans-serif"],
+                        "label": ["Manrope", "sans-serif"],
+                        "manrope": ["Manrope", "sans-serif"],
+                        "inter": ["Inter", "sans-serif"]
+                    },
+                    borderRadius: { "DEFAULT": "0.375rem", "md": "0.375rem", "lg": "0.5rem", "xl": "0.75rem", "2xl": "1rem", "3xl": "1.5rem", "full": "9999px" },
+                },
+            },
+        }
+    </script>
+    <style>
+        body { font-family: 'Manrope', sans-serif; }
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+            vertical-align: middle;
+        }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .hide-scrollbar::-webkit-scrollbar { display: none; }
+        .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .signature-gradient {
+            background: linear-gradient(135deg, #6366F1 0%, #8083ff 100%);
+        }
+        .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+        .animate-slide-up { animation: slideUp 0.3s ease-out forwards; }
+        @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-background text-on-background min-h-screen">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+        const { createRoot } = ReactDOM;
+        const { MemoryRouter, Routes, Route, Link, useNavigate, useLocation } = ReactRouterDOM;
+
+        // --- Shared Components ---
+
+        const TopNavBar = ({ title = "DittoTrade", showBack = false, titleNode = null }) => {
+            const navigate = useNavigate();
+            return (
+                <header className="fixed top-0 w-full z-50 bg-[#0b1326]/80 backdrop-blur-xl shadow-2xl shadow-black/40 border-b border-[#464554]/15">
+                    <div className="flex justify-between items-center px-6 h-16 w-full max-w-7xl mx-auto">
+                        <div className="flex items-center gap-4">
+                            {showBack && (
+                                <button onClick={() => navigate(-1)} className="active:scale-95 transition-transform text-[#c0c1ff]">
+                                    <span className="material-symbols-outlined">arrow_back</span>
+                                </button>
+                            )}
+                            {titleNode ? titleNode : (
+                                <div className="flex items-center gap-3">
+                                    <span className="text-xl font-bold tracking-tighter text-[#c0c1ff]">{title}</span>
+                                </div>
+                            )}
+                        </div>
+                        <div className="hidden md:flex items-center gap-8 font-['Manrope'] tracking-tight text-[#dae2fd]">
+                            <Link to="/" className="text-[#c0c1ff] transition-colors">Home</Link>
+                            <Link to="/discover" className="text-[#c7c4d7] hover:bg-[#31394d] transition-colors px-3 py-1 rounded-md">Discover</Link>
+                            <Link to="/portfolio" className="text-[#c7c4d7] hover:bg-[#31394d] transition-colors px-3 py-1 rounded-md">Portfolio</Link>
+                            <Link to="/alert" className="text-[#c7c4d7] hover:bg-[#31394d] transition-colors px-3 py-1 rounded-md">Alerts</Link>
+                        </div>
+                        <div className="flex items-center gap-4 text-[#c0c1ff]">
+                            <Link to="/alert" className="material-symbols-outlined hover:bg-[#31394d] p-2 rounded-full transition-colors active:scale-95 duration-200">notifications</Link>
+                            <button className="material-symbols-outlined hover:bg-[#31394d] p-2 rounded-full transition-colors active:scale-95 duration-200">account_circle</button>
+                        </div>
+                    </div>
+                </header>
+            );
+        };
+
+        const BottomNavBar = () => {
+            const location = useLocation();
+            
+            const getTabClass = (path) => {
+                const isActive = location.pathname === path;
+                return isActive 
+                    ? "flex flex-col items-center justify-center text-[#c0c1ff] bg-gradient-to-br from-[#c0c1ff]/10 to-[#8083ff]/5 rounded-md px-3 py-1 active:scale-90 duration-150 transition-all"
+                    : "flex flex-col items-center justify-center text-[#c7c4d7] opacity-60 hover:text-[#dae2fd] active:scale-90 duration-150 transition-all";
+            };
+
+            const getIconSettings = (path) => {
+                 return location.pathname === path ? { fontVariationSettings: "'FILL' 1" } : {};
+            }
+
+            return (
+                <nav className="md:hidden fixed bottom-0 left-0 w-full flex justify-around items-center px-4 py-3 pb-safe bg-[#0b1326]/90 backdrop-blur-2xl z-50 border-t border-[#464554]/15 shadow-[0_-10px_30px_rgba(0,0,0,0.5)]">
+                    <Link to="/" className={getTabClass("/")}>
+                        <span className="material-symbols-outlined" style={getIconSettings("/")}>home</span>
+                        <span className="font-['Manrope'] text-[10px] font-medium uppercase tracking-widest mt-1">Home</span>
+                    </Link>
+                    <Link to="/discover" className={getTabClass("/discover")}>
+                        <span className="material-symbols-outlined" style={getIconSettings("/discover")}>explore</span>
+                        <span className="font-['Manrope'] text-[10px] font-medium uppercase tracking-widest mt-1">Discover</span>
+                    </Link>
+                    <Link to="/portfolio" className={getTabClass("/portfolio")}>
+                        <span className="material-symbols-outlined" style={getIconSettings("/portfolio")}>pie_chart</span>
+                        <span className="font-['Manrope'] text-[10px] font-medium uppercase tracking-widest mt-1">Portfolio</span>
+                    </Link>
+                    <Link to="/alert" className={getTabClass("/alert")}>
+                        <span className="material-symbols-outlined" style={getIconSettings("/alert")}>notifications</span>
+                        <span className="font-['Manrope'] text-[10px] font-medium uppercase tracking-widest mt-1">Alerts</span>
+                    </Link>
+                    <Link to="/settings" className={getTabClass("/settings")}>
+                        <span className="material-symbols-outlined" style={getIconSettings("/settings")}>settings</span>
+                        <span className="font-['Manrope'] text-[10px] font-medium uppercase tracking-widest mt-1">Settings</span>
+                    </Link>
+                </nav>
+            );
+        };
+
+        // --- Screens ---
+
+        const Dashboard1 = () => {
+            return (
+                <div className="pb-24">
+                    <TopNavBar />
+                    <main className="pt-24 px-6 max-w-7xl mx-auto space-y-12">
+                        <section className="md:pl-[15%]">
+                            <h1 className="text-headline-lg text-4xl font-extrabold tracking-tight text-on-background">Welcome back, Alex</h1>
+                            <p className="text-on-surface-variant mt-2 font-medium">Your portfolio is performing in the top 5% today.</p>
+                        </section>
+
+                        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                            <div className="lg:col-span-8 space-y-8">
+                                <div className="bg-surface-container-high rounded-md p-8 shadow-2xl relative overflow-hidden border border-outline-variant/10">
+                                    <div className="absolute top-0 right-0 w-64 h-64 bg-primary/10 blur-[100px] rounded-full -mr-20 -mt-20"></div>
+                                    <div className="relative z-10 flex flex-col md:flex-row justify-between items-start md:items-end gap-6">
+                                        <div>
+                                            <span className="text-label-sm text-on-surface-variant uppercase tracking-widest font-semibold">Total Portfolio Value</span>
+                                            <div className="text-5xl font-extrabold tracking-tight mt-2 text-on-surface">$31,175.00</div>
+                                            <div className="flex items-center gap-2 mt-3">
+                                                <span className="bg-tertiary/10 text-tertiary px-3 py-1 rounded-full text-sm font-bold flex items-center gap-1">
+                                                    <span className="material-symbols-outlined text-sm" style={{fontVariationSettings: "'FILL' 1"}}>trending_up</span>
+                                                    +$120.00 (0.38%)
+                                                </span>
+                                                <span className="text-on-surface-variant text-sm">vs yesterday</span>
+                                            </div>
+                                        </div>
+                                        <div className="flex flex-wrap gap-3">
+                                            <button className="bg-gradient-to-br from-primary to-primary-container text-white px-5 py-2.5 rounded-md font-bold text-sm shadow-lg active:scale-95 duration-150 transition-transform">Deposit</button>
+                                            <button className="bg-surface-bright text-on-surface px-5 py-2.5 rounded-md font-bold text-sm hover:bg-surface-container-highest transition-colors">Withdraw</button>
+                                            <button className="bg-surface-container-highest text-primary px-5 py-2.5 rounded-md font-bold text-sm border border-outline-variant/15 flex items-center gap-2">
+                                                <span className="material-symbols-outlined text-sm">sync</span>
+                                                Sync Portfolio
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div className="mt-12 h-64 w-full relative group">
+                                        <div className="absolute inset-0 bg-gradient-to-b from-primary/10 to-transparent rounded-md"></div>
+                                        <svg className="w-full h-full overflow-visible" viewBox="0 0 1000 200">
+                                            <path d="M0,150 Q100,140 200,100 T400,80 T600,120 T800,60 T1000,40" fill="none" stroke="#6366F1" strokeLinecap="round" strokeWidth="4"></path>
+                                        </svg>
+                                        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-surface-container-lowest/80 backdrop-blur-md p-1.5 rounded-md border border-outline-variant/10">
+                                            <button className="px-4 py-1 text-xs font-bold rounded-md transition-all text-on-surface-variant hover:text-on-surface">1D</button>
+                                            <button className="px-4 py-1 text-xs font-bold rounded-md transition-all text-on-surface-variant hover:text-on-surface">1W</button>
+                                            <button className="px-4 py-1 text-xs font-bold rounded-md transition-all bg-primary/20 text-primary">1M</button>
+                                            <button className="px-4 py-1 text-xs font-bold rounded-md transition-all text-on-surface-variant hover:text-on-surface">1Y</button>
+                                            <button className="px-4 py-1 text-xs font-bold rounded-md transition-all text-on-surface-variant hover:text-on-surface">ALL</button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <section>
+                                    <div className="flex justify-between items-center mb-6">
+                                        <h2 className="text-xl font-bold tracking-tight text-on-surface">Active Copilots</h2>
+                                        <Link to="/discover" className="text-primary text-sm font-bold flex items-center gap-1 hover:underline">View All <span className="material-symbols-outlined text-sm">arrow_forward</span></Link>
+                                    </div>
+                                    <div className="flex gap-4 overflow-x-auto no-scrollbar pb-4 -mx-2 px-2">
+                                        <Link to="/settings" className="flex-none w-72 bg-surface-container rounded-md p-5 border border-outline-variant/10 hover:border-primary/50 transition-all cursor-pointer block">
+                                            <div className="flex items-center gap-4 mb-6">
+                                                <img alt="Elena Rodriguez" className="w-12 h-12 rounded-full object-cover ring-2 ring-primary/20" src="https://lh3.googleusercontent.com/aida-public/AB6AXuAatBbh8GLJp0IZFjB5X0mITQNP0Pds_06eikJ6l0AkjIOGa_zUV_mP9ZUo9d5pGBnUtwiq2uJ45FNumdS-NRiRykXuRRLEE7Qe4kowaisbW-yzKBSVhvT1c-FzUX1oOtUtHsPmV7YUpVL1PcO9XDZJbH8qQaAP8Eyz5YXakOAdnwM1O_rNmawIW_U8yCwExdjb-iCPTq8HgHGpt0DB2rem4DbuLn5SsGPrNw6dI_NjqstXr2_4RIYH1zgXPAb6xkBSICT4Qyqqb9U"/>
+                                                <div>
+                                                    <h4 className="font-bold text-on-surface">Elena Rodriguez</h4>
+                                                    <span className="text-[10px] text-tertiary font-bold uppercase tracking-widest bg-tertiary/10 px-2 py-0.5 rounded-full">Ditto All</span>
+                                                </div>
+                                            </div>
+                                            <div className="flex justify-between items-end">
+                                                <div>
+                                                    <span className="text-xs text-on-surface-variant block mb-1">Copying</span>
+                                                    <span className="text-lg font-extrabold text-on-surface">$10,000</span>
+                                                </div>
+                                                <div className="text-right">
+                                                    <span className="text-xs text-on-surface-variant block mb-1">Profit</span>
+                                                    <span className="text-lg font-extrabold text-tertiary">+$840</span>
+                                                </div>
+                                            </div>
+                                        </Link>
+                                        
+                                        <Link to="/settings" className="flex-none w-72 bg-surface-container rounded-md p-5 border border-outline-variant/10 hover:border-primary/50 transition-all cursor-pointer block">
+                                            <div className="flex items-center gap-4 mb-6">
+                                                <img alt="Marcus Chen" className="w-12 h-12 rounded-full object-cover ring-2 ring-primary/20" src="https://lh3.googleusercontent.com/aida-public/AB6AXuCOHs6njJAOSRqy030jR-OWY7uPd6A2S5QFE7lnJFglj7Jmk9HHGYoqYXiEnmc5UBF3qorKI3vb4k6ufx97LlheELmOQblxh4jUXFuRccmQu7fMmr3aJKMiGIAeIrfcdr7XJ47tWGZ-kbE4juUMPSnRDyU1ec9UDczKbS1uq7qr9P768NgAtGOYbgBIkGqy3vzZVpKQr_TqLYRLKHHMXy6WUKE4v2z0HQaoiKrbxvdRNx1RI1D6yZVBl1AYBsJzr2pw_Vut-lMeSno"/>
+                                                <div>
+                                                    <h4 className="font-bold text-on-surface">Marcus Chen</h4>
+                                                    <span className="text-[10px] text-on-surface-variant font-bold uppercase tracking-widest bg-surface-container-highest px-2 py-0.5 rounded-full">Alerts Only</span>
+                                                </div>
+                                            </div>
+                                            <div className="flex justify-between items-end">
+                                                <div>
+                                                    <span className="text-xs text-on-surface-variant block mb-1">Copying</span>
+                                                    <span className="text-lg font-extrabold text-on-surface">$10,000</span>
+                                                </div>
+                                                <div className="text-right">
+                                                    <span className="text-xs text-on-surface-variant block mb-1">Profit</span>
+                                                    <span className="text-lg font-extrabold text-tertiary">+$1,120</span>
+                                                </div>
+                                            </div>
+                                        </Link>
+                                    </div>
+                                </section>
+                            </div>
+
+                            <div className="lg:col-span-4 space-y-6">
+                                <div className="bg-surface-container-low rounded-md p-6 h-fit border border-outline-variant/10">
+                                    <h3 className="text-lg font-bold mb-6 text-on-surface">Market Overview</h3>
+                                    <div className="space-y-4">
+                                        <div className="bg-surface-container rounded-md p-4 flex justify-between items-center group cursor-pointer hover:bg-surface-container-highest transition-colors">
+                                            <div className="flex items-center gap-3">
+                                                <div className="w-10 h-10 bg-primary/10 rounded-md flex items-center justify-center text-primary font-bold">SPX</div>
+                                                <div>
+                                                    <div className="font-bold text-sm">S&P 500</div>
+                                                    <div className="text-xs text-on-surface-variant">4,783.45</div>
+                                                </div>
+                                            </div>
+                                            <div className="text-right">
+                                                <div className="text-tertiary text-sm font-bold">+1.24%</div>
+                                                <div className="w-16 h-6 mt-1 opacity-50 group-hover:opacity-100 transition-opacity flex items-center">
+                                                     <svg className="w-full h-full" viewBox="0 0 60 20">
+                                                        <path d="M0,15 L10,12 L20,14 L30,8 L40,10 L50,4 L60,6" fill="none" stroke="#ffb783" strokeLinecap="round" strokeWidth="2"></path>
+                                                    </svg>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div className="bg-surface-container rounded-md p-4 flex justify-between items-center group cursor-pointer hover:bg-surface-container-highest transition-colors">
+                                            <div className="flex items-center gap-3">
+                                                <div className="w-10 h-10 bg-primary/10 rounded-md flex items-center justify-center text-primary font-bold">NAS</div>
+                                                <div>
+                                                    <div className="font-bold text-sm">NASDAQ</div>
+                                                    <div className="text-xs text-on-surface-variant">15,011.35</div>
+                                                </div>
+                                            </div>
+                                            <div className="text-right">
+                                                <div className="text-tertiary text-sm font-bold">+1.82%</div>
+                                                <div className="w-16 h-6 mt-1 opacity-50 group-hover:opacity-100 transition-opacity flex items-center">
+                                                     <svg className="w-full h-full" viewBox="0 0 60 20">
+                                                        <path d="M0,18 L10,15 L20,12 L30,10 L40,6 L50,8 L60,2" fill="none" stroke="#ffb783" strokeLinecap="round" strokeWidth="2"></path>
+                                                    </svg>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div className="mt-8 rounded-md bg-gradient-to-br from-primary-container/20 to-surface-container p-6 border border-primary/20">
+                                    <span className="text-[10px] font-bold uppercase tracking-widest text-primary mb-2 block">Upgrade Your Edge</span>
+                                    <h4 className="font-bold text-lg mb-2">DittoTrade Pro</h4>
+                                    <p className="text-xs text-on-surface-variant leading-relaxed mb-4">Get instant execution and unlimited Copilot slots for higher returns.</p>
+                                    <button className="w-full py-2 bg-primary text-white rounded-md font-bold text-sm hover:opacity-90">Go Pro Now</button>
+                                </div>
+                            </div>
+                        </div>
+                    </main>
+                    <BottomNavBar />
+                </div>
+            );
+        };
+
+        const PortfolioScreen = () => {
+            return (
+                <div className="pb-32">
+                    <TopNavBar title="My Portfolio" />
+                    <main className="pt-24 px-6 max-w-7xl mx-auto space-y-8">
+                        <section className="mt-4 space-y-2">
+                            <span className="text-primary font-bold tracking-widest text-[10px] uppercase font-label">Financial Overview</span>
+                            <div className="flex flex-col md:flex-row md:justify-between md:items-end gap-4">
+                                <h2 className="font-headline text-4xl font-extrabold tracking-tight">My Portfolio</h2>
+                                <div className="text-left md:text-right">
+                                    <p className="text-[10px] text-on-surface-variant font-medium uppercase tracking-wider">Total Value</p>
+                                    <p className="font-headline text-2xl font-bold text-on-surface">$42,912.84</p>
+                                </div>
+                            </div>
+                        </section>
+
+                        <nav className="flex p-1.5 bg-surface-container-low rounded-md w-fit border border-outline-variant/10">
+                            <button className="px-6 py-2 rounded-md text-sm font-semibold bg-surface-container-highest shadow-sm text-primary transition-all">All</button>
+                            <button className="px-6 py-2 rounded-md text-sm font-medium text-on-surface-variant hover:text-on-surface transition-all">Independent</button>
+                            <button className="px-6 py-2 rounded-md text-sm font-medium text-on-surface-variant hover:text-on-surface transition-all">Copied</button>
+                        </nav>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                            <div className="group relative bg-surface-container rounded-md overflow-hidden transition-all duration-300 hover:border-primary/30 border border-outline-variant/10 flex flex-col">
+                                <div className="p-6 space-y-4">
+                                    <div className="flex justify-between items-start">
+                                        <div className="flex items-center gap-4">
+                                            <div className="w-12 h-12 rounded-full bg-surface-container-high flex items-center justify-center">
+                                                <span className="material-symbols-outlined text-primary text-2xl">devices</span>
+                                            </div>
+                                            <div>
+                                                <h3 className="font-headline text-lg font-bold leading-none">AAPL</h3>
+                                                <p className="text-xs text-on-surface-variant font-medium">Apple Inc.</p>
+                                            </div>
+                                        </div>
+                                        <div className="text-right">
+                                            <p className="font-headline text-lg font-bold">$189.43</p>
+                                            <span className="inline-flex items-center text-xs font-bold text-tertiary">
+                                                <span className="material-symbols-outlined text-sm mr-0.5">arrow_drop_up</span>
+                                                1.2%
+                                            </span>
+                                        </div>
+                                    </div>
+                                    <div className="bg-primary/10 px-3 py-2 rounded-md flex items-center gap-2">
+                                        <span className="material-symbols-outlined text-sm text-primary" style={{fontVariationSettings: "'FILL' 1"}}>link</span>
+                                        <p className="text-[11px] font-semibold text-primary">Copied from Brian Lund</p>
+                                    </div>
+                                </div>
+                                <div className="flex border-t border-outline-variant/10 bg-surface-container-low mt-auto">
+                                    <button className="flex-1 py-3 flex items-center justify-center gap-2 text-primary font-bold text-xs uppercase tracking-widest hover:bg-primary/5 transition-colors">
+                                        <span className="material-symbols-outlined text-sm">content_cut</span> Detach
+                                    </button>
+                                    <div className="w-[1px] bg-outline-variant/10"></div>
+                                    <button className="flex-1 py-3 flex items-center justify-center gap-2 text-error font-bold text-xs uppercase tracking-widest hover:bg-error/5 transition-colors">
+                                        <span className="material-symbols-outlined text-sm">close</span> Close
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div className="bg-surface-container rounded-md p-6 space-y-4 border border-outline-variant/10">
+                                <div className="flex justify-between items-start">
+                                    <div className="flex items-center gap-4">
+                                        <div className="w-12 h-12 rounded-full bg-surface-container-high flex items-center justify-center">
+                                            <span className="material-symbols-outlined text-primary text-2xl">bolt</span>
+                                        </div>
+                                        <div>
+                                            <h3 className="font-headline text-lg font-bold leading-none">GE</h3>
+                                            <p className="text-xs text-on-surface-variant font-medium">General Electric</p>
+                                        </div>
+                                    </div>
+                                    <div className="text-right">
+                                        <p className="font-headline text-lg font-bold">$132.10</p>
+                                        <span className="inline-flex items-center text-xs font-bold text-error">
+                                            <span className="material-symbols-outlined text-sm mr-0.5">arrow_drop_down</span>
+                                            0.4%
+                                        </span>
+                                    </div>
+                                </div>
+                                <div className="bg-surface-container-high px-3 py-2 rounded-md flex items-center gap-2">
+                                    <span className="material-symbols-outlined text-sm text-on-surface-variant">person</span>
+                                    <p className="text-[11px] font-semibold text-on-surface-variant">Independent Position</p>
+                                </div>
+                            </div>
+
+                            <div className="bg-gradient-to-br from-primary to-primary-container p-6 rounded-md flex flex-col justify-between text-white lg:row-span-1 shadow-lg shadow-primary/20">
+                                <div>
+                                    <span className="text-[10px] font-bold uppercase tracking-widest opacity-80">Quick Stats</span>
+                                    <h3 className="font-headline text-xl font-bold mt-1">Growth Overview</h3>
+                                </div>
+                                <div className="mt-8 space-y-4">
+                                    <div className="flex justify-between items-end">
+                                        <div>
+                                            <p className="text-[10px] opacity-70 font-medium">Weekly Gain</p>
+                                            <p className="text-2xl font-bold font-headline">+$1,402.50</p>
+                                        </div>
+                                        <div className="bg-white/20 p-2 rounded-md">
+                                            <span className="material-symbols-outlined">trending_up</span>
+                                        </div>
+                                    </div>
+                                    <div className="h-1 w-full bg-white/20 rounded-full overflow-hidden">
+                                        <div className="h-full bg-white w-[70%]"></div>
+                                    </div>
+                                    <p className="text-[10px] font-medium opacity-80">70% of targets achieved this month</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <section className="space-y-4">
+                            <div className="flex justify-between items-center">
+                                <h3 className="font-headline text-xl font-bold tracking-tight">Recent Performance</h3>
+                                <button className="text-primary font-bold text-xs uppercase tracking-widest hover:underline">View History</button>
+                            </div>
+                            <div className="bg-surface-container-low rounded-md p-2 space-y-1 border border-outline-variant/10">
+                                <div className="bg-surface-container p-4 rounded-md flex items-center justify-between">
+                                    <div className="flex items-center gap-4">
+                                        <div className="w-10 h-10 rounded-md bg-tertiary/10 flex items-center justify-center">
+                                            <span className="material-symbols-outlined text-tertiary">check_circle</span>
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-bold">Dividend Received: AAPL</p>
+                                            <p className="text-[10px] text-on-surface-variant">Today, 10:45 AM</p>
+                                        </div>
+                                    </div>
+                                    <p className="text-sm font-bold text-tertiary">+$12.40</p>
+                                </div>
+                                <div className="bg-surface-container p-4 rounded-md flex items-center justify-between">
+                                    <div className="flex items-center gap-4">
+                                        <div className="w-10 h-10 rounded-md bg-primary/10 flex items-center justify-center">
+                                            <span className="material-symbols-outlined text-primary">sync</span>
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-bold">Position Rebalanced</p>
+                                            <p className="text-[10px] text-on-surface-variant">Yesterday, 4:12 PM</p>
+                                        </div>
+                                    </div>
+                                    <p className="text-sm font-bold text-on-surface-variant">System Auto</p>
+                                </div>
+                            </div>
+                        </section>
+                    </main>
+                    <BottomNavBar />
+                </div>
+            );
+        };
+
+        const DiscoverScreen = () => {
+            return (
+                <div className="pb-24">
+                    <TopNavBar title="Discover" />
+                    <main className="pt-24 px-6 max-w-7xl mx-auto">
+                        <section className="mb-10">
+                            <div className="flex flex-col md:flex-row md:items-end justify-between gap-6">
+                                <div className="max-w-xl">
+                                    <h1 className="font-headline font-extrabold text-4xl lg:text-5xl text-on-surface mb-4 tracking-tight">Discover Experts.</h1>
+                                    <p className="text-on-surface-variant text-lg leading-relaxed">Connect with high-performance traders and mirror their strategies in real-time.</p>
+                                </div>
+                                <div className="flex items-center gap-3 w-full md:w-auto">
+                                    <div className="relative flex-grow md:w-80">
+                                        <span className="material-symbols-outlined absolute left-4 top-1/2 -translate-y-1/2 text-outline">search</span>
+                                        <input className="w-full pl-12 pr-4 py-3 bg-surface-container-low border border-outline-variant/20 rounded-md text-on-surface focus:ring-2 focus:ring-primary focus:outline-none transition-all" placeholder="Search experts..." type="text"/>
+                                    </div>
+                                </div>
+                            </div>
+                        </section>
+
+                        <div className="flex gap-3 mb-10 overflow-x-auto pb-2 no-scrollbar">
+                            <button className="px-5 py-2 rounded-full bg-primary text-white font-medium whitespace-nowrap text-sm">All Strategies</button>
+                            <button className="px-5 py-2 rounded-full bg-surface-container-low border border-outline-variant/20 text-on-surface-variant font-medium whitespace-nowrap hover:bg-surface-container-highest transition-colors text-sm">Low Risk</button>
+                            <button className="px-5 py-2 rounded-full bg-surface-container-low border border-outline-variant/20 text-on-surface-variant font-medium whitespace-nowrap hover:bg-surface-container-highest transition-colors text-sm">Top 1Y Return</button>
+                            <button className="px-5 py-2 rounded-full bg-surface-container-low border border-outline-variant/20 text-on-surface-variant font-medium whitespace-nowrap hover:bg-surface-container-highest transition-colors text-sm">Crypto Only</button>
+                        </div>
+
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                            <div className="bg-surface-container rounded-md p-6 border border-outline-variant/10 hover:border-primary/50 transition-all flex flex-col sm:flex-row gap-6">
+                                <div className="shrink-0 relative">
+                                    <img alt="Brian Lund" className="w-20 h-20 rounded-md object-cover" src="https://lh3.googleusercontent.com/aida-public/AB6AXuDpA1g9RdUweOyrJcKTwBBmxpQH2pmjdVOa0s4MBTmZvJNG9vrj5Ow1RkpW9ZNkd_yqhAxaZ2s1hzDvNYMrkFQ785eKEDx1ADI-GmZMBrHl5vqR-boIY9Qd-UlD7bEJ-3xyFzHxq2rUmOuWhI5M9IXWXMlDdF9BNmcwH671zRv1of8GfcPtCY5dwIgT33bNj0nUnA1LYc8gsFe2sPyYD32MGc1einI-toD6BW70DLLBY3nVhA614xyqLC99SIDKU1tac-YiDYEpfXE"/>
+                                    <div className="absolute -bottom-2 -right-2 bg-tertiary text-on-tertiary px-2 py-0.5 rounded-sm text-[10px] font-bold uppercase tracking-wider">Top Tier</div>
+                                </div>
+                                <div className="flex-grow flex flex-col justify-between">
+                                    <div>
+                                        <div className="flex justify-between items-start mb-1">
+                                            <h2 className="font-headline font-bold text-xl text-on-surface">Brian Lund</h2>
+                                            <span className="bg-error-container text-on-error-container px-2 py-0.5 rounded-md text-[10px] font-semibold">Risk: 7/10</span>
+                                        </div>
+                                        <p className="text-primary font-medium text-sm mb-4">Aggressive Growth</p>
+                                        <div className="grid grid-cols-2 gap-y-2 mb-6">
+                                            <div>
+                                                <p className="text-on-surface-variant text-[10px] font-medium uppercase tracking-widest mb-1">1Y Return</p>
+                                                <p className="text-tertiary font-bold text-lg">+22%</p>
+                                            </div>
+                                            <div>
+                                                <p className="text-on-surface-variant text-[10px] font-medium uppercase tracking-widest mb-1">Followers</p>
+                                                <p className="text-on-surface font-bold text-lg">1.2k</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="flex gap-2">
+                                        <Link to="/settings" className="flex-grow text-center py-2 px-3 rounded-md border border-outline-variant/30 text-on-surface text-sm font-semibold hover:bg-surface-container-high transition-colors">Settings</Link>
+                                        <button className="flex-grow py-2 px-3 rounded-md bg-primary text-white text-sm font-semibold shadow-md active:scale-95 transition-all">Connect</button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="bg-surface-container rounded-md p-6 border border-outline-variant/10 hover:border-primary/50 transition-all flex flex-col sm:flex-row gap-6">
+                                <div className="shrink-0 relative">
+                                    <img alt="Sarah Chen" className="w-20 h-20 rounded-md object-cover" src="https://lh3.googleusercontent.com/aida-public/AB6AXuBPM4om4n0OjG6Rtq-9rTPjmtQbThFrgYUH4fei7jzY_UUMZaeGY_JID7z0TmNGaXHiwhwCqBcFJ0ebd9Qv2kzDTKFX7n9tNCeu83O7-0tk7BpMH3nXFS8QLtjOmuTfznfA6cGc5KGZgLqLWXFSuqFUk1b4xNgV2US36bi0zPOIoU8_Vq86buOFumKH2wVAwFnrsxnTprXS0cBpYhzCdfD8B6bITNJX4xVctwHcqxHu2RC9SOwBc5nyI4OaTiRAG4KyJ2W0_FV9ZUg"/>
+                                    <div className="absolute -bottom-2 -right-2 bg-primary text-white px-2 py-0.5 rounded-sm text-[10px] font-bold uppercase tracking-wider">Expert</div>
+                                </div>
+                                <div className="flex-grow flex flex-col justify-between">
+                                    <div>
+                                        <div className="flex justify-between items-start mb-1">
+                                            <h2 className="font-headline font-bold text-xl text-on-surface">Sarah Chen</h2>
+                                            <span className="bg-secondary-container text-on-secondary-container px-2 py-0.5 rounded-md text-[10px] font-semibold">Risk: 3/10</span>
+                                        </div>
+                                        <p className="text-primary font-medium text-sm mb-4">Dividend Income</p>
+                                        <div className="grid grid-cols-2 gap-y-2 mb-6">
+                                            <div>
+                                                <p className="text-on-surface-variant text-[10px] font-medium uppercase tracking-widest mb-1">1Y Return</p>
+                                                <p className="text-tertiary font-bold text-lg">+14%</p>
+                                            </div>
+                                            <div>
+                                                <p className="text-on-surface-variant text-[10px] font-medium uppercase tracking-widest mb-1">Followers</p>
+                                                <p className="text-on-surface font-bold text-lg">850</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="flex gap-2">
+                                        <button className="flex-grow py-2 px-3 rounded-md border border-outline-variant/30 text-on-surface text-sm font-semibold hover:bg-surface-container-high transition-colors">Profile</button>
+                                        <button className="flex-grow py-2 px-3 rounded-md bg-primary text-white text-sm font-semibold shadow-md active:scale-95 transition-all">Connect</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </main>
+                    <BottomNavBar />
+                </div>
+            );
+        };
+
+        const AlertScreen = () => {
+            const navigate = useNavigate();
+            return (
+                <div className="bg-background text-on-background min-h-screen">
+                    <div className="fixed inset-0 z-0 blur-md pointer-events-none opacity-60">
+                        <TopNavBar />
+                        <main className="max-w-7xl mx-auto px-6 py-24">
+                            <div className="mb-10">
+                                <p className="text-sm text-on-surface-variant mb-1">Total Balance</p>
+                                <h1 className="text-5xl font-extrabold font-headline tracking-tight text-primary">$42,890.12</h1>
+                            </div>
+                            <div className="grid grid-cols-12 gap-6">
+                                <div className="col-span-8 bg-surface-container rounded-md h-64 border border-outline-variant/10"></div>
+                                <div className="col-span-4 bg-surface-container rounded-md h-64 border border-outline-variant/10"></div>
+                            </div>
+                        </main>
+                    </div>
+
+                    <div className="fixed inset-0 z-[60] bg-black/50 backdrop-blur-sm flex flex-col justify-end">
+                        <div className="bg-surface-container w-full max-w-2xl mx-auto rounded-t-2xl shadow-2xl animate-slide-up overflow-hidden border-t border-outline-variant/20">
+                            <div className="flex justify-center py-4">
+                                <div className="w-12 h-1.5 bg-surface-variant rounded-full opacity-50"></div>
+                            </div>
+                            <div className="px-6 md:px-8 pb-12">
+                                <div className="flex items-start gap-4 mb-8">
+                                    <div className="w-14 h-14 rounded-full overflow-hidden flex-shrink-0 bg-primary/20">
+                                        <img alt="Brian Lund" className="w-full h-full object-cover" src="https://lh3.googleusercontent.com/aida-public/AB6AXuC4JDmVhXp7ivLeQ0qNiPHV-D5o9zApv5ZePCo9HLrwMEKjWewr4sY88Bier1Z_zSRVhgU3GfV3OnWwr2NGiweifrGPMjOfFJnrSuxcK0FZimGYn7t7J5_cf3-H1onoOW2d1AXSyUDakuku5wSB4q9VxOBVezj7-b3q0ijBz6vNXrIS5ib_slNHHRp6CuZmY0r342paOamBqA3jSJGgDWvN0-Ei1nmV1ZRnpZ7LZzN711VVMy0zlnQ9b9jHmKmceUrw0A5Bl_K_dws"/>
+                                    </div>
+                                    <div>
+                                        <div className="inline-flex items-center gap-1.5 px-2 py-0.5 bg-error-container text-on-error-container text-[10px] font-bold uppercase tracking-wider rounded-md mb-2">
+                                            <span className="material-symbols-outlined text-[14px]" style={{fontVariationSettings: "'FILL' 1"}}>error</span>
+                                            Live Trade Alert
+                                        </div>
+                                        <h2 className="text-xl md:text-2xl font-extrabold font-headline leading-tight text-on-surface">
+                                            New Trade Alert from Brian Lund
+                                        </h2>
+                                    </div>
+                                </div>
+
+                                <div className="bg-surface-container-high rounded-md p-6 mb-8 border border-outline-variant/10">
+                                    <div className="flex justify-between items-center mb-6">
+                                        <div className="flex items-center gap-3">
+                                            <div className="w-12 h-12 bg-primary rounded-md flex items-center justify-center text-white font-bold text-lg">J</div>
+                                            <div>
+                                                <p className="text-on-surface font-bold text-lg">Jazz Pharmaceuticals</p>
+                                                <p className="text-on-surface-variant text-sm">JAZZ • Nasdaq</p>
+                                            </div>
+                                        </div>
+                                        <div className="text-right">
+                                            <p className="text-on-surface-variant text-xs uppercase font-semibold tracking-wider">Market Price</p>
+                                            <p className="text-xl font-headline font-bold text-on-surface">~$160.80</p>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-4">
+                                        <div className="flex items-center justify-between py-3 border-b border-outline-variant/20">
+                                            <span className="text-on-surface-variant font-medium text-sm">Action</span>
+                                            <span className="text-tertiary font-bold flex items-center gap-1 text-sm">
+                                                <span className="material-symbols-outlined text-[18px]">shopping_cart</span>
+                                                BUYING
+                                            </span>
+                                        </div>
+                                        <div className="flex items-center justify-between py-3 border-b border-outline-variant/20">
+                                            <span className="text-on-surface-variant font-medium text-sm">Quantity</span>
+                                            <span className="text-on-surface font-bold text-sm">5 Shares</span>
+                                        </div>
+                                        <div className="flex items-center justify-between pt-3">
+                                            <span className="text-on-surface-variant font-medium text-sm">Estimated Impact</span>
+                                            <span className="text-primary font-bold text-lg">~$804.00</span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="flex flex-col gap-2 mb-8">
+                                    <div className="flex justify-between text-xs font-bold text-on-surface-variant uppercase tracking-tighter">
+                                        <span>Buying Power Impact</span>
+                                        <span>Available: $12,450</span>
+                                    </div>
+                                    <div className="h-2 w-full bg-surface-variant rounded-full overflow-hidden">
+                                        <div className="h-full bg-primary w-[15%] rounded-full"></div>
+                                    </div>
+                                </div>
+
+                                <div className="flex flex-col gap-3">
+                                    <button onClick={() => navigate('/')} className="w-full py-4 rounded-md bg-primary text-white font-bold text-sm md:text-base flex items-center justify-center gap-2 active:scale-[0.98] transition-transform">
+                                        <span className="material-symbols-outlined" style={{fontVariationSettings: "'FILL' 1"}}>check_circle</span>
+                                        Accept Trade
+                                    </button>
+                                    <button onClick={() => navigate('/')} className="w-full py-3 rounded-md bg-surface-container-highest text-on-surface font-bold text-sm flex items-center justify-center gap-2 active:scale-[0.98] transition-transform">
+                                        <span className="material-symbols-outlined">settings_suggest</span>
+                                        Modify Trade
+                                    </button>
+                                    <button onClick={() => navigate('/')} className="w-full py-2 rounded-md bg-transparent text-on-surface-variant font-medium text-sm flex items-center justify-center gap-2 hover:text-on-surface transition-colors">
+                                        Ignore
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const SettingsScreen = () => {
+            const navigate = useNavigate();
+            
+            const TitleNode = () => (
+                <div className="flex items-center gap-3">
+                    <div className="w-8 h-8 rounded-full bg-primary/20 overflow-hidden">
+                        <img alt="Brian Lund Avatar" src="https://lh3.googleusercontent.com/aida-public/AB6AXuDd6_Gl4zMRqBid4E8JeAD37gQgK-I50ZVWmRImip-7DTa0OR-muftkAZy1QATdFxMADGAhH2h-2uBaIrMDirppZh0nGQY-lhIPPo7pNL9PIo1ET5rAXQXeB4sg3Ew96_HlZkPpx7VOl_VIq9LV8iygK4GD6j8EuCGLyYm8wwgwsdp6zwa7gcZBotMBbfJMwYmlVZ_AbXK-r0NmGzZr4N5XmRkJkBLOp6zJsiWsPAvTCyXH4QCCiQ19ftKbX6Va5RnawllJKniePEM"/>
+                    </div>
+                    <h1 className="font-bold text-lg text-on-surface tracking-tight">Brian Lund</h1>
+                </div>
+            );
+
+            return (
+                <div className="pb-32">
+                    <TopNavBar showBack={true} titleNode={<TitleNode />} />
+                    <main className="pt-24 px-6 max-w-2xl mx-auto space-y-8">
+                        <section className="flex flex-col md:flex-row gap-4 items-start md:items-center justify-between">
+                            <div>
+                                <h2 className="font-headline text-2xl font-extrabold text-on-surface leading-tight mb-2">Configure Strategy</h2>
+                                <p className="text-on-surface-variant text-sm leading-relaxed max-w-md">Adjust how you follow Brian Lund's trades.</p>
+                            </div>
+                            <div className="bg-tertiary/20 px-3 py-1.5 rounded-md flex items-center gap-2">
+                                <span className="material-symbols-outlined text-tertiary text-sm" style={{fontVariationSettings: "'FILL' 1"}}>verified</span>
+                                <span className="text-tertiary text-[10px] font-bold uppercase tracking-wider">Top Tier</span>
+                            </div>
+                        </section>
+
+                        <section className="space-y-4">
+                            <label className="font-bold text-xs text-on-surface-variant uppercase tracking-widest px-1">Execution Mode</label>
+                            <div className="bg-surface-container-low p-1.5 rounded-md flex gap-1 border border-outline-variant/10">
+                                <button className="flex-1 py-3 px-4 rounded-md flex items-center justify-center gap-2 bg-surface-container-highest text-primary font-semibold transition-all">
+                                    <span className="material-symbols-outlined text-[18px]">bolt</span>
+                                    <span className="text-sm">Ditto All (Auto)</span>
+                                </button>
+                                <button className="flex-1 py-3 px-4 rounded-md flex items-center justify-center gap-2 text-on-surface-variant font-medium hover:bg-surface-container transition-colors">
+                                    <span className="material-symbols-outlined text-[18px]">notifications_active</span>
+                                    <span className="text-sm">Alerts Only</span>
+                                </button>
+                            </div>
+                        </section>
+
+                        <section className="bg-surface-container rounded-md p-6 space-y-6 border border-outline-variant/10">
+                            <div className="flex items-center gap-3 border-l-4 border-primary pl-4">
+                                <h3 className="font-bold text-lg">Position Sizing</h3>
+                            </div>
+                            <div className="grid gap-6">
+                                <div className="space-y-2">
+                                    <label className="text-xs font-semibold text-on-surface-variant">Match Method</label>
+                                    <select className="w-full bg-surface-container-low border border-outline-variant/20 rounded-md px-4 py-3 text-sm font-medium focus:ring-1 focus:ring-primary text-on-surface outline-none">
+                                        <option>Percentage of Account</option>
+                                        <option>Flat Dollar Amount</option>
+                                        <option>Match Lead Trader %</option>
+                                    </select>
+                                </div>
+                                <div className="space-y-2">
+                                    <label className="text-xs font-semibold text-on-surface-variant">Max Allocation (USD)</label>
+                                    <input className="w-full bg-surface-container-low border border-outline-variant/20 rounded-md px-4 py-3 text-sm font-bold focus:ring-1 focus:ring-primary text-on-surface outline-none" placeholder="0.00" type="text" defaultValue="5,000"/>
+                                    <p className="text-[10px] text-on-surface-variant/70">Total capital available for this trader.</p>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section className="bg-surface-container rounded-md p-6 space-y-6 border border-outline-variant/10">
+                            <div className="flex items-center gap-3 border-l-4 border-error pl-4">
+                                <h3 className="font-bold text-lg">Risk Limits</h3>
+                            </div>
+                            <div className="grid gap-6">
+                                <div className="space-y-2">
+                                    <label className="text-xs font-semibold text-on-surface-variant">Max Amount per Trade (USD)</label>
+                                    <input className="w-full bg-surface-container-low border border-outline-variant/20 rounded-md px-4 py-3 text-sm font-bold focus:ring-1 focus:ring-primary text-on-surface outline-none" type="text" defaultValue="500"/>
+                                </div>
+                                <div className="space-y-3">
+                                    <label className="text-xs font-semibold text-on-surface-variant">Allowed Asset Classes</label>
+                                    <div className="flex gap-3">
+                                        <label className="flex-1 cursor-pointer">
+                                            <div className="flex items-center justify-between p-3 bg-primary/10 rounded-md border border-primary/50 transition-all">
+                                                <span className="text-sm font-bold text-primary">Stocks</span>
+                                                <span className="material-symbols-outlined text-primary text-[18px]" style={{fontVariationSettings: "'FILL' 1"}}>check_circle</span>
+                                            </div>
+                                        </label>
+                                        <label className="flex-1 cursor-pointer">
+                                            <div className="flex items-center justify-between p-3 bg-surface-container-low rounded-md border border-outline-variant/20 transition-all">
+                                                <span className="text-sm font-bold text-on-surface-variant">Options</span>
+                                            </div>
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+                        </section>
+
+                        <div className="flex gap-4 p-4 bg-surface-container-high/50 rounded-md border border-outline-variant/10">
+                            <span className="material-symbols-outlined text-primary text-xl">info</span>
+                            <p className="text-xs leading-relaxed text-on-surface-variant">
+                                Copied trades are subject to slippage. Historical performance does not guarantee future returns.
+                            </p>
+                        </div>
+                    </main>
+
+                    <div className="fixed bottom-0 left-0 w-full bg-[#0b1326]/90 backdrop-blur-xl border-t border-[#464554]/15 p-4 z-40">
+                        <div className="max-w-2xl mx-auto">
+                            <button onClick={() => navigate(-1)} className="w-full bg-primary text-white font-bold py-3.5 rounded-md active:scale-[0.98] transition-all flex items-center justify-center gap-2">
+                                <span className="material-symbols-outlined text-[20px]">save</span>
+                                Save Settings
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+
+        // --- App Setup ---
+
+        const App = () => {
+            return (
+                <MemoryRouter>
+                    <Routes>
+                        <Route path="/" element={<Dashboard1 />} />
+                        <Route path="/discover" element={<DiscoverScreen />} />
+                        <Route path="/portfolio" element={<PortfolioScreen />} />
+                        <Route path="/alert" element={<AlertScreen />} />
+                        <Route path="/settings" element={<SettingsScreen />} />
+                    </Routes>
+                </MemoryRouter>
+            );
+        };
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
