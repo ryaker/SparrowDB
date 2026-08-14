@@ -1762,6 +1762,10 @@ impl GraphDb {
         }
         let mut total_mutated: u64 = 0;
         let mut has_detach_delete = false;
+        // prop -> (vector, raw node ids). Accumulated across all UNWIND rows so
+        // the HNSW index is serialised once per (label, prop), not once per row.
+        let mut pending_vectors: std::collections::HashMap<String, (Vec<f32>, Vec<u64>)> =
+            std::collections::HashMap::new();
 
         for element in list {
             // Honour caller's deadline between iterations (fixes #310).
@@ -1818,15 +1822,19 @@ impl GraphDb {
                         // #410 silent-data-loss shape (KMSmcp ch#202), reached
                         // through a second entry point.
                         //
+                        // Writes are ACCUMULATED here and applied once after the
+                        // row loop. Saving per row costs a full index
+                        // serialization + fsync each time — measured at ~10 ms
+                        // per row, so a 1000-row UNWIND would spend ~10 s
+                        // rewriting the same file 1000 times. The MATCH…SET path
+                        // saves once per (label, prop) per statement and this
+                        // must match it.
+                        //
                         // Only the `$param` form is handled, matching the
                         // MATCH…SET path: a vector cannot survive
                         // `resolve_set_value`'s storage-layer round trip, so
                         // `SET n.emb = row.emb` cannot carry one today (see #475,
                         // where that coercion silently yields Int64(0)).
-                        //
-                        // Label is derived per matched NodeId rather than from the
-                        // AST, so anonymous and multi-label UNWIND patterns resolve
-                        // correctly.
                         if let sparrowdb_cypher::ast::Expr::Literal(
                             sparrowdb_cypher::ast::Literal::Param(p),
                         ) = value
@@ -1835,37 +1843,11 @@ impl GraphDb {
                                 .and_then(|m| m.get(p.as_str()))
                                 .and_then(|v| v.as_vector())
                             {
-                                let vidx_dir = self.inner.path.join("vector_indexes");
-                                let cat = self.catalog_snapshot();
-                                let label_id_to_name: std::collections::HashMap<u16, String> =
-                                    cat.list_labels().unwrap_or_default().into_iter().collect();
-                                let vidx_guard =
-                                    self.inner.vector_indexes.read().expect("vector_indexes");
-
-                                let mut label_to_raw_ids: std::collections::HashMap<
-                                    &str,
-                                    Vec<u64>,
-                                > = std::collections::HashMap::new();
-                                for node_id in &matching_ids {
-                                    let lid = (node_id.0 >> 32) as u16;
-                                    if let Some(name) = label_id_to_name.get(&lid) {
-                                        label_to_raw_ids
-                                            .entry(name.as_str())
-                                            .or_default()
-                                            .push(node_id.0);
-                                    }
-                                }
-                                for (label, raw_ids) in &label_to_raw_ids {
-                                    let key = (label.to_string(), prop.clone());
-                                    if let Some(arc_idx) = vidx_guard.get(&key) {
-                                        let mut idx = arc_idx.write().expect("vector_index write");
-                                        for &raw_id in raw_ids {
-                                            idx.insert(raw_id, &vec);
-                                        }
-                                        // Persist once per (label, prop) pair.
-                                        idx.save(&vidx_dir, label, prop).map_err(Error::Io)?;
-                                    }
-                                }
+                                pending_vectors
+                                    .entry(prop.clone())
+                                    .or_insert_with(|| (vec.clone(), Vec::new()))
+                                    .1
+                                    .extend(matching_ids.iter().map(|n| n.0));
                             }
                         }
                     }
@@ -1883,6 +1865,39 @@ impl GraphDb {
                 }
             }
             total_mutated += matching_ids.len() as u64;
+        }
+
+        // Apply the accumulated vector writes once, grouping by the label each
+        // matched node actually carries (derived from the NodeId's upper 32
+        // bits) rather than from the AST, so anonymous and multi-label UNWIND
+        // patterns resolve correctly.
+        if !pending_vectors.is_empty() {
+            let vidx_dir = self.inner.path.join("vector_indexes");
+            let cat = self.catalog_snapshot();
+            let label_id_to_name: std::collections::HashMap<u16, String> =
+                cat.list_labels().unwrap_or_default().into_iter().collect();
+            let vidx_guard = self.inner.vector_indexes.read().expect("vector_indexes");
+            for (prop, (vec, raw_ids)) in &pending_vectors {
+                let mut label_to_raw: std::collections::HashMap<&str, Vec<u64>> =
+                    std::collections::HashMap::new();
+                for &raw in raw_ids {
+                    let lid = (raw >> 32) as u16;
+                    if let Some(name) = label_id_to_name.get(&lid) {
+                        label_to_raw.entry(name.as_str()).or_default().push(raw);
+                    }
+                }
+                for (label, ids) in &label_to_raw {
+                    let key = (label.to_string(), prop.clone());
+                    if let Some(arc_idx) = vidx_guard.get(&key) {
+                        let mut idx = arc_idx.write().expect("vector_index write");
+                        for &raw in ids {
+                            idx.insert(raw, vec);
+                        }
+                        // One save per (label, prop) for the whole statement.
+                        idx.save(&vidx_dir, label, prop).map_err(Error::Io)?;
+                    }
+                }
+            }
         }
 
         tx.commit()?;
