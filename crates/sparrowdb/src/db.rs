@@ -9,8 +9,8 @@ use crate::helpers::{
     build_label_row_counts_from_disk, collect_maintenance_params, dir_size_bytes, eval_expr_merge,
     exec_value_to_storage, expr_to_value, expr_to_value_with_params, fnv1a_col_id,
     is_edge_delete_mutation, is_reserved_label, literal_to_value, load_constraints,
-    load_vector_indexes, open_csr_map, save_constraints, storage_value_to_exec, try_open_csr_map,
-    VectorIndexHealth,
+    load_vector_indexes, open_csr_map, resolve_create_prop_value, save_constraints,
+    storage_value_to_exec, try_open_csr_map, VectorIndexHealth,
 };
 use crate::read_tx::ReadTx;
 use crate::types::{DbInner, NodeVersions, PendingOp, VersionStore, WriteBuffer, WriteGuard};
@@ -559,10 +559,10 @@ impl GraphDb {
                 Statement::MatchMergeRel(ref mm) => self.execute_match_merge_rel(mm),
                 Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
                 Statement::UnwindMatchMutate(ref umm) => self.execute_unwind_match_mutate(umm),
-                Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
+                Statement::MatchCreate(ref mc) => self.execute_match_create(mc, None),
                 // Standalone CREATE with edges — must go through WriteTx so
                 // create_edge can register the rel type and write the WAL.
-                Statement::Create(ref c) => self.execute_create_standalone(c),
+                Statement::Create(ref c) => self.execute_create_standalone(c, None),
                 _ => unreachable!(),
             }
         } else {
@@ -646,8 +646,8 @@ impl GraphDb {
                 Statement::MatchMergeRel(ref mm) => self.execute_match_merge_rel(mm),
                 Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
                 Statement::UnwindMatchMutate(ref umm) => self.execute_unwind_match_mutate(umm),
-                Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
-                Statement::Create(ref c) => self.execute_create_standalone(c),
+                Statement::MatchCreate(ref mc) => self.execute_match_create(mc, None),
+                Statement::Create(ref c) => self.execute_create_standalone(c, None),
                 _ => unreachable!(),
             }
         } else {
@@ -762,8 +762,10 @@ impl GraphDb {
                 Statement::UnwindMatchMutate(ref umm) => {
                     self.execute_unwind_match_mutate_deadline(umm, deadline)
                 }
-                Statement::MatchCreate(ref mc) => self.execute_match_create_deadline(mc, deadline),
-                Statement::Create(ref c) => self.execute_create_standalone(c),
+                Statement::MatchCreate(ref mc) => {
+                    self.execute_match_create_deadline(mc, deadline, None)
+                }
+                Statement::Create(ref c) => self.execute_create_standalone(c, None),
                 _ => unreachable!(),
             };
         }
@@ -827,9 +829,16 @@ impl GraphDb {
         Ok(QueryResult::empty(vec![]))
     }
 
+    /// `params` is `Some` only when called from [`Self::execute_with_params`];
+    /// it makes `$param` property values resolvable via
+    /// [`resolve_create_prop_value`] (SPA-480/S0). When `None` (plain
+    /// `execute()` / `execute_with_timeout()`), a `$param` reference in a
+    /// CREATE property is rejected with a clear error rather than silently
+    /// written as `0`.
     fn execute_create_standalone(
         &self,
         create: &sparrowdb_cypher::ast::CreateStatement,
+        params: Option<&HashMap<String, sparrowdb_execution::Value>>,
     ) -> Result<QueryResult> {
         // Pre-flight: verify that every variable referenced by an edge is
         // declared as a named node in this CREATE clause.  Doing this before
@@ -895,27 +904,7 @@ impl GraphDb {
                 .props
                 .iter()
                 .map(|entry| {
-                    let val = match &entry.value {
-                        sparrowdb_cypher::ast::Expr::Literal(
-                            sparrowdb_cypher::ast::Literal::Null,
-                        ) => Err(sparrowdb_common::Error::InvalidArgument(format!(
-                            "CREATE property '{}' is null; use a concrete value",
-                            entry.key
-                        ))),
-                        sparrowdb_cypher::ast::Expr::Literal(
-                            sparrowdb_cypher::ast::Literal::Param(p),
-                        ) => Err(sparrowdb_common::Error::InvalidArgument(format!(
-                            "CREATE property '{}' references parameter ${p}; runtime parameters are not yet supported in standalone CREATE",
-                            entry.key
-                        ))),
-                        sparrowdb_cypher::ast::Expr::Literal(lit) => {
-                            Ok(literal_to_value(lit))
-                        }
-                        _ => Err(sparrowdb_common::Error::InvalidArgument(format!(
-                            "CREATE property '{}' must be a literal value (int, float, bool, or string)",
-                            entry.key
-                        ))),
-                    }?;
+                    let val = resolve_create_prop_value(&entry.key, &entry.value, params)?;
                     Ok((entry.key.clone(), val))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1104,20 +1093,13 @@ impl GraphDb {
                     "CREATE edge references unresolved variable '{right_var}'"
                 ))
             })?;
-            // Convert rel_pat.props (AST PropEntries) to HashMap<String, Value>.
+            // Convert rel_pat.props (AST PropEntries) to HashMap<String, Value>,
+            // resolving $param references the same way node props are (SPA-480).
             let edge_props: HashMap<String, Value> = rel_pat
                 .props
                 .iter()
                 .map(|pe| {
-                    let val = match &pe.value {
-                        sparrowdb_cypher::ast::Expr::Literal(lit) => literal_to_value(lit),
-                        _ => {
-                            return Err(sparrowdb_common::Error::InvalidArgument(format!(
-                                "CREATE edge property '{}' must be a literal value",
-                                pe.key
-                            )))
-                        }
-                    };
+                    let val = resolve_create_prop_value(&pe.key, &pe.value, params)?;
                     Ok((pe.key.clone(), val))
                 })
                 .collect::<Result<HashMap<_, _>>>()?;
@@ -1286,9 +1268,16 @@ impl GraphDb {
                 Stmt::UnwindMatchMutate(ref umm) => {
                     self.execute_unwind_match_mutate_with_params(umm, &params)
                 }
+                // SPA-480 (S0): standalone CREATE and MATCH...CREATE now resolve
+                // $param property values via resolve_create_prop_value, closing
+                // the last Cypher-injection gap — a CREATE built from untrusted
+                // text no longer requires string interpolation.
+                Stmt::Create(ref c) => self.execute_create_standalone(c, Some(&params)),
+                Stmt::MatchCreate(ref mc) => self.execute_match_create(mc, Some(&params)),
                 _ => Err(Error::InvalidArgument(
-                    "execute_with_params: parameterized MATCH...CREATE and standalone CREATE \
-                     are not yet supported; use MERGE or MATCH...SET with $params"
+                    "execute_with_params: parameterized MATCH...MERGE relationship and CALL \
+                     subquery mutations are not yet supported; use MERGE, MATCH...SET, or \
+                     CREATE with $params"
                         .into(),
                 )),
             };
@@ -2121,9 +2110,13 @@ impl GraphDb {
     ///
     /// If the MATCH finds no rows the CREATE is a no-op (no edges created,
     /// no error — SPA-168).
+    /// `params` is `Some` only when called from [`Self::execute_with_params`];
+    /// it makes `$param` edge-property values resolvable via
+    /// [`resolve_create_prop_value`] (SPA-480/S0).
     fn execute_match_create(
         &self,
         mc: &sparrowdb_cypher::ast::MatchCreateStatement,
+        params: Option<&HashMap<String, sparrowdb_execution::Value>>,
     ) -> Result<QueryResult> {
         // Acquire the write lock first so no concurrent writer can commit
         // between the scan and the edge creation.
@@ -2198,15 +2191,7 @@ impl GraphDb {
                     .props
                     .iter()
                     .map(|pe| {
-                        let val = match &pe.value {
-                            sparrowdb_cypher::ast::Expr::Literal(lit) => literal_to_value(lit),
-                            _ => {
-                                return Err(Error::InvalidArgument(format!(
-                                    "CREATE edge property '{}' must be a literal value",
-                                    pe.key
-                                )))
-                            }
-                        };
+                        let val = resolve_create_prop_value(&pe.key, &pe.value, params)?;
                         Ok((pe.key.clone(), val))
                     })
                     .collect::<Result<HashMap<_, _>>>()?;
@@ -2223,10 +2208,14 @@ impl GraphDb {
     }
 
     /// Deadline-aware variant of [`execute_match_create`] (fixes #310).
+    ///
+    /// `params` is `Some` only when called from [`Self::execute_with_params`]
+    /// (SPA-480/S0); see [`execute_match_create`](Self::execute_match_create).
     fn execute_match_create_deadline(
         &self,
         mc: &sparrowdb_cypher::ast::MatchCreateStatement,
         deadline: std::time::Instant,
+        params: Option<&HashMap<String, sparrowdb_execution::Value>>,
     ) -> Result<QueryResult> {
         let mut tx = self.begin_write()?;
 
@@ -2273,15 +2262,7 @@ impl GraphDb {
                     .props
                     .iter()
                     .map(|pe| {
-                        let val = match &pe.value {
-                            sparrowdb_cypher::ast::Expr::Literal(lit) => literal_to_value(lit),
-                            _ => {
-                                return Err(Error::InvalidArgument(format!(
-                                    "CREATE edge property '{}' must be a literal value",
-                                    pe.key
-                                )))
-                            }
-                        };
+                        let val = resolve_create_prop_value(&pe.key, &pe.value, params)?;
                         Ok((pe.key.clone(), val))
                     })
                     .collect::<Result<HashMap<_, _>>>()?;

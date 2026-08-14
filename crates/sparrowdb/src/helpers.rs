@@ -107,6 +107,90 @@ pub(crate) fn expr_to_value_with_params(
     }
 }
 
+/// Resolve a CREATE-clause property value expression (node or edge) to a
+/// storage `Value`, optionally substituting a bound `$parameter`.
+///
+/// Shared by standalone `CREATE` and `MATCH...CREATE`, for both node and
+/// edge properties, so a `$param` in any CREATE-clause property position is
+/// governed by one set of rules:
+///
+/// * A literal `null` is always rejected — CREATE has never accepted an
+///   explicit null property (see the pre-existing check this replaces). A
+///   `$param` that resolves to null is rejected the same way rather than
+///   redefined to mean "omit the property": one null convention for this
+///   call site, not two.
+/// * `$param` is resolved from `params` when supplied. When `params` is
+///   `None` (the plain, non-parameterized `execute()` / `execute_with_timeout()`
+///   paths), a `$param` reference is rejected with a clear error instead of
+///   silently written as `Value::Int64(0)` — the failure mode
+///   `exec_value_to_storage`'s catch-all is prone to (#475); this resolver
+///   never delegates to it.
+/// * A resolved parameter value must be a storage scalar (int, float, bool,
+///   string). `List` / `Map` / `Vector` / `NodeRef` / `EdgeRef` have no
+///   representation in a property column and are rejected rather than
+///   silently coerced to `0`.
+pub(crate) fn resolve_create_prop_value(
+    key: &str,
+    expr: &sparrowdb_cypher::ast::Expr,
+    params: Option<&HashMap<String, sparrowdb_execution::Value>>,
+) -> crate::Result<Value> {
+    use sparrowdb_cypher::ast::{Expr, Literal};
+    use sparrowdb_execution::Value as EV;
+
+    match expr {
+        Expr::Literal(Literal::Null) => Err(Error::InvalidArgument(format!(
+            "CREATE property '{key}' is null; use a concrete value"
+        ))),
+        Expr::Literal(Literal::Param(p)) => {
+            let Some(params) = params else {
+                return Err(Error::InvalidArgument(format!(
+                    "CREATE property '{key}' references parameter ${p}; use \
+                     GraphDb::execute_with_params to bind runtime parameters"
+                )));
+            };
+            match params.get(p.as_str()) {
+                None => Err(Error::InvalidArgument(format!(
+                    "parameter ${p} was referenced in the query but not supplied"
+                ))),
+                Some(EV::Null) => Err(Error::InvalidArgument(format!(
+                    "CREATE property '{key}' is bound to parameter ${p}, which is null; \
+                     use a concrete value"
+                ))),
+                Some(EV::Int64(n)) => Ok(Value::Int64(*n)),
+                Some(EV::Float64(f)) => Ok(Value::Float(*f)),
+                Some(EV::Bool(b)) => Ok(Value::Int64(if *b { 1 } else { 0 })),
+                Some(EV::String(s)) => Ok(Value::Bytes(s.as_bytes().to_vec())),
+                Some(other) => Err(Error::InvalidArgument(format!(
+                    "CREATE property '{key}' is bound to parameter ${p}, whose value ({other:?}) \
+                     is a {} and cannot be stored as a scalar property; only int, float, bool, \
+                     and string parameters may be used in CREATE",
+                    exec_value_kind(other),
+                ))),
+            }
+        }
+        Expr::Literal(lit) => Ok(literal_to_value(lit)),
+        _ => Err(Error::InvalidArgument(format!(
+            "CREATE property '{key}' must be a literal value or $parameter"
+        ))),
+    }
+}
+
+fn exec_value_kind(v: &sparrowdb_execution::Value) -> &'static str {
+    use sparrowdb_execution::Value as EV;
+    match v {
+        EV::Null => "null",
+        EV::Int64(_) => "int",
+        EV::Float64(_) => "float",
+        EV::Bool(_) => "bool",
+        EV::String(_) => "string",
+        EV::NodeRef(_) => "node reference",
+        EV::EdgeRef(_) => "edge reference",
+        EV::List(_) => "list",
+        EV::Map(_) => "map",
+        EV::Vector(_) => "vector",
+    }
+}
+
 pub(crate) fn exec_value_to_storage(v: &sparrowdb_execution::Value) -> Value {
     use sparrowdb_execution::Value as EV;
     match v {
