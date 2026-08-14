@@ -580,6 +580,12 @@ impl SparrowDB {
     /// (`GraphDb::execute_with_params`) has supported this since SPA-218; this
     /// binding simply exposes it to JS callers.
     ///
+    /// **`CREATE` support (SPA-480):** standalone `CREATE` and
+    /// `MATCH ... CREATE` — including edge properties — now accept `$param`
+    /// values, closing the last gap in the parameterized-query story: a
+    /// `CREATE` built from untrusted input no longer needs string
+    /// interpolation to bind a runtime value.
+    ///
     /// ```typescript
     /// const emb = Array.from(new Float32Array(768))  // your model output
     /// db.executeWithParams(

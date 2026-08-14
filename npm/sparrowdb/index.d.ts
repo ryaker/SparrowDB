@@ -302,6 +302,17 @@ export declare class SparrowDB {
    * Previously the property was stored but the HNSW file was not updated —
    * a silent data-loss bug surfaced by KMSmcp channel message #202.
    *
+   * **`CREATE` support (SPA-480):** standalone `CREATE (:Label {prop: $p})`
+   * and `MATCH ... CREATE` (including edge properties, e.g.
+   * `CREATE (a)-[:R {weight: $w}]->(b)`) now accept `$param` values. This
+   * closes the last gap in the parameterized-query story: building a
+   * `CREATE` from untrusted input via `executeWithParams` no longer
+   * requires string interpolation, so a value like `'", role: "admin'` is
+   * stored as a literal property value instead of being able to inject
+   * Cypher syntax. Previously these statements threw
+   * `"parameterized MATCH...CREATE and standalone CREATE are not yet
+   * supported"`.
+   *
    * ```typescript
    * const emb = Array.from(new Float32Array(768))  // your model output
    * db.executeWithParams(
