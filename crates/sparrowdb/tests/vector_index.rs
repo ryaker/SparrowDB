@@ -431,3 +431,109 @@ fn create_vector_index_dot_product_metric() {
     let results = arc.read().expect("r").search(&[1.0, 1.0], 1, 10);
     assert_eq!(results[0].0, 1, "highest dot product should be node 1");
 }
+
+/// #410 fixed silent HNSW data loss on `MATCH … SET n.emb = $vec`: the property
+/// was written and the index left untouched, so the vector was invisible to
+/// search forever. SPA-415 added `UNWIND … MATCH … SET`, a second entry point to
+/// the same mutation, and it must not reopen that hole.
+///
+/// Mirrors `set_vector_param_populates_hnsw` exactly, through the UNWIND path.
+#[test]
+fn unwind_match_set_vector_param_populates_hnsw() {
+    let (_dir, db) = make_db();
+
+    db.create_vector_index("Memory", "embedding", 4, "cosine")
+        .expect("create index");
+    db.execute("CREATE (n:Memory {id: 'k1'})")
+        .expect("CREATE node");
+
+    let emb: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4];
+    let mut params = std::collections::HashMap::new();
+    params.insert(
+        "rows".to_string(),
+        Value::List(vec![Value::Map(vec![(
+            "id".to_string(),
+            Value::String("k1".to_string()),
+        )])]),
+    );
+    params.insert("emb".to_string(), Value::Vector(emb.clone()));
+    db.execute_with_params(
+        "UNWIND $rows AS row MATCH (n:Memory {id: row.id}) SET n.embedding = $emb",
+        params,
+    )
+    .expect("UNWIND SET with vector param must not error");
+
+    let arc = db
+        .get_vector_index("Memory", "embedding")
+        .expect("index must exist");
+    let idx = arc.read().expect("read lock");
+    let results = idx.search(&emb, 5, 20);
+    assert!(
+        !results.is_empty(),
+        "vectorSearch after UNWIND MATCH SET must return the inserted node — \
+         an empty HNSW means the property was written and the index skipped (#410 class)"
+    );
+    assert_eq!(results.len(), 1, "exactly one node should be in the index");
+}
+
+/// `SET n.emb = $a, n.emb = $b` parses into two `Mutation::Set` sharing the same
+/// prop — `parse_set_items_inner` is a bare comma loop with no duplicate guard,
+/// and nothing downstream rejects it.
+///
+/// `tx.set_property` is last-write-wins, and so is the MATCH…SET vector path
+/// (which calls `idx.insert` per mutation, in order). The UNWIND accumulator must
+/// agree with both, or the stored property and the HNSW index silently disagree —
+/// the #410 class this maintenance exists to prevent.
+///
+/// Asserted on the INDEX, not the property: the property was never the broken
+/// half. `$b` is the nearest neighbour to itself, so a first-write-wins
+/// accumulator returns `$a`'s node ordering and fails this.
+#[test]
+fn unwind_duplicate_set_same_prop_indexes_the_last_vector() {
+    let (_dir, db) = make_db();
+    db.create_vector_index("Memory", "embedding", 4, "cosine")
+        .expect("create index");
+    db.execute("CREATE (n:Memory {id: 'k1'})").expect("CREATE");
+
+    // Deliberately near-orthogonal so nearest-neighbour cannot confuse them.
+    let a: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
+    let b: Vec<f32> = vec![0.0, 1.0, 0.0, 0.0];
+
+    let mut params = std::collections::HashMap::new();
+    params.insert(
+        "rows".to_string(),
+        Value::List(vec![Value::Map(vec![(
+            "id".to_string(),
+            Value::String("k1".to_string()),
+        )])]),
+    );
+    params.insert("a".to_string(), Value::Vector(a.clone()));
+    params.insert("b".to_string(), Value::Vector(b.clone()));
+
+    db.execute_with_params(
+        "UNWIND $rows AS row MATCH (n:Memory {id: row.id}) SET n.embedding = $a, n.embedding = $b",
+        params,
+    )
+    .expect("duplicate SET on one prop must not error");
+
+    let arc = db
+        .get_vector_index("Memory", "embedding")
+        .expect("index must exist");
+    let idx = arc.read().expect("read lock");
+
+    // Exactly one node was matched, so exactly one vector may be indexed.
+    let hits_b = idx.search(&b, 5, 20);
+    assert_eq!(hits_b.len(), 1, "one matched node => one indexed vector");
+
+    // The indexed vector must be $b (the last write), so querying $b scores
+    // better than querying $a. With cosine on orthogonal vectors, an index
+    // holding $a scores 0 against $b.
+    let score_b = hits_b[0].1;
+    let score_a = idx.search(&a, 5, 20)[0].1;
+    assert!(
+        score_b > score_a,
+        "index must hold the LAST vector ($b) to agree with the stored property; \
+         got score_b={score_b} score_a={score_a} — first-write-wins leaves the \
+         property as $b while the index holds $a"
+    );
+}

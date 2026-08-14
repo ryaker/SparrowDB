@@ -7,9 +7,10 @@
 use crate::batch::augment_rows_with_pending;
 use crate::helpers::{
     build_label_row_counts_from_disk, collect_maintenance_params, dir_size_bytes, eval_expr_merge,
-    expr_to_value, expr_to_value_with_params, fnv1a_col_id, is_edge_delete_mutation,
-    is_reserved_label, literal_to_value, load_constraints, load_vector_indexes, open_csr_map,
-    save_constraints, storage_value_to_exec, try_open_csr_map, VectorIndexHealth,
+    exec_value_to_storage, expr_to_value, expr_to_value_with_params, fnv1a_col_id,
+    is_edge_delete_mutation, is_reserved_label, literal_to_value, load_constraints,
+    load_vector_indexes, open_csr_map, save_constraints, storage_value_to_exec, try_open_csr_map,
+    VectorIndexHealth,
 };
 use crate::read_tx::ReadTx;
 use crate::types::{DbInner, NodeVersions, PendingOp, VersionStore, WriteBuffer, WriteGuard};
@@ -557,6 +558,7 @@ impl GraphDb {
                 Statement::Merge(ref m) => self.execute_merge(m),
                 Statement::MatchMergeRel(ref mm) => self.execute_match_merge_rel(mm),
                 Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
+                Statement::UnwindMatchMutate(ref umm) => self.execute_unwind_match_mutate(umm),
                 Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
                 // Standalone CREATE with edges — must go through WriteTx so
                 // create_edge can register the rel type and write the WAL.
@@ -643,6 +645,7 @@ impl GraphDb {
                 Statement::Merge(ref m) => self.execute_merge(m),
                 Statement::MatchMergeRel(ref mm) => self.execute_match_merge_rel(mm),
                 Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
+                Statement::UnwindMatchMutate(ref umm) => self.execute_unwind_match_mutate(umm),
                 Statement::MatchCreate(ref mc) => self.execute_match_create(mc),
                 Statement::Create(ref c) => self.execute_create_standalone(c),
                 _ => unreachable!(),
@@ -756,6 +759,9 @@ impl GraphDb {
             return match bound.inner {
                 Statement::Merge(ref m) => self.execute_merge(m),
                 Statement::MatchMutate(ref mm) => self.execute_match_mutate_deadline(mm, deadline),
+                Statement::UnwindMatchMutate(ref umm) => {
+                    self.execute_unwind_match_mutate_deadline(umm, deadline)
+                }
                 Statement::MatchCreate(ref mc) => self.execute_match_create_deadline(mc, deadline),
                 Statement::Create(ref c) => self.execute_create_standalone(c),
                 _ => unreachable!(),
@@ -1277,6 +1283,9 @@ impl GraphDb {
             return match bound.inner {
                 Stmt::Merge(ref m) => self.execute_merge_with_params(m, &params),
                 Stmt::MatchMutate(ref mm) => self.execute_match_mutate_with_params(mm, &params),
+                Stmt::UnwindMatchMutate(ref umm) => {
+                    self.execute_unwind_match_mutate_with_params(umm, &params)
+                }
                 _ => Err(Error::InvalidArgument(
                     "execute_with_params: parameterized MATCH...CREATE and standalone CREATE \
                      are not yet supported; use MERGE or MATCH...SET with $params"
@@ -1652,7 +1661,302 @@ impl GraphDb {
             self.invalidate_csr_map();
         }
 
-        Ok(QueryResult::empty(vec![]))
+        Self::build_mutate_return(&mm.return_clause, matching_ids.len() as u64)
+    }
+
+    /// Build a QueryResult from an optional RETURN clause after a mutation.
+    ///
+    /// When `return_clause` is `None`, returns an empty result (backward compat).
+    /// When present and the RETURN expression is `count(n)`, returns one row
+    /// with the mutation count.
+    fn build_mutate_return(
+        return_clause: &Option<sparrowdb_cypher::ast::ReturnClause>,
+        count: u64,
+    ) -> Result<QueryResult> {
+        match return_clause {
+            None => Ok(QueryResult::empty(vec![])),
+            Some(rc) => {
+                // Only honour RETURN when the expression is count(n) / count(*).
+                // Full RETURN expression evaluation for mutations is deferred
+                // to a future engine extension.
+                if rc.items.len() == 1 && is_count_expr(&rc.items[0].expr) {
+                    let col = rc.items[0]
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| "count(n)".to_string());
+                    Ok(QueryResult {
+                        columns: vec![col],
+                        rows: vec![vec![sparrowdb_execution::Value::Int64(count as i64)]],
+                    })
+                } else {
+                    Ok(QueryResult::empty(vec![]))
+                }
+            }
+        }
+    }
+
+    // ── UNWIND … MATCH … SET/DELETE execution (SPA-415) ─────────────────────
+
+    /// Execute `UNWIND $param AS var MATCH ... SET/DELETE` with runtime
+    /// parameter bindings.  Evaluates the UNWIND list, then for each element
+    /// runs the MATCH + mutation inside a single write transaction.
+    fn execute_unwind_match_mutate_with_params(
+        &self,
+        umm: &sparrowdb_cypher::ast::UnwindMatchMutateStatement,
+        params: &HashMap<String, sparrowdb_execution::Value>,
+    ) -> Result<QueryResult> {
+        let list = eval_unwind_list(&umm.expr, params)?;
+        self.execute_unwind_mutate_inner(umm, list.as_slice(), Some(params), None)
+    }
+
+    /// Execute `UNWIND [literal] AS var MATCH ... SET/DELETE` without params.
+    fn execute_unwind_match_mutate(
+        &self,
+        umm: &sparrowdb_cypher::ast::UnwindMatchMutateStatement,
+    ) -> Result<QueryResult> {
+        let list = match &umm.expr {
+            sparrowdb_cypher::ast::Expr::List(items) => items
+                .iter()
+                .map(|e| {
+                    let sv = expr_to_value(e);
+                    Ok(storage_value_to_exec(&sv))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => {
+                return Err(Error::InvalidArgument(
+                    "UNWIND MATCH SET/DELETE without parameters requires a list literal".into(),
+                ));
+            }
+        };
+        self.execute_unwind_mutate_inner(umm, list.as_slice(), None, None)
+    }
+
+    /// Deadline-aware variant (fixes #310).
+    fn execute_unwind_match_mutate_deadline(
+        &self,
+        umm: &sparrowdb_cypher::ast::UnwindMatchMutateStatement,
+        deadline: std::time::Instant,
+    ) -> Result<QueryResult> {
+        // Evaluate the UNWIND list from the expression (non-params path).
+        let list = match &umm.expr {
+            sparrowdb_cypher::ast::Expr::List(items) => items
+                .iter()
+                .map(|e| {
+                    let sv = expr_to_value(e);
+                    Ok(storage_value_to_exec(&sv))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => {
+                return Err(Error::InvalidArgument(
+                    "UNWIND MATCH SET/DELETE with timeout requires a list literal".into(),
+                ));
+            }
+        };
+        self.execute_unwind_mutate_inner(umm, list.as_slice(), None, Some(deadline))
+    }
+
+    /// Shared inner: iterate UNWIND elements, apply mutations per row, single tx.
+    ///
+    /// When `params` is `Some`, the engine and `resolve_set_value` can resolve
+    /// `$param` references in `where_clause` and `SET` value expressions.
+    ///
+    /// When `deadline` is `Some`, each iteration checks elapsed time and returns
+    /// `Err(Timeout)` if the caller's deadline has passed (fixes #310).
+    ///
+    /// **Visibility limitation**: each UNWIND row is scanned against committed
+    /// storage — earlier rows' mutations within the same transaction are NOT
+    /// visible to later rows' MATCH scans.  This is by design: the single-pass
+    /// engine reuses the same read snapshot for all iterations, matching the
+    /// semantics of `UNWIND` in standard Cypher (all rows see the same pre-query
+    /// state).  Use cases that require row-to-row visibility (e.g. accumulating
+    /// mutations on the same node across iterations) must issue separate
+    /// statements.
+    fn execute_unwind_mutate_inner(
+        &self,
+        umm: &sparrowdb_cypher::ast::UnwindMatchMutateStatement,
+        list: &[sparrowdb_execution::Value],
+        params: Option<&HashMap<String, sparrowdb_execution::Value>>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<QueryResult> {
+        if list.is_empty() {
+            return Ok(QueryResult::empty(vec![]));
+        }
+
+        let mut tx = self.begin_write()?;
+        let csrs = self.cached_csr_map();
+        let mut engine = Engine::new(
+            NodeStore::open(&self.inner.path)?,
+            self.catalog_snapshot(),
+            csrs,
+            &self.inner.path,
+        );
+        // Configure engine with params so WHERE clause can resolve $param.
+        if let Some(p) = params {
+            engine = engine.with_params(p.clone());
+        }
+        let mut total_mutated: u64 = 0;
+        let mut has_detach_delete = false;
+        // prop -> (vector, raw node ids). Accumulated across all UNWIND rows so
+        // the HNSW index is serialised once per (label, prop), not once per row.
+        let mut pending_vectors: std::collections::HashMap<String, (Vec<f32>, Vec<u64>)> =
+            std::collections::HashMap::new();
+
+        for element in list {
+            // Honour caller's deadline between iterations (fixes #310).
+            if let Some(dl) = deadline {
+                Self::check_deadline(dl)?;
+            }
+
+            // Each element must be a Map (e.g. {id: "m1", score: 0.5}).
+            let row = match element {
+                sparrowdb_execution::Value::Map(entries) => entries,
+                _ => {
+                    return Err(Error::InvalidArgument(format!(
+                        "UNWIND element must be a map (e.g. {{id: '...', score: 0.5}}), got {}",
+                        element
+                    )));
+                }
+            };
+
+            // Build a temporary MatchMutateStatement with inline property
+            // filters resolved from the row values.
+            let resolved_patterns: Vec<sparrowdb_cypher::ast::PathPattern> = umm
+                .match_patterns
+                .iter()
+                .map(|pat| resolve_pattern_props(pat, &umm.alias, row))
+                .collect();
+
+            let resolved_mm = sparrowdb_cypher::ast::MatchMutateStatement {
+                match_patterns: resolved_patterns,
+                where_clause: umm.where_clause.clone(),
+                mutations: umm.mutations.clone(),
+                return_clause: None,
+            };
+
+            let matching_ids = engine.scan_match_mutate(&resolved_mm)?;
+            if matching_ids.is_empty() {
+                continue;
+            }
+
+            for mutation in &umm.mutations {
+                match mutation {
+                    sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
+                        let sv = resolve_set_value(value, &umm.alias, row, params)?;
+                        for node_id in &matching_ids {
+                            tx.set_property(*node_id, prop, sv.clone())?;
+                        }
+
+                        // Vector index write-path — the same maintenance
+                        // `execute_match_mutate_with_params` performs, which this
+                        // entry point must not skip. Without it,
+                        // `UNWIND $rows AS row MATCH (n:L {id: row.id}) SET n.emb = $vec`
+                        // would store the property and leave the HNSW file
+                        // untouched: the vector becomes invisible to search
+                        // forever, with the write reporting success. That is the
+                        // #410 silent-data-loss shape (KMSmcp ch#202), reached
+                        // through a second entry point.
+                        //
+                        // Writes are ACCUMULATED here and applied once after the
+                        // row loop. Saving per row costs a full index
+                        // serialization + fsync each time — measured at ~10 ms
+                        // per row, so a 1000-row UNWIND would spend ~10 s
+                        // rewriting the same file 1000 times. The MATCH…SET path
+                        // saves once per (label, prop) per statement and this
+                        // must match it.
+                        //
+                        // Only the `$param` form is handled, matching the
+                        // MATCH…SET path: a vector cannot survive
+                        // `resolve_set_value`'s storage-layer round trip, so
+                        // `SET n.emb = row.emb` cannot carry one today (see #475,
+                        // where that coercion silently yields Int64(0)).
+                        if let sparrowdb_cypher::ast::Expr::Literal(
+                            sparrowdb_cypher::ast::Literal::Param(p),
+                        ) = value
+                        {
+                            if let Some(vec) = params
+                                .and_then(|m| m.get(p.as_str()))
+                                .and_then(|v| v.as_vector())
+                            {
+                                // LAST write wins, matching `tx.set_property`
+                                // and the MATCH…SET vector path (which calls
+                                // idx.insert per mutation, in order). A
+                                // first-write-wins accumulator would leave the
+                                // stored property as the last value while the
+                                // index held the first — property and index
+                                // silently disagreeing is the #410 class this
+                                // block exists to prevent. `SET n.e = $a, n.e = $b`
+                                // reaches this: parse_set_items_inner is a bare
+                                // comma loop with no duplicate-prop guard.
+                                let entry = pending_vectors
+                                    .entry(prop.clone())
+                                    .or_insert_with(|| (vec.clone(), Vec::new()));
+                                entry.0 = vec.clone();
+                                entry.1.extend(matching_ids.iter().map(|n| n.0));
+                            }
+                        }
+                    }
+                    sparrowdb_cypher::ast::Mutation::Delete { detach: true, .. } => {
+                        has_detach_delete = true;
+                        for node_id in &matching_ids {
+                            tx.detach_delete_node(*node_id)?;
+                        }
+                    }
+                    sparrowdb_cypher::ast::Mutation::Delete { detach: false, .. } => {
+                        for node_id in &matching_ids {
+                            tx.delete_node(*node_id)?;
+                        }
+                    }
+                }
+            }
+            total_mutated += matching_ids.len() as u64;
+        }
+
+        // Apply the accumulated vector writes once, grouping by the label each
+        // matched node actually carries (derived from the NodeId's upper 32
+        // bits) rather than from the AST, so anonymous and multi-label UNWIND
+        // patterns resolve correctly.
+        if !pending_vectors.is_empty() {
+            let vidx_dir = self.inner.path.join("vector_indexes");
+            let cat = self.catalog_snapshot();
+            let label_id_to_name: std::collections::HashMap<u16, String> =
+                cat.list_labels().unwrap_or_default().into_iter().collect();
+            let vidx_guard = self.inner.vector_indexes.read().expect("vector_indexes");
+            for (prop, (vec, raw_ids)) in &pending_vectors {
+                // A node accumulates once per matching row and again per
+                // duplicate SET on the same prop, so dedup before inserting.
+                let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                let mut label_to_raw: std::collections::HashMap<&str, Vec<u64>> =
+                    std::collections::HashMap::new();
+                for &raw in raw_ids {
+                    if !seen.insert(raw) {
+                        continue;
+                    }
+                    let lid = (raw >> 32) as u16;
+                    if let Some(name) = label_id_to_name.get(&lid) {
+                        label_to_raw.entry(name.as_str()).or_default().push(raw);
+                    }
+                }
+                for (label, ids) in &label_to_raw {
+                    let key = (label.to_string(), prop.clone());
+                    if let Some(arc_idx) = vidx_guard.get(&key) {
+                        let mut idx = arc_idx.write().expect("vector_index write");
+                        for &raw in ids {
+                            idx.insert(raw, vec);
+                        }
+                        // One save per (label, prop) for the whole statement.
+                        idx.save(&vidx_dir, label, prop).map_err(Error::Io)?;
+                    }
+                }
+            }
+        }
+
+        tx.commit()?;
+        self.invalidate_catalog();
+        if has_detach_delete {
+            self.invalidate_csr_map();
+        }
+
+        Self::build_mutate_return(&umm.return_clause, total_mutated)
     }
 
     /// Internal: execute a MATCH … SET / DELETE by scanning then writing.
@@ -1683,20 +1987,21 @@ impl GraphDb {
         // SPA-219: `MATCH (a)-[r:REL]->(b) DELETE r` — edge delete path.
         if is_edge_delete_mutation(mm) {
             let edges = engine.scan_match_mutate_edges(mm)?;
+            let edge_count = edges.len();
             for (src, dst, rel_type) in edges {
                 tx.delete_edge(src, dst, &rel_type)?;
             }
             tx.commit()?;
             self.invalidate_csr_map();
             self.invalidate_catalog();
-            return Ok(QueryResult::empty(vec![]));
+            return Self::build_mutate_return(&mm.return_clause, edge_count as u64);
         }
 
         // Collect matching node ids via the engine's scan (lock already held).
         let matching_ids = engine.scan_match_mutate(mm)?;
 
         if matching_ids.is_empty() {
-            return Ok(QueryResult::empty(vec![]));
+            return Self::build_mutate_return(&mm.return_clause, 0);
         }
 
         let mut has_detach_delete = false;
@@ -1727,7 +2032,7 @@ impl GraphDb {
         if has_detach_delete {
             self.invalidate_csr_map();
         }
-        Ok(QueryResult::empty(vec![]))
+        Self::build_mutate_return(&mm.return_clause, matching_ids.len() as u64)
     }
 
     /// Deadline-aware variant of [`execute_match_mutate`] (fixes #310).
@@ -1800,7 +2105,8 @@ impl GraphDb {
         if has_detach_delete {
             self.invalidate_csr_map();
         }
-        Ok(QueryResult::empty(vec![]))
+        // Honor optional RETURN clause.
+        Self::build_mutate_return(&mm.return_clause, matching_ids.len() as u64)
     }
 
     /// Internal: execute a `MATCH … CREATE (a)-[:R]->(b)` statement.
@@ -2419,6 +2725,16 @@ impl GraphDb {
                     has_detach_delete = true;
                 }
             }
+            if let sparrowdb_cypher::ast::Statement::UnwindMatchMutate(ref umm) = bound.inner {
+                if umm.mutations.iter().any(|m| {
+                    matches!(
+                        m,
+                        sparrowdb_cypher::ast::Mutation::Delete { detach: true, .. }
+                    )
+                }) {
+                    has_detach_delete = true;
+                }
+            }
 
             let result = if Engine::is_mutation(&bound.inner) {
                 self.execute_batch_mutation(bound.inner, &mut tx)?
@@ -2595,6 +2911,7 @@ impl GraphDb {
                     for (src, dst, rel_type) in edges {
                         tx.delete_edge(src, dst, &rel_type)?;
                     }
+                    Ok(QueryResult::empty(vec![]))
                 } else {
                     let matching_ids = engine.scan_match_mutate(mm)?;
                     for mutation in &mm.mutations {
@@ -2617,9 +2934,15 @@ impl GraphDb {
                             }
                         }
                     }
+                    Ok(QueryResult::empty(vec![]))
                 }
-                Ok(QueryResult::empty(vec![]))
             }
+
+            Statement::UnwindMatchMutate(_) => Err(Error::InvalidArgument(
+                "UNWIND...MATCH...SET/DELETE is not yet supported in batch execution; \
+                 use execute_with_params instead"
+                    .into(),
+            )),
 
             Statement::MatchCreate(ref mc) => {
                 for (_, rel_pat, _) in &mc.create.edges {
@@ -3032,6 +3355,144 @@ impl GraphDb {
         tx.commit()?;
         self.invalidate_csr_map();
         Ok(())
+    }
+}
+
+// ── RETURN helpers ──────────────────────────────────────────────────────────
+
+/// Check whether an expression is a `count(n)` or `count(*)` aggregate call.
+fn is_count_expr(expr: &sparrowdb_cypher::ast::Expr) -> bool {
+    use sparrowdb_cypher::ast::Expr;
+    matches!(
+        expr,
+        Expr::FnCall { name, .. } if name.eq_ignore_ascii_case("count")
+            || name == "COUNT"
+    ) || matches!(expr, Expr::CountStar)
+}
+
+// ── UNWIND helpers (SPA-415) ────────────────────────────────────────────────
+
+/// Evaluate a UNWIND expression to a list of `Value`s.
+fn eval_unwind_list(
+    expr: &sparrowdb_cypher::ast::Expr,
+    params: &HashMap<String, sparrowdb_execution::Value>,
+) -> Result<Vec<sparrowdb_execution::Value>> {
+    match expr {
+        sparrowdb_cypher::ast::Expr::Literal(sparrowdb_cypher::ast::Literal::Param(name)) => {
+            match params.get(name.as_str()) {
+                Some(sparrowdb_execution::Value::List(items)) => Ok(items.clone()),
+                Some(other) => Err(Error::InvalidArgument(format!(
+                    "UNWIND parameter ${} must be a list, got {}",
+                    name, other
+                ))),
+                None => Err(Error::InvalidArgument(format!(
+                    "UNWIND parameter ${} not found in params",
+                    name
+                ))),
+            }
+        }
+        _ => Err(Error::InvalidArgument(
+            "UNWIND expression must be a $param bound to a list".into(),
+        )),
+    }
+}
+
+/// Resolve inline property filters in a PathPattern by replacing
+/// `alias.prop` references with literal values from the UNWIND row.
+fn resolve_pattern_props(
+    pat: &sparrowdb_cypher::ast::PathPattern,
+    alias: &str,
+    row: &[(String, sparrowdb_execution::Value)],
+) -> sparrowdb_cypher::ast::PathPattern {
+    use sparrowdb_cypher::ast::{NodePattern, PropEntry};
+
+    let nodes: Vec<NodePattern> = pat
+        .nodes
+        .iter()
+        .map(|np| {
+            let props: Vec<PropEntry> = np
+                .props
+                .iter()
+                .map(|pe| {
+                    let resolved_expr = row_expr_to_literal(&pe.value, alias, row);
+                    PropEntry {
+                        key: pe.key.clone(),
+                        value: resolved_expr,
+                    }
+                })
+                .collect();
+            NodePattern {
+                var: np.var.clone(),
+                labels: np.labels.clone(),
+                props,
+            }
+        })
+        .collect();
+
+    sparrowdb_cypher::ast::PathPattern {
+        path_var: pat.path_var.clone(),
+        nodes,
+        rels: pat.rels.clone(),
+    }
+}
+
+/// Resolve an expression that references `alias.prop` to a literal Expr.
+/// If the expression is `alias.prop`, look up `prop` in the row map and
+/// return the corresponding `Expr::Literal`. Otherwise return the expr as-is.
+fn row_expr_to_literal(
+    expr: &sparrowdb_cypher::ast::Expr,
+    alias: &str,
+    row: &[(String, sparrowdb_execution::Value)],
+) -> sparrowdb_cypher::ast::Expr {
+    use sparrowdb_cypher::ast::Expr;
+    if let Expr::PropAccess { var, prop } = expr {
+        if var == alias {
+            for (key, val) in row {
+                if key == prop {
+                    return exec_value_to_expr_literal(val);
+                }
+            }
+        }
+    }
+    expr.clone()
+}
+
+/// Convert a sparrowdb_execution::Value to an Expr::Literal for inline props.
+fn exec_value_to_expr_literal(v: &sparrowdb_execution::Value) -> sparrowdb_cypher::ast::Expr {
+    use sparrowdb_cypher::ast::{Expr, Literal};
+    match v {
+        sparrowdb_execution::Value::String(s) => Expr::Literal(Literal::String(s.clone())),
+        sparrowdb_execution::Value::Int64(n) => Expr::Literal(Literal::Int(*n)),
+        sparrowdb_execution::Value::Float64(f) => Expr::Literal(Literal::Float(*f)),
+        sparrowdb_execution::Value::Bool(b) => Expr::Literal(Literal::Bool(*b)),
+        _ => Expr::Literal(Literal::Null),
+    }
+}
+
+/// Resolve a mutation SET value expression to a storage-layer Value.
+/// If the value is `alias.prop`, look it up from the row map; otherwise
+/// evaluate it via `expr_to_value_with_params` when params are available,
+/// falling back to `expr_to_value` for literal-only expressions.
+fn resolve_set_value(
+    value: &sparrowdb_cypher::ast::Expr,
+    alias: &str,
+    row: &[(String, sparrowdb_execution::Value)],
+    params: Option<&HashMap<String, sparrowdb_execution::Value>>,
+) -> crate::Result<Value> {
+    use sparrowdb_cypher::ast::Expr;
+    if let Expr::PropAccess { var, prop } = value {
+        if var == alias {
+            for (key, val) in row {
+                if key == prop {
+                    return Ok(exec_value_to_storage(val));
+                }
+            }
+        }
+    }
+    // Fall back: use params-aware evaluation when available, otherwise literal-only.
+    match params {
+        Some(p) => expr_to_value_with_params(value, p),
+        None => Ok(expr_to_value(value)),
     }
 }
 

@@ -327,6 +327,34 @@ pub struct MatchMutateStatement {
     /// For SET, there may be multiple items (comma-separated).
     /// For DELETE, this always contains exactly one `Mutation::Delete`.
     pub mutations: Vec<Mutation>,
+    /// Optional RETURN clause after mutations (e.g. `DELETE n RETURN count(n)`).
+    pub return_clause: Option<ReturnClause>,
+}
+
+/// UNWIND … MATCH … SET/DELETE statement (SPA-415).
+///
+/// Iterates a list expression, binding each element to `alias`, then for
+/// each element executes a MATCH + mutation (SET or DELETE).
+///
+/// ```cypher
+/// UNWIND $updates AS row
+/// MATCH (n:Memory {id: row.id})
+/// SET n.score = row.score
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnwindMatchMutateStatement {
+    /// The list expression to unwind (e.g. `$updates`).
+    pub expr: Expr,
+    /// Variable bound to each list element (e.g. `row`).
+    pub alias: String,
+    /// The MATCH patterns whose nodes are mutated.
+    pub match_patterns: Vec<PathPattern>,
+    /// Optional WHERE predicate on the MATCH.
+    pub where_clause: Option<Expr>,
+    /// The mutations to apply (SET or DELETE).
+    pub mutations: Vec<Mutation>,
+    /// Optional RETURN clause after mutations.
+    pub return_clause: Option<ReturnClause>,
 }
 
 /// A single projection in a WITH clause: `expr AS alias`.
@@ -501,6 +529,8 @@ pub enum Statement {
     /// MATCH … MERGE (a)-[r:TYPE]->(b) — find-or-create a relationship (SPA-233).
     MatchMergeRel(MatchMergeRelStatement),
     MatchMutate(MatchMutateStatement),
+    /// UNWIND … MATCH … SET/DELETE — batched mutations via list parameter (SPA-415).
+    UnwindMatchMutate(UnwindMatchMutateStatement),
     OptionalMatch(OptionalMatchStatement),
     MatchOptionalMatch(MatchOptionalMatchStatement),
     Union(UnionStatement),
