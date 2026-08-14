@@ -22,17 +22,24 @@ impl Engine {
         }
 
         let pat = &m.pattern[0];
-        let src_node_pat = &pat.nodes[0];
-        let dst_node_pat = &pat.nodes[1];
         let rel_pat = &pat.rels[0];
-
         let dir = &rel_pat.dir;
-        // Incoming-only: swap the logical src/dst and recurse as Outgoing by
-        // swapping pattern roles.  We handle it by falling through with the
-        // node patterns in swapped order below.
-        // Both (undirected): handled by running forward + backward passes.
-        // Unknown directions remain unimplemented.
         use sparrowdb_cypher::ast::EdgeDir;
+
+        // Incoming (`(a)<-[:R]-(x)`): the physical edge runs x -> a, so swap
+        // which pattern node plays the "src" (traversal-forward) role before
+        // any label resolution, table filtering, or CSR lookups happen below.
+        // Every reference downstream goes through src_node_pat/dst_node_pat
+        // (never pat.nodes[..] directly), so this single swap is sufficient —
+        // it also naturally binds the correct variable name to each side when
+        // rows are projected at the end of the function.
+        // Both (undirected): handled by running forward + backward passes,
+        // so it keeps the unswapped (nodes[0], nodes[1]) order here.
+        let (src_node_pat, dst_node_pat) = if *dir == EdgeDir::Incoming {
+            (&pat.nodes[1], &pat.nodes[0])
+        } else {
+            (&pat.nodes[0], &pat.nodes[1])
+        };
 
         let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
         let dst_label = dst_node_pat.labels.first().cloned().unwrap_or_default();
