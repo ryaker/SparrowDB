@@ -1155,6 +1155,19 @@ mod subquery;
 /// query referenced a parameter the caller never supplied, not that the
 /// caller deliberately bound it to null.
 fn is_filter_expr_resolvable(expr: &Expr, params: &HashMap<String, Value>) -> bool {
+    is_filter_expr_resolvable_scoped(expr, params, &[])
+}
+
+/// As [`is_filter_expr_resolvable`], but with a set of locally-bound variable
+/// names — the loop variable of a list predicate (`ANY(x IN … WHERE …)`) is
+/// bound by the comprehension itself, not by the params map, so a bare
+/// `Expr::Var("x")` inside the predicate is legitimately resolvable.
+fn is_filter_expr_resolvable_scoped(
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    locals: &[&str],
+) -> bool {
+    let rec = |e: &Expr| is_filter_expr_resolvable_scoped(e, params, locals);
     match expr {
         // A literal `$name` — resolvable only if the caller actually supplied it.
         Expr::Literal(Literal::Param(p)) => params.contains_key(&format!("${p}")),
@@ -1175,23 +1188,16 @@ fn is_filter_expr_resolvable(expr: &Expr, params: &HashMap<String, Value>) -> bo
         // duplicated list of known names, which would silently drift as
         // functions are added.
         Expr::FnCall { name, args } => {
-            args.iter().all(|a| is_filter_expr_resolvable(a, params)) && {
+            args.iter().all(&rec) && {
                 let evaluated: Vec<Value> = args.iter().map(|a| eval_expr(a, params)).collect();
                 crate::functions::dispatch_function(name, evaluated).is_ok()
             }
         }
-        Expr::BinOp { left, right, .. } => {
-            is_filter_expr_resolvable(left, params) && is_filter_expr_resolvable(right, params)
-        }
-        Expr::List(items) => items.iter().all(|e| is_filter_expr_resolvable(e, params)),
-        Expr::InList { expr, list, .. } => {
-            is_filter_expr_resolvable(expr, params)
-                && list.iter().all(|e| is_filter_expr_resolvable(e, params))
-        }
-        Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => is_filter_expr_resolvable(e, params),
-        Expr::And(a, b) | Expr::Or(a, b) => {
-            is_filter_expr_resolvable(a, params) && is_filter_expr_resolvable(b, params)
-        }
+        Expr::BinOp { left, right, .. } => rec(left) && rec(right),
+        Expr::List(items) => items.iter().all(&rec),
+        Expr::InList { expr, list, .. } => rec(expr) && list.iter().all(&rec),
+        Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => rec(e),
+        Expr::And(a, b) | Expr::Or(a, b) => rec(a) && rec(b),
         // `CASE WHEN <cond> THEN <val> … [ELSE <val>]` is resolvable iff every
         // condition, every branch value, and the ELSE are.  This one is NOT
         // merely conservative: `MATCH (n:Item {id: CASE WHEN true THEN 1 ELSE 2 END})`
@@ -1201,12 +1207,26 @@ fn is_filter_expr_resolvable(expr: &Expr, params: &HashMap<String, Value>) -> bo
             branches,
             else_expr,
         } => {
-            branches.iter().all(|(cond, val)| {
-                is_filter_expr_resolvable(cond, params) && is_filter_expr_resolvable(val, params)
-            }) && else_expr
-                .as_ref()
-                .is_none_or(|e| is_filter_expr_resolvable(e, params))
+            branches.iter().all(|(cond, val)| rec(cond) && rec(val))
+                && else_expr.as_ref().is_none_or(|e| rec(e))
         }
+        // `ANY/ALL/NONE/SINGLE (x IN <list> WHERE <pred>)` binds `x` itself, so
+        // the predicate is resolvable even though it names a variable absent
+        // from the params map. Omitting this arm dropped the whole expression
+        // into the catch-all below, silently discarding a legitimate row — the
+        // same symptom-free under-match as the CASE WHEN gap above.
+        Expr::ListPredicate {
+            variable,
+            list_expr,
+            predicate,
+            ..
+        } => {
+            let mut inner: Vec<&str> = locals.to_vec();
+            inner.push(variable.as_str());
+            rec(list_expr) && is_filter_expr_resolvable_scoped(predicate, params, &inner)
+        }
+        // A comprehension-bound loop variable is resolvable inside its own body.
+        Expr::Var(v) if locals.contains(&v.as_str()) => true,
         // A bare variable or property access can never be resolved from a
         // params-only map — see the doc comment above.  Everything else
         // (EXISTS, shortestPath, CountStar, list predicates, …) is not

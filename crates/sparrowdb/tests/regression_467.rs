@@ -303,3 +303,80 @@ fn known_function_in_prop_filter_still_matches() {
         "abs(-1) is 1, so only the id=1 node must match"
     );
 }
+
+/// `ANY/ALL/NONE/SINGLE (x IN <list> WHERE <pred>)` is statically evaluable when
+/// the list and predicate are literals — the loop variable is bound by the
+/// comprehension itself, not by the params map. Omitting it from the
+/// resolvability check dropped the whole expression into the catch-all and
+/// silently discarded a legitimate row: the same symptom-free under-match as the
+/// CASE WHEN gap, in the same arm.
+///
+/// Expected values derived by hand: `ANY(x IN [1,2,3] WHERE x > 1)` is true
+/// (2 and 3 qualify), so only the `flag: true` node matches.
+#[test]
+fn list_predicate_literal_in_pattern_prop_still_matches() {
+    let (db, _dir) = open_db();
+    db.execute("CREATE (:Item {flag: true, tag: 'yes'})")
+        .unwrap();
+    db.execute("CREATE (:Item {flag: false, tag: 'no'})")
+        .unwrap();
+
+    for (q, expect) in [
+        // ANY: 2 > 1 and 3 > 1 -> true
+        (
+            "MATCH (n:Item {flag: ANY(x IN [1,2,3] WHERE x > 1)}) RETURN n.tag",
+            "yes",
+        ),
+        // ALL: every element > 0 -> true
+        (
+            "MATCH (n:Item {flag: ALL(x IN [1,2,3] WHERE x > 0)}) RETURN n.tag",
+            "yes",
+        ),
+        // NONE: no element > 9 -> true
+        (
+            "MATCH (n:Item {flag: NONE(x IN [1,2,3] WHERE x > 9)}) RETURN n.tag",
+            "yes",
+        ),
+        // ANY over an empty-qualifying set -> false, selects the other node
+        (
+            "MATCH (n:Item {flag: ANY(x IN [1,2,3] WHERE x > 9)}) RETURN n.tag",
+            "no",
+        ),
+    ] {
+        let r = db
+            .execute(q)
+            .expect("a literal list predicate must be resolvable");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::String(expect.to_string())]],
+            "{q}: expected the {expect:?} node"
+        );
+    }
+}
+
+/// The other direction: a list predicate carrying an unresolvable sub-expression
+/// must still fail closed rather than widening to every node of the label.
+#[test]
+fn list_predicate_with_unresolvable_parts_fails_closed() {
+    let (db, _dir) = open_db();
+    db.execute("CREATE (:Item {flag: true, tag: 'yes'})")
+        .unwrap();
+    db.execute("CREATE (:Item {flag: false, tag: 'no'})")
+        .unwrap();
+
+    for q in [
+        // unbound var in the predicate body (not the loop variable)
+        "MATCH (n:Item {flag: ANY(x IN [1,2,3] WHERE x > unbound_var)}) RETURN n.tag",
+        // unbound var as the list itself
+        "MATCH (n:Item {flag: ANY(x IN unbound_list WHERE x > 1)}) RETURN n.tag",
+        // the loop variable must not leak outside its own comprehension
+        "MATCH (n:Item {flag: x}) RETURN n.tag",
+    ] {
+        let r = db.execute(q).expect("should not error");
+        assert!(
+            r.rows.is_empty(),
+            "{q}: must fail closed, not match every node; got {:?}",
+            r.rows
+        );
+    }
+}
