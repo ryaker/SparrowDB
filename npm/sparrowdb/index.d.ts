@@ -76,6 +76,7 @@ export interface VectorIndexHealth {
  *   prop: string;    // vector property the index was built on
  *   path: string;    // exact file on disk; the machine-readable field
  *   reason: string;  // human-readable; see the caveat below
+ *   kind: string;    // "live_unserviceable" | "quarantined_no_live_index" — see below
  * }
  * ```
  *
@@ -84,6 +85,20 @@ export interface VectorIndexHealth {
  * RECONSTRUCTED rather than recovered, because #442 reports the original
  * decode failure only in the error it returns at quarantine time and writes no
  * sidecar. Do not parse it and do not present it as the authoritative cause.
+ *
+ * `kind` is the machine-checkable version of the same distinction `reason`
+ * only describes in prose (#451):
+ * - `"live_unserviceable"` — a `.bin` is present but does not resolve or does
+ *   not load. `SparrowDB.open` (the Rust/other-binding equivalent) refuses to
+ *   start while this is true; there is no running store to guard a write on.
+ * - `"quarantined_no_live_index"` — a `.bin.corrupt.<millis>` quarantine
+ *   artifact is present and no live index currently serves the pair. The
+ *   store **opened successfully** and looks healthy, but
+ *   `db.executeWithParams` now throws on a vector write against this exact
+ *   `(label, prop)` instead of silently discarding it — see
+ *   `SparrowDB.prototype.executeWithParams`. Call `db.createVectorIndex(...)`
+ *   to clear it; the entry then moves from `active` to `historical` on the
+ *   next `vectorIndexDamageScan`/`vectorIndexLoadFailures` call.
  *
  * The `//` comments above are deliberate rather than nested doc comments: a
  * close-comment marker inside a generated JSDoc block ends it early, which is
@@ -105,6 +120,12 @@ export interface VectorIndexLoadFailure {
    * not authoritative and not machine-parseable.
    */
   reason: string
+  /**
+   * `"live_unserviceable"` or `"quarantined_no_live_index"` — see the
+   * interface doc comment. Check this before deciding whether a vector write
+   * against this `(label, prop)` would currently succeed or throw.
+   */
+  kind: string
 }
 /**
  * What an inspection of a database's `vector_indexes/` observed — see
@@ -215,11 +236,21 @@ export declare class SparrowDB {
    * - **already quarantined** — `hnsw_<label>_<prop>.bin.corrupt.<millis>`,
    *   bytes a previous load attempt moved aside (#442).
    *
-   * The second arm is why this is the only usable health signal for #451:
-   * once a damaged file has been quarantined, the *first* `open` has already
-   * thrown and every later `open` succeeds with the index silently absent,
-   * so vector writes for that pair are dropped and searches return nothing.
-   * Nothing else distinguishes that store from a healthy one.
+   * The second arm used to be the *only* usable signal for #451: once a
+   * damaged file had been quarantined, the *first* `open` had already
+   * thrown and every later `open` succeeded with the index silently
+   * absent, and nothing else distinguished that store from a healthy one
+   * — vector writes for that pair were dropped or, after #475, rejected
+   * with a message naming neither the pair nor the quarantine.
+   *
+   * That is fixed as of #451: a vector write against a `(label, prop)` in
+   * this state now throws, naming the label, the property, and this exact
+   * quarantine artifact — see `SparrowDB.prototype.executeWithParams`.
+   * This diagnostic remains the way to find the condition *before* a write
+   * hits it, and each entry's `kind` field
+   * (`VectorIndexLoadFailure.kind === "quarantined_no_live_index"`) is now
+   * the machine-checkable way to tell it apart from a `"live_unserviceable"`
+   * entry, which `open()` refusing to start already makes loud on its own.
    *
    * **Read-only since #456.** It used to quarantine the live entries it
    * probed, so a second call answered differently from the first and the

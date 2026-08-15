@@ -277,7 +277,8 @@ fn cross_label_prop_name_collision_does_not_silently_drop_the_write() {
     db.create_vector_index("Doc", "embedding", DIMS, "cosine")
         .expect("create Doc.embedding index");
     // Note never gets an index on "embedding" at all.
-    db.execute("CREATE (:Note {key: 'n1'})").expect("create Note node");
+    db.execute("CREATE (:Note {key: 'n1'})")
+        .expect("create Note node");
 
     let err = db
         .execute_with_params(
@@ -313,7 +314,8 @@ fn cross_label_prop_name_collision_does_not_silently_drop_the_write() {
 
     // The unrelated Doc.embedding write path must still work — this fix must
     // not have broken the case it was meant to leave untouched.
-    db.execute("CREATE (:Doc {key: 'd1'})").expect("create Doc node");
+    db.execute("CREATE (:Doc {key: 'd1'})")
+        .expect("create Doc node");
     db.execute_with_params(
         "MATCH (n:Doc {key: 'd1'}) SET n.embedding = $emb",
         params(&[("emb", embedding_param())]),

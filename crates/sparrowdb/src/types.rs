@@ -311,6 +311,19 @@ pub(crate) struct DbInner {
     /// consults this before falling through to the ordinary property-write
     /// rejection, so `open()`'s silent "healthy" success on a quarantined
     /// store cannot let writes for that pair disappear a second time.
+    ///
+    /// **Scope: this `GraphDb` instance only, not the process or the file.**
+    /// This is in-memory state seeded once at `open()`, not re-derived from
+    /// disk on every write. A second `GraphDb` handle opened against the same
+    /// `path` — in this process or another — computes its own copy at its own
+    /// `open()` and the two are never reconciled; nothing here detects or
+    /// guards against concurrent access to one database directory from
+    /// multiple handles. This is a real limitation, not an oversight to "fix
+    /// later" casually: correctness would require either re-scanning disk on
+    /// every write (defeats the point of caching this) or a cross-process
+    /// coordination mechanism this crate does not otherwise have. Out of
+    /// scope for #451, which is about a single handle's `open()` being
+    /// stale, not about multiple handles disagreeing.
     pub quarantined_vector_writes: RwLock<HashMap<(String, String), Vec<PathBuf>>>,
 }
 
