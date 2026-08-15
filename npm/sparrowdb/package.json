@@ -17,7 +17,7 @@
     "*.node"
   ],
   "scripts": {
-    "test": "node --test test/integration.test.js",
+    "test": "node --test test/*.test.js",
     "typecheck": "tsc -p tsconfig.json"
   },
   "engines": {
@@ -29,13 +29,6 @@
     "url": "https://github.com/ryaker/SparrowDB"
   },
   "keywords": ["graph", "database", "cypher", "native", "napi"],
-  "optionalDependencies": {
-    "@sparrowdb/linux-x64-gnu": "0.1.25",
-    "@sparrowdb/linux-arm64-gnu": "0.1.25",
-    "@sparrowdb/darwin-x64": "0.1.25",
-    "@sparrowdb/darwin-arm64": "0.1.25",
-    "@sparrowdb/win32-x64-msvc": "0.1.25"
-  },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4",
     "typescript": "^5.6.0"

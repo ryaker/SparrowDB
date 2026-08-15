@@ -147,6 +147,24 @@ SparrowDB is *not* the right choice when:
 npm install sparrowdb
 ```
 
+The `sparrowdb` npm package bundles prebuilt native binaries directly in the tarball — there is no separate `@sparrowdb/<platform>` package to resolve.
+
+| Platform | Supported |
+|---|---|
+| macOS arm64 (Apple Silicon) | Yes |
+| Linux x64 (glibc) | Yes |
+| macOS x64 (Intel) | No — build from source |
+| Linux arm64 | No — build from source |
+| Windows x64 | No — build from source |
+| Linux x64/arm64 (musl / Alpine) | No — unsupported on every architecture |
+
+On an unsupported platform, `require('sparrowdb')` throws a clear error naming the platform and the supported list, rather than a raw module-resolution failure. To build from source on those platforms:
+
+```bash
+cargo build --release -p sparrowdb-node
+cp target/release/libsparrowdb_node.<so|dylib|dll> npm/sparrowdb/sparrowdb.node
+```
+
 ### Rust
 
 ```toml
