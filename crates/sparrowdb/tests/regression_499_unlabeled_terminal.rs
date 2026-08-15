@@ -41,6 +41,17 @@ fn two_hop_unlabeled_terminal_projects_property() {
 }
 
 #[test]
+fn two_hop_unlabeled_terminal_supports_incoming_traversal() {
+    let (_dir, db) = make_db();
+
+    let result = db
+        .execute("MATCH (c:C)<-[:S]-(b:B)<-[:R]-(a) RETURN a.name")
+        .expect("incoming traversal with unlabeled terminal");
+
+    assert_eq!(result.rows, vec![vec![Value::String("source".into())]]);
+}
+
+#[test]
 fn two_hop_unlabeled_terminal_aggregates_node_binding() {
     let (_dir, db) = make_db();
 
