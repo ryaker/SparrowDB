@@ -299,6 +299,19 @@ pub(crate) struct DbInner {
     /// Each index is wrapped in `Arc<RwLock<VectorIndex>>` for SWMR access
     /// without holding the outer write-lock.
     pub vector_indexes: RwLock<VectorIndexMap>,
+    /// `(label, property)` pairs with an unrecovered #451 quarantine
+    /// artifact and no live index serving them right now — the paths are the
+    /// quarantined `.bin.corrupt.<millis>` files, kept for the write-refusal
+    /// error message.
+    ///
+    /// Populated once at `GraphDb::open`/`open_encrypted` time (quarantining
+    /// only happens on the open path, so nothing later in a session can add
+    /// to this) and cleared per-pair by `GraphDb::create_vector_index` once a
+    /// fresh index actually replaces the artifact. Every vector-write path
+    /// consults this before falling through to the ordinary property-write
+    /// rejection, so `open()`'s silent "healthy" success on a quarantined
+    /// store cannot let writes for that pair disappear a second time.
+    pub quarantined_vector_writes: RwLock<HashMap<(String, String), Vec<PathBuf>>>,
 }
 
 /// Run GC on the version store every this many commits.

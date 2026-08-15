@@ -99,7 +99,7 @@ pub use helpers::cypher_escape_string;
 
 /// Vector index health reporting — see [`GraphDb::vector_index_health`] and
 /// [`GraphDb::vector_index_load_failures`].
-pub use helpers::{VectorIndexFailure, VectorIndexHealth};
+pub use helpers::{VectorIndexFailure, VectorIndexFailureKind, VectorIndexHealth};
 
 // ── Legacy alias ──────────────────────────────────────────────────────────────
 

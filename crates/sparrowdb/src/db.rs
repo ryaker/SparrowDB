@@ -9,8 +9,8 @@ use crate::helpers::{
     build_label_row_counts_from_disk, collect_maintenance_params, dir_size_bytes, eval_expr_merge,
     exec_value_to_storage, expr_to_value, expr_to_value_with_params, fnv1a_col_id,
     is_edge_delete_mutation, is_reserved_label, load_constraints, load_vector_indexes,
-    open_csr_map, resolve_create_prop_value, save_constraints, storage_value_to_exec,
-    try_open_csr_map, VectorIndexHealth,
+    open_csr_map, quarantined_no_index_pairs, resolve_create_prop_value, save_constraints,
+    storage_value_to_exec, try_open_csr_map, VectorIndexHealth,
 };
 use crate::read_tx::ReadTx;
 use crate::types::{DbInner, NodeVersions, PendingOp, VersionStore, WriteBuffer, WriteGuard};
@@ -121,6 +121,13 @@ impl GraphDb {
             0
         };
         let vector_indexes = RwLock::new(load_vector_indexes(path)?);
+        // #451: `load_vector_indexes` above just ran the identical directory
+        // scan and would have already refused to open had it failed, so this
+        // second (cheap, names-only) pass is known-good.  It seeds the
+        // write-guard that keeps a "clean" second `open()` after a quarantine
+        // from silently dropping every subsequent vector write for the
+        // affected pair — see `DbInner::quarantined_vector_writes`.
+        let quarantined_vector_writes = RwLock::new(quarantined_no_index_pairs(path));
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -139,6 +146,7 @@ impl GraphDb {
                 active_readers: Mutex::new(BTreeMap::new()),
                 commits_since_gc: AtomicU64::new(0),
                 vector_indexes,
+                quarantined_vector_writes,
             }),
         })
     }
@@ -186,6 +194,8 @@ impl GraphDb {
             0
         };
         let vector_indexes = RwLock::new(load_vector_indexes(path)?);
+        // See the identical comment in `GraphDb::open` (#451).
+        let quarantined_vector_writes = RwLock::new(quarantined_no_index_pairs(path));
         Ok(GraphDb {
             inner: Arc::new(DbInner {
                 path: path.to_path_buf(),
@@ -204,6 +214,7 @@ impl GraphDb {
                 active_readers: Mutex::new(BTreeMap::new()),
                 commits_since_gc: AtomicU64::new(0),
                 vector_indexes,
+                quarantined_vector_writes,
             }),
         })
     }
@@ -1474,39 +1485,86 @@ impl GraphDb {
         Ok(QueryResult::empty(vec![]))
     }
 
-    /// True when `value` is a `$param` reference bound to `Value::Vector` for
-    /// a property that has a registered HNSW vector index.
+    /// Build the #451 write-refusal error for `(label, prop)`, if that pair
+    /// currently has an unrecovered quarantine artifact and no live index.
     ///
-    /// A vector has no property-column representation — `exec_value_to_storage`
-    /// rejects it (#475/#473) — but a vector `$param` on a genuinely indexed
-    /// property is a real, tested feature (#410): it is written to the HNSW
-    /// index by a dedicated block, not the property column. Callers use this
-    /// to skip the column write for exactly that one case, so the value
-    /// resolver's rejection only fires for a vector with nowhere to go (no
-    /// index registered for this property at all), not for the indexed case
-    /// this whole write-path exists to support.
-    fn set_value_is_indexed_vector_param(
+    /// `None` means the pair is not in that state — either it was never
+    /// indexed, or a live index already serves it — and the caller should
+    /// fall through to its existing behaviour unchanged.
+    fn quarantine_write_blocked_error(&self, label: &str, prop: &str) -> Option<Error> {
+        let guard = self
+            .inner
+            .quarantined_vector_writes
+            .read()
+            .expect("quarantined_vector_writes poisoned");
+        let paths = guard.get(&(label.to_string(), prop.to_string()))?;
+        let path_list = paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(Error::Corruption(format!(
+            "vector write to ({label}, {prop}) refused: a previous load quarantined this \
+             index's bytes ({path_list}) and no live index has replaced it since. `open()` \
+             already succeeded — this pair looks configured but every vector write to it is \
+             being silently discarded and every search silently returns nothing (#451). To \
+             recover: call createVectorIndex('{label}', '{prop}', <dimensions>, <similarity>) \
+             to register a fresh index, then retry this write. The quarantined bytes are the \
+             only surviving evidence of the original damage; if the vectors themselves need to \
+             be recovered from them, do that before or alongside re-registering the index."
+        )))
+    }
+
+    /// Decide how a SET-clause value bound to `(label, prop)` should be
+    /// handled, and fail loudly right here when it must not proceed.
+    ///
+    /// `Ok(true)` — `value` is a `$param` bound to a vector and a live HNSW
+    /// index is registered for `(label, prop)`. The caller must skip the
+    /// ordinary property-column write for this value: it is written to the
+    /// HNSW index by a dedicated block instead (#410), never to the property
+    /// column — a vector has no column representation and
+    /// `exec_value_to_storage` rejects it (#475/#473).
+    ///
+    /// `Ok(false)` — not that case. The caller proceeds with its existing
+    /// write path unchanged, including the existing rejection a non-scalar
+    /// value with no live index hits today.
+    ///
+    /// `Err(_)` — `(label, prop)` has an unrecovered #451 quarantine artifact
+    /// and no live index. The caller must propagate this immediately rather
+    /// than let the value fall through to the ordinary write path, whose
+    /// rejection does not mention quarantine, the artifact, or how to
+    /// recover — the entire reason this check exists.
+    fn resolve_vector_write_route(
         &self,
         value: &sparrowdb_cypher::ast::Expr,
+        label: &str,
         prop: &str,
         params: &HashMap<String, sparrowdb_execution::Value>,
-    ) -> bool {
+    ) -> Result<bool> {
         use sparrowdb_cypher::ast::{Expr, Literal};
         let Expr::Literal(Literal::Param(p)) = value else {
-            return false;
+            return Ok(false);
         };
         let Some(v) = params.get(p.as_str()) else {
-            return false;
+            return Ok(false);
         };
         if v.as_vector().is_none() {
-            return false;
+            return Ok(false);
         }
-        self.inner
+        let key = (label.to_string(), prop.to_string());
+        if self
+            .inner
             .vector_indexes
             .read()
             .expect("vector_indexes")
-            .keys()
-            .any(|(_, prop_name)| prop_name == prop)
+            .contains_key(&key)
+        {
+            return Ok(true);
+        }
+        match self.quarantine_write_blocked_error(label, prop) {
+            Some(e) => Err(e),
+            None => Ok(false),
+        }
     }
 
     /// Params-aware MERGE with $param support (SPA-218).
@@ -1517,17 +1575,18 @@ impl GraphDb {
     ) -> Result<QueryResult> {
         // A vector `$param` bound to an indexed property is written to the
         // HNSW index by the block below, not the merge-key/property columns
-        // — see `set_value_is_indexed_vector_param`. Excluded from `props`
-        // here rather than resolved to a storage `Value`.
-        let props: HashMap<String, Value> = m
-            .props
-            .iter()
-            .filter(|pe| !self.set_value_is_indexed_vector_param(&pe.value, &pe.key, params))
-            .map(|pe| {
-                let val = expr_to_value_with_params(&pe.value, params)?;
-                Ok((pe.key.clone(), val))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
+        // — see `resolve_vector_write_route`. Excluded from `props` here
+        // rather than resolved to a storage `Value`. A pair with a #451
+        // quarantine artifact and no live index fails loudly right here,
+        // before `merge_node` ever runs.
+        let mut props: HashMap<String, Value> = HashMap::new();
+        for pe in &m.props {
+            if self.resolve_vector_write_route(&pe.value, &m.label, &pe.key, params)? {
+                continue;
+            }
+            let val = expr_to_value_with_params(&pe.value, params)?;
+            props.insert(pe.key.clone(), val);
+        }
         let mut tx = self.begin_write()?;
         let dirty_before = tx.dirty_nodes.len();
         let node_id = tx.merge_node(&m.label, props)?;
@@ -1542,7 +1601,7 @@ impl GraphDb {
         };
         for mutation in on_set_items {
             if let sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } = mutation {
-                if self.set_value_is_indexed_vector_param(value, prop, params) {
+                if self.resolve_vector_write_route(value, &m.label, prop, params)? {
                     continue;
                 }
                 let sv = expr_to_value_with_params(value, params)?;
@@ -1663,20 +1722,54 @@ impl GraphDb {
         if matching_ids.is_empty() {
             return Ok(QueryResult::empty(vec![]));
         }
+        // Resolved once, up front, from the catalog: needed both by the
+        // per-node vector-write routing below and by the HNSW write-path
+        // block further down.  Label is derived per matched NodeId (upper 32
+        // bits of node_id.0 encode the label_id) rather than from the AST.
+        // This correctly handles:
+        //   • Anonymous matches (`MATCH (n) SET n.embedding = $emb`) where
+        //     the AST carries no label — the label is resolved from the node.
+        //   • Multi-pattern queries: each matched node's label is used, not
+        //     the first MATCH pattern's label (multi-pattern is currently
+        //     rejected by the engine guard, but this code is future-proof).
+        let cat = self.catalog_snapshot();
+        let label_id_to_name: std::collections::HashMap<u16, String> =
+            cat.list_labels().unwrap_or_default().into_iter().collect();
+        let node_label = |node_id: &NodeId| -> &str {
+            let lid = (node_id.0 >> 32) as u16;
+            label_id_to_name.get(&lid).map(String::as_str).unwrap_or("")
+        };
+
         let mut has_detach_delete = false;
         for mutation in &mm.mutations {
             match mutation {
                 sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
                     // A vector `$param` bound to an indexed property has no
                     // property-column representation — it is written to the
-                    // HNSW index by the dedicated block below instead. Skip
-                    // the column write for this one mutation.
-                    if self.set_value_is_indexed_vector_param(value, prop, params) {
-                        continue;
-                    }
-                    let sv = expr_to_value_with_params(value, params)?;
+                    // HNSW index by the dedicated block below instead.
+                    // Routed per matched node's own label so a #451
+                    // quarantine-blocked `(label, prop)` fails loudly right
+                    // here, before any property write for it is attempted,
+                    // and a live-indexed pair is skipped correctly even when
+                    // other matched nodes carry a different label that
+                    // happens to share the property name.
+                    let mut to_write: Vec<NodeId> = Vec::with_capacity(matching_ids.len());
                     for node_id in &matching_ids {
-                        tx.set_property(*node_id, prop, sv.clone())?;
+                        if self.resolve_vector_write_route(
+                            value,
+                            node_label(node_id),
+                            prop,
+                            params,
+                        )? {
+                            continue;
+                        }
+                        to_write.push(*node_id);
+                    }
+                    if !to_write.is_empty() {
+                        let sv = expr_to_value_with_params(value, params)?;
+                        for node_id in &to_write {
+                            tx.set_property(*node_id, prop, sv.clone())?;
+                        }
                     }
                 }
                 sparrowdb_cypher::ast::Mutation::Delete { detach: true, .. } => {
@@ -1704,22 +1797,9 @@ impl GraphDb {
         // block, `MATCH (n:L {id: $id}) SET n.embedding = $emb` would silently
         // store the property but leave the HNSW file untouched — silent data
         // loss surfaced by KMSmcp channel message #202.
-        //
-        // Label is derived per matched NodeId (upper 32 bits of node_id.0
-        // encode the label_id) rather than from the AST.  This correctly
-        // handles:
-        //   • Anonymous matches (`MATCH (n) SET n.embedding = $emb`) where
-        //     the AST carries no label — the label is resolved from the node.
-        //   • Multi-pattern queries: each matched node's label is used, not
-        //     the first MATCH pattern's label (multi-pattern is currently
-        //     rejected by the engine guard, but this code is future-proof).
         {
             use sparrowdb_cypher::ast::{Expr, Literal};
             let vidx_dir = self.inner.path.join("vector_indexes");
-            // Build a label_id → name map from the catalog once.
-            let cat = self.catalog_snapshot();
-            let label_id_to_name: std::collections::HashMap<u16, String> =
-                cat.list_labels().unwrap_or_default().into_iter().collect();
             let vidx_guard = self.inner.vector_indexes.read().expect("vector_indexes");
             for mutation in &mm.mutations {
                 if let sparrowdb_cypher::ast::Mutation::Set {
@@ -1905,6 +1985,18 @@ impl GraphDb {
         // the HNSW index is serialised once per (label, prop), not once per row.
         let mut pending_vectors: std::collections::HashMap<String, (Vec<f32>, Vec<u64>)> =
             std::collections::HashMap::new();
+        // Resolved once, up front: needed both by the per-row vector-write
+        // routing below and by the accumulated-write block after the row
+        // loop. Label is derived per matched NodeId (upper 32 bits of
+        // node_id.0 encode the label_id) rather than from the AST, so
+        // anonymous and multi-label UNWIND patterns resolve correctly.
+        let cat = self.catalog_snapshot();
+        let label_id_to_name: std::collections::HashMap<u16, String> =
+            cat.list_labels().unwrap_or_default().into_iter().collect();
+        let node_label = |node_id: &NodeId| -> &str {
+            let lid = (node_id.0 >> 32) as u16;
+            label_id_to_name.get(&lid).map(String::as_str).unwrap_or("")
+        };
 
         for element in list {
             // Honour caller's deadline between iterations (fixes #310).
@@ -1950,12 +2042,29 @@ impl GraphDb {
                         // vector `$param` bound to an indexed property is
                         // handled entirely by the accumulation block below
                         // and must not go through the column-value resolver.
-                        let is_indexed_vector = params
-                            .map(|p| self.set_value_is_indexed_vector_param(value, prop, p))
-                            .unwrap_or(false);
-                        if !is_indexed_vector {
-                            let sv = resolve_set_value(value, &umm.alias, row, params)?;
+                        // Routed per matched node's own label — see
+                        // `resolve_vector_write_route` — so a #451
+                        // quarantine-blocked `(label, prop)` fails loudly
+                        // right here rather than silently rewriting nothing.
+                        let mut to_write: Vec<NodeId> = Vec::with_capacity(matching_ids.len());
+                        if let Some(p) = params {
                             for node_id in &matching_ids {
+                                if self.resolve_vector_write_route(
+                                    value,
+                                    node_label(node_id),
+                                    prop,
+                                    p,
+                                )? {
+                                    continue;
+                                }
+                                to_write.push(*node_id);
+                            }
+                        } else {
+                            to_write.extend(matching_ids.iter().copied());
+                        }
+                        if !to_write.is_empty() {
+                            let sv = resolve_set_value(value, &umm.alias, row, params)?;
+                            for node_id in &to_write {
                                 tx.set_property(*node_id, prop, sv.clone())?;
                             }
                         }
@@ -2031,9 +2140,6 @@ impl GraphDb {
         // patterns resolve correctly.
         if !pending_vectors.is_empty() {
             let vidx_dir = self.inner.path.join("vector_indexes");
-            let cat = self.catalog_snapshot();
-            let label_id_to_name: std::collections::HashMap<u16, String> =
-                cat.list_labels().unwrap_or_default().into_iter().collect();
             let vidx_guard = self.inner.vector_indexes.read().expect("vector_indexes");
             for (prop, (vec, raw_ids)) in &pending_vectors {
                 // A node accumulates once per matching row and again per
@@ -2594,6 +2700,18 @@ impl GraphDb {
         };
 
         let key = (label.to_string(), prop.to_string());
+        // #451: registering (or confirming) an index for this pair is exactly
+        // the remediation step the write-guard error tells a caller to take,
+        // so clear it here regardless of which branch below returns —
+        // already-live, lost-update, or freshly created all mean a live
+        // index now exists (or will, on the next `open`) for `(label,
+        // prop)`, and a cleared entry is what makes `vectorIndexHealth`'s
+        // `quarantined_no_live_index` state go clean without a restart.
+        self.inner
+            .quarantined_vector_writes
+            .write()
+            .expect("quarantined_vector_writes poisoned")
+            .remove(&key);
         {
             let guard = self
                 .inner
