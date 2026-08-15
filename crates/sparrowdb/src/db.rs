@@ -554,17 +554,7 @@ impl GraphDb {
         }
 
         if Engine::is_mutation(&bound.inner) {
-            match bound.inner {
-                Statement::Merge(ref m) => self.execute_merge(m),
-                Statement::MatchMergeRel(ref mm) => self.execute_match_merge_rel(mm),
-                Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
-                Statement::UnwindMatchMutate(ref umm) => self.execute_unwind_match_mutate(umm),
-                Statement::MatchCreate(ref mc) => self.execute_match_create(mc, None),
-                // Standalone CREATE with edges — must go through WriteTx so
-                // create_edge can register the rel type and write the WAL.
-                Statement::Create(ref c) => self.execute_create_standalone(c, None),
-                _ => unreachable!(),
-            }
+            self.dispatch_mutation(bound.inner, None, None)
         } else {
             let _span = info_span!("sparrowdb.query").entered();
 
@@ -641,15 +631,7 @@ impl GraphDb {
         if Engine::is_mutation(&bound.inner) {
             // Mutations don't use the read pipeline — fall through to the
             // standard mutation paths (write transactions are unaffected).
-            match bound.inner {
-                Statement::Merge(ref m) => self.execute_merge(m),
-                Statement::MatchMergeRel(ref mm) => self.execute_match_merge_rel(mm),
-                Statement::MatchMutate(ref mm) => self.execute_match_mutate(mm),
-                Statement::UnwindMatchMutate(ref umm) => self.execute_unwind_match_mutate(umm),
-                Statement::MatchCreate(ref mc) => self.execute_match_create(mc, None),
-                Statement::Create(ref c) => self.execute_create_standalone(c, None),
-                _ => unreachable!(),
-            }
+            self.dispatch_mutation(bound.inner, None, None)
         } else {
             let _span = info_span!("sparrowdb.query_chunked").entered();
 
@@ -756,18 +738,7 @@ impl GraphDb {
             // Thread the deadline into mutation code paths so that
             // MATCH…SET / MATCH…DELETE / MATCH…CREATE honour the caller's
             // timeout instead of running unbounded (fixes #310).
-            return match bound.inner {
-                Statement::Merge(ref m) => self.execute_merge(m),
-                Statement::MatchMutate(ref mm) => self.execute_match_mutate_deadline(mm, deadline),
-                Statement::UnwindMatchMutate(ref umm) => {
-                    self.execute_unwind_match_mutate_deadline(umm, deadline)
-                }
-                Statement::MatchCreate(ref mc) => {
-                    self.execute_match_create_deadline(mc, deadline, None)
-                }
-                Statement::Create(ref c) => self.execute_create_standalone(c, None),
-                _ => unreachable!(),
-            };
+            return self.dispatch_mutation(bound.inner, Some(deadline), None);
         }
 
         let _span = info_span!("sparrowdb.query_with_timeout").entered();
@@ -1261,26 +1232,11 @@ impl GraphDb {
         }
         if Engine::is_mutation(&bound.inner) {
             // Route mutations through params-aware helpers (SPA-218).
-            use sparrowdb_cypher::ast::Statement as Stmt;
-            return match bound.inner {
-                Stmt::Merge(ref m) => self.execute_merge_with_params(m, &params),
-                Stmt::MatchMutate(ref mm) => self.execute_match_mutate_with_params(mm, &params),
-                Stmt::UnwindMatchMutate(ref umm) => {
-                    self.execute_unwind_match_mutate_with_params(umm, &params)
-                }
-                // SPA-480 (S0): standalone CREATE and MATCH...CREATE now resolve
-                // $param property values via resolve_create_prop_value, closing
-                // the last Cypher-injection gap — a CREATE built from untrusted
-                // text no longer requires string interpolation.
-                Stmt::Create(ref c) => self.execute_create_standalone(c, Some(&params)),
-                Stmt::MatchCreate(ref mc) => self.execute_match_create(mc, Some(&params)),
-                _ => Err(Error::InvalidArgument(
-                    "execute_with_params: parameterized MATCH...MERGE relationship and CALL \
-                     subquery mutations are not yet supported; use MERGE, MATCH...SET, or \
-                     CREATE with $params"
-                        .into(),
-                )),
-            };
+            // SPA-480 (S0): standalone CREATE and MATCH...CREATE now resolve
+            // $param property values via resolve_create_prop_value, closing
+            // the last Cypher-injection gap — a CREATE built from untrusted
+            // text no longer requires string interpolation.
+            return self.dispatch_mutation(bound.inner, None, Some(&params));
         }
 
         let _span = info_span!("sparrowdb.query_with_params").entered();
@@ -1302,6 +1258,116 @@ impl GraphDb {
 
         tracing::debug!(rows = result.rows.len(), "query_with_params complete");
         Ok(result)
+    }
+
+    /// Route a statement already classified `Statement::is_mutation() == true`
+    /// to its transactional executor.
+    ///
+    /// This is the single dispatch point shared by [`Self::execute`],
+    /// [`Self::execute_chunked`], [`Self::execute_with_timeout`], and
+    /// [`Self::execute_with_params`] — each used to carry its own hand-written
+    /// copy of this match, and the copies had already drifted independently:
+    /// `execute_with_timeout`'s copy was missing the `MatchMergeRel` arm
+    /// entirely (a panic via the `_ => unreachable!()` fallthrough on any
+    /// `MATCH … MERGE (a)-[r:TYPE]->(b)` query run through it), and only
+    /// `execute_with_params`'s copy had already been hardened against a bare
+    /// `CALL { <mutation> }` (`Statement::CallSubquery`) with a real error
+    /// instead of `unreachable!()`. Both gaps are the same defect class as
+    /// issue #502 (a bare `CALL { CREATE (...) }` panicking at the old
+    /// `_ => unreachable!()` in `execute`/`execute_chunked`): `is_mutation()`
+    /// classifies a statement shape as a mutation, but nothing enforces that
+    /// every dispatch site that gates on it was updated to handle that shape.
+    /// `deadline` is `Some` only from `execute_with_timeout`; `params` is
+    /// `Some` only from `execute_with_params` — no caller currently supplies
+    /// both, and no combination here is invented that a caller didn't already
+    /// have before this refactor.
+    ///
+    /// The non-mutation arm below is intentionally exhaustive (no `_`
+    /// wildcard): every `Statement` variant that
+    /// [`sparrowdb_cypher::ast::Statement::is_mutation`] classifies as
+    /// non-mutating is listed by name. Adding a new `Statement` variant to
+    /// the AST is therefore a compile error in *both* that match and this one
+    /// until it is deliberately classified in both places — the two silently
+    /// drifting apart is exactly how #478 (`Union`) and #502 (`CallSubquery`)
+    /// happened.
+    fn dispatch_mutation(
+        &self,
+        stmt: sparrowdb_cypher::ast::Statement,
+        deadline: Option<std::time::Instant>,
+        params: Option<&HashMap<String, sparrowdb_execution::Value>>,
+    ) -> Result<QueryResult> {
+        use sparrowdb_cypher::ast::Statement;
+
+        match stmt {
+            Statement::Merge(ref m) => match params {
+                Some(p) => self.execute_merge_with_params(m, p),
+                None => self.execute_merge(m),
+            },
+            Statement::MatchMergeRel(ref mm) => match params {
+                Some(_) => Err(Error::InvalidArgument(
+                    "execute_with_params: parameterized MATCH...MERGE relationship \
+                     mutations are not yet supported; use MERGE, MATCH...SET, or \
+                     CREATE with $params"
+                        .into(),
+                )),
+                None => self.execute_match_merge_rel(mm),
+            },
+            Statement::MatchMutate(ref mm) => match (deadline, params) {
+                (Some(d), _) => self.execute_match_mutate_deadline(mm, d),
+                (None, Some(p)) => self.execute_match_mutate_with_params(mm, p),
+                (None, None) => self.execute_match_mutate(mm),
+            },
+            Statement::UnwindMatchMutate(ref umm) => match (deadline, params) {
+                (Some(d), _) => self.execute_unwind_match_mutate_deadline(umm, d),
+                (None, Some(p)) => self.execute_unwind_match_mutate_with_params(umm, p),
+                (None, None) => self.execute_unwind_match_mutate(umm),
+            },
+            Statement::MatchCreate(ref mc) => match deadline {
+                Some(d) => self.execute_match_create_deadline(mc, d, None),
+                None => self.execute_match_create(mc, params),
+            },
+            // Standalone CREATE with edges — must go through WriteTx so
+            // create_edge can register the rel type and write the WAL.
+            // No deadline-aware variant exists; a timeout-bounded caller gets
+            // the same (unbounded) behaviour it always has.
+            Statement::Create(ref c) => self.execute_create_standalone(c, params),
+            // CALL { } wrapping a mutation (`CALL { CREATE ... }`,
+            // `CALL { MERGE ... }`, etc.): no transactional executor exists
+            // yet for an arbitrary subquery body. Reject with the same
+            // explanation the read-path subquery guard already gives a
+            // mutating `CALL { }` body embedded in a pipeline stage (see
+            // `execute_read_stmt_with_bindings` in
+            // `sparrowdb-execution/src/engine/subquery.rs`) — issue #502 was
+            // this same shape reaching the old `_ => unreachable!()` instead.
+            Statement::CallSubquery { ref subquery, .. } => Err(Error::InvalidArgument(format!(
+                "CALL {{ }}: mutating statement kind not supported inside CALL {{ }}: {:?}",
+                std::mem::discriminant(subquery.as_ref())
+            ))),
+            // Every remaining variant is classified `is_mutation() == false`
+            // and must never reach this function — every caller gates on
+            // `Engine::is_mutation` before calling `dispatch_mutation`. If
+            // this branch is ever hit, `Statement::is_mutation` and this
+            // match have drifted out of sync with each other.
+            other @ (Statement::Match(_)
+            | Statement::MatchWith(_)
+            | Statement::Unwind(_)
+            | Statement::OptionalMatch(_)
+            | Statement::MatchOptionalMatch(_)
+            | Statement::Union(_)
+            | Statement::Checkpoint
+            | Statement::Optimize
+            | Statement::Call(_)
+            | Statement::Pipeline(_)
+            | Statement::CreateIndex { .. }
+            | Statement::CreateConstraint { .. }
+            | Statement::CreateFulltextIndex { .. }
+            | Statement::CreateVectorIndex { .. }
+            | Statement::DropIndex { .. }) => unreachable!(
+                "dispatch_mutation called with a non-mutating statement {:?} — \
+                 Statement::is_mutation() and dispatch_mutation() have drifted out of sync",
+                std::mem::discriminant(&other)
+            ),
+        }
     }
 
     /// Internal: execute a MERGE statement by opening a write transaction.
@@ -3052,7 +3118,20 @@ impl GraphDb {
                 Ok(QueryResult::empty(vec![]))
             }
 
-            _ => Err(Error::Unimplemented),
+            // CALL { } wrapping a mutation inside a batched statement: same
+            // restriction, and same message, as the non-batch path in
+            // `dispatch_mutation` (issue #502).
+            Statement::CallSubquery { ref subquery, .. } => Err(Error::InvalidArgument(format!(
+                "CALL {{ }}: mutating statement kind not supported inside CALL {{ }}: {:?}",
+                std::mem::discriminant(subquery.as_ref())
+            ))),
+            // Every remaining variant is non-mutating and must never reach
+            // this function — `execute_batch` only calls it when
+            // `Engine::is_mutation` is true for the statement.
+            other => Err(Error::InvalidArgument(format!(
+                "execute_batch_mutation called with a non-mutating statement kind: {:?}",
+                std::mem::discriminant(&other)
+            ))),
         }
     }
 
