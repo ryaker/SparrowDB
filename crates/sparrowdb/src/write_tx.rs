@@ -456,45 +456,72 @@ impl WriteTx {
     ///
     /// [`commit`]: WriteTx::commit
     pub fn delete_node(&mut self, node_id: NodeId) -> crate::Result<()> {
-        // SPA-185: check ALL per-type delta logs for attached edges, not just
-        // the hardcoded RelTableId(0).  Always include table-0 so that any
-        // edges written before the catalog had entries are still detected.
-        let rel_entries = self.catalog.list_rel_table_ids();
-        let mut rel_ids_to_check: Vec<u32> =
-            rel_entries.iter().map(|(id, _, _, _)| *id as u32).collect();
-        // Always include the legacy table-0 slot.  If it is already in the
-        // catalog list this dedup prevents a double-read.
-        if !rel_ids_to_check.contains(&0u32) {
-            rel_ids_to_check.push(0u32);
-        }
-        for rel_id in rel_ids_to_check {
-            let store = EdgeStore::open(&self.inner.path, RelTableId(rel_id));
+        // SPA-185 / #436: check ALL per-type delta logs and CSR files for
+        // attached edges, not just the hardcoded RelTableId(0).
+        //
+        // CSR files are indexed by label-relative *slot*, not by the packed
+        // `NodeId` (which has the label folded into the upper 32 bits, see
+        // `NodeId` encoding). Indexing with the full `node_id.0` overflows
+        // `CsrForward::n_nodes`/`CsrBackward::n_nodes` for almost any label
+        // other than label 0, so `neighbors`/`predecessors` silently returned
+        // `&[]` and this check never fired for checkpointed edges — a node
+        // with a checkpointed edge could be deleted, leaving that edge
+        // dangling (#436). Strip the label bits before indexing.
+        //
+        // Each rel table's CSR is only meaningful for node_id when its label
+        // actually matches that table's declared src label (forward) or dst
+        // label (backward); a table for an unrelated label pair may have a
+        // numerically coincidental slot that is not actually node_id at all.
+        let node_slot = node_id.0 & 0xFFFF_FFFF;
+        let node_label_id = (node_id.0 >> 32) as u16;
 
-            // Check delta log (un-checkpointed edges).
-            if let Ok(ref s) = store {
+        let rel_entries = self.catalog.list_rel_table_ids();
+        for (rel_table_id, src_label_id, dst_label_id, _rel_type) in &rel_entries {
+            let store = EdgeStore::open(&self.inner.path, RelTableId(*rel_table_id as u32));
+            let Ok(ref s) = store else { continue };
+
+            // Check delta log (un-checkpointed edges). Delta records store
+            // full NodeIds, so a direct `==` comparison is unambiguous
+            // regardless of which table it came from.
+            let delta = s.read_delta().unwrap_or_default();
+            if delta.iter().any(|r| r.src == node_id || r.dst == node_id) {
+                return Err(sparrowdb_common::Error::NodeHasEdges { node_id: node_id.0 });
+            }
+
+            // SPA-304: Check CSR forward file — node_id can only be a
+            // *source* in this table if its label matches the table's src
+            // label.
+            if node_label_id == *src_label_id {
+                if let Ok(csr) = s.open_fwd() {
+                    if !csr.neighbors(node_slot).is_empty() {
+                        return Err(sparrowdb_common::Error::NodeHasEdges { node_id: node_id.0 });
+                    }
+                }
+            }
+
+            // SPA-304: Check CSR backward file — node_id can only be a
+            // *destination* in this table if its label matches the table's
+            // dst label.
+            if node_label_id == *dst_label_id {
+                if let Ok(csr) = s.open_bwd() {
+                    if !csr.predecessors(node_slot).is_empty() {
+                        return Err(sparrowdb_common::Error::NodeHasEdges { node_id: node_id.0 });
+                    }
+                }
+            }
+        }
+
+        // Legacy fallback: always also check RelTableId(0)'s delta log, in
+        // case it holds edges written before the catalog had any rel-table
+        // entries (and so is absent from `rel_entries` above). There is no
+        // label information for this ad-hoc table, so only the (unambiguous,
+        // full-NodeId) delta check applies here; skip it if 0 was already
+        // covered above to avoid a redundant read.
+        if !rel_entries.iter().any(|(id, ..)| *id == 0) {
+            if let Ok(s) = EdgeStore::open(&self.inner.path, RelTableId(0)) {
                 let delta = s.read_delta().unwrap_or_default();
                 if delta.iter().any(|r| r.src == node_id || r.dst == node_id) {
                     return Err(sparrowdb_common::Error::NodeHasEdges { node_id: node_id.0 });
-                }
-            }
-
-            // SPA-304: Check CSR forward file — the node may be a *source* of
-            // checkpointed edges that are no longer in the delta log.
-            if let Ok(ref s) = store {
-                if let Ok(csr) = s.open_fwd() {
-                    if !csr.neighbors(node_id.0).is_empty() {
-                        return Err(sparrowdb_common::Error::NodeHasEdges { node_id: node_id.0 });
-                    }
-                }
-            }
-
-            // SPA-304: Check CSR backward file — the node may be a *destination*
-            // of checkpointed edges.
-            if let Ok(ref s) = store {
-                if let Ok(csr) = s.open_bwd() {
-                    if !csr.predecessors(node_id.0).is_empty() {
-                        return Err(sparrowdb_common::Error::NodeHasEdges { node_id: node_id.0 });
-                    }
                 }
             }
         }
@@ -544,6 +571,7 @@ impl WriteTx {
         // Strip the label bits before calling neighbors/predecessors, and
         // reconstruct full NodeIds with the correct label bits on return.
         let node_slot = node_id.0 & 0xFFFF_FFFF;
+        let node_label_id = (node_id.0 >> 32) as u16;
 
         for (rel_table_id, src_label_id, dst_label_id, rel_type) in &rel_entries {
             let rel_id = *rel_table_id as u32;
@@ -551,7 +579,8 @@ impl WriteTx {
             let Ok(ref s) = store else { continue };
 
             // Collect incident edges from the delta log (un-checkpointed).
-            // Delta records store full NodeIds, so compare directly.
+            // Delta records store full NodeIds, so compare directly — this is
+            // unambiguous regardless of which table it came from.
             if let Ok(delta) = s.read_delta() {
                 for rec in &delta {
                     if rec.src == node_id || rec.dst == node_id {
@@ -561,22 +590,34 @@ impl WriteTx {
             }
 
             // Collect outgoing edges from the checkpointed CSR forward file.
-            // CSR is indexed by slot and returns destination slots.
-            // Reconstruct full NodeIds by combining the dst_label_id with the slot.
-            if let Ok(csr) = s.open_fwd() {
-                for &dst_slot in csr.neighbors(node_slot) {
-                    let dst_id = NodeId((*dst_label_id as u64) << 32 | dst_slot);
-                    edges_to_delete.push((node_id, dst_id, rel_type.clone()));
+            // CSR is indexed by slot and returns destination slots. This
+            // table's forward CSR is only meaningful for node_id if node_id's
+            // own label matches the table's declared src label — otherwise
+            // `node_slot` is being used to index a completely unrelated
+            // node's adjacency list, which can spuriously "find" a neighbor
+            // that has nothing to do with node_id (#436: this produced
+            // phantom edges — including a self-loop on node_id when the
+            // node's slot coincided with an unrelated table's dst slot — and
+            // then failed to resolve in the catalog when deleted).
+            if node_label_id == *src_label_id {
+                if let Ok(csr) = s.open_fwd() {
+                    for &dst_slot in csr.neighbors(node_slot) {
+                        let dst_id = NodeId((*dst_label_id as u64) << 32 | dst_slot);
+                        edges_to_delete.push((node_id, dst_id, rel_type.clone()));
+                    }
                 }
             }
 
             // Collect incoming edges from the checkpointed CSR backward file.
-            // CSR is indexed by slot and returns source slots.
-            // Reconstruct full NodeIds by combining the src_label_id with the slot.
-            if let Ok(csr) = s.open_bwd() {
-                for &src_slot in csr.predecessors(node_slot) {
-                    let src_id = NodeId((*src_label_id as u64) << 32 | src_slot);
-                    edges_to_delete.push((src_id, node_id, rel_type.clone()));
+            // CSR is indexed by slot and returns source slots. Symmetric to
+            // the forward case: only meaningful if node_id's label matches
+            // this table's declared dst label.
+            if node_label_id == *dst_label_id {
+                if let Ok(csr) = s.open_bwd() {
+                    for &src_slot in csr.predecessors(node_slot) {
+                        let src_id = NodeId((*src_label_id as u64) << 32 | src_slot);
+                        edges_to_delete.push((src_id, node_id, rel_type.clone()));
+                    }
                 }
             }
         }
