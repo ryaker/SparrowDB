@@ -1084,23 +1084,12 @@ impl Engine {
         }
     }
 
+    /// Delegates to [`Statement::is_mutation`], the single source of truth
+    /// for this classification (see its doc comment — issue #478 was a
+    /// `Statement::Union` variant missing from a match that used to live
+    /// here directly).
     pub fn is_mutation(stmt: &Statement) -> bool {
-        match stmt {
-            Statement::Merge(_)
-            | Statement::MatchMergeRel(_)
-            | Statement::MatchMutate(_)
-            | Statement::UnwindMatchMutate(_)
-            | Statement::MatchCreate(_) => true,
-            // All standalone CREATE statements must go through the
-            // write-transaction path to ensure WAL durability and correct
-            // single-writer semantics, regardless of whether edges are present.
-            Statement::Create(_) => true,
-            // Recursively check CALL { } subqueries so that a mutation inside
-            // the braces is routed through the write-transaction path rather than
-            // being silently dispatched via the read path and failing late.
-            Statement::CallSubquery { subquery, .. } => Self::is_mutation(subquery),
-            _ => false,
-        }
+        stmt.is_mutation()
     }
 }
 

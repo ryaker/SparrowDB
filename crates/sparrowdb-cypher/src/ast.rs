@@ -594,3 +594,39 @@ pub enum Statement {
         name: String,
     },
 }
+
+impl Statement {
+    /// Returns `true` if executing this statement can durably mutate graph
+    /// state, and therefore must be routed through the transactional
+    /// `WriteTx` path rather than the read-only engine dispatch.
+    ///
+    /// This is the single source of truth for that classification — do not
+    /// duplicate this match elsewhere. A statement shape that can reach a
+    /// mutation but is missing here is a silent-data-loss bug: the caller
+    /// takes the read-only path, executes a `CREATE`/`MERGE`/`SET`/`DELETE`
+    /// against a non-transactional `NodeStore`, and reports success while
+    /// nothing durable happens (issue #478).
+    ///
+    /// `Union` is deliberately *not* listed as a mutation here: Cypher does
+    /// not define `UNION` over mutating branches, so the binder rejects a
+    /// `UNION` with a mutating side at bind time (see `bind()` in
+    /// `binder.rs`) rather than trying to route it through the write path.
+    pub fn is_mutation(&self) -> bool {
+        match self {
+            Statement::Merge(_)
+            | Statement::MatchMergeRel(_)
+            | Statement::MatchMutate(_)
+            | Statement::UnwindMatchMutate(_)
+            | Statement::MatchCreate(_) => true,
+            // All standalone CREATE statements must go through the
+            // write-transaction path to ensure WAL durability and correct
+            // single-writer semantics, regardless of whether edges are present.
+            Statement::Create(_) => true,
+            // Recursively check CALL { } subqueries so that a mutation inside
+            // the braces is routed through the write-transaction path rather than
+            // being silently dispatched via the read path and failing late.
+            Statement::CallSubquery { subquery, .. } => subquery.is_mutation(),
+            _ => false,
+        }
+    }
+}
