@@ -350,8 +350,8 @@ impl Engine {
 
         // Check if this is a relationship hop pattern.
         if !pat.rels.is_empty() {
-            // Relationship traversal in a pipeline MATCH stage.
-            // Currently supports single-hop: (src)-[:REL]->(dst)
+            // Relationship traversal in a pipeline MATCH stage. Handles any
+            // number of fixed hops, e.g. (src)-[:REL]->(mid)-[:REL]->(dst) (#430).
             return self.execute_pipeline_match_hop(pat, where_clause, binding);
         }
 
@@ -405,30 +405,33 @@ impl Engine {
         Ok(result)
     }
 
-    /// Execute a single-hop relationship traversal in a pipeline MATCH stage.
+    /// Execute a relationship-chain traversal in a pipeline MATCH stage.
     ///
-    /// Handles `(src:Label {props})-[:REL]->(dst:Label {props})` where `src` or `dst`
-    /// variable names may already be bound in `binding`.
+    /// Handles `(src:Label {props})-[:REL]->(mid:Label {props})-[:REL]->(dst:Label {props})…`
+    /// — any number of fixed hops — where the leading variable may already be
+    /// bound in `binding` from a preceding `WITH`.
+    ///
+    /// #430: this used to read only `pat.rels[0]` / `pat.nodes[0..2]` and
+    /// silently drop every hop after the first, so `WITH a MATCH
+    /// (a)-[:R]->(b)-[:S]->(c)` answered the one-hop pattern `(a)-[:R]->(b)`
+    /// instead: `c` was never bound (it projected as NULL), and a pattern
+    /// whose second hop didn't exist at all still returned a row. This walks
+    /// every hop in `pat.rels` in turn, threading the accumulated binding map
+    /// forward the same way `execute_n_hop` does for the leading MATCH.
     pub(crate) fn execute_pipeline_match_hop(
         &self,
         pat: &sparrowdb_cypher::ast::PathPattern,
         where_clause: Option<&Expr>,
         binding: &HashMap<String, Value>,
     ) -> Result<Vec<HashMap<String, Value>>> {
-        if pat.nodes.len() < 2 || pat.rels.is_empty() {
+        if pat.nodes.len() < 2 || pat.rels.is_empty() || pat.nodes.len() != pat.rels.len() + 1 {
             return Ok(vec![]);
         }
 
-        // #421: this executor takes a single step along `rels[0]` and ignores
-        // any quantifier on it.  A variable-length relationship inside a
-        // pipeline MATCH stage (`WITH … MATCH (a)-[:R*1..2]->(b) …`) would
-        // therefore be answered with depth-1 matches only — the same silent
-        // truncation #421 fixed in the top-level MATCH path.  Reject instead:
-        // an error the caller can see beats data they cannot check.
-        //
-        // It also drops `rels[1..]` of any multi-hop pattern, which is the same
-        // failure without a quantifier; that is tracked separately as #430 and
-        // deliberately left alone here.
+        // #421: reject variable-length quantifiers anywhere in the chain — a
+        // pipeline MATCH stage takes one fixed step per hop and would
+        // otherwise silently truncate `*min..max` to depth 1, the same
+        // failure #421 fixed in the top-level MATCH path.
         if pat
             .rels
             .iter()
@@ -442,30 +445,16 @@ impl Engine {
             ));
         }
 
-        let src_pat = &pat.nodes[0];
-        let dst_pat = &pat.nodes[1];
-        let rel_pat = &pat.rels[0];
-
-        let dst_label = dst_pat.labels.first().cloned().unwrap_or_default();
-
-        let dst_label_id = match self.snapshot.catalog.get_label(&dst_label)? {
-            Some(id) => id as u32,
-            None => return Ok(vec![]),
-        };
-
-        let dst_col_ids: Vec<u32> = self
-            .snapshot
-            .store
-            .col_ids_for_label(dst_label_id)
-            .unwrap_or_default();
         let params = self.dollar_params();
 
-        // Find candidate src nodes.
+        // ── Hop 0: resolve the source node(s) ───────────────────────────────
+        //
         // Check binding BEFORE resolving the src label: when the src variable is
         // already bound as a NodeRef (from a preceding WITH stage), we derive the
         // src_label_id directly from the NodeId encoding and skip the label scan
         // entirely.  This is the critical fix for issue #355: `WITH a MATCH (a)-…`
         // where `a` has no label annotation on the second MATCH pattern.
+        let src_pat = &pat.nodes[0];
         let bound_src_nid: Option<NodeId> = binding
             .get(&src_pat.var)
             .or_else(|| binding.get(&format!("{}.__node_id__", src_pat.var)))
@@ -508,7 +497,6 @@ impl Engine {
             .col_ids_for_label(src_label_id)
             .unwrap_or_default();
 
-        // Find candidate src nodes.
         let src_candidates: Vec<NodeId> = if let Some(nid) = bound_src_nid {
             vec![nid]
         } else {
@@ -533,48 +521,88 @@ impl Engine {
             cands
         };
 
-        let rel_table_id = self.resolve_rel_table_id(src_label_id, dst_label_id, &rel_pat.rel_type);
-
-        let mut result: Vec<HashMap<String, Value>> = Vec::new();
+        // Frontier: one entry per partial match so far — the current node's
+        // label (needed to resolve the next hop's rel table), its NodeId, and
+        // the row_vals accumulated for every variable bound up to this point.
+        let mut frontier: Vec<(u32, NodeId, HashMap<String, Value>)> =
+            Vec::with_capacity(src_candidates.len());
         for src_id in src_candidates {
-            let src_slot = src_id.0 & 0xFFFF_FFFF;
-            let dst_slots: Vec<u64> = match &rel_table_id {
-                RelTableLookup::Found(rtid) => self.csr_neighbors(*rtid, src_slot),
-                RelTableLookup::NotFound => continue,
-                // Untyped edge: restrict to tables that run from this node's
-                // label to `dst_label_id`, which is the label the destination
-                // NodeId is built from a few lines below.
-                RelTableLookup::All => self.csr_neighbor_slots_to_label(
-                    src_slot,
-                    src_label_id,
-                    Some(dst_label_id),
-                    &[],
-                ),
-            };
-            // Also check the delta.  Slots are label-relative, so an edge that
-            // lands on a different label must not be read as `dst_label_id`.
-            let delta_slots: Vec<u64> = self
-                .read_delta_all()
-                .into_iter()
-                .filter(|r| {
-                    let r_src_label = (r.src.0 >> 32) as u32;
-                    let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                    let r_dst_label = (r.dst.0 >> 32) as u32;
-                    r_src_label == src_label_id
-                        && r_src_slot == src_slot
-                        && r_dst_label == dst_label_id
-                })
-                .map(|r| r.dst.0 & 0xFFFF_FFFF)
-                .collect();
-            let all_slots: std::collections::HashSet<u64> =
-                dst_slots.into_iter().chain(delta_slots).collect();
+            let src_props = self
+                .snapshot
+                .store
+                .get_node_raw(src_id, &src_col_ids)
+                .unwrap_or_default();
+            let mut row_vals =
+                build_row_vals(&src_props, &src_pat.var, &src_col_ids, &self.snapshot.store);
+            row_vals.insert(src_pat.var.clone(), Value::NodeRef(src_id));
+            row_vals.insert(
+                format!("{}.__node_id__", src_pat.var),
+                Value::NodeRef(src_id),
+            );
+            frontier.push((src_label_id, src_id, row_vals));
+        }
 
-            for dst_slot in all_slots {
-                let dst_id = NodeId(((dst_label_id as u64) << 32) | dst_slot);
-                if self.is_node_tombstoned(dst_id) {
-                    continue;
-                }
-                if let Ok(dst_props) = self.snapshot.store.get_node_raw(dst_id, &dst_col_ids) {
+        // ── Walk every hop, threading the accumulated binding map forward ───
+        for (hop_idx, rel_pat) in pat.rels.iter().enumerate() {
+            let dst_pat = &pat.nodes[hop_idx + 1];
+            let dst_label = dst_pat.labels.first().cloned().unwrap_or_default();
+            let dst_label_id = match self.snapshot.catalog.get_label(&dst_label)? {
+                Some(id) => id as u32,
+                None => return Ok(vec![]),
+            };
+            let dst_col_ids: Vec<u32> = self
+                .snapshot
+                .store
+                .col_ids_for_label(dst_label_id)
+                .unwrap_or_default();
+
+            let mut next_frontier: Vec<(u32, NodeId, HashMap<String, Value>)> = Vec::new();
+
+            for (cur_label_id, cur_id, row_vals) in frontier {
+                let rel_table_id =
+                    self.resolve_rel_table_id(cur_label_id, dst_label_id, &rel_pat.rel_type);
+                let cur_slot = cur_id.0 & 0xFFFF_FFFF;
+                let dst_slots: Vec<u64> = match &rel_table_id {
+                    RelTableLookup::Found(rtid) => self.csr_neighbors(*rtid, cur_slot),
+                    RelTableLookup::NotFound => continue,
+                    // Untyped edge: restrict to tables that run from this
+                    // node's label to `dst_label_id`, the label the
+                    // destination NodeId is built from a few lines below.
+                    RelTableLookup::All => self.csr_neighbor_slots_to_label(
+                        cur_slot,
+                        cur_label_id,
+                        Some(dst_label_id),
+                        &[],
+                    ),
+                };
+                // Also check the delta.  Slots are label-relative, so an edge
+                // that lands on a different label must not be read as
+                // `dst_label_id`.
+                let delta_slots: Vec<u64> = self
+                    .read_delta_all()
+                    .into_iter()
+                    .filter(|r| {
+                        let r_src_label = (r.src.0 >> 32) as u32;
+                        let r_src_slot = r.src.0 & 0xFFFF_FFFF;
+                        let r_dst_label = (r.dst.0 >> 32) as u32;
+                        r_src_label == cur_label_id
+                            && r_src_slot == cur_slot
+                            && r_dst_label == dst_label_id
+                    })
+                    .map(|r| r.dst.0 & 0xFFFF_FFFF)
+                    .collect();
+                let all_slots: std::collections::HashSet<u64> =
+                    dst_slots.into_iter().chain(delta_slots).collect();
+
+                for dst_slot in all_slots {
+                    let dst_id = NodeId(((dst_label_id as u64) << 32) | dst_slot);
+                    if self.is_node_tombstoned(dst_id) {
+                        continue;
+                    }
+                    let dst_props = match self.snapshot.store.get_node_raw(dst_id, &dst_col_ids) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
                     if !self.matches_prop_filter_with_binding(
                         &dst_props,
                         &dst_pat.props,
@@ -583,46 +611,42 @@ impl Engine {
                     ) {
                         continue;
                     }
-                    let src_props = self
-                        .snapshot
-                        .store
-                        .get_node_raw(src_id, &src_col_ids)
-                        .unwrap_or_default();
-                    let mut row_vals = build_row_vals(
-                        &src_props,
-                        &src_pat.var,
-                        &src_col_ids,
-                        &self.snapshot.store,
-                    );
-                    row_vals.extend(build_row_vals(
+                    let mut new_row_vals = row_vals.clone();
+                    new_row_vals.extend(build_row_vals(
                         &dst_props,
                         &dst_pat.var,
                         &dst_col_ids,
                         &self.snapshot.store,
                     ));
-                    // Merge upstream bindings.
-                    row_vals.extend(binding.clone());
-                    row_vals.insert(src_pat.var.clone(), Value::NodeRef(src_id));
-                    row_vals.insert(
-                        format!("{}.__node_id__", src_pat.var),
-                        Value::NodeRef(src_id),
-                    );
-                    row_vals.insert(dst_pat.var.clone(), Value::NodeRef(dst_id));
-                    row_vals.insert(
+                    new_row_vals.insert(dst_pat.var.clone(), Value::NodeRef(dst_id));
+                    new_row_vals.insert(
                         format!("{}.__node_id__", dst_pat.var),
                         Value::NodeRef(dst_id),
                     );
-
-                    if let Some(wexpr) = where_clause {
-                        let mut row_vals_p = row_vals.clone();
-                        row_vals_p.extend(params.clone());
-                        if !self.eval_where_graph(wexpr, &row_vals_p) {
-                            continue;
-                        }
-                    }
-                    result.push(row_vals);
+                    next_frontier.push((dst_label_id, dst_id, new_row_vals));
                 }
             }
+
+            frontier = next_frontier;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+
+        // ── Merge upstream binding and apply the trailing WHERE clause ──────
+        let mut result: Vec<HashMap<String, Value>> = Vec::new();
+        for (_label_id, _id, row_vals) in frontier {
+            let mut final_row = binding.clone();
+            final_row.extend(row_vals);
+
+            if let Some(wexpr) = where_clause {
+                let mut row_vals_p = final_row.clone();
+                row_vals_p.extend(params.clone());
+                if !self.eval_where_graph(wexpr, &row_vals_p) {
+                    continue;
+                }
+            }
+            result.push(final_row);
         }
         Ok(result)
     }
@@ -1055,7 +1079,7 @@ impl Engine {
             }
 
             // Fetch all properties we might need for RETURN projection.
-            let all_col_ids: Vec<u32> = collect_col_ids_from_columns(column_names);
+            let all_col_ids: Vec<u32> = collect_col_ids_from_return_items(&m.return_clause.items);
             let nullable_props = self
                 .snapshot
                 .store
@@ -1065,31 +1089,33 @@ impl Engine {
                 .filter_map(|&(col_id, opt)| opt.map(|v| (col_id, v)))
                 .collect();
 
-            // Project the RETURN columns.
-            let row: Vec<Value> = column_names
+            // Project the RETURN columns. Dispatch on the AST expression, not
+            // on the (possibly aliased) output column name — see #444.
+            let row: Vec<Value> = m
+                .return_clause
+                .items
                 .iter()
-                .map(|col_name| {
+                .map(|item| match &item.expr {
                     // Resolve out_degree(var) / degree(var) → degree value.
-                    let degree_col_name_out = format!("out_degree({node_var})");
-                    let degree_col_name_deg = format!("degree({node_var})");
-                    if col_name == &degree_col_name_out
-                        || col_name == &degree_col_name_deg
-                        || col_name == "degree"
-                        || col_name == "out_degree"
-                    {
-                        return Value::Int64(degree as i64);
+                    Expr::FnCall { name, args } => {
+                        let name_lc = name.to_lowercase();
+                        let arg_matches =
+                            matches!(args.first(), Some(Expr::Var(v)) if v == node_var);
+                        if (name_lc == "out_degree" || name_lc == "degree") && arg_matches {
+                            Value::Int64(degree as i64)
+                        } else {
+                            Value::Null
+                        }
                     }
-                    // Resolve property accesses: "var.prop" or "prop".
-                    let prop = col_name
-                        .split_once('.')
-                        .map(|(_, p)| p)
-                        .unwrap_or(col_name.as_str());
-                    let col_id = prop_name_to_col_id(prop);
-                    props
-                        .iter()
-                        .find(|(c, _)| *c == col_id)
-                        .map(|(_, v)| decode_raw_val(*v, &self.snapshot.store))
-                        .unwrap_or(Value::Null)
+                    Expr::PropAccess { prop, .. } => {
+                        let col_id = prop_name_to_col_id(prop);
+                        props
+                            .iter()
+                            .find(|(c, _)| *c == col_id)
+                            .map(|(_, v)| decode_raw_val(*v, &self.snapshot.store))
+                            .unwrap_or(Value::Null)
+                    }
+                    _ => Value::Null,
                 })
                 .collect();
 
@@ -1379,10 +1405,6 @@ impl Engine {
             .cloned()
             .collect();
 
-        // We need all column names from leading MATCH variables for the scan.
-        // Collect all column names referenced by lead-side return items.
-        let lead_col_names = extract_return_column_names(&lead_return_items);
-
         // Check that the leading MATCH label exists.
         if mom.match_patterns.is_empty() || mom.match_patterns[0].nodes.is_empty() {
             let null_row = vec![Value::Null; column_names.len()];
@@ -1406,7 +1428,7 @@ impl Engine {
 
         // Collect all col_ids needed for lead scan.
         let lead_all_col_ids: Vec<u32> = {
-            let mut ids = collect_col_ids_from_columns(&lead_col_names);
+            let mut ids = collect_col_ids_from_return_items(&lead_return_items);
             if let Some(ref wexpr) = mom.match_where {
                 collect_col_ids_from_expr(wexpr, &mut ids);
             }
@@ -1809,7 +1831,7 @@ impl Engine {
 
         // Collect all col_ids we need: RETURN columns + WHERE clause columns +
         // inline prop filter columns.
-        let col_ids = collect_col_ids_from_columns(column_names);
+        let col_ids = collect_col_ids_from_return_items(&m.return_clause.items);
         let mut all_col_ids: Vec<u32> = col_ids.clone();
         // Add col_ids referenced by the WHERE clause.
         if let Some(ref where_expr) = m.where_clause {
@@ -2161,12 +2183,9 @@ impl Engine {
                 // Project RETURN columns directly (fast path).
                 let row = project_row(
                     &props,
-                    column_names,
-                    &all_col_ids,
+                    &m.return_clause.items,
                     var_name,
-                    &label,
                     &self.snapshot.store,
-                    Some(node_id),
                 );
                 rows.push(row);
                 // SPA-198: early exit when we have enough rows for SKIP+LIMIT.
@@ -2286,25 +2305,11 @@ impl Engine {
                     }
                     raw_rows.push(row_vals);
                 } else {
-                    // Fast path: find the primary label name for project_row.
-                    let sec_primary_lid = (sec_node_id.0 >> 32) as u32;
-                    let sec_primary_label = self
-                        .snapshot
-                        .catalog
-                        .list_labels()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .find(|(id, _)| *id as u32 == sec_primary_lid)
-                        .map(|(_, name)| name)
-                        .unwrap_or_default();
                     let row = project_row(
                         &props,
-                        column_names,
-                        &all_col_ids,
+                        &m.return_clause.items,
                         sec_var_name,
-                        &sec_primary_label,
                         &self.snapshot.store,
-                        Some(sec_node_id),
                     );
                     rows.push(row);
                 }
@@ -2369,7 +2374,7 @@ impl Engine {
         }
 
         // Collect col_ids.
-        let mut all_col_ids: Vec<u32> = collect_col_ids_from_columns(column_names);
+        let mut all_col_ids: Vec<u32> = collect_col_ids_from_return_items(&m.return_clause.items);
         if let Some(ref where_expr) = m.where_clause {
             collect_col_ids_from_expr(where_expr, &mut all_col_ids);
         }
@@ -2462,24 +2467,11 @@ impl Engine {
                 }
                 raw_rows.push(row_vals);
             } else {
-                let prim_lid = (node_id.0 >> 32) as u32;
-                let prim_label_name = self
-                    .snapshot
-                    .catalog
-                    .list_labels()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|(id, _)| *id as u32 == prim_lid)
-                    .map(|(_, name)| name)
-                    .unwrap_or_default();
                 let row = project_row(
                     &props,
-                    column_names,
-                    &all_col_ids,
+                    &m.return_clause.items,
                     var_name,
-                    &prim_label_name,
                     &self.snapshot.store,
-                    Some(node_id),
                 );
                 rows.push(row);
             }
@@ -2524,7 +2516,7 @@ impl Engine {
         let var_name = node.var.as_str();
 
         // Collect col_ids needed across all labels (same set for every label).
-        let mut all_col_ids: Vec<u32> = collect_col_ids_from_columns(column_names);
+        let mut all_col_ids: Vec<u32> = collect_col_ids_from_return_items(&m.return_clause.items);
         if let Some(ref where_expr) = m.where_clause {
             collect_col_ids_from_expr(where_expr, &mut all_col_ids);
         }
@@ -2642,12 +2634,9 @@ impl Engine {
                 } else {
                     let row = project_row(
                         &props,
-                        column_names,
-                        &all_col_ids,
+                        &m.return_clause.items,
                         var_name,
-                        label_name,
                         &self.snapshot.store,
-                        Some(node_id),
                     );
                     rows.push(row);
                 }

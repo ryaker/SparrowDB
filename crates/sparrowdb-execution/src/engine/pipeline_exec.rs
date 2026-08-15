@@ -1095,12 +1095,9 @@ impl Engine {
             // Project output row.
             let row = project_row(
                 &x_props,
-                column_names,
-                &col_ids_x,
+                &m.return_clause.items,
                 x_var,
-                &label,
                 &self.snapshot.store,
-                Some(x_node_id),
             );
             rows.push(row);
 
@@ -1842,7 +1839,7 @@ impl Engine {
         tracing::debug!(label = %label, hwm = hwm, "chunked pipeline: label scan");
 
         // Collect all col_ids needed (RETURN + WHERE + inline prop filters).
-        let mut all_col_ids: Vec<u32> = collect_col_ids_from_columns(column_names);
+        let mut all_col_ids: Vec<u32> = collect_col_ids_from_return_items(&m.return_clause.items);
         if let Some(ref wexpr) = m.where_clause {
             collect_col_ids_from_expr(wexpr, &mut all_col_ids);
         }
@@ -1912,12 +1909,9 @@ impl Engine {
                 // Project RETURN columns.
                 let row = project_row(
                     &props,
-                    column_names,
-                    &all_col_ids,
+                    &m.return_clause.items,
                     var_name,
-                    &label,
                     &self.snapshot.store,
-                    Some(node_id),
                 );
                 rows.push(row);
             }
