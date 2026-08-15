@@ -141,8 +141,10 @@ impl Engine {
         if !m.order_by.is_empty() {
             ordered_projected.sort_by(|a, b| {
                 for (expr, dir) in &m.order_by {
-                    let val_a = eval_expr(expr, a);
-                    let val_b = eval_expr(expr, b);
+                    // #477: graph-aware so `ORDER BY bm25_score(n.text, 'q')`
+                    // resolves even when the score was not also WITH-aliased.
+                    let val_a = self.eval_expr_graph(expr, a);
+                    let val_b = self.eval_expr_graph(expr, b);
                     let cmp = compare_values(&val_a, &val_b);
                     let cmp = if *dir == SortDir::Desc {
                         cmp.reverse()
@@ -217,7 +219,7 @@ impl Engine {
         for row_vals in rows {
             let key: Vec<Value> = key_indices
                 .iter()
-                .map(|&i| eval_expr(&items[i].expr, row_vals))
+                .map(|&i| self.eval_expr_graph(&items[i].expr, row_vals))
                 .collect();
             let group_idx = if let Some(pos) = group_keys.iter().position(|k| k == &key) {
                 pos
@@ -234,8 +236,13 @@ impl Engine {
                     sparrowdb_cypher::ast::Expr::FnCall { name, args }
                         if name.to_lowercase() == "collect" =>
                     {
+                        // #477: use the graph-aware evaluator so an aggregate
+                        // argument like `collect(bm25_score(n.text, 'q'))` can
+                        // resolve — the plain `eval_expr` does not know
+                        // full_text_search/bm25_score/hybrid_search and would
+                        // silently score every row `Null`.
                         let val = if !args.is_empty() {
-                            eval_expr(&args[0], row_vals)
+                            self.eval_expr_graph(&args[0], row_vals)
                         } else {
                             Value::Null
                         };
@@ -250,7 +257,7 @@ impl Engine {
                         ) =>
                     {
                         let val = if !args.is_empty() {
-                            eval_expr(&args[0], row_vals)
+                            self.eval_expr_graph(&args[0], row_vals)
                         } else {
                             Value::Null
                         };

@@ -68,74 +68,124 @@ fn hybrid_cache_insert(
 impl Engine {
     // ── FTS scalar functions ──────────────────────────────────────────────────
 
-    /// Evaluate `full_text_search(label, property, query)`.
+    /// Evaluate `full_text_search(...)`, in either of two forms:
+    ///
+    ///  - `full_text_search(label, property, query)` — all-literal form. The
+    ///    current node is resolved by scanning `vals` for any `__node_id__`
+    ///    entry whose label matches the given `label` literal.
+    ///  - `full_text_search(var.property, query)` — the natural form used from
+    ///    a `WHERE` clause once a variable is already bound by `MATCH`, mirroring
+    ///    `bm25_score(var.property, query)`. The label and node are inferred
+    ///    directly from `var`'s bound `NodeRef`, exactly as `eval_bm25_score` does.
     ///
     /// Returns `Value::Bool(true)` if the current node's ID appears in the BM25
-    /// results for `(label, property, query)`.  The current node is resolved by
-    /// scanning `vals` for any `__node_id__` entry that matches the given label.
+    /// results for the resolved `(label, property, query)`.
     ///
-    /// Returns `Value::Bool(false)` when no matching entry is found or the FTS
-    /// index does not exist for the pair.
+    /// Returns `Value::Bool(false)` when the node/label cannot be resolved or no
+    /// FTS index is configured for the pair, and `Value::Null` when a configured
+    /// index exists on disk but could not be opened (issue #462: corruption must
+    /// not read the same as "no match").
     fn eval_full_text_search(&self, args: &[Expr], vals: &HashMap<String, Value>) -> Value {
-        if args.len() != 3 {
-            return Value::Bool(false);
-        }
-        let label_val = eval_expr(&args[0], vals);
-        let prop_val = eval_expr(&args[1], vals);
-        let query_val = eval_expr(&args[2], vals);
+        let (label, property, query, node_id) = match args.len() {
+            3 => {
+                let label_val = eval_expr(&args[0], vals);
+                let prop_val = eval_expr(&args[1], vals);
+                let query_val = eval_expr(&args[2], vals);
 
-        let (Value::String(label), Value::String(property), Value::String(query)) =
-            (label_val, prop_val, query_val)
-        else {
-            return Value::Bool(false);
-        };
+                let (Value::String(label), Value::String(property), Value::String(query)) =
+                    (label_val, prop_val, query_val)
+                else {
+                    return Value::Bool(false);
+                };
 
-        // Locate the current node's ID for the given label.
-        //
-        // During WHERE evaluation (`execute_scan`) the NodeRef is stored under
-        // the plain variable name (e.g. "n").  During aggregation / eval path
-        // it is also stored under "{var}.__node_id__".  We accept both.
-        let expected_lid: Option<u32> = self
-            .snapshot
-            .catalog
-            .get_label(&label)
-            .ok()
-            .flatten()
-            .map(|id| id as u32);
+                // Locate the current node's ID for the given label.
+                //
+                // During WHERE evaluation (`execute_scan`) the NodeRef is stored
+                // under the plain variable name (e.g. "n"). During aggregation /
+                // eval path it is also stored under "{var}.__node_id__". We
+                // accept both.
+                let expected_lid: Option<u32> = self
+                    .snapshot
+                    .catalog
+                    .get_label(&label)
+                    .ok()
+                    .flatten()
+                    .map(|id| id as u32);
 
-        let node_id: u64 = {
-            let mut found = None;
+                let node_id: u64 = {
+                    let mut found = None;
 
-            // Pass 1: prefer explicit __node_id__ keys.
-            for (k, v) in vals.iter() {
-                if k.ends_with(".__node_id__") {
-                    if let Value::NodeRef(nid) = v {
-                        let label_id_from_node = (nid.0 >> 32) as u32;
-                        if expected_lid.is_none_or(|eid| label_id_from_node == eid) {
-                            found = Some(nid.0);
-                            break;
+                    // Pass 1: prefer explicit __node_id__ keys.
+                    for (k, v) in vals.iter() {
+                        if k.ends_with(".__node_id__") {
+                            if let Value::NodeRef(nid) = v {
+                                let label_id_from_node = (nid.0 >> 32) as u32;
+                                if expected_lid.is_none_or(|eid| label_id_from_node == eid) {
+                                    found = Some(nid.0);
+                                    break;
+                                }
+                            }
                         }
                     }
-                }
-            }
 
-            // Pass 2: fall back to any plain NodeRef entry matching the label.
-            if found.is_none() {
-                for v in vals.values() {
-                    if let Value::NodeRef(nid) = v {
-                        let label_id_from_node = (nid.0 >> 32) as u32;
-                        if expected_lid.is_none_or(|eid| label_id_from_node == eid) {
-                            found = Some(nid.0);
-                            break;
+                    // Pass 2: fall back to any plain NodeRef entry matching the label.
+                    if found.is_none() {
+                        for v in vals.values() {
+                            if let Value::NodeRef(nid) = v {
+                                let label_id_from_node = (nid.0 >> 32) as u32;
+                                if expected_lid.is_none_or(|eid| label_id_from_node == eid) {
+                                    found = Some(nid.0);
+                                    break;
+                                }
+                            }
                         }
                     }
-                }
-            }
 
-            match found {
-                Some(id) => id,
-                None => return Value::Bool(false),
+                    match found {
+                        Some(id) => id,
+                        None => return Value::Bool(false),
+                    }
+                };
+
+                (label, property, query, node_id)
             }
+            2 => {
+                // `full_text_search(var.property, query)` — the label and node
+                // are known precisely from `var`'s binding, so unlike the 3-arg
+                // form there is no need to scan `vals` for a matching NodeRef.
+                let query_val = eval_expr(&args[1], vals);
+                let Value::String(query) = query_val else {
+                    return Value::Bool(false);
+                };
+
+                let (var_name, prop_name) = match &args[0] {
+                    Expr::PropAccess { var, prop } => (var.clone(), prop.clone()),
+                    _ => return Value::Bool(false),
+                };
+
+                let node_id_key = format!("{var_name}.__node_id__");
+                let node_id: u64 = match vals.get(&node_id_key) {
+                    Some(Value::NodeRef(nid)) => nid.0,
+                    _ => match vals.get(var_name.as_str()) {
+                        Some(Value::NodeRef(nid)) => nid.0,
+                        _ => return Value::Bool(false),
+                    },
+                };
+
+                // Infer the label from the node_id (high 32 bits = label_id),
+                // exactly as `eval_bm25_score` does for the same call shape.
+                let label_id = (node_id >> 32) as u32;
+                let label = match self.snapshot.catalog.list_labels() {
+                    Ok(labels) => match labels.into_iter().find(|(id, _)| *id as u32 == label_id) {
+                        Some((_, name)) => name,
+                        None => return Value::Bool(false),
+                    },
+                    Err(_) => return Value::Bool(false),
+                };
+
+                (label, prop_name, query, node_id)
+            }
+            _ => return Value::Bool(false),
         };
 
         // Use the per-query FTS cache so the index is loaded from disk at most
@@ -621,6 +671,140 @@ impl Engine {
                 "hybrid_search" => self.eval_hybrid_search(args, vals),
                 _ => eval_expr(expr, vals),
             },
+            // #477: a bare `full_text_search(...)`/`bm25_score(...)` call is
+            // routed above, but a threshold comparison like
+            // `bm25_score(n.text, 'q') > 0.5` wraps the call in a `BinOp` —
+            // and without an arm here, the whole expression fell through to
+            // `_ => eval_expr(expr, vals)` below, which recurses on `left`/
+            // `right` with the *generic* `eval_expr` rather than
+            // `eval_expr_graph`. That generic recursion evaluates the nested
+            // `FnCall` via `dispatch_function`, which does not know these
+            // three functions, so the comparison always saw `Value::Null` on
+            // the FTS side and the row was rejected regardless of score.
+            // Mirrors `eval_expr`'s `BinOp` arm in `engine/mod.rs` exactly,
+            // just recursing through `eval_expr_graph` so a nested
+            // `full_text_search`/`bm25_score`/`hybrid_search` call resolves.
+            Expr::BinOp { left, op, right } => {
+                let lv = self.eval_expr_graph(left, vals);
+                let rv = self.eval_expr_graph(right, vals);
+                match op {
+                    BinOpKind::Eq => Value::Bool(values_equal(&lv, &rv)),
+                    BinOpKind::Neq => Value::Bool(!values_equal(&lv, &rv)),
+                    BinOpKind::Lt => match (&lv, &rv) {
+                        (Value::Int64(a), Value::Int64(b)) => Value::Bool(a < b),
+                        (Value::Float64(a), Value::Float64(b)) => Value::Bool(a < b),
+                        (Value::Int64(a), Value::Float64(b)) => {
+                            cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_lt()))
+                        }
+                        (Value::Float64(a), Value::Int64(b)) => {
+                            cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_gt()))
+                        }
+                        _ => Value::Null,
+                    },
+                    BinOpKind::Le => match (&lv, &rv) {
+                        (Value::Int64(a), Value::Int64(b)) => Value::Bool(a <= b),
+                        (Value::Float64(a), Value::Float64(b)) => Value::Bool(a <= b),
+                        (Value::Int64(a), Value::Float64(b)) => {
+                            cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_le()))
+                        }
+                        (Value::Float64(a), Value::Int64(b)) => {
+                            cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_ge()))
+                        }
+                        _ => Value::Null,
+                    },
+                    BinOpKind::Gt => match (&lv, &rv) {
+                        (Value::Int64(a), Value::Int64(b)) => Value::Bool(a > b),
+                        (Value::Float64(a), Value::Float64(b)) => Value::Bool(a > b),
+                        (Value::Int64(a), Value::Float64(b)) => {
+                            cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_gt()))
+                        }
+                        (Value::Float64(a), Value::Int64(b)) => {
+                            cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_lt()))
+                        }
+                        _ => Value::Null,
+                    },
+                    BinOpKind::Ge => match (&lv, &rv) {
+                        (Value::Int64(a), Value::Int64(b)) => Value::Bool(a >= b),
+                        (Value::Float64(a), Value::Float64(b)) => Value::Bool(a >= b),
+                        (Value::Int64(a), Value::Float64(b)) => {
+                            cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_ge()))
+                        }
+                        (Value::Float64(a), Value::Int64(b)) => {
+                            cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_le()))
+                        }
+                        _ => Value::Null,
+                    },
+                    BinOpKind::Contains => match (&lv, &rv) {
+                        (Value::String(l), Value::String(r)) => Value::Bool(l.contains(r.as_str())),
+                        _ => Value::Null,
+                    },
+                    BinOpKind::StartsWith => match (&lv, &rv) {
+                        (Value::String(l), Value::String(r)) => {
+                            Value::Bool(l.starts_with(r.as_str()))
+                        }
+                        _ => Value::Null,
+                    },
+                    BinOpKind::EndsWith => match (&lv, &rv) {
+                        (Value::String(l), Value::String(r)) => {
+                            Value::Bool(l.ends_with(r.as_str()))
+                        }
+                        _ => Value::Null,
+                    },
+                    BinOpKind::And => match (&lv, &rv) {
+                        (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
+                        _ => Value::Null,
+                    },
+                    BinOpKind::Or => match (&lv, &rv) {
+                        (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
+                        _ => Value::Null,
+                    },
+                    BinOpKind::Add => match (&lv, &rv) {
+                        (Value::Int64(a), Value::Int64(b)) => Value::Int64(a + b),
+                        (Value::Float64(a), Value::Float64(b)) => Value::Float64(a + b),
+                        (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 + b),
+                        (Value::Float64(a), Value::Int64(b)) => Value::Float64(a + *b as f64),
+                        (Value::String(a), Value::String(b)) => Value::String(format!("{a}{b}")),
+                        _ => Value::Null,
+                    },
+                    BinOpKind::Sub => match (&lv, &rv) {
+                        (Value::Int64(a), Value::Int64(b)) => Value::Int64(a - b),
+                        (Value::Float64(a), Value::Float64(b)) => Value::Float64(a - b),
+                        (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 - b),
+                        (Value::Float64(a), Value::Int64(b)) => Value::Float64(a - *b as f64),
+                        _ => Value::Null,
+                    },
+                    BinOpKind::Mul => match (&lv, &rv) {
+                        (Value::Int64(a), Value::Int64(b)) => Value::Int64(a * b),
+                        (Value::Float64(a), Value::Float64(b)) => Value::Float64(a * b),
+                        (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 * b),
+                        (Value::Float64(a), Value::Int64(b)) => Value::Float64(a * *b as f64),
+                        _ => Value::Null,
+                    },
+                    BinOpKind::Div => match (&lv, &rv) {
+                        (Value::Int64(a), Value::Int64(b)) => {
+                            if *b == 0 {
+                                Value::Null
+                            } else {
+                                Value::Int64(a / b)
+                            }
+                        }
+                        (Value::Float64(a), Value::Float64(b)) => Value::Float64(a / b),
+                        (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 / b),
+                        (Value::Float64(a), Value::Int64(b)) => Value::Float64(a / *b as f64),
+                        _ => Value::Null,
+                    },
+                    BinOpKind::Mod => match (&lv, &rv) {
+                        (Value::Int64(a), Value::Int64(b)) => {
+                            if *b == 0 {
+                                Value::Null
+                            } else {
+                                Value::Int64(a % b)
+                            }
+                        }
+                        _ => Value::Null,
+                    },
+                }
+            }
             _ => eval_expr(expr, vals),
         }
     }
@@ -926,7 +1110,7 @@ impl Engine {
         // Check if any return item needs graph access.
         let needs_graph = return_items.iter().any(|item| expr_needs_graph(&item.expr));
         if !needs_graph {
-            return aggregate_rows(rows, return_items);
+            return aggregate_rows(self, rows, return_items);
         }
         // For graph-dependent items, project each row using eval_expr_graph.
         rows.iter()
