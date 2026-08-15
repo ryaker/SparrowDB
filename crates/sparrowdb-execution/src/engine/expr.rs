@@ -957,9 +957,19 @@ impl Engine {
                         .iter()
                         .map(|p| prop_name_to_col_id(&p.key))
                         .collect();
-                    match self.snapshot.store.get_node_raw(probe_id, &col_ids) {
-                        Ok(props) => {
+                    // #479: nullable accessor + drop-absent, matching every
+                    // read-path prop-filter site — see node_matches_prop_filter.
+                    match self
+                        .snapshot
+                        .store
+                        .get_node_raw_nullable(probe_id, &col_ids)
+                    {
+                        Ok(raw_props) => {
                             let params = self.dollar_params();
+                            let props: Vec<(u32, u64)> = raw_props
+                                .into_iter()
+                                .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+                                .collect();
                             if !matches_prop_filter_static(
                                 &props,
                                 &dst_pat.props,
@@ -1073,8 +1083,16 @@ impl Engine {
         let params = self.dollar_params();
         for slot in 0..hwm {
             let node_id = NodeId(((label_id as u64) << 32) | slot);
-            if let Ok(raw_props) = self.snapshot.store.get_node_raw(node_id, &col_ids) {
-                if matches_prop_filter_static(&raw_props, props, &params, &self.snapshot.store) {
+            // #479: route through the nullable accessor (as the read-path scan
+            // does) and drop absent columns, so a genuinely null-bound filter
+            // can match the node whose property is actually absent instead of
+            // silently never matching via `get_node_raw`'s zero-sentinel.
+            if let Ok(raw_props) = self.snapshot.store.get_node_raw_nullable(node_id, &col_ids) {
+                let stored: Vec<(u32, u64)> = raw_props
+                    .into_iter()
+                    .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+                    .collect();
+                if matches_prop_filter_static(&stored, props, &params, &self.snapshot.store) {
                     return Some(slot);
                 }
             }

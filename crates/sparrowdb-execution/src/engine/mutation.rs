@@ -279,13 +279,31 @@ impl Engine {
         if props.is_empty() {
             return true;
         }
-        match self.snapshot.store.get_node_raw(node_id, filter_col_ids) {
-            Ok(raw_props) => matches_prop_filter_static(
-                &raw_props,
-                props,
-                &self.dollar_params(),
-                &self.snapshot.store,
-            ),
+        // #479: use the nullable accessor and drop absent columns from the
+        // list entirely, mirroring every read-path call site. `get_node_raw`'s
+        // `read_col_slot` zero-sentinels an absent slot to `Ok(0)` (decodes to
+        // `Value::Int64(0)`), which made `matches_prop_filter_static`'s
+        // `Value::Null => stored_val.is_none()` arm unreachable here — a
+        // genuinely null-bound `$param` filter could never match the node
+        // whose property is actually absent, even though the read path
+        // matches it correctly.
+        match self
+            .snapshot
+            .store
+            .get_node_raw_nullable(node_id, filter_col_ids)
+        {
+            Ok(raw_props) => {
+                let stored: Vec<(u32, u64)> = raw_props
+                    .into_iter()
+                    .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+                    .collect();
+                matches_prop_filter_static(
+                    &stored,
+                    props,
+                    &self.dollar_params(),
+                    &self.snapshot.store,
+                )
+            }
             Err(_) => false,
         }
     }
