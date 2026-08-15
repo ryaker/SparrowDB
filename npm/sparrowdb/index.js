@@ -3,32 +3,33 @@
 const { existsSync } = require('fs')
 const { join } = require('path')
 
-// Map platform+arch to the optional dependency package name.
-const PLATFORM_PACKAGES = {
-  'linux-x64': '@sparrowdb/linux-x64-gnu',
-  'linux-arm64': '@sparrowdb/linux-arm64-gnu',
-  'darwin-x64': '@sparrowdb/darwin-x64',
-  'darwin-arm64': '@sparrowdb/darwin-arm64',
-  'win32-x64': '@sparrowdb/win32-x64-msvc',
+// There are no separate `@sparrowdb/<platform>` packages — the prebuilt
+// binaries for every platform this package supports are bundled directly
+// in this tarball (see .github/workflows/release.yml). Map platform+arch
+// to the bundled filename so we only ever try to load a binary that was
+// actually built for the running platform. See README for the supported
+// platform list and why musl/Alpine isn't one of them.
+const PLATFORM_BINARIES = {
+  'linux-x64': 'sparrowdb.linux-x64-gnu.node',
+  'darwin-arm64': 'sparrowdb.darwin-arm64.node',
 }
 
 function loadNative() {
-  // 1. Try the platform-specific optional dependency (production / npm install).
+  // 1. Try the binary bundled for this exact platform+arch (production / npm install).
   const key = `${process.platform}-${process.arch}`
-  const pkg = PLATFORM_PACKAGES[key]
-  if (pkg) {
-    try {
-      return require(pkg)
-    } catch (err) {
-      // Only fall through if the package simply isn't installed.
-      // Re-throw any other error (ABI mismatch, init failure, etc.) so it
-      // isn't silently swallowed and we don't end up loading the wrong binary.
-      if (err.code !== 'MODULE_NOT_FOUND') throw err
+  const bundled = PLATFORM_BINARIES[key]
+  if (bundled) {
+    const bundledPath = join(__dirname, bundled)
+    if (existsSync(bundledPath)) {
+      return require(bundledPath)
     }
   }
 
   // 2. Try a locally compiled sparrowdb.node in the same directory
   //    (development: `cargo build --release && cp target/release/libsparrowdb_node.so npm/sparrowdb/sparrowdb.node`).
+  //    This is a dev-only convenience — CI never publishes a file by this
+  //    name, so it can't shadow the platform-specific binaries above with
+  //    the wrong platform's build (see issue #481).
   const local = join(__dirname, 'sparrowdb.node')
   if (existsSync(local)) {
     return require(local)
@@ -50,9 +51,9 @@ function loadNative() {
     }
   }
 
-  const supported = Object.keys(PLATFORM_PACKAGES).join(', ')
+  const supported = Object.keys(PLATFORM_BINARIES).join(', ')
   throw new Error(
-    `sparrowdb: could not load native module for ${process.platform}-${process.arch}.\n` +
+    `sparrowdb: no prebuilt native module for ${process.platform}-${process.arch}.\n` +
     `Supported platforms: ${supported}\n` +
     `Run \`cargo build --release -p sparrowdb-node\` to build locally.`
   )

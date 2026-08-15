@@ -20,7 +20,7 @@ const path = require('node:path')
 // ── Load native binding ──────────────────────────────────────────────────────
 
 // index.js handles the platform lookup / fallback chain:
-//   1. Platform-specific optional dependency (production)
+//   1. Bundled platform-specific binary, e.g. sparrowdb.darwin-arm64.node (production)
 //   2. npm/sparrowdb/sparrowdb.node (local dev / pre-built)
 //   3. target/release|debug/sparrowdb.node (cargo build in place)
 const { SparrowDB } = require('../index.js')

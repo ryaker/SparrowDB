@@ -93,16 +93,17 @@ jobs:
 
       - name: Assemble npm package
         run: |
-          # Copy native binaries into npm package directory
+          # Copy native binaries into npm package directory. index.js maps
+          # process.platform+arch to exactly these filenames — do NOT also
+          # write a platform-agnostic `sparrowdb.node` here. That name is
+          # reserved for local dev builds (see index.js); publishing one
+          # from CI made every install silently load whichever platform's
+          # binary happened to be copied last, regardless of the actual
+          # runtime platform (issue #481).
           cp artifacts/sparrowdb-node-linux-x64/libsparrowdb_node.so \
              npm/sparrowdb/sparrowdb.linux-x64-gnu.node 2>/dev/null || true
           cp artifacts/sparrowdb-node-darwin-arm64/libsparrowdb_node.dylib \
              npm/sparrowdb/sparrowdb.darwin-arm64.node 2>/dev/null || true
-
-          # Also create a generic fallback name
-          if [ -f npm/sparrowdb/sparrowdb.linux-x64-gnu.node ]; then
-            cp npm/sparrowdb/sparrowdb.linux-x64-gnu.node npm/sparrowdb/sparrowdb.node
-          fi
 
       - name: Sync version to package.json
         run: |
@@ -111,12 +112,6 @@ jobs:
           node -e "
             const pkg = require('./package.json');
             pkg.version = '$VERSION';
-            // Update optional dependency versions too
-            if (pkg.optionalDependencies) {
-              for (const dep of Object.keys(pkg.optionalDependencies)) {
-                pkg.optionalDependencies[dep] = '$VERSION';
-              }
-            }
             require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
           echo "package.json version set to $VERSION"
