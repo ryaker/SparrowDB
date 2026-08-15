@@ -3221,11 +3221,28 @@ fn agg_kind(expr: &Expr) -> AggKind {
 /// Non-aggregate RETURN items become the group key.  Returns one output
 /// `Vec<Value>` per unique key in the same column order as `return_items`.
 /// Returns `true` if the expression contains a `CASE WHEN`, `shortestPath`,
-/// or `EXISTS` sub-expression that requires the graph-aware eval path
-/// (rather than the fast `project_row` column lookup).
+/// `EXISTS`, or graph-only scalar function (`hybrid_search`,
+/// `full_text_search`, `bm25_score`, ...) sub-expression that requires the
+/// graph-aware eval path (rather than the fast `project_row` column lookup
+/// or the non-engine-aware `eval_expr` fallback).
+///
+/// # #459: ask the real dispatcher, never a duplicated name list
+///
+/// The graph-only function names are *not* repeated here. `expr::GRAPH_ONLY_FNS`
+/// (`engine/expr.rs`) is the single table both `Engine::eval_expr_graph`'s
+/// `FnCall` arm and this function read from, via `expr::is_graph_only_fn`.
+/// Before that table existed, this match and `eval_expr_graph`'s dispatch
+/// each kept an independent copy of the same three names. When they agreed
+/// the system worked; the day they drifted, a graph-only function would
+/// dispatch fine from `eval_expr_graph` directly but never trip this check,
+/// so `aggregate_rows_graph` would keep delegating to the non-engine
+/// `aggregate_rows` → `eval_expr`, which has never heard of it — silently
+/// `Value::Null` against a perfectly healthy index. That was this issue,
+/// caused by exactly this shape. See `regression_459_hybrid_search_return.rs`.
 fn expr_needs_graph(expr: &Expr) -> bool {
     match expr {
         Expr::ShortestPath(_) | Expr::ExistsSubquery(_) | Expr::CaseWhen { .. } => true,
+        Expr::FnCall { name, .. } => expr::is_graph_only_fn(name),
         Expr::And(l, r) | Expr::Or(l, r) => expr_needs_graph(l) || expr_needs_graph(r),
         Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => expr_needs_graph(inner),
         Expr::BinOp { left, right, .. } => expr_needs_graph(left) || expr_needs_graph(right),

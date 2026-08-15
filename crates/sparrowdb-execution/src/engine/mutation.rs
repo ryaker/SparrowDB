@@ -773,36 +773,39 @@ impl Engine {
         let mut op = UnwindOperator::new(u.alias.clone(), values);
         let chunks = op.collect_all()?;
 
-        // Materialize: for each chunk/group/row, project the RETURN columns.
+        // Materialize: for each chunk/group/row, project the RETURN columns
+        // through `eval_expr_graph` against a row-value map containing only
+        // the UNWIND alias binding.
         //
-        // Only fall back to the UNWIND alias value when the output column
-        // actually corresponds to the alias variable.  Returning a value for
-        // an unrelated variable (e.g. `RETURN y` when alias is `x`) would
-        // silently produce wrong results instead of NULL.
+        // #459: this used to hand-roll a single case — `RETURN <alias>`
+        // returned the unwound value, and *every other expression shape*
+        // (a bare `hybrid_search(...)` call, arithmetic on the alias, an
+        // unrelated variable, ...) hardcoded `Value::Null`. That correctly
+        // NULLs an out-of-scope variable (e.g. `RETURN y` when the alias is
+        // `x`) purely by accident of it not being `Expr::Var(alias)` either —
+        // but it also NULLs every legitimate expression that isn't a bare
+        // alias reference. Evaluating through `eval_expr_graph` against a row
+        // map that only contains the alias preserves the "unrelated variable
+        // → NULL" behavior (an absent key evaluates to `Value::Null`, same as
+        // before) while making `hybrid_search`/`full_text_search`/
+        // `bm25_score` and any other expression resolve correctly. See
+        // `regression_459_hybrid_search_return.rs`.
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for chunk in &chunks {
             for group in &chunk.groups {
                 let n = group.len();
                 for row_idx in 0..n {
-                    let row = u
+                    let mut row_vals: HashMap<String, Value> = HashMap::new();
+                    row_vals.insert(
+                        u.alias.clone(),
+                        group.get_value(&u.alias, row_idx).unwrap_or(Value::Null),
+                    );
+                    row_vals.extend(self.dollar_params());
+                    let row: Vec<Value> = u
                         .return_clause
                         .items
                         .iter()
-                        .map(|item| {
-                            // Determine whether this RETURN item refers to the
-                            // alias variable produced by UNWIND.
-                            let is_alias = match &item.expr {
-                                Expr::Var(name) => name == &u.alias,
-                                _ => false,
-                            };
-                            if is_alias {
-                                group.get_value(&u.alias, row_idx).unwrap_or(Value::Null)
-                            } else {
-                                // Variable is not in scope for this UNWIND —
-                                // return NULL rather than leaking the alias value.
-                                Value::Null
-                            }
-                        })
+                        .map(|item| self.eval_expr_graph(&item.expr, &row_vals))
                         .collect();
                     rows.push(row);
                 }
