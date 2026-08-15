@@ -2018,6 +2018,9 @@ impl Engine {
         // Reusable neighbor buffer for the variable-length traversal.
         let mut neighbors_buf: HashSet<(u64, u32)> = HashSet::new();
 
+        let use_agg = has_aggregate_in_return(&m.return_clause.items);
+        let use_eval_projection = needs_node_ref_in_return(&m.return_clause.items);
+        let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
         for src_slot in 0..hwm_src {
@@ -2046,6 +2049,15 @@ impl Engine {
                     let key = format!("{}.col_{col_id}", pat.nodes[0].var);
                     row_vals.insert(key, decode_raw_val(raw, &self.snapshot.store));
                 }
+                row_vals.insert(pat.nodes[0].var.clone(), Value::NodeRef(src_node_id));
+                row_vals.insert(
+                    format!("{}.__node_id__", pat.nodes[0].var),
+                    Value::NodeRef(src_node_id),
+                );
+                row_vals.insert(
+                    format!("{}.__labels__", pat.nodes[0].var),
+                    self.labels_value_for_node(src_node_id),
+                );
             }
 
             // `frontier` holds (slot, label_id, accumulated_vals) triples for the
@@ -2198,6 +2210,23 @@ impl Engine {
                                 let key = format!("{}.col_{col_id}", next_node_pat.var);
                                 new_vals.insert(key, decode_raw_val(raw, &self.snapshot.store));
                             }
+                            new_vals
+                                .insert(next_node_pat.var.clone(), Value::NodeRef(next_node_id));
+                            new_vals.insert(
+                                format!("{}.__node_id__", next_node_pat.var),
+                                Value::NodeRef(next_node_id),
+                            );
+                            new_vals.insert(
+                                format!("{}.__labels__", next_node_pat.var),
+                                self.labels_value_for_node(next_node_id),
+                            );
+                        }
+                        let rel_pat = &pat.rels[hop_idx];
+                        if !rel_pat.var.is_empty() {
+                            new_vals.insert(
+                                format!("{}.__type__", rel_pat.var),
+                                Value::String(rel_pat.rel_type.clone()),
+                            );
                         }
 
                         next_frontier.push((next_slot, next_label_id, new_vals));
@@ -2218,26 +2247,41 @@ impl Engine {
                     }
                 }
 
-                // Project column values from the accumulated binding map.
-                // Each column name is "var.prop" — look up "var.col_<id>" in the map.
-                let row: Vec<Value> = column_names
-                    .iter()
-                    .map(|col_name| {
-                        if let Some((var, prop)) = col_name.split_once('.') {
-                            let key = format!("{var}.col_{}", col_id_of(prop));
-                            path_vals.get(&key).cloned().unwrap_or(Value::Null)
-                        } else {
-                            Value::Null
-                        }
-                    })
-                    .collect();
+                if use_agg {
+                    raw_rows.push(path_vals);
+                    continue;
+                }
+
+                let row: Vec<Value> = if use_eval_projection {
+                    // Evaluate expressions that need complete bindings, including
+                    // metadata functions such as labels(n) and type(r).
+                    m.return_clause
+                        .items
+                        .iter()
+                        .map(|item| self.eval_expr_graph(&item.expr, &path_vals))
+                        .collect()
+                } else {
+                    // Preserve the established property-only projection path.
+                    column_names
+                        .iter()
+                        .map(|col_name| {
+                            if let Some((var, prop)) = col_name.split_once('.') {
+                                let key = format!("{var}.col_{}", col_id_of(prop));
+                                path_vals.get(&key).cloned().unwrap_or(Value::Null)
+                            } else {
+                                Value::Null
+                            }
+                        })
+                        .collect()
+                };
 
                 rows.push(row);
             }
         }
 
-        // DISTINCT
-        if m.distinct {
+        if use_agg {
+            rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
+        } else if m.distinct {
             deduplicate_rows(&mut rows);
         }
 
