@@ -30,13 +30,13 @@ const { spawnSync } = require('node:child_process')
 const PACKAGE_DIR = path.join(__dirname, '..')
 const INDEX_JS = path.join(PACKAGE_DIR, 'index.js')
 
-// Mirrors the filename convention documented in index.js / README.md.
-// Deliberately re-derived here rather than imported from index.js: the
-// point of this suite is to check the convention resolves correctly
-// end-to-end, not to exercise index.js's own idea of its own convention.
-function bundledName(platform, arch) {
-  return `sparrowdb.${platform}-${arch}.node`
-}
+// Read the real filename convention from index.js rather than reconstructing
+// it here. A hand-copied convention is a second place for it to drift from
+// the loader — which is exactly how #481 shipped: index.js looks for
+// "sparrowdb.linux-x64-gnu.node" (the `-gnu` suffix matters), and an earlier
+// version of this file built "sparrowdb.linux-x64.node" by concatenation,
+// so it passed on darwin-arm64 by coincidence and failed on Linux CI.
+const { PLATFORM_BINARIES } = require(INDEX_JS)
 
 // Locate a real, loadable compiled binary for the machine running this
 // suite — the same places index.js's own dev fallback (steps 2/3) looks,
@@ -90,26 +90,44 @@ function runInChild(dir, { platform, arch } = {}) {
 }
 
 describe('production binary resolution (issue #481)', () => {
+  const key = `${process.platform}-${process.arch}`
+  const expectedFilename = PLATFORM_BINARIES[key]
   const realBinary = findRealBinary()
 
   it('a binary bundled under the correct platform-specific filename loads and exposes the API', (t) => {
+    if (!expectedFilename) {
+      t.skip(`${key} is not a supported platform (see PLATFORM_BINARIES in index.js)`)
+      return
+    }
     if (!realBinary) {
       t.skip('no compiled sparrowdb.node available in this environment')
       return
     }
     const dir = makeIsolatedPackageDir()
     try {
-      fs.copyFileSync(realBinary, path.join(dir, bundledName(process.platform, process.arch)))
+      fs.copyFileSync(realBinary, path.join(dir, expectedFilename))
       const output = runInChild(dir)
-      assert.ok(output.startsWith('LOADED:'), `expected a clean load for ${process.platform}-${process.arch}, got: ${output}`)
+      assert.ok(output.startsWith('LOADED:'), `expected a clean load for ${key}, got: ${output}`)
+      // A subset check, not deepEqual against the full key list: index.js's
+      // own module.exports can grow (e.g. PLATFORM_BINARIES, added for this
+      // suite's own use), and this test's job is to confirm the *native*
+      // API loaded, not to pin index.js's exact export list. Sorted in the
+      // child (see runInChild) is irrelevant to a subset check but keeps
+      // the raw output readable in a failure message.
       const exported = output.slice('LOADED:'.length).split(',')
-      assert.deepEqual(exported, ['ReadTx', 'SparrowDB', 'WriteTx'])
+      for (const name of ['ReadTx', 'SparrowDB', 'WriteTx']) {
+        assert.ok(exported.includes(name), `expected ${name} among the loaded exports, got: ${exported.join(',')}`)
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  it('a bad binary under the expected platform filename does not crash uncaught — it falls through to the clear supported-platforms error', () => {
+  it('a bad binary under the expected platform filename does not crash uncaught — it falls through to the clear supported-platforms error', (t) => {
+    if (!expectedFilename) {
+      t.skip(`${key} is not a supported platform (see PLATFORM_BINARIES in index.js)`)
+      return
+    }
     const dir = makeIsolatedPackageDir()
     try {
       // Reproduces the actual shape of #481: a file that does not match
@@ -117,7 +135,7 @@ describe('production binary resolution (issue #481)', () => {
       // unconditionally. The content doesn't need to be a real foreign
       // binary — any bytes dlopen can't parse reproduce the failure mode
       // (an ERR_DLOPEN_FAILED-style error thrown out of `require`).
-      fs.writeFileSync(path.join(dir, bundledName(process.platform, process.arch)), 'not a real native module')
+      fs.writeFileSync(path.join(dir, expectedFilename), 'not a real native module')
       const output = runInChild(dir)
       assert.ok(output.startsWith('THREW:'), `expected a clean thrown Error, got: ${output}`)
       const message = output.slice('THREW:'.length)
@@ -133,12 +151,19 @@ describe('production binary resolution (issue #481)', () => {
   })
 
   it('an explicitly unsupported platform+arch throws the catchable error naming it', () => {
+    assert.ok(!PLATFORM_BINARIES['win32-x64'], 'this test assumes win32-x64 stays unsupported')
     const dir = makeIsolatedPackageDir()
     try {
       const output = runInChild(dir, { platform: 'win32', arch: 'x64' })
       assert.ok(output.startsWith('THREW:'), `expected a clean thrown Error, got: ${output}`)
       assert.match(output, /no prebuilt native module for win32-x64/)
-      assert.match(output, /Supported platforms: linux-x64, darwin-arm64/)
+      // Derived from PLATFORM_BINARIES, not hardcoded — same reasoning as
+      // expectedFilename above: don't let this list drift from the loader's.
+      const supportedList = Object.keys(PLATFORM_BINARIES).join(', ')
+      assert.ok(
+        output.includes(`Supported platforms: ${supportedList}`),
+        `expected the supported-platform list to read "${supportedList}", got: ${output}`,
+      )
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

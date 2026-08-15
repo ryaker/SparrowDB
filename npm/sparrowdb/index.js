@@ -99,3 +99,13 @@ module.exports = native
 module.exports.SparrowDB = native.SparrowDB
 module.exports.ReadTx = native.ReadTx
 module.exports.WriteTx = native.WriteTx
+
+// Exposed so test/platform-resolution.test.js can look up the bundled
+// filename for the running platform+arch instead of re-deriving the naming
+// convention itself — a test that keeps its own copy of this rule is a
+// second place for it to drift from index.js (see issue #481, where a test
+// doing exactly that passed on darwin-arm64 by coincidence and failed on
+// linux-x64 because it reconstructed "sparrowdb.linux-x64.node" instead of
+// the real "sparrowdb.linux-x64-gnu.node"). Not part of the documented
+// public API.
+module.exports.PLATFORM_BINARIES = PLATFORM_BINARIES
