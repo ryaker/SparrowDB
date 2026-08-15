@@ -14,28 +14,48 @@ const PLATFORM_BINARIES = {
   'darwin-arm64': 'sparrowdb.darwin-arm64.node',
 }
 
+// A file existing under an expected name is not proof it's a valid,
+// loadable binary for this platform — issue #481 shipped for a year because
+// a mis-copied binary sat at a name that was `require`d unconditionally, and
+// the resulting dlopen/ABI error propagated straight out of loadNative()
+// uncaught instead of falling through to the clear message below. Every
+// candidate here is therefore tried, not just checked for existence.
+function tryLoad(path) {
+  try {
+    return { ok: true, value: require(path) }
+  } catch (err) {
+    return { ok: false, error: err }
+  }
+}
+
 function loadNative() {
-  // 1. Try the binary bundled for this exact platform+arch (production / npm install).
+  const attempts = []
+
+  // 1. The binary bundled for this exact platform+arch (production / npm install).
   const key = `${process.platform}-${process.arch}`
   const bundled = PLATFORM_BINARIES[key]
   if (bundled) {
     const bundledPath = join(__dirname, bundled)
     if (existsSync(bundledPath)) {
-      return require(bundledPath)
+      const result = tryLoad(bundledPath)
+      if (result.ok) return result.value
+      attempts.push(`${bundledPath}: ${result.error.message}`)
     }
   }
 
-  // 2. Try a locally compiled sparrowdb.node in the same directory
+  // 2. A locally compiled sparrowdb.node in the same directory
   //    (development: `cargo build --release && cp target/release/libsparrowdb_node.so npm/sparrowdb/sparrowdb.node`).
   //    This is a dev-only convenience — CI never publishes a file by this
   //    name, so it can't shadow the platform-specific binaries above with
   //    the wrong platform's build (see issue #481).
   const local = join(__dirname, 'sparrowdb.node')
   if (existsSync(local)) {
-    return require(local)
+    const result = tryLoad(local)
+    if (result.ok) return result.value
+    attempts.push(`${local}: ${result.error.message}`)
   }
 
-  // 3. Try the workspace target directory (useful during development without copying).
+  // 3. The workspace target directory (useful during development without copying).
   //    Node native addons must be loaded as .node files regardless of platform.
   //    Use `napi-cli` or manually rename the compiled artifact:
   //      Linux:   target/release/libsparrowdb_node.so  → sparrowdb.node
@@ -47,15 +67,21 @@ function loadNative() {
   ]
   for (const t of targets) {
     if (existsSync(t)) {
-      return require(t)
+      const result = tryLoad(t)
+      if (result.ok) return result.value
+      attempts.push(`${t}: ${result.error.message}`)
     }
   }
 
   const supported = Object.keys(PLATFORM_BINARIES).join(', ')
+  const detail = attempts.length
+    ? `\nTried and failed to load:\n${attempts.map((a) => `  - ${a}`).join('\n')}`
+    : ''
   throw new Error(
     `sparrowdb: no prebuilt native module for ${process.platform}-${process.arch}.\n` +
     `Supported platforms: ${supported}\n` +
-    `Run \`cargo build --release -p sparrowdb-node\` to build locally.`
+    `Run \`cargo build --release -p sparrowdb-node\` to build locally.` +
+    detail
   )
 }
 

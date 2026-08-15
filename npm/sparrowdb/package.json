@@ -17,7 +17,7 @@
     "*.node"
   ],
   "scripts": {
-    "test": "node --test test/integration.test.js",
+    "test": "node --test test/*.test.js",
     "typecheck": "tsc -p tsconfig.json"
   },
   "engines": {

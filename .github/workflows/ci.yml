@@ -232,7 +232,7 @@ jobs:
           echo "Copied $ARTIFACT → npm/sparrowdb/sparrowdb.node"
 
       - name: Run Node.js integration tests
-        run: node --test npm/sparrowdb/test/integration.test.js
+        run: node --test npm/sparrowdb/test/*.test.js
 
   # ── Ruby bindings (compile check) ─────────────────────────────────────────
   ruby-bindings:
