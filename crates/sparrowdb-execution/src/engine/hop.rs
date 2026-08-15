@@ -838,6 +838,14 @@ impl Engine {
         // nodes[2] is the fof (friend-of-friend) / anchor-B in Q8
         let fof_node_pat = &pat.nodes[2];
 
+        // If the terminal node is unlabeled, the generic N-hop executor already
+        // recovers the actual label of every final hop from the stored edges.
+        // Route there instead of requiring fof_label_id and returning a bare
+        // "not found".
+        if fof_node_pat.labels.is_empty() {
+            return self.execute_n_hop(m, column_names);
+        }
+
         let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
         let fof_label = fof_node_pat.labels.first().cloned().unwrap_or_default();
         let src_label_id = self
