@@ -3045,10 +3045,10 @@ fn expr_has_collect(expr: &Expr) -> bool {
 /// Handles two forms:
 /// - Direct: `collect(expr)` → evaluates `expr` against `row_vals`
 /// - Nested: `ANY(x IN collect(expr) WHERE pred)` → evaluates `expr` against `row_vals`
-fn extract_collect_arg(expr: &Expr, row_vals: &HashMap<String, Value>) -> Value {
+fn extract_collect_arg(engine: &Engine, expr: &Expr, row_vals: &HashMap<String, Value>) -> Value {
     match expr {
-        Expr::FnCall { args, .. } if !args.is_empty() => eval_expr(&args[0], row_vals),
-        Expr::ListPredicate { list_expr, .. } => extract_collect_arg(list_expr, row_vals),
+        Expr::FnCall { args, .. } if !args.is_empty() => engine.eval_expr_graph(&args[0], row_vals),
+        Expr::ListPredicate { list_expr, .. } => extract_collect_arg(engine, list_expr, row_vals),
         _ => Value::Null,
     }
 }
@@ -3240,7 +3240,17 @@ fn expr_needs_graph(expr: &Expr) -> bool {
     }
 }
 
-fn aggregate_rows(rows: &[HashMap<String, Value>], return_items: &[ReturnItem]) -> Vec<Vec<Value>> {
+/// `engine` is used only to route aggregate arguments and grouping keys
+/// through `eval_expr_graph` (#477: `avg(bm25_score(n.text, 'q')))` etc. must
+/// resolve the same way the plain `bm25_score(...)` call would); it is not
+/// consulted for the no-aggregate plain-projection fallback below, which
+/// intentionally keeps its pre-existing non-graph-aware behaviour (see
+/// `regression_462_fts_open_swallow.rs::full_text_search_and_bm25_score_return_null_on_corrupt_index`).
+fn aggregate_rows(
+    engine: &Engine,
+    rows: &[HashMap<String, Value>],
+    return_items: &[ReturnItem],
+) -> Vec<Vec<Value>> {
     // Classify each return item.
     let kinds: Vec<AggKind> = return_items
         .iter()
@@ -3282,7 +3292,7 @@ fn aggregate_rows(rows: &[HashMap<String, Value>], return_items: &[ReturnItem]) 
     for row_vals in rows {
         let key: Vec<Value> = key_indices
             .iter()
-            .map(|&i| eval_expr(&return_items[i].expr, row_vals))
+            .map(|&i| engine.eval_expr_graph(&return_items[i].expr, row_vals))
             .collect();
 
         let group_idx = if let Some(pos) = group_keys.iter().position(|k| k == &key) {
@@ -3302,7 +3312,7 @@ fn aggregate_rows(rows: &[HashMap<String, Value>], return_items: &[ReturnItem]) 
                 AggKind::Count | AggKind::Sum | AggKind::Avg | AggKind::Min | AggKind::Max => {
                     let arg_val = match &return_items[ri].expr {
                         Expr::FnCall { args, .. } if !args.is_empty() => {
-                            eval_expr(&args[0], row_vals)
+                            engine.eval_expr_graph(&args[0], row_vals)
                         }
                         _ => Value::Null,
                     };
@@ -3314,7 +3324,7 @@ fn aggregate_rows(rows: &[HashMap<String, Value>], return_items: &[ReturnItem]) 
                 AggKind::Collect => {
                     // For collect() or ListPredicate(x IN collect(...) WHERE ...), extract the
                     // collect() argument (handles both direct and nested forms).
-                    let arg_val = extract_collect_arg(&return_items[ri].expr, row_vals);
+                    let arg_val = extract_collect_arg(engine, &return_items[ri].expr, row_vals);
                     // Standard Cypher: collect() ignores nulls.
                     if !matches!(arg_val, Value::Null) {
                         group_accum[group_idx][ai].push(arg_val);
