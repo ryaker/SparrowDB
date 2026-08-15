@@ -1,6 +1,55 @@
 //! Auto-generated submodule — see engine/mod.rs for context.
 use super::*;
 
+/// Signature shared by every scalar function that can only be evaluated with
+/// engine (graph) context — `eval_full_text_search`, `eval_bm25_score`, and
+/// `eval_hybrid_search` all have this exact shape.
+type GraphOnlyFn = fn(&Engine, &[Expr], &HashMap<String, Value>) -> Value;
+
+/// The single source of truth for which scalar functions require
+/// `Engine::eval_expr_graph` rather than the free, non-engine `eval_expr`,
+/// and how to dispatch each one.
+///
+/// # #459: one table instead of two name lists
+///
+/// Before this table existed, `eval_expr_graph`'s `FnCall` arm and
+/// `expr_needs_graph` (`engine/mod.rs`) each kept their own copy of the same
+/// three names, with nothing keeping them in sync. When they agreed the
+/// system worked; the day someone added a fourth graph-only function to one
+/// list and not the other, `expr_needs_graph` would keep saying "no" for it,
+/// `aggregate_rows_graph` would keep delegating to the non-engine
+/// `aggregate_rows` → `eval_expr`, and the new function would silently
+/// return `Value::Null` against a perfectly healthy index — this issue,
+/// verbatim, for the next function. This project has hit the same shape
+/// twice already for a match/dispatch pair that can drift (`is_mutation` vs
+/// its dispatch match: #478 missing-from-classifier, #502
+/// missing-from-dispatch).
+///
+/// A table is used instead of a plain name list so the dispatch itself reads
+/// from the same data `is_graph_only_fn` checks against — adding a function
+/// here is the only step; both the "does this need graph context" check and
+/// the actual call site update together. See `eval_expr_graph`'s `FnCall`
+/// arm below and `regression_459_hybrid_search_return.rs` /
+/// `graph_only_fn_table_covers_every_dispatched_name` (this file's tests).
+///
+/// To add a new graph-only function: add its `eval_*` method to this `impl
+/// Engine` block, then add one row here. Nothing else needs to change.
+const GRAPH_ONLY_FNS: &[(&str, GraphOnlyFn)] = &[
+    ("full_text_search", Engine::eval_full_text_search),
+    ("bm25_score", Engine::eval_bm25_score),
+    ("hybrid_search", Engine::eval_hybrid_search),
+];
+
+/// Returns `true` when `name` (case-insensitive) names one of
+/// [`GRAPH_ONLY_FNS`] — a scalar function that can only be evaluated via
+/// `Engine::eval_expr_graph`. Used by `expr_needs_graph` (`engine/mod.rs`)
+/// to route `aggregate_rows_graph` correctly; see the module doc on
+/// `GRAPH_ONLY_FNS` for why this must not be a second, independent list.
+pub(crate) fn is_graph_only_fn(name: &str) -> bool {
+    let name_lc = name.to_ascii_lowercase();
+    GRAPH_ONLY_FNS.iter().any(|(n, _)| *n == name_lc)
+}
+
 /// Key of the process-global `hybrid_search` index cache: which database
 /// directory, which `(label, prop)` pair.
 type HybridCacheKey = (std::path::PathBuf, String, String);
@@ -665,12 +714,17 @@ impl Engine {
                 }
                 Value::Null
             }
-            Expr::FnCall { name, args } => match name.to_ascii_lowercase().as_str() {
-                "full_text_search" => self.eval_full_text_search(args, vals),
-                "bm25_score" => self.eval_bm25_score(args, vals),
-                "hybrid_search" => self.eval_hybrid_search(args, vals),
-                _ => eval_expr(expr, vals),
-            },
+            // Dispatch through the shared GRAPH_ONLY_FNS table (#459) rather
+            // than a hand-written match, so this call site and
+            // `is_graph_only_fn` can never disagree about which names route
+            // here.
+            Expr::FnCall { name, args } => {
+                let name_lc = name.to_ascii_lowercase();
+                match GRAPH_ONLY_FNS.iter().find(|(n, _)| *n == name_lc) {
+                    Some((_, f)) => f(self, args, vals),
+                    None => eval_expr(expr, vals),
+                }
+            }
             // #477: a bare `full_text_search(...)`/`bm25_score(...)` call is
             // routed above, but a threshold comparison like
             // `bm25_score(n.text, 'q') > 0.5` wraps the call in a `BinOp` —
@@ -1121,5 +1175,64 @@ impl Engine {
                     .collect()
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #459 pin: `expr_needs_graph` (`engine/mod.rs`) must return `true` for
+    /// every name `eval_expr_graph` actually dispatches through
+    /// `GRAPH_ONLY_FNS` — read directly off that table, not a fourth copy of
+    /// the name list, so this test cannot silently drift the same way the
+    /// two independent name lists it replaces did before this fix. If a
+    /// future graph-only function is added to `GRAPH_ONLY_FNS` without a
+    /// matching change anywhere, this test still passes (there is nothing
+    /// left to keep in sync) — that is the point.
+    #[test]
+    fn expr_needs_graph_covers_every_name_in_the_dispatch_table() {
+        for (name, _) in GRAPH_ONLY_FNS {
+            let expr = Expr::FnCall {
+                name: (*name).to_string(),
+                args: vec![],
+            };
+            assert!(
+                expr_needs_graph(&expr),
+                "expr_needs_graph() must return true for {name:?} — it is in \
+                 GRAPH_ONLY_FNS (eval_expr_graph's real dispatch table), so \
+                 aggregate_rows_graph must route it through eval_expr_graph \
+                 rather than the non-engine eval_expr fallback that produced \
+                 issue #459's Null-on-a-healthy-index bug"
+            );
+            assert!(
+                is_graph_only_fn(name),
+                "is_graph_only_fn({name:?}) must agree with its own table"
+            );
+        }
+    }
+
+    /// Sanity companion: an ordinary function name outside the table must
+    /// NOT be flagged as graph-only — otherwise the pin above would pass
+    /// trivially by treating every function as graph-only.
+    #[test]
+    fn expr_needs_graph_does_not_flag_an_ordinary_function() {
+        let expr = Expr::FnCall {
+            name: "toUpper".to_string(),
+            args: vec![],
+        };
+        assert!(!expr_needs_graph(&expr));
+        assert!(!is_graph_only_fn("toUpper"));
+    }
+
+    /// Case-insensitivity parity: `eval_expr_graph`'s dispatch lowercases the
+    /// name before matching, so the routing check must too.
+    #[test]
+    fn expr_needs_graph_is_case_insensitive() {
+        let expr = Expr::FnCall {
+            name: "HYBRID_SEARCH".to_string(),
+            args: vec![],
+        };
+        assert!(expr_needs_graph(&expr));
     }
 }
