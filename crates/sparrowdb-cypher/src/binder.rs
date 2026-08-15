@@ -64,7 +64,25 @@ pub fn bind(stmt: Statement, catalog: &Catalog) -> Result<BoundStatement> {
         Statement::OptionalMatch(_) => {}
         Statement::MatchOptionalMatch(mom) => bind_match_optional_match(mom, catalog)?,
         // UNION: bind both sides independently.
+        //
+        // Cypher does not define UNION over mutating clauses. Reject here
+        // rather than letting a mutating branch (CREATE, MERGE, MATCH...SET,
+        // MATCH...DELETE) reach the read-only engine dispatch: that path runs
+        // against a non-transactional NodeStore, so the statement would
+        // report success while durably writing nothing (issue #478). This
+        // check must run on *both* sides — `UNION` is left/right-symmetric
+        // and a mutation can appear on either branch, or nested arbitrarily
+        // deep in a `UNION`-of-`UNION` chain (each nested `Union` is bound
+        // recursively via this same arm, so nesting is covered for free).
         Statement::Union(u) => {
+            if u.left.is_mutation() || u.right.is_mutation() {
+                return Err(sparrowdb_common::Error::InvalidArgument(
+                    "UNION cannot contain a mutating clause (CREATE, MERGE, \
+                     MATCH ... SET, MATCH ... DELETE); each UNION branch must \
+                     be a read-only query"
+                        .into(),
+                ));
+            }
             bind((*u.left).clone(), catalog)?;
             bind((*u.right).clone(), catalog)?;
         }
