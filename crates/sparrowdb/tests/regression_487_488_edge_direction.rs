@@ -23,7 +23,7 @@
 //!
 //! The fix threads a `first_hop_incoming` / per-hop `incoming` flag through
 //! both functions, mirroring the existing `second_hop_incoming` (SPA-201)
-//! pattern: a new `Engine::csr_predecessors_labeled` (the backward mirror of
+//! pattern: a per-table backward-CSR lookup (the mirror of
 //! `csr_neighbors_labeled`) plus a per-table `CsrBackward` built the same way
 //! `execute_one_hop`'s `Both` backward pass and `execute_two_hop`'s existing
 //! `merged_bwd_csr` already do, so checkpointed edges are covered; the delta
@@ -33,7 +33,7 @@
 //! All expected values are derived by hand from each fixture's create calls,
 //! never captured from program output. Tests are duplicated pre- and
 //! post-CHECKPOINT where practical, because the delta-log path and the
-//! persisted-CSR path (`csr_predecessors_labeled`, `hop1_bwd_csr`) are
+//! persisted-CSR path (per-table predecessor lookup, `hop1_bwd_csr`) are
 //! genuinely different code and a bug in either would otherwise go unnoticed
 //! — none of this repo's existing MATCH e2e tests call CHECKPOINT, so the
 //! CSR-backed backward path was previously untested by any file in this repo.
@@ -124,7 +124,7 @@ fn issue_487_two_hop_first_hop_incoming_post_checkpoint() {
         collect_strings(&result.rows),
         vec!["a1".to_string()],
         "#487: same query must also return a1 after CHECKPOINT, exercising \
-         Engine::csr_predecessors_labeled / hop1_bwd_csr rather than the \
+         per-table predecessor lookup / hop1_bwd_csr rather than the \
          delta log"
     );
 }
@@ -267,7 +267,7 @@ fn issue_488_three_hop_all_incoming_post_checkpoint() {
         collect_strings(&result.rows),
         vec!["a1".to_string()],
         "#488: same chain must also return a1 after CHECKPOINT, exercising \
-         csr_predecessors_labeled in execute_n_hop's fixed-hop branch"
+         the per-table backward CSR lookup in execute_n_hop's fixed-hop branch"
     );
 }
 
