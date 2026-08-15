@@ -831,44 +831,6 @@ impl Engine {
         out
     }
 
-    /// Predecessor **slots** of `(dst_slot, dst_label_id)` — the mirror of
-    /// [`Engine::csr_neighbors_labeled`] for a left-pointing (`<-`) pattern
-    /// hop.  Every hit is tagged with its own table's *source* label, exactly
-    /// as `csr_neighbors_labeled` tags forward hits with the destination
-    /// label — never inferred from the caller's slot.
-    ///
-    /// Only covers checkpointed edges (each table's on-disk backward CSR,
-    /// written at checkpoint time). Callers must separately scan the delta
-    /// log for post-checkpoint predecessors, the same two-source pattern
-    /// `csr_neighbors_labeled` callers already follow for the forward case
-    /// (CSR ∪ delta). A table with no backward CSR yet (pre-checkpoint) is
-    /// skipped rather than treated as an error — matching how the `Both`
-    /// backward pass in `execute_one_hop` degrades gracefully.
-    fn csr_predecessors_labeled(
-        &self,
-        dst_slot: u64,
-        dst_label_id: u32,
-        rel_ids: &[u32],
-    ) -> Vec<(u64, u32)> {
-        let topo = self.snapshot.csr_topology();
-        let mut out: Vec<(u64, u32)> = Vec::new();
-        for &(rid, tbl_src_lid, tbl_dst_lid) in &topo.tables {
-            if !rel_ids.is_empty() && !rel_ids.contains(&rid) {
-                continue;
-            }
-            if tbl_dst_lid != dst_label_id {
-                continue;
-            }
-            let bwd = EdgeStore::open(&self.snapshot.db_root, RelTableId(rid))
-                .and_then(|s| s.open_bwd())
-                .ok();
-            if let Some(bwd) = bwd {
-                out.extend(bwd.predecessors(dst_slot).iter().map(|&s| (s, tbl_src_lid)));
-            }
-        }
-        out
-    }
-
     /// Destination **slots** of the outgoing CSR edges of `(src_slot,
     /// src_label_id)`, restricted to edges that land on `dst_label_id` when it
     /// is `Some`.

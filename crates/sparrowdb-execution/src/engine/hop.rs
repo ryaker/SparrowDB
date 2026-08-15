@@ -5,6 +5,14 @@ use super::*;
 /// hash-set intersection: `(b_slot, forward_neighbor_set, b_property_values)`.
 type BNeighborEntry = (u64, HashSet<u64>, Vec<(u32, u64)>);
 
+#[derive(Clone)]
+struct NhopRelBinding {
+    edge_id: sparrowdb_common::EdgeId,
+    rel_type: String,
+}
+
+type NhopNeighbor = (u64, u32, Option<NhopRelBinding>);
+
 impl Engine {
     // ── 1-hop traversal: (a)-[:R]->(f) ───────────────────────────────────────
 
@@ -837,6 +845,14 @@ impl Engine {
         let mid_node_pat = &pat.nodes[1];
         // nodes[2] is the fof (friend-of-friend) / anchor-B in Q8
         let fof_node_pat = &pat.nodes[2];
+
+        // If the terminal node is unlabeled, the generic N-hop executor already
+        // recovers the actual label of every final hop from the stored edges.
+        // Route there instead of requiring fof_label_id and returning a bare
+        // "not found".
+        if fof_node_pat.labels.is_empty() {
+            return self.execute_n_hop(m, column_names);
+        }
 
         let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
         let fof_label = fof_node_pat.labels.first().cloned().unwrap_or_default();
@@ -2010,6 +2026,16 @@ impl Engine {
         // Reusable neighbor buffer for the variable-length traversal.
         let mut neighbors_buf: HashSet<(u64, u32)> = HashSet::new();
 
+        let use_agg = has_aggregate_in_return(&m.return_clause.items);
+        let use_eval_projection = needs_node_ref_in_return(&m.return_clause.items);
+        let rel_type_by_id: HashMap<u32, String> = self
+            .snapshot
+            .catalog
+            .list_rel_tables_with_ids()
+            .into_iter()
+            .map(|(id, _, _, rel_type)| (id as u32, rel_type))
+            .collect();
+        let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
         let mut rows: Vec<Vec<Value>> = Vec::new();
 
         for src_slot in 0..hwm_src {
@@ -2038,6 +2064,15 @@ impl Engine {
                     let key = format!("{}.col_{col_id}", pat.nodes[0].var);
                     row_vals.insert(key, decode_raw_val(raw, &self.snapshot.store));
                 }
+                row_vals.insert(pat.nodes[0].var.clone(), Value::NodeRef(src_node_id));
+                row_vals.insert(
+                    format!("{}.__node_id__", pat.nodes[0].var),
+                    Value::NodeRef(src_node_id),
+                );
+                row_vals.insert(
+                    format!("{}.__labels__", pat.nodes[0].var),
+                    self.labels_value_for_node(src_node_id),
+                );
             }
 
             // `frontier` holds (slot, label_id, accumulated_vals) triples for the
@@ -2065,12 +2100,12 @@ impl Engine {
                 for (cur_slot, cur_label_id, cur_vals) in frontier {
                     let hop_rel_ids = &rel_ids_per_hop[hop_idx];
 
-                    // `(slot, resolved_label_id)` candidates for this hop, each
+                    // `(slot, resolved_label_id, relationship)` candidates for this hop, each
                     // carrying the neighbour's *actual* label — read from the
                     // catalog/CSR or the stored NodeId, never guessed from the
                     // pattern or assumed from the source's label. A bare slot
                     // is not a safe node identity: see #427, #429, #431.
-                    let all_nb: Vec<(u64, u32)> = match varlen_per_hop[hop_idx] {
+                    let all_nb: Vec<NhopNeighbor> = match varlen_per_hop[hop_idx] {
                         // ── #421: variable-length hop ────────────────────────
                         Some((min_hops, max_hops)) => {
                             // Per-path enumeration is only collapsed to
@@ -2096,8 +2131,8 @@ impl Engine {
                                         // A label on the pattern is a filter:
                                         // drop nodes whose recovered label differs.
                                         Some(required) if discovered_label != required => None,
-                                        Some(required) => Some((slot, required)),
-                                        None => Some((slot, discovered_label)),
+                                        Some(required) => Some((slot, required, None)),
+                                        None => Some((slot, discovered_label, None)),
                                     }
                                 })
                                 .collect()
@@ -2123,15 +2158,89 @@ impl Engine {
                             // hop's direction rather than assuming Outgoing.
                             let incoming =
                                 pat.rels[hop_idx].dir == sparrowdb_cypher::ast::EdgeDir::Incoming;
-                            let mut seen: HashSet<(u64, u32)> = HashSet::new();
-                            let mut nb: Vec<(u64, u32)> = if incoming {
-                                self.csr_predecessors_labeled(cur_slot, cur_label_id, hop_rel_ids)
-                            } else {
-                                self.csr_neighbors_labeled(cur_slot, cur_label_id, hop_rel_ids)
+                            let mut seen: HashSet<(u64, u32, u64)> = HashSet::new();
+                            let mut nb: Vec<NhopNeighbor> = Vec::new();
+                            let topo = self.snapshot.csr_topology();
+                            for &(rid, tbl_src_lid, tbl_dst_lid) in &topo.tables {
+                                if !hop_rel_ids.is_empty() && !hop_rel_ids.contains(&rid) {
+                                    continue;
+                                }
+                                let rel_type =
+                                    rel_type_by_id.get(&rid).cloned().unwrap_or_default();
+                                let candidates: Vec<(u64, u32)> = if incoming {
+                                    if tbl_dst_lid != cur_label_id {
+                                        continue;
+                                    }
+                                    EdgeStore::open(&self.snapshot.db_root, RelTableId(rid))
+                                        .and_then(|store| store.open_bwd())
+                                        .map(|bwd| {
+                                            bwd.predecessors(cur_slot)
+                                                .iter()
+                                                .map(|&slot| (slot, tbl_src_lid))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                } else {
+                                    if tbl_src_lid != cur_label_id {
+                                        continue;
+                                    }
+                                    self.snapshot
+                                        .csrs
+                                        .get(&rid)
+                                        .map(|csr| {
+                                            csr.neighbors(cur_slot)
+                                                .iter()
+                                                .map(|&slot| (slot, tbl_dst_lid))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                };
+                                for (slot, label_id) in candidates {
+                                    let (physical_src, physical_dst) = if incoming {
+                                        (slot, cur_slot)
+                                    } else {
+                                        (cur_slot, slot)
+                                    };
+                                    let edge_id = sparrowdb_common::EdgeId(
+                                        ((rid as u64) << 32)
+                                            | (physical_src ^ physical_dst) & 0xFFFF_FFFF,
+                                    );
+                                    if seen.insert((slot, label_id, edge_id.0)) {
+                                        nb.push((
+                                            slot,
+                                            label_id,
+                                            Some(NhopRelBinding {
+                                                edge_id,
+                                                rel_type: rel_type.clone(),
+                                            }),
+                                        ));
+                                    }
+                                }
                             }
-                            .into_iter()
-                            .filter(|nb| seen.insert(*nb))
-                            .collect();
+                            // Preserve the legacy unlabeled-CSR fallback. These
+                            // tables have no catalog relationship metadata.
+                            if !incoming && hop_rel_ids.is_empty() {
+                                for &rid in &topo.unlabeled {
+                                    if let Some(csr) = self.snapshot.csrs.get(&rid) {
+                                        for &slot in csr.neighbors(cur_slot) {
+                                            let edge_id = sparrowdb_common::EdgeId(
+                                                ((rid as u64) << 32)
+                                                    | (cur_slot ^ slot) & 0xFFFF_FFFF,
+                                            );
+                                            if seen.insert((slot, cur_label_id, edge_id.0)) {
+                                                nb.push((
+                                                    slot,
+                                                    cur_label_id,
+                                                    Some(NhopRelBinding {
+                                                        edge_id,
+                                                        rel_type: String::new(),
+                                                    }),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             for r in delta_all.iter() {
                                 // Filter by relation-table IDs when a type constraint exists.
                                 if !hop_rel_ids.is_empty() && !hop_rel_ids.contains(&r.rel_id.0) {
@@ -2145,8 +2254,22 @@ impl Engine {
                                         continue;
                                     }
                                     let (r_src_label, r_src_slot) = node_id_parts(r.src.0);
-                                    if seen.insert((r_src_slot, r_src_label)) {
-                                        nb.push((r_src_slot, r_src_label));
+                                    let edge_id = sparrowdb_common::EdgeId(
+                                        ((r.rel_id.0 as u64) << 32)
+                                            | (r_src_slot ^ cur_slot) & 0xFFFF_FFFF,
+                                    );
+                                    if seen.insert((r_src_slot, r_src_label, edge_id.0)) {
+                                        nb.push((
+                                            r_src_slot,
+                                            r_src_label,
+                                            Some(NhopRelBinding {
+                                                edge_id,
+                                                rel_type: rel_type_by_id
+                                                    .get(&r.rel_id.0)
+                                                    .cloned()
+                                                    .unwrap_or_default(),
+                                            }),
+                                        ));
                                     }
                                 } else {
                                     let (r_src_label, r_src_slot) = node_id_parts(r.src.0);
@@ -2154,8 +2277,22 @@ impl Engine {
                                         continue;
                                     }
                                     let (r_dst_label, r_dst_slot) = node_id_parts(r.dst.0);
-                                    if seen.insert((r_dst_slot, r_dst_label)) {
-                                        nb.push((r_dst_slot, r_dst_label));
+                                    let edge_id = sparrowdb_common::EdgeId(
+                                        ((r.rel_id.0 as u64) << 32)
+                                            | (cur_slot ^ r_dst_slot) & 0xFFFF_FFFF,
+                                    );
+                                    if seen.insert((r_dst_slot, r_dst_label, edge_id.0)) {
+                                        nb.push((
+                                            r_dst_slot,
+                                            r_dst_label,
+                                            Some(NhopRelBinding {
+                                                edge_id,
+                                                rel_type: rel_type_by_id
+                                                    .get(&r.rel_id.0)
+                                                    .cloned()
+                                                    .unwrap_or_default(),
+                                            }),
+                                        ));
                                     }
                                 }
                             }
@@ -2163,7 +2300,7 @@ impl Engine {
                         }
                     };
 
-                    for (next_slot, next_label_id) in all_nb {
+                    for (next_slot, next_label_id, rel_binding) in all_nb {
                         // When this position carries a label, the neighbour must
                         // actually have it — matching on the slot alone would
                         // admit the same-numbered node of any other label.
@@ -2190,6 +2327,31 @@ impl Engine {
                                 let key = format!("{}.col_{col_id}", next_node_pat.var);
                                 new_vals.insert(key, decode_raw_val(raw, &self.snapshot.store));
                             }
+                            new_vals
+                                .insert(next_node_pat.var.clone(), Value::NodeRef(next_node_id));
+                            new_vals.insert(
+                                format!("{}.__node_id__", next_node_pat.var),
+                                Value::NodeRef(next_node_id),
+                            );
+                            new_vals.insert(
+                                format!("{}.__labels__", next_node_pat.var),
+                                self.labels_value_for_node(next_node_id),
+                            );
+                        }
+                        let rel_pat = &pat.rels[hop_idx];
+                        if !rel_pat.var.is_empty() {
+                            let rel_type = rel_binding
+                                .as_ref()
+                                .map(|binding| binding.rel_type.clone())
+                                .unwrap_or_else(|| rel_pat.rel_type.clone());
+                            new_vals.insert(
+                                format!("{}.__type__", rel_pat.var),
+                                Value::String(rel_type),
+                            );
+                            if let Some(binding) = rel_binding {
+                                new_vals
+                                    .insert(rel_pat.var.clone(), Value::EdgeRef(binding.edge_id));
+                            }
                         }
 
                         next_frontier.push((next_slot, next_label_id, new_vals));
@@ -2210,26 +2372,41 @@ impl Engine {
                     }
                 }
 
-                // Project column values from the accumulated binding map.
-                // Each column name is "var.prop" — look up "var.col_<id>" in the map.
-                let row: Vec<Value> = column_names
-                    .iter()
-                    .map(|col_name| {
-                        if let Some((var, prop)) = col_name.split_once('.') {
-                            let key = format!("{var}.col_{}", col_id_of(prop));
-                            path_vals.get(&key).cloned().unwrap_or(Value::Null)
-                        } else {
-                            Value::Null
-                        }
-                    })
-                    .collect();
+                if use_agg {
+                    raw_rows.push(path_vals);
+                    continue;
+                }
+
+                let row: Vec<Value> = if use_eval_projection {
+                    // Evaluate expressions that need complete bindings, including
+                    // metadata functions such as labels(n) and type(r).
+                    m.return_clause
+                        .items
+                        .iter()
+                        .map(|item| self.eval_expr_graph(&item.expr, &path_vals))
+                        .collect()
+                } else {
+                    // Preserve the established property-only projection path.
+                    column_names
+                        .iter()
+                        .map(|col_name| {
+                            if let Some((var, prop)) = col_name.split_once('.') {
+                                let key = format!("{var}.col_{}", col_id_of(prop));
+                                path_vals.get(&key).cloned().unwrap_or(Value::Null)
+                            } else {
+                                Value::Null
+                            }
+                        })
+                        .collect()
+                };
 
                 rows.push(row);
             }
         }
 
-        // DISTINCT
-        if m.distinct {
+        if use_agg {
+            rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
+        } else if m.distinct {
             deduplicate_rows(&mut rows);
         }
 
