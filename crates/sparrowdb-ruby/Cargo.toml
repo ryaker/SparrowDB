@@ -2,6 +2,10 @@
 name = "sparrowdb-ruby"
 version = "0.1.8"
 edition = "2021"
+# Ships as a Ruby gem (extconf.rb + Gemfile + lib/), not as a crate. It has never
+# been published to crates.io and cannot be: its path dependencies carry no version
+# requirement. The rubygems publish path is release.yml's commented-out job.
+publish = false
 license = "MIT OR Apache-2.0"
 authors = ["Rich Yaker"]
 description = "Ruby bindings for SparrowDB embedded graph database"
