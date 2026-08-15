@@ -330,7 +330,7 @@ jobs:
           # sparrowdb-ruby depends on common + execution and is published last.
           # sparrowdb-bench is a dev-dependency of sparrowdb and is not published;
           # cargo publish ignores dev-dependencies.
-          CRATES="sparrowdb-common sparrowdb-storage sparrowdb-catalog sparrowdb-cypher sparrowdb-execution sparrowdb sparrowdb-ruby"
+          CRATES="sparrowdb-common sparrowdb-storage sparrowdb-catalog sparrowdb-cypher sparrowdb-execution sparrowdb"
 
           for crate in $CRATES; do
             echo "── $crate ──"
