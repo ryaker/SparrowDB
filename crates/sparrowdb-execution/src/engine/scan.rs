@@ -304,10 +304,19 @@ impl Engine {
             if self.is_node_tombstoned(node_id) {
                 continue;
             }
-            let props = match self.snapshot.store.get_node_raw(node_id, &col_ids) {
+            // Nullable read so absent columns are omitted rather than
+            // zero-sentineled, matching the main MATCH scan (#479-adjacent:
+            // this pipeline leading-match scan had the same absent-vs-zero
+            // conflation as the three sites #479 named explicitly).
+            let nullable_props = match self.snapshot.store.get_node_raw_nullable(node_id, &col_ids)
+            {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            let props: Vec<(u32, u64)> = nullable_props
+                .into_iter()
+                .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+                .collect();
             if !self.matches_prop_filter(&props, &node.props) {
                 continue;
             }
@@ -377,10 +386,19 @@ impl Engine {
             if self.is_node_tombstoned(node_id) {
                 continue;
             }
-            let props = match self.snapshot.store.get_node_raw(node_id, &col_ids) {
+            // Nullable read so absent columns are omitted rather than
+            // zero-sentineled — same #479-adjacent fix as collect_pipeline_match_rows
+            // above, needed so a genuinely null-bound binding var matches the
+            // node whose property is actually absent (see matches_prop_filter_with_binding).
+            let nullable_props = match self.snapshot.store.get_node_raw_nullable(node_id, &col_ids)
+            {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            let props: Vec<(u32, u64)> = nullable_props
+                .into_iter()
+                .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+                .collect();
 
             // Evaluate inline prop filters, resolving variable references from binding.
             if !self.matches_prop_filter_with_binding(&props, &node.props, binding, &params) {
@@ -507,7 +525,16 @@ impl Engine {
                 if self.is_node_tombstoned(node_id) {
                     continue;
                 }
-                if let Ok(props) = self.snapshot.store.get_node_raw(node_id, &src_col_ids) {
+                // Nullable read — see the analogous fix a few lines above.
+                if let Ok(nullable_props) = self
+                    .snapshot
+                    .store
+                    .get_node_raw_nullable(node_id, &src_col_ids)
+                {
+                    let props: Vec<(u32, u64)> = nullable_props
+                        .into_iter()
+                        .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+                        .collect();
                     if self.matches_prop_filter_with_binding(
                         &props,
                         &src_pat.props,
@@ -527,11 +554,16 @@ impl Engine {
         let mut frontier: Vec<(u32, NodeId, HashMap<String, Value>)> =
             Vec::with_capacity(src_candidates.len());
         for src_id in src_candidates {
-            let src_props = self
+            // Nullable read so row_vals reflects true absence for downstream
+            // WHERE/RETURN/next-stage evaluation rather than the zero-sentinel.
+            let src_props: Vec<(u32, u64)> = self
                 .snapshot
                 .store
-                .get_node_raw(src_id, &src_col_ids)
-                .unwrap_or_default();
+                .get_node_raw_nullable(src_id, &src_col_ids)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+                .collect();
             let mut row_vals =
                 build_row_vals(&src_props, &src_pat.var, &src_col_ids, &self.snapshot.store);
             row_vals.insert(src_pat.var.clone(), Value::NodeRef(src_id));
@@ -599,8 +631,16 @@ impl Engine {
                     if self.is_node_tombstoned(dst_id) {
                         continue;
                     }
-                    let dst_props = match self.snapshot.store.get_node_raw(dst_id, &dst_col_ids) {
-                        Ok(p) => p,
+                    // Nullable read — see the analogous fix above for src_candidates.
+                    let dst_props: Vec<(u32, u64)> = match self
+                        .snapshot
+                        .store
+                        .get_node_raw_nullable(dst_id, &dst_col_ids)
+                    {
+                        Ok(p) => p
+                            .into_iter()
+                            .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+                            .collect(),
                         Err(_) => continue,
                     };
                     if !self.matches_prop_filter_with_binding(
@@ -663,14 +703,32 @@ impl Engine {
         binding: &HashMap<String, Value>,
         params: &HashMap<String, Value>,
     ) -> bool {
+        // #472: fail closed on the same "unresolvable" gate #467 introduced
+        // for `matches_prop_filter_static`, extended so that a bare `Expr::Var`
+        // present in `binding` counts as locally resolvable (it's a real
+        // pipeline-stage variable, threaded through from the preceding WITH).
+        // A `Expr::Var` NOT in `binding` is unresolved — a correlated/outer
+        // variable never carried into this stage's binding, or a typo — not a
+        // deliberate null, and must not be silently treated as `Value::Null`.
+        // Before this gate, an unresolved var defaulted to `Value::Null` and
+        // then only matched nodes whose own property happened to be absent
+        // (via the `(None, Value::Null) => true` arm below) — a
+        // symptom-free wrong answer rather than the fail-open "match every
+        // node" #467 fixed, but still wrong (issue #472).
+        let locals: Vec<&str> = binding.keys().map(|s| s.as_str()).collect();
         for f in filters {
+            if !super::is_filter_expr_resolvable_scoped(&f.value, params, &locals) {
+                return false;
+            }
+
             let col_id = prop_name_to_col_id(&f.key);
             let stored_raw = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
 
             // Evaluate the filter expression, first substituting from binding.
             let filter_val = match &f.value {
                 sparrowdb_cypher::ast::Expr::Var(v) => {
-                    // Variable reference — look up in binding.
+                    // Variable reference — resolvability just confirmed `v` is
+                    // present in `binding`.
                     binding.get(v).cloned().unwrap_or(Value::Null)
                 }
                 other => eval_expr(other, params),
