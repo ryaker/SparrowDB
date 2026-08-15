@@ -753,15 +753,20 @@ describe('SparrowDB vector index damage reporting — issues #446 / #451 / #455 
     )
   }
 
-  function assertFailureShape(entry, indexFile) {
+  // The two `kind` values a `VectorIndexLoadFailure` can carry (#451) — see
+  // `VectorIndexFailureKind` in `crates/sparrowdb/src/helpers.rs`.
+  const KIND_LIVE_UNSERVICEABLE = 'live_unserviceable'
+  const KIND_QUARANTINED_NO_LIVE_INDEX = 'quarantined_no_live_index'
+
+  function assertFailureShape(entry, indexFile, expectedKind) {
     // Named fields, not tuple positions — a consumer building an alert needs
     // to read `entry.path`, not `entry[2]`.
     assert.deepEqual(
       Object.keys(entry).sort(),
-      ['label', 'path', 'prop', 'reason'],
-      'entry must expose exactly { label, prop, path, reason }'
+      ['kind', 'label', 'path', 'prop', 'reason'],
+      'entry must expose exactly { label, prop, path, reason, kind }'
     )
-    for (const field of ['label', 'prop', 'path', 'reason']) {
+    for (const field of ['label', 'prop', 'path', 'reason', 'kind']) {
       assert.equal(
         typeof entry[field], 'string',
         `${field} must be a string, got ${typeof entry[field]}`
@@ -777,6 +782,16 @@ describe('SparrowDB vector index damage reporting — issues #446 / #451 / #455 
       `path must name the damaged index (${indexFile} or its .corrupt.* ` +
       `artifact); got ${entry.path}`
     )
+    assert.ok(
+      entry.kind === KIND_LIVE_UNSERVICEABLE || entry.kind === KIND_QUARANTINED_NO_LIVE_INDEX,
+      `kind must be one of the two documented values, got ${entry.kind}`
+    )
+    if (expectedKind !== undefined) {
+      assert.equal(
+        entry.kind, expectedKind,
+        `expected kind ${expectedKind} for this scenario, got ${entry.kind}`
+      )
+    }
   }
 
   it('both tiers are static methods on the class, not instance methods', () => {
@@ -970,7 +985,7 @@ describe('SparrowDB vector index damage reporting — issues #446 / #451 / #455 
       assert.equal(report.historical.length, 0, 'nothing has been rebuilt')
       assert.equal(report.healthy, false, 'a damaged live index is not healthy')
 
-      assertFailureShape(report.active[0], indexFile)
+      assertFailureShape(report.active[0], indexFile, KIND_LIVE_UNSERVICEABLE)
       assert.equal(
         report.active[0].path, indexFile,
         'the live arm reports the .bin path it scanned'
@@ -1108,7 +1123,7 @@ describe('SparrowDB vector index damage reporting — issues #446 / #451 / #455 
         `expected exactly ${EXPECTED_FAILURES} damaged index while open() is ` +
         `failing, got ${JSON.stringify(duringOutage.active)}`
       )
-      assertFailureShape(duringOutage.active[0], indexFile)
+      assertFailureShape(duringOutage.active[0], indexFile, KIND_QUARANTINED_NO_LIVE_INDEX)
 
       // The failed open() quarantined the bytes, so the reported path is now
       // the artifact: `<indexFile>.corrupt.<unix_millis>`.  The stem is
@@ -1136,8 +1151,8 @@ describe('SparrowDB vector index damage reporting — issues #446 / #451 / #455 
         duringOutage.active[0].reason
       )
 
-      // ── Phase 2: #451. The .bin is gone, so this is now the "absent" case
-      //    and open() succeeds — with the index silently missing. ───────────
+      // ── Phase 2: #451. The .bin is gone, so this is the "looks absent, but
+      //    was actually quarantined" state — open() succeeds. ────────────────
       const db = SparrowDB.open(dbPath)
       assert.ok(
         db instanceof SparrowDB,
@@ -1151,7 +1166,27 @@ describe('SparrowDB vector index damage reporting — issues #446 / #451 / #455 
         'the quarantined index must be absent from the reopened database'
       )
 
-      // ── Phase 3: the diagnostic is the ONLY remaining signal. ────────────
+      // A vector write against this exact (label, prop) must now be refused
+      // loudly rather than silently discarded — the fix for #451, exercised
+      // through the actual Node binding a JS caller (e.g. KMSmcp) would use.
+      db.execute(`CREATE (:${LABEL} {id: 'after-quarantine'})`)
+      assert.throws(
+        () => db.executeWithParams(
+          `MATCH (n:${LABEL} {id: 'after-quarantine'}) SET n.${PROP} = $emb`,
+          { emb: [0.1, 0.2, 0.3] }
+        ),
+        err => {
+          const msg = String(err.message || err)
+          for (const token of [LABEL, PROP, 'createVectorIndex']) {
+            assert.ok(msg.includes(token), `write-refusal error missing '${token}': ${msg}`)
+          }
+          return true
+        },
+        'a vector write against a quarantined, unrecovered pair must throw, not silently no-op'
+      )
+
+      // ── Phase 3: the diagnostic is now one of two signals — writes throw,
+      //    and this call finds the condition before a write ever hits it. ───
       const afterReopen = SparrowDB.vectorIndexLoadFailures(dbPath)
       assertReportShape(afterReopen)
       assert.equal(
@@ -1163,7 +1198,7 @@ describe('SparrowDB vector index damage reporting — issues #446 / #451 / #455 
         afterReopen.healthy, false,
         'a store silently dropping vector writes is not healthy'
       )
-      assertFailureShape(afterReopen.active[0], indexFile)
+      assertFailureShape(afterReopen.active[0], indexFile, KIND_QUARANTINED_NO_LIVE_INDEX)
       assert.equal(
         afterReopen.active[0].path, duringOutage.active[0].path,
         'the artifact path must be stable across calls'

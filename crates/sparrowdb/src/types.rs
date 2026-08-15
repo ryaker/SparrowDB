@@ -299,6 +299,32 @@ pub(crate) struct DbInner {
     /// Each index is wrapped in `Arc<RwLock<VectorIndex>>` for SWMR access
     /// without holding the outer write-lock.
     pub vector_indexes: RwLock<VectorIndexMap>,
+    /// `(label, property)` pairs with an unrecovered #451 quarantine
+    /// artifact and no live index serving them right now — the paths are the
+    /// quarantined `.bin.corrupt.<millis>` files, kept for the write-refusal
+    /// error message.
+    ///
+    /// Populated once at `GraphDb::open`/`open_encrypted` time (quarantining
+    /// only happens on the open path, so nothing later in a session can add
+    /// to this) and cleared per-pair by `GraphDb::create_vector_index` once a
+    /// fresh index actually replaces the artifact. Every vector-write path
+    /// consults this before falling through to the ordinary property-write
+    /// rejection, so `open()`'s silent "healthy" success on a quarantined
+    /// store cannot let writes for that pair disappear a second time.
+    ///
+    /// **Scope: this `GraphDb` instance only, not the process or the file.**
+    /// This is in-memory state seeded once at `open()`, not re-derived from
+    /// disk on every write. A second `GraphDb` handle opened against the same
+    /// `path` — in this process or another — computes its own copy at its own
+    /// `open()` and the two are never reconciled; nothing here detects or
+    /// guards against concurrent access to one database directory from
+    /// multiple handles. This is a real limitation, not an oversight to "fix
+    /// later" casually: correctness would require either re-scanning disk on
+    /// every write (defeats the point of caching this) or a cross-process
+    /// coordination mechanism this crate does not otherwise have. Out of
+    /// scope for #451, which is about a single handle's `open()` being
+    /// stale, not about multiple handles disagreeing.
+    pub quarantined_vector_writes: RwLock<HashMap<(String, String), Vec<PathBuf>>>,
 }
 
 /// Run GC on the version store every this many commits.

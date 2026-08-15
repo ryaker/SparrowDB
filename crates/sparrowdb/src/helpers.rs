@@ -670,13 +670,42 @@ pub(crate) fn load_vector_indexes(db_root: &Path) -> crate::Result<crate::types:
     Ok(map)
 }
 
+/// Which of the two shapes of "not in service" a [`VectorIndexFailure`]
+/// represents (#451).
+///
+/// The two demand different responses from a caller, which is why this is a
+/// field rather than something inferred from `reason` prose:
+///
+/// * [`LiveUnserviceable`](Self::LiveUnserviceable) is a `.bin` `open()`
+///   already refused to load, or refuses right now — there is no running
+///   store to guard a write on; the fix happens before or at `open()`.
+/// * [`QuarantinedNoLiveIndex`](Self::QuarantinedNoLiveIndex) is the #451
+///   state: `open()` already **succeeded**, "clean", and every vector write
+///   to this `(label, prop)` is being silently dropped *right now*. This is
+///   what `GraphDb`'s write paths refuse on, and what a monitor should page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorIndexFailureKind {
+    /// `hnsw_<label>_<prop>.bin` is present but does not resolve (dangling
+    /// symlink) or — at [`vector_index_load_failures`]'s depth — does not
+    /// load.  `GraphDb::open` refuses to start while this is true.
+    LiveUnserviceable,
+    /// `hnsw_<label>_<prop>.bin.corrupt.<millis>` is present and no live
+    /// index currently serves the pair (#442 quarantine, #451 residual
+    /// hole).  `open()` succeeds anyway — the damaged bytes are already out
+    /// of service — which is exactly why this needs its own tag: nothing
+    /// else distinguishes this store from a healthy one.
+    QuarantinedNoLiveIndex,
+}
+
 /// One vector index that is not in service, and why.
 ///
 /// `path` names bytes that are actually on disk when the report is handed to
 /// you — the machine-readable field, and the one a caller can act on.  `reason`
 /// is prose: for a live file it is the loader's own error, for a quarantine
 /// artifact it is reconstructed, because #442 records the decode failure only in
-/// the `io::Error` it returns at quarantine time and writes no sidecar.
+/// the `io::Error` it returns at quarantine time and writes no sidecar.  `kind`
+/// is the machine-checkable field for the same distinction `reason` describes
+/// in prose — see [`VectorIndexFailureKind`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorIndexFailure {
     /// Node label the index belongs to.
@@ -687,6 +716,9 @@ pub struct VectorIndexFailure {
     pub path: PathBuf,
     /// Human-readable explanation.  Not machine-parseable; not stable.
     pub reason: String,
+    /// Which of the two "not in service" shapes this is.  Check this before
+    /// deciding whether a write against this pair would currently succeed.
+    pub kind: VectorIndexFailureKind,
 }
 
 /// What an inspection of `<db_root>/vector_indexes/` observed.
@@ -887,6 +919,7 @@ fn health(db_root: &Path, depth: Depth) -> VectorIndexHealth {
                          treating it as unconfigured would silently drop every vector write \
                          for it."
                     .to_owned(),
+                kind: VectorIndexFailureKind::LiveUnserviceable,
             });
             continue;
         }
@@ -911,6 +944,7 @@ fn health(db_root: &Path, depth: Depth) -> VectorIndexHealth {
                     prop: prop.clone(),
                     path,
                     reason: e.to_string(),
+                    kind: VectorIndexFailureKind::LiveUnserviceable,
                 }),
             },
         }
@@ -948,6 +982,7 @@ fn health(db_root: &Path, depth: Depth) -> VectorIndexHealth {
             prop,
             path,
             reason,
+            kind: VectorIndexFailureKind::QuarantinedNoLiveIndex,
         };
         if superseded {
             historical.push(failure);
@@ -968,6 +1003,36 @@ fn health(db_root: &Path, depth: Depth) -> VectorIndexHealth {
         active,
         historical,
     }
+}
+
+/// `(label, prop)` pairs currently in the #451 write-guard state: an
+/// unrecovered quarantine artifact exists and no live index serves the pair,
+/// so a vector write would be silently dropped were it not refused.
+///
+/// Computed with the cheap names-only tier — the same one-`read_dir`,
+/// no-content-I/O cost as [`vector_index_health`] — because this runs once at
+/// `GraphDb::open` time and must not become the thing that makes `open` slow.
+/// Quarantining only ever happens on the open path (`load_and_quarantine`),
+/// so nothing that happens *after* `open` can add to this set within a
+/// session; [`crate::db::GraphDb::create_vector_index`] is the only thing
+/// that removes an entry, once a fresh index actually replaces the artifact.
+///
+/// An unscannable directory yields an empty map rather than an error: `open`
+/// already ran the identical scan via `load_vector_indexes` and would have
+/// refused to start had it failed, so by the time this runs the directory is
+/// known-good for this session.
+pub(crate) fn quarantined_no_index_pairs(
+    db_root: &Path,
+) -> HashMap<(String, String), Vec<PathBuf>> {
+    let mut out: HashMap<(String, String), Vec<PathBuf>> = HashMap::new();
+    for failure in vector_index_health(db_root).active {
+        if failure.kind == VectorIndexFailureKind::QuarantinedNoLiveIndex {
+            out.entry((failure.label, failure.prop))
+                .or_default()
+                .push(failure.path);
+        }
+    }
+    out
 }
 
 // ── Storage-size helpers (SPA-171) ────────────────────────────────────────────
