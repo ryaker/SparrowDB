@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2020",
+    "lib": ["ES2020"],
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "types": [],
+    "noEmit": true,
+    "skipLibCheck": false,
+    "baseUrl": ".",
+    "paths": {
+      "sparrowdb": ["./index.d.ts"]
+    }
+  },
+  "include": ["index.d.ts", "test/consumer.ts"]
+}

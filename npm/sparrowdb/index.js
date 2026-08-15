@@ -58,4 +58,17 @@ function loadNative() {
   )
 }
 
-module.exports = loadNative()
+const native = loadNative()
+
+module.exports = native
+
+// Named exports must be assigned explicitly (not just spread onto
+// `module.exports`) so that Node's ESM/CJS interop — which relies on static
+// analysis via cjs-module-lexer, not evaluation — can see them. A dynamic
+// `module.exports = loadNative()` alone is invisible to that analysis, so an
+// ESM consumer's `import { SparrowDB } from 'sparrowdb'` fails with "Named
+// export 'SparrowDB' not found" even though `require('sparrowdb').SparrowDB`
+// works fine under CommonJS. See issue #449.
+module.exports.SparrowDB = native.SparrowDB
+module.exports.ReadTx = native.ReadTx
+module.exports.WriteTx = native.WriteTx
