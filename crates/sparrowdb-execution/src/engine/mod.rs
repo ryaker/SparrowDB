@@ -3221,11 +3221,31 @@ fn agg_kind(expr: &Expr) -> AggKind {
 /// Non-aggregate RETURN items become the group key.  Returns one output
 /// `Vec<Value>` per unique key in the same column order as `return_items`.
 /// Returns `true` if the expression contains a `CASE WHEN`, `shortestPath`,
-/// or `EXISTS` sub-expression that requires the graph-aware eval path
-/// (rather than the fast `project_row` column lookup).
+/// `EXISTS`, or `hybrid_search`/`full_text_search`/`bm25_score` sub-expression
+/// that requires the graph-aware eval path (rather than the fast
+/// `project_row` column lookup or the non-engine-aware `eval_expr` fallback).
+///
+/// # #459: the three engine-only scalar functions
+///
+/// `Engine::eval_expr_graph` (`engine/expr.rs`) special-cases exactly three
+/// function names — `hybrid_search`, `full_text_search`, `bm25_score` — and
+/// falls through to the free, non-engine `eval_expr` for everything else.
+/// That free `eval_expr`'s `FnCall` arm dispatches to
+/// `functions::dispatch_function`, which has never heard of these three, so
+/// it silently returns `Value::Null` for an unrelated reason (unknown
+/// function name). Before this fix, a bare `hybrid_search(...)` (or the
+/// other two) in a non-aggregate RETURN item did not trip `expr_needs_graph`,
+/// so `aggregate_rows_graph` delegated to the plain `aggregate_rows` helper's
+/// `eval_expr`-based projection instead of `eval_expr_graph` — producing
+/// `Null` against a perfectly healthy index. See
+/// `regression_459_hybrid_search_return.rs`.
 fn expr_needs_graph(expr: &Expr) -> bool {
     match expr {
         Expr::ShortestPath(_) | Expr::ExistsSubquery(_) | Expr::CaseWhen { .. } => true,
+        Expr::FnCall { name, .. } => matches!(
+            name.to_ascii_lowercase().as_str(),
+            "hybrid_search" | "full_text_search" | "bm25_score"
+        ),
         Expr::And(l, r) | Expr::Or(l, r) => expr_needs_graph(l) || expr_needs_graph(r),
         Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => expr_needs_graph(inner),
         Expr::BinOp { left, right, .. } => expr_needs_graph(left) || expr_needs_graph(right),
