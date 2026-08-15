@@ -611,6 +611,16 @@ impl Statement {
     /// not define `UNION` over mutating branches, so the binder rejects a
     /// `UNION` with a mutating side at bind time (see `bind()` in
     /// `binder.rs`) rather than trying to route it through the write path.
+    ///
+    /// The `false` arm is intentionally exhaustive (no `_` wildcard): every
+    /// non-mutating variant is listed by name, matching the equally-exhaustive
+    /// mutation dispatch in `sparrowdb::GraphDb::dispatch_mutation`. Adding a
+    /// new `Statement` variant to the AST is therefore a compile error in
+    /// *both* places until it is deliberately classified in both — the two
+    /// silently drifting apart is exactly what produced issue #478 (`Union`
+    /// missing here) and issue #502 (`CallSubquery` classified `true` here
+    /// but missing its own arm in the dispatch, so it hit that match's old
+    /// `_ => unreachable!()` and panicked on ordinary user input).
     pub fn is_mutation(&self) -> bool {
         match self {
             Statement::Merge(_)
@@ -626,7 +636,21 @@ impl Statement {
             // the braces is routed through the write-transaction path rather than
             // being silently dispatched via the read path and failing late.
             Statement::CallSubquery { subquery, .. } => subquery.is_mutation(),
-            _ => false,
+            Statement::Match(_)
+            | Statement::MatchWith(_)
+            | Statement::Unwind(_)
+            | Statement::OptionalMatch(_)
+            | Statement::MatchOptionalMatch(_)
+            | Statement::Union(_)
+            | Statement::Checkpoint
+            | Statement::Optimize
+            | Statement::Call(_)
+            | Statement::Pipeline(_)
+            | Statement::CreateIndex { .. }
+            | Statement::CreateConstraint { .. }
+            | Statement::CreateFulltextIndex { .. }
+            | Statement::CreateVectorIndex { .. }
+            | Statement::DropIndex { .. } => false,
         }
     }
 }
