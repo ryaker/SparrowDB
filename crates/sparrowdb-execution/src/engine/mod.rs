@@ -2087,14 +2087,27 @@ fn prop_name_to_col_id(name: &str) -> u32 {
     col_id_of(name)
 }
 
-fn collect_col_ids_from_columns(column_names: &[String]) -> Vec<u32> {
+/// Collect column IDs referenced by property-access RETURN items.
+///
+/// Dispatches on the AST expression (`item.expr`), not on the (possibly
+/// aliased) output column name. `collect_col_ids_from_columns` — the function
+/// this replaces — parsed the *display* name (`RETURN n.name AS personName`
+/// produced `"personName"`) as if it encoded `var.prop`, so the property to
+/// fetch from storage was hashed from the alias instead of `name`. That
+/// silently omitted the real column from the read, which is the root cause of
+/// #444 (aliased projection returns Null) and part of #430's phantom rows.
+///
+/// See `project_row` for the corresponding projection-time fix, and
+/// `collect_col_ids_for_var_from_items` (#369) for the same item-based
+/// pattern already established on the hop/traversal paths.
+fn collect_col_ids_from_return_items(items: &[ReturnItem]) -> Vec<u32> {
     let mut ids = Vec::new();
-    for name in column_names {
-        // name could be "var.col_N" or "col_N"
-        let prop = name.split('.').next_back().unwrap_or(name.as_str());
-        let col_id = prop_name_to_col_id(prop);
-        if !ids.contains(&col_id) {
-            ids.push(col_id);
+    for item in items {
+        if let Expr::PropAccess { prop, .. } = &item.expr {
+            let col_id = prop_name_to_col_id(prop);
+            if !ids.contains(&col_id) {
+                ids.push(col_id);
+            }
         }
     }
     ids
@@ -2639,50 +2652,41 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
     }
 }
 
+/// Project a scanned node's properties into RETURN columns.
+///
+/// Dispatches on the AST expression (`items[i].expr`), not on the (possibly
+/// aliased) output column name — this fixes #444: `RETURN n.name AS
+/// personName` must resolve `n.name`, not `"personName"`. The old
+/// implementation split the *output* column string on `.` and hashed
+/// whatever followed, which only happened to work when the alias equalled
+/// the property name.
+///
+/// Every call site only reaches `project_row` once `id(var)`, `labels(var)`,
+/// bare `var`, and every other non-aggregate `FnCall` have already been
+/// routed to the eval path (`needs_node_ref_in_return` /
+/// `expr_needs_eval_path`, checked by every caller before choosing between
+/// this fast path and the eval path). So every item here is guaranteed to be
+/// a `PropAccess`; the `_ => Value::Null` arm is a defensive fallback, not a
+/// reachable case.
 fn project_row(
     props: &[(u32, u64)],
-    column_names: &[String],
-    _col_ids: &[u32],
-    // Variable name for the scanned node (e.g. "n"), used for labels(n) columns.
+    items: &[ReturnItem],
+    // Variable name for the scanned node, used to disambiguate PropAccess.
     var_name: &str,
-    // Primary label for the scanned node, used for labels(n) columns.
-    node_label: &str,
     store: &NodeStore,
-    // NodeId of the scanned node, used for id(var) columns.
-    node_id: Option<NodeId>,
 ) -> Vec<Value> {
-    column_names
+    items
         .iter()
-        .map(|col_name| {
-            // Handle id(var) column — returns the node's integer id.
-            if let Some(inner) = col_name
-                .strip_prefix("id(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                if inner == var_name {
-                    if let Some(nid) = node_id {
-                        return Value::Int64(nid.0 as i64);
-                    }
-                }
-                return Value::Null;
+        .map(|item| match &item.expr {
+            Expr::PropAccess { var, prop } if var.as_str() == var_name => {
+                let col_id = prop_name_to_col_id(prop);
+                props
+                    .iter()
+                    .find(|(c, _)| *c == col_id)
+                    .map(|(_, v)| decode_raw_val(*v, store))
+                    .unwrap_or(Value::Null)
             }
-            // Handle labels(var) column.
-            if let Some(inner) = col_name
-                .strip_prefix("labels(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                if inner == var_name && !node_label.is_empty() {
-                    return Value::List(vec![Value::String(node_label.to_string())]);
-                }
-                return Value::Null;
-            }
-            let prop = col_name.split('.').next_back().unwrap_or(col_name.as_str());
-            let col_id = prop_name_to_col_id(prop);
-            props
-                .iter()
-                .find(|(c, _)| *c == col_id)
-                .map(|(_, v)| decode_raw_val(*v, store))
-                .unwrap_or(Value::Null)
+            _ => Value::Null,
         })
         .collect()
 }
