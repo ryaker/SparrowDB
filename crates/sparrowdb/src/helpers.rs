@@ -52,25 +52,47 @@ pub fn cypher_escape_string(s: &str) -> String {
 // ── Mutation value helpers ─────────────────────────────────────────────────────
 
 /// Convert a Cypher [`Literal`] to a storage [`Value`].
-pub(crate) fn literal_to_value(lit: &sparrowdb_cypher::ast::Literal) -> Value {
+///
+/// Returns `Err` for `null` and for an unbound `$param` reference (fixes
+/// #475/#473's underlying habit): both used to fall into a catch-all that
+/// silently wrote `Value::Int64(0)`, a value indistinguishable on read from a
+/// genuine stored zero. A literal `null` has never had a defined write
+/// semantic here, so it is rejected rather than given a new meaning; a
+/// `$param` with no bound value is a caller error and must surface as one.
+pub(crate) fn literal_to_value(lit: &sparrowdb_cypher::ast::Literal) -> crate::Result<Value> {
     use sparrowdb_cypher::ast::Literal;
     match lit {
-        Literal::Int(n) => Value::Int64(*n),
+        Literal::Int(n) => Ok(Value::Int64(*n)),
         // Float stored as Value::Float — NodeStore::encode_value writes the full
         // 8 IEEE-754 bytes to the overflow heap (SPA-267).
-        Literal::Float(f) => Value::Float(*f),
-        Literal::Bool(b) => Value::Int64(if *b { 1 } else { 0 }),
-        Literal::String(s) => Value::Bytes(s.as_bytes().to_vec()),
-        Literal::Null | Literal::Param(_) => Value::Int64(0),
+        Literal::Float(f) => Ok(Value::Float(*f)),
+        Literal::Bool(b) => Ok(Value::Int64(if *b { 1 } else { 0 })),
+        Literal::String(s) => Ok(Value::Bytes(s.as_bytes().to_vec())),
+        Literal::Null => Err(Error::InvalidArgument(
+            "property value is null; use a concrete value".into(),
+        )),
+        Literal::Param(p) => Err(Error::InvalidArgument(format!(
+            "property value references parameter ${p}; use GraphDb::execute_with_params \
+             to bind runtime parameters"
+        ))),
     }
 }
 
 /// Convert a Cypher [`Expr`] to a storage [`Value`].
-pub(crate) fn expr_to_value(expr: &sparrowdb_cypher::ast::Expr) -> Value {
+///
+/// Only literal expressions have a defined storage representation; anything
+/// else (a bare variable, a property access, an unsupported function call, …)
+/// previously fell into a catch-all that silently wrote `Value::Int64(0)`.
+/// That is rejected now for the same reason `literal_to_value` rejects
+/// `null` — an unrepresentable value must error, not become a value that
+/// means something else.
+pub(crate) fn expr_to_value(expr: &sparrowdb_cypher::ast::Expr) -> crate::Result<Value> {
     use sparrowdb_cypher::ast::Expr;
     match expr {
         Expr::Literal(lit) => literal_to_value(lit),
-        _ => Value::Int64(0),
+        _ => Err(Error::InvalidArgument(
+            "property value must be a literal or $parameter".into(),
+        )),
     }
 }
 
@@ -84,9 +106,11 @@ pub(crate) fn literal_to_value_with_params(
         Literal::Float(f) => Ok(Value::Float(*f)),
         Literal::Bool(b) => Ok(Value::Int64(if *b { 1 } else { 0 })),
         Literal::String(s) => Ok(Value::Bytes(s.as_bytes().to_vec())),
-        Literal::Null => Ok(Value::Int64(0)),
+        Literal::Null => Err(Error::InvalidArgument(
+            "property value is null; use a concrete value".into(),
+        )),
         Literal::Param(p) => match params.get(p.as_str()) {
-            Some(v) => Ok(exec_value_to_storage(v)),
+            Some(v) => exec_value_to_storage(v),
             None => Err(sparrowdb_common::Error::InvalidArgument(format!(
                 "parameter ${p} was referenced in the query but not supplied"
             ))),
@@ -122,20 +146,24 @@ pub(crate) fn expr_to_value_with_params(
 /// * `$param` is resolved from `params` when supplied. When `params` is
 ///   `None` (the plain, non-parameterized `execute()` / `execute_with_timeout()`
 ///   paths), a `$param` reference is rejected with a clear error instead of
-///   silently written as `Value::Int64(0)` — the failure mode
-///   `exec_value_to_storage`'s catch-all is prone to (#475); this resolver
-///   never delegates to it.
+///   silently written as `Value::Int64(0)`.
 /// * A resolved parameter value must be a storage scalar (int, float, bool,
 ///   string). `List` / `Map` / `Vector` / `NodeRef` / `EdgeRef` have no
 ///   representation in a property column and are rejected rather than
 ///   silently coerced to `0`.
+///
+///   This used to duplicate `exec_value_to_storage`'s per-variant match by
+///   hand, specifically because that function's catch-all silently produced
+///   `Value::Int64(0)` for exactly these cases (#475) and could not be
+///   trusted. Now that `exec_value_to_storage` itself rejects them, this
+///   resolver delegates to it and only adds CREATE-specific error context —
+///   the duplication is gone.
 pub(crate) fn resolve_create_prop_value(
     key: &str,
     expr: &sparrowdb_cypher::ast::Expr,
     params: Option<&HashMap<String, sparrowdb_execution::Value>>,
 ) -> crate::Result<Value> {
     use sparrowdb_cypher::ast::{Expr, Literal};
-    use sparrowdb_execution::Value as EV;
 
     match expr {
         Expr::Literal(Literal::Null) => Err(Error::InvalidArgument(format!(
@@ -152,23 +180,14 @@ pub(crate) fn resolve_create_prop_value(
                 None => Err(Error::InvalidArgument(format!(
                     "parameter ${p} was referenced in the query but not supplied"
                 ))),
-                Some(EV::Null) => Err(Error::InvalidArgument(format!(
-                    "CREATE property '{key}' is bound to parameter ${p}, which is null; \
-                     use a concrete value"
-                ))),
-                Some(EV::Int64(n)) => Ok(Value::Int64(*n)),
-                Some(EV::Float64(f)) => Ok(Value::Float(*f)),
-                Some(EV::Bool(b)) => Ok(Value::Int64(if *b { 1 } else { 0 })),
-                Some(EV::String(s)) => Ok(Value::Bytes(s.as_bytes().to_vec())),
-                Some(other) => Err(Error::InvalidArgument(format!(
-                    "CREATE property '{key}' is bound to parameter ${p}, whose value ({other:?}) \
-                     is a {} and cannot be stored as a scalar property; only int, float, bool, \
-                     and string parameters may be used in CREATE",
-                    exec_value_kind(other),
-                ))),
+                Some(v) => exec_value_to_storage(v).map_err(|e| {
+                    Error::InvalidArgument(format!(
+                        "CREATE property '{key}' is bound to parameter ${p}: {e}"
+                    ))
+                }),
             }
         }
-        Expr::Literal(lit) => Ok(literal_to_value(lit)),
+        Expr::Literal(lit) => literal_to_value(lit),
         _ => Err(Error::InvalidArgument(format!(
             "CREATE property '{key}' must be a literal value or $parameter"
         ))),
@@ -191,14 +210,32 @@ fn exec_value_kind(v: &sparrowdb_execution::Value) -> &'static str {
     }
 }
 
-pub(crate) fn exec_value_to_storage(v: &sparrowdb_execution::Value) -> Value {
+/// Convert a bound `$param` value to a storage [`Value`].
+///
+/// Exhaustive over every [`sparrowdb_execution::Value`] variant on purpose:
+/// adding a new variant to that enum must be a compile error here, not a
+/// silent fall-through. The match used to end `_ => Value::Int64(0)`, which
+/// swallowed `Null`, `List`, `Map`, `Vector`, `NodeRef`, and `EdgeRef` alike
+/// (#475) — indistinguishable on read from a genuinely stored zero. None of
+/// those six have a scalar storage representation, so each is now rejected
+/// with a message naming the offending kind.
+pub(crate) fn exec_value_to_storage(v: &sparrowdb_execution::Value) -> crate::Result<Value> {
     use sparrowdb_execution::Value as EV;
     match v {
-        EV::Int64(n) => Value::Int64(*n),
-        EV::Float64(f) => Value::Float(*f),
-        EV::Bool(b) => Value::Int64(if *b { 1 } else { 0 }),
-        EV::String(s) => Value::Bytes(s.as_bytes().to_vec()),
-        _ => Value::Int64(0),
+        EV::Int64(n) => Ok(Value::Int64(*n)),
+        EV::Float64(f) => Ok(Value::Float(*f)),
+        EV::Bool(b) => Ok(Value::Int64(if *b { 1 } else { 0 })),
+        EV::String(s) => Ok(Value::Bytes(s.as_bytes().to_vec())),
+        EV::Null => Err(Error::InvalidArgument(
+            "property value is null; use a concrete value".into(),
+        )),
+        EV::NodeRef(_) | EV::EdgeRef(_) | EV::List(_) | EV::Map(_) | EV::Vector(_) => {
+            Err(Error::InvalidArgument(format!(
+                "property value is a {}, which has no scalar storage representation \
+                 and cannot be written as a property value",
+                exec_value_kind(v),
+            )))
+        }
     }
 }
 

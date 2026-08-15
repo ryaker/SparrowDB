@@ -359,10 +359,27 @@ describe('executeWithParams — parameterized queries (KMSmcp #67)', () => {
     assert.ok(Array.isArray(r.rows), 'rows must be an array')
     assert.equal(r.rows.length, 0, 'SET returns no rows')
 
-    // The property must roundtrip on a follow-up read.
+    // `n.embedding` reads back as null via plain RETURN — this is correct,
+    // not a gap. The storage layer's property columns have no vector type
+    // (Int64 / Bytes / Float only), so a vector SET on an indexed property
+    // is written *exclusively* to the HNSW index below; the column is left
+    // absent rather than holding a value that isn't the real embedding.
+    //
+    // Before SPA-475/#473's fix, this assertion read `!= null` and passed —
+    // but only because the property WAS being written, as a silently
+    // coerced `Int64(0)` (the exact bug those issues fixed: a null/non-
+    // representable value written as the literal integer 0, indistinguishable
+    // from a real stored zero). `0 != null` in JS, so the assertion was
+    // satisfied by the coercion artifact, never by a real embedding value —
+    // it was enshrining the bug it looked like it was guarding against. See
+    // the discussion on PR #505.
     const got = db.execute("MATCH (n:Memory {id: 'k1'}) RETURN n.embedding")
     assert.equal(got.rows.length, 1, 'must find the node back')
-    assert.ok(got.rows[0]['n.embedding'] != null, 'embedding must be set')
+    assert.equal(
+      got.rows[0]['n.embedding'],
+      null,
+      'a vector property has no property-column representation; it must read back absent (null), not a coercion artifact — the real value lives only in the HNSW index, verified below'
+    )
 
     // CRITICAL: vectorSearch must return the node — the HNSW index must have
     // been updated by the SET.  Before the fix this returned an empty array.

@@ -1635,32 +1635,53 @@ fn collect_col_ids_from_expr(expr: &Expr, out: &mut Vec<u32>) {
 ///
 /// Integers are stored as `Int64`; strings are stored as `Bytes` (up to 8 bytes
 /// inline, matching the storage layer's encoding in `Value::to_u64`).
+///
+/// Exhaustive on purpose (see [`value_to_store_value`] below, which this
+/// mirrors for the bare-literal case): `Null` and `Param` used to share a
+/// catch-all with every other unhandled variant that produced
+/// `StoreValue::Int64(0)`, indistinguishable on read from a genuinely stored
+/// zero (#473/#475). Currently unreachable in production — kept exhaustive
+/// so it cannot silently regress if it is ever wired up.
 #[allow(dead_code)]
-fn literal_to_store_value(lit: &Literal) -> StoreValue {
+fn literal_to_store_value(lit: &Literal) -> Result<StoreValue> {
     match lit {
-        Literal::Int(n) => StoreValue::Int64(*n),
-        Literal::String(s) => StoreValue::Bytes(s.as_bytes().to_vec()),
-        Literal::Float(f) => StoreValue::Float(*f),
-        Literal::Bool(b) => StoreValue::Int64(if *b { 1 } else { 0 }),
-        Literal::Null | Literal::Param(_) => StoreValue::Int64(0),
+        Literal::Int(n) => Ok(StoreValue::Int64(*n)),
+        Literal::String(s) => Ok(StoreValue::Bytes(s.as_bytes().to_vec())),
+        Literal::Float(f) => Ok(StoreValue::Float(*f)),
+        Literal::Bool(b) => Ok(StoreValue::Int64(if *b { 1 } else { 0 })),
+        Literal::Null => Err(sparrowdb_common::Error::InvalidArgument(
+            "property value is null; use a concrete value".into(),
+        )),
+        Literal::Param(p) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "property value references parameter ${p}; use GraphDb::execute_with_params \
+             to bind runtime parameters"
+        ))),
     }
 }
 
 /// Convert an evaluated `Value` to the `StoreValue` used by the node store.
 ///
 /// Used when a node property value is an arbitrary expression (e.g.
-/// `datetime()`), rather than a bare literal.
-fn value_to_store_value(val: Value) -> StoreValue {
+/// `datetime()`), rather than a bare literal. `key` is the property name,
+/// used only to name the offending property in the error message.
+///
+/// Exhaustive over every `Value` variant on purpose: adding a new variant to
+/// that enum must be a compile error here, not a silent fall-through. The
+/// match used to end with several arms mapped to `StoreValue::Int64(0)` —
+/// `Null`, `List`, `Map`, and `Vector` all had no scalar representation and
+/// were coerced anyway, a value indistinguishable on read from a genuinely
+/// stored zero (#473). None of those four (nor `NodeRef`/`EdgeRef`, which
+/// also have no meaningful property representation) can be written silently
+/// anymore — each is rejected with a message naming the offending kind.
+fn value_to_store_value(key: &str, val: Value) -> Result<StoreValue> {
     match val {
-        Value::Int64(n) => StoreValue::Int64(n),
-        Value::Float64(f) => StoreValue::Float(f),
-        Value::Bool(b) => StoreValue::Int64(if b { 1 } else { 0 }),
-        Value::String(s) => StoreValue::Bytes(s.into_bytes()),
-        Value::Null => StoreValue::Int64(0),
-        Value::NodeRef(id) => StoreValue::Int64(id.0 as i64),
-        Value::EdgeRef(id) => StoreValue::Int64(id.0 as i64),
-        Value::List(_) => StoreValue::Int64(0),
-        Value::Map(_) => StoreValue::Int64(0),
+        Value::Int64(n) => Ok(StoreValue::Int64(n)),
+        Value::Float64(f) => Ok(StoreValue::Float(f)),
+        Value::Bool(b) => Ok(StoreValue::Int64(if b { 1 } else { 0 })),
+        Value::String(s) => Ok(StoreValue::Bytes(s.into_bytes())),
+        Value::Null => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "CREATE property '{key}' is null; use a concrete value"
+        ))),
         // Vector values are managed exclusively by the HNSW vector-index
         // write-path in GraphDb (db.rs), which inserts them directly into the
         // in-memory index and persists the index snapshot to disk.  A vector
@@ -1669,13 +1690,30 @@ fn value_to_store_value(val: Value) -> StoreValue {
         //
         // In practice, vector properties reach GraphDb via $params on the
         // MERGE path, not through the AST literal path that calls this
-        // function.  If a vector value reaches here it is a programming error;
-        // we return a null sentinel (0) rather than panicking so a production
-        // write path does not crash, but the vector data will not be indexed.
-        //
-        // TODO(#394): change the signature to Result<StoreValue> and return
-        // Err(InvalidArgument) here once all callers can propagate errors.
-        Value::Vector(_) => StoreValue::Int64(0),
+        // function. If a vector value reaches here it is a programming error;
+        // we now reject it explicitly (TODO(#394) asked for exactly this)
+        // instead of silently returning a null sentinel that let a production
+        // write path "succeed" while the vector data went unindexed.
+        Value::NodeRef(_) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "CREATE property '{key}' is a node reference, which has no scalar storage \
+             representation and cannot be written as a property value"
+        ))),
+        Value::EdgeRef(_) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "CREATE property '{key}' is an edge reference, which has no scalar storage \
+             representation and cannot be written as a property value"
+        ))),
+        Value::List(_) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "CREATE property '{key}' is a list, which has no scalar storage representation \
+             and cannot be written as a property value"
+        ))),
+        Value::Map(_) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "CREATE property '{key}' is a map, which has no scalar storage representation \
+             and cannot be written as a property value"
+        ))),
+        Value::Vector(_) => Err(sparrowdb_common::Error::InvalidArgument(format!(
+            "CREATE property '{key}' is a vector, which has no scalar storage representation \
+             and cannot be written as a property value"
+        ))),
     }
 }
 

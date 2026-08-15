@@ -8,9 +8,9 @@ use crate::batch::augment_rows_with_pending;
 use crate::helpers::{
     build_label_row_counts_from_disk, collect_maintenance_params, dir_size_bytes, eval_expr_merge,
     exec_value_to_storage, expr_to_value, expr_to_value_with_params, fnv1a_col_id,
-    is_edge_delete_mutation, is_reserved_label, literal_to_value, load_constraints,
-    load_vector_indexes, open_csr_map, resolve_create_prop_value, save_constraints,
-    storage_value_to_exec, try_open_csr_map, VectorIndexHealth,
+    is_edge_delete_mutation, is_reserved_label, load_constraints, load_vector_indexes,
+    open_csr_map, resolve_create_prop_value, save_constraints, storage_value_to_exec,
+    try_open_csr_map, VectorIndexHealth,
 };
 use crate::read_tx::ReadTx;
 use crate::types::{DbInner, NodeVersions, PendingOp, VersionStore, WriteBuffer, WriteGuard};
@@ -1375,8 +1375,8 @@ impl GraphDb {
         let props: HashMap<String, Value> = m
             .props
             .iter()
-            .map(|pe| (pe.key.clone(), expr_to_value(&pe.value)))
-            .collect();
+            .map(|pe| Ok((pe.key.clone(), expr_to_value(&pe.value)?)))
+            .collect::<Result<_>>()?;
         let mut tx = self.begin_write()?;
         // Detect create vs match by observing whether merge_node dirtied a new node.
         let dirty_before = tx.dirty_nodes.len();
@@ -1391,7 +1391,7 @@ impl GraphDb {
         };
         for mutation in on_set_items {
             if let sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } = mutation {
-                let sv = expr_to_value(value);
+                let sv = expr_to_value(value)?;
                 tx.set_property(node_id, prop, sv)?;
             }
         }
@@ -1474,15 +1474,55 @@ impl GraphDb {
         Ok(QueryResult::empty(vec![]))
     }
 
+    /// True when `value` is a `$param` reference bound to `Value::Vector` for
+    /// a property that has a registered HNSW vector index.
+    ///
+    /// A vector has no property-column representation — `exec_value_to_storage`
+    /// rejects it (#475/#473) — but a vector `$param` on a genuinely indexed
+    /// property is a real, tested feature (#410): it is written to the HNSW
+    /// index by a dedicated block, not the property column. Callers use this
+    /// to skip the column write for exactly that one case, so the value
+    /// resolver's rejection only fires for a vector with nowhere to go (no
+    /// index registered for this property at all), not for the indexed case
+    /// this whole write-path exists to support.
+    fn set_value_is_indexed_vector_param(
+        &self,
+        value: &sparrowdb_cypher::ast::Expr,
+        prop: &str,
+        params: &HashMap<String, sparrowdb_execution::Value>,
+    ) -> bool {
+        use sparrowdb_cypher::ast::{Expr, Literal};
+        let Expr::Literal(Literal::Param(p)) = value else {
+            return false;
+        };
+        let Some(v) = params.get(p.as_str()) else {
+            return false;
+        };
+        if v.as_vector().is_none() {
+            return false;
+        }
+        self.inner
+            .vector_indexes
+            .read()
+            .expect("vector_indexes")
+            .keys()
+            .any(|(_, prop_name)| prop_name == prop)
+    }
+
     /// Params-aware MERGE with $param support (SPA-218).
     fn execute_merge_with_params(
         &self,
         m: &sparrowdb_cypher::ast::MergeStatement,
         params: &HashMap<String, sparrowdb_execution::Value>,
     ) -> Result<QueryResult> {
+        // A vector `$param` bound to an indexed property is written to the
+        // HNSW index by the block below, not the merge-key/property columns
+        // — see `set_value_is_indexed_vector_param`. Excluded from `props`
+        // here rather than resolved to a storage `Value`.
         let props: HashMap<String, Value> = m
             .props
             .iter()
+            .filter(|pe| !self.set_value_is_indexed_vector_param(&pe.value, &pe.key, params))
             .map(|pe| {
                 let val = expr_to_value_with_params(&pe.value, params)?;
                 Ok((pe.key.clone(), val))
@@ -1502,6 +1542,9 @@ impl GraphDb {
         };
         for mutation in on_set_items {
             if let sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } = mutation {
+                if self.set_value_is_indexed_vector_param(value, prop, params) {
+                    continue;
+                }
                 let sv = expr_to_value_with_params(value, params)?;
                 tx.set_property(node_id, prop, sv)?;
             }
@@ -1624,6 +1667,13 @@ impl GraphDb {
         for mutation in &mm.mutations {
             match mutation {
                 sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
+                    // A vector `$param` bound to an indexed property has no
+                    // property-column representation — it is written to the
+                    // HNSW index by the dedicated block below instead. Skip
+                    // the column write for this one mutation.
+                    if self.set_value_is_indexed_vector_param(value, prop, params) {
+                        continue;
+                    }
                     let sv = expr_to_value_with_params(value, params)?;
                     for node_id in &matching_ids {
                         tx.set_property(*node_id, prop, sv.clone())?;
@@ -1773,7 +1823,7 @@ impl GraphDb {
             sparrowdb_cypher::ast::Expr::List(items) => items
                 .iter()
                 .map(|e| {
-                    let sv = expr_to_value(e);
+                    let sv = expr_to_value(e)?;
                     Ok(storage_value_to_exec(&sv))
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -1797,7 +1847,7 @@ impl GraphDb {
             sparrowdb_cypher::ast::Expr::List(items) => items
                 .iter()
                 .map(|e| {
-                    let sv = expr_to_value(e);
+                    let sv = expr_to_value(e)?;
                     Ok(storage_value_to_exec(&sv))
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -1896,9 +1946,18 @@ impl GraphDb {
             for mutation in &umm.mutations {
                 match mutation {
                     sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
-                        let sv = resolve_set_value(value, &umm.alias, row, params)?;
-                        for node_id in &matching_ids {
-                            tx.set_property(*node_id, prop, sv.clone())?;
+                        // Same skip as `execute_match_mutate_with_params`: a
+                        // vector `$param` bound to an indexed property is
+                        // handled entirely by the accumulation block below
+                        // and must not go through the column-value resolver.
+                        let is_indexed_vector = params
+                            .map(|p| self.set_value_is_indexed_vector_param(value, prop, p))
+                            .unwrap_or(false);
+                        if !is_indexed_vector {
+                            let sv = resolve_set_value(value, &umm.alias, row, params)?;
+                            for node_id in &matching_ids {
+                                tx.set_property(*node_id, prop, sv.clone())?;
+                            }
                         }
 
                         // Vector index write-path — the same maintenance
@@ -2063,7 +2122,7 @@ impl GraphDb {
         for mutation in &mm.mutations {
             match mutation {
                 sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
-                    let sv = expr_to_value(value);
+                    let sv = expr_to_value(value)?;
                     for node_id in &matching_ids {
                         tx.set_property(*node_id, prop, sv.clone())?;
                     }
@@ -2133,7 +2192,7 @@ impl GraphDb {
         for mutation in &mm.mutations {
             match mutation {
                 sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
-                    let sv = expr_to_value(value);
+                    let sv = expr_to_value(value)?;
                     for node_id in &matching_ids {
                         Self::check_deadline(deadline)?;
                         tx.set_property(*node_id, prop, sv.clone())?;
@@ -2872,31 +2931,14 @@ impl GraphDb {
                 for node in &c.nodes {
                     let label = node.labels.first().cloned().unwrap_or_default();
                     let label_id: u32 = tx.get_or_create_label_id(&label)?;
+                    // Delegate to the shared CREATE-prop resolver (params=None: batch
+                    // execution is non-parameterized) rather than a hand-rolled
+                    // Null/Param check — this used to duplicate that logic here.
                     let named_props: Vec<(String, Value)> = node
                         .props
                         .iter()
                         .map(|entry| {
-                            let val = match &entry.value {
-                                sparrowdb_cypher::ast::Expr::Literal(
-                                    sparrowdb_cypher::ast::Literal::Null,
-                                ) => Err(sparrowdb_common::Error::InvalidArgument(format!(
-                                    "CREATE property '{}' is null",
-                                    entry.key
-                                ))),
-                                sparrowdb_cypher::ast::Expr::Literal(
-                                    sparrowdb_cypher::ast::Literal::Param(p),
-                                ) => Err(sparrowdb_common::Error::InvalidArgument(format!(
-                                    "CREATE property '{}' references parameter ${p}",
-                                    entry.key
-                                ))),
-                                sparrowdb_cypher::ast::Expr::Literal(lit) => {
-                                    Ok(literal_to_value(lit))
-                                }
-                                _ => Err(sparrowdb_common::Error::InvalidArgument(format!(
-                                    "CREATE property '{}' must be a literal",
-                                    entry.key
-                                ))),
-                            }?;
+                            let val = resolve_create_prop_value(&entry.key, &entry.value, None)?;
                             Ok((entry.key.clone(), val))
                         })
                         .collect::<Result<Vec<_>>>()?;
@@ -2925,8 +2967,8 @@ impl GraphDb {
                 let props: HashMap<String, Value> = m
                     .props
                     .iter()
-                    .map(|pe| (pe.key.clone(), expr_to_value(&pe.value)))
-                    .collect();
+                    .map(|pe| Ok((pe.key.clone(), expr_to_value(&pe.value)?)))
+                    .collect::<Result<_>>()?;
                 let dirty_before = tx.dirty_nodes.len();
                 let node_id = tx.merge_node(&m.label, props)?;
                 let was_created = tx.dirty_nodes.len() > dirty_before;
@@ -2937,7 +2979,7 @@ impl GraphDb {
                 };
                 for mutation in on_set_items {
                     if let sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } = mutation {
-                        let sv = expr_to_value(value);
+                        let sv = expr_to_value(value)?;
                         tx.set_property(node_id, prop, sv)?;
                     }
                 }
@@ -2964,7 +3006,7 @@ impl GraphDb {
                     for mutation in &mm.mutations {
                         match mutation {
                             sparrowdb_cypher::ast::Mutation::Set { prop, value, .. } => {
-                                let sv = expr_to_value(value);
+                                let sv = expr_to_value(value)?;
                                 for node_id in &matching_ids {
                                     tx.set_property(*node_id, prop, sv.clone())?;
                                 }
@@ -3553,7 +3595,7 @@ fn resolve_set_value(
         if var == alias {
             for (key, val) in row {
                 if key == prop {
-                    return Ok(exec_value_to_storage(val));
+                    return exec_value_to_storage(val);
                 }
             }
         }
@@ -3561,7 +3603,7 @@ fn resolve_set_value(
     // Fall back: use params-aware evaluation when available, otherwise literal-only.
     match params {
         Some(p) => expr_to_value_with_params(value, p),
-        None => Ok(expr_to_value(value)),
+        None => expr_to_value(value),
     }
 }
 

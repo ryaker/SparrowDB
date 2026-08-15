@@ -34,7 +34,18 @@ pub(crate) fn pending_candidates_for(
             // All pattern props must match a corresponding pending prop.
             let all_match = node_props.iter().all(|pe| {
                 let wanted_col = col_id_of(&pe.key);
-                let wanted_val = expr_to_value(&pe.value);
+                // A pattern value with no scalar storage representation (e.g. an
+                // explicit `null` literal) can never equal a pending node's
+                // stored value — treat it as "no match" rather than coercing to
+                // a sentinel that could wrongly equal a real stored value (the
+                // #475/#473 failure mode). This is a MATCH-filter comparison,
+                // not a write, so it intentionally does not propagate an error;
+                // null used as a filter value has its own broader defect
+                // tracked separately by #467.
+                let wanted_val = match expr_to_value(&pe.value) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
                 op_props
                     .iter()
                     .any(|&(c, ref v)| c == wanted_col && *v == wanted_val)

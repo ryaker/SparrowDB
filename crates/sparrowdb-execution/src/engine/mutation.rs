@@ -872,10 +872,10 @@ impl Engine {
                 .map(|entry| {
                     let col_id = prop_name_to_col_id(&entry.key);
                     let val = eval_expr(&entry.value, &empty_bindings);
-                    let store_val = value_to_store_value(val);
-                    (col_id, store_val)
+                    let store_val = value_to_store_value(&entry.key, val)?;
+                    Ok((col_id, store_val))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             // SPA-234: enforce UNIQUE constraints declared via
             // `CREATE CONSTRAINT ON (n:Label) ASSERT n.property IS UNIQUE`.
