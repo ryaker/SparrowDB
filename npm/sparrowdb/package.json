@@ -1,6 +1,6 @@
 {
   "name": "sparrowdb",
-  "version": "0.1.25",
+  "version": "0.1.26",
   "description": "Native Node.js/TypeScript bindings for SparrowDB — embedded graph database with Cypher query support",
   "main": "index.js",
   "types": "index.d.ts",
@@ -28,7 +28,13 @@
     "type": "git",
     "url": "https://github.com/ryaker/SparrowDB"
   },
-  "keywords": ["graph", "database", "cypher", "native", "napi"],
+  "keywords": [
+    "graph",
+    "database",
+    "cypher",
+    "native",
+    "napi"
+  ],
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4",
     "typescript": "^5.6.0"
