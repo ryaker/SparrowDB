@@ -200,6 +200,12 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Type-check npm/sparrowdb/index.d.ts
+        working-directory: npm/sparrowdb
+        run: |
+          npm install
+          npm run typecheck
+
       - name: Build sparrowdb-node (.node binary)
         run: |
           cargo build --release -p sparrowdb-node

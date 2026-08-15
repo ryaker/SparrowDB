@@ -4,13 +4,21 @@
   "description": "Native Node.js/TypeScript bindings for SparrowDB — embedded graph database with Cypher query support",
   "main": "index.js",
   "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "index.js",
     "index.d.ts",
     "*.node"
   ],
   "scripts": {
-    "test": "node --test test/integration.test.js"
+    "test": "node --test test/integration.test.js",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "engines": {
     "node": ">= 18"
@@ -29,6 +37,7 @@
     "@sparrowdb/win32-x64-msvc": "0.1.25"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.4"
+    "@napi-rs/cli": "^2.18.4",
+    "typescript": "^5.6.0"
   }
 }

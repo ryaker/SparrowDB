@@ -28,10 +28,8 @@ export interface QueryResult {
  *
  * ```typescript
  * interface NodeResult {
- *   /** Node ID as a decimal string (full u64 range, JS-safe). */
- *   id: string;
- *   /** Relevance score: cosine similarity / BM25 score / distance. */
- *   score: number;
+ *   id: string;   // Node ID as a decimal string (full u64 range, JS-safe).
+ *   score: number; // Relevance score: cosine similarity / BM25 score / distance.
  * }
  * ```
  */
