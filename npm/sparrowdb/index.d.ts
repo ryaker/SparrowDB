@@ -28,8 +28,10 @@ export interface QueryResult {
  *
  * ```typescript
  * interface NodeResult {
- *   id: string;   // Node ID as a decimal string (full u64 range, JS-safe).
- *   score: number; // Relevance score: cosine similarity / BM25 score / distance.
+ *   // Node ID as a decimal string (full u64 range, JS-safe).
+ *   id: string;
+ *   // Relevance score: cosine similarity / BM25 score / distance.
+ *   score: number;
  * }
  * ```
  */
@@ -50,9 +52,12 @@ export interface NodeResult {
  * }
  * ```
  *
- * Note the `//` comments above rather than nested doc comments: a `*\/` inside
- * a generated JSDoc block closes it early, which is why the checked-in
- * `npm/sparrowdb/index.d.ts` does not currently parse as TypeScript.
+ * Note the `//` comments above rather than nested doc comments. A JSDoc
+ * close-marker inside a generated JSDoc block terminates it early, and every
+ * declaration after that point is then parsed as code — which is exactly how
+ * the checked-in `npm/sparrowdb/index.d.ts` stopped parsing as TypeScript
+ * (#449). `npm run typecheck` in CI now guards against a recurrence; keep
+ * examples in these doc comments to `//` so it never fires.
  */
 export interface VectorIndexHealth {
   /** Vectors stored in the index. */
