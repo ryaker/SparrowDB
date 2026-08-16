@@ -237,7 +237,14 @@ impl Engine {
                         }
                         v
                     };
-                    self.snapshot.store.get_node_raw(src_node, &all_needed)?
+                    // #521: nullable accessor + drop-absent (matches the
+                    // read_node_props helper already used by execute_two_hop /
+                    // execute_n_hop), so a genuinely null-bound $param filter
+                    // can match a node whose property is actually absent
+                    // instead of silently never matching via get_node_raw's
+                    // zero-sentinel (read_col_slot returns Ok(0) for an absent
+                    // slot, indistinguishable from a stored Int64(0)).
+                    read_node_props(&self.snapshot.store, src_node, &all_needed)?
                 } else {
                     vec![]
                 };
@@ -336,9 +343,10 @@ impl Engine {
                                 .collect()
                         } else {
                             // Fallback: individual read (e.g. delta-only slot).
-                            self.snapshot
-                                .store
-                                .get_node_raw(dst_node, &all_needed_dst)?
+                            // #521: nullable accessor + drop-absent — see the
+                            // src_props comment above for why get_node_raw's
+                            // zero-sentinel is wrong here.
+                            read_node_props(&self.snapshot.store, dst_node, &all_needed_dst)?
                         }
                     } else {
                         vec![]
@@ -599,7 +607,9 @@ impl Engine {
                             }
                             v
                         };
-                        self.snapshot.store.get_node_raw(b_node, &all_needed)?
+                        // #521: nullable accessor + drop-absent — see the
+                        // src_props comment in the forward pass above.
+                        read_node_props(&self.snapshot.store, b_node, &all_needed)?
                     } else {
                         vec![]
                     };
@@ -668,7 +678,9 @@ impl Engine {
                                 }
                                 v
                             };
-                            self.snapshot.store.get_node_raw(a_node, &all_needed)?
+                            // #521: nullable accessor + drop-absent — see the
+                            // src_props comment in the forward pass above.
+                            read_node_props(&self.snapshot.store, a_node, &all_needed)?
                         } else {
                             vec![]
                         };
