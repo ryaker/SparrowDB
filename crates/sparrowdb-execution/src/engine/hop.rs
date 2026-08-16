@@ -237,7 +237,14 @@ impl Engine {
                         }
                         v
                     };
-                    self.snapshot.store.get_node_raw(src_node, &all_needed)?
+                    // #521: nullable accessor + drop-absent (matches the
+                    // read_node_props helper already used by execute_two_hop /
+                    // execute_n_hop), so a genuinely null-bound $param filter
+                    // can match a node whose property is actually absent
+                    // instead of silently never matching via get_node_raw's
+                    // zero-sentinel (read_col_slot returns Ok(0) for an absent
+                    // slot, indistinguishable from a stored Int64(0)).
+                    read_node_props(&self.snapshot.store, src_node, &all_needed)?
                 } else {
                     vec![]
                 };
@@ -297,8 +304,19 @@ impl Engine {
 
                 // Batch-read: one fs::read() per column for all neighbors.
                 // dst_batch[i] = raw column values for unique_dst_slots[i].
-                let dst_batch: Vec<Vec<u64>> = if !all_needed_dst.is_empty() {
-                    self.snapshot.store.batch_read_node_props(
+                //
+                // #521 (broader finding, expanded scope): use the nullable
+                // variant so absent columns arrive as `None` instead of the
+                // old raw-0-as-absent sentinel `batch_read_node_props` used —
+                // same defect as `get_node_raw`'s zero-sentinel (see the
+                // src_props comment above), but this is the *primary* path
+                // for dst_props below, not a rare fallback: every neighbor
+                // slot found via CSR/delta lands in `dst_slot_to_idx` and is
+                // read from this batch; the individual `read_node_props`
+                // fallback a few lines down is the one that's effectively
+                // unreachable.
+                let dst_batch: Vec<Vec<Option<u64>>> = if !all_needed_dst.is_empty() {
+                    self.snapshot.store.batch_read_node_props_nullable(
                         effective_dst_label_id,
                         &unique_dst_slots,
                         &all_needed_dst,
@@ -333,12 +351,14 @@ impl Engine {
                                 .iter()
                                 .copied()
                                 .zip(dst_batch[idx].iter().copied())
+                                .filter_map(|(c, opt)| opt.map(|v| (c, v)))
                                 .collect()
                         } else {
                             // Fallback: individual read (e.g. delta-only slot).
-                            self.snapshot
-                                .store
-                                .get_node_raw(dst_node, &all_needed_dst)?
+                            // #521: nullable accessor + drop-absent — see the
+                            // src_props comment above for why get_node_raw's
+                            // zero-sentinel is wrong here.
+                            read_node_props(&self.snapshot.store, dst_node, &all_needed_dst)?
                         }
                     } else {
                         vec![]
@@ -599,7 +619,9 @@ impl Engine {
                             }
                             v
                         };
-                        self.snapshot.store.get_node_raw(b_node, &all_needed)?
+                        // #521: nullable accessor + drop-absent — see the
+                        // src_props comment in the forward pass above.
+                        read_node_props(&self.snapshot.store, b_node, &all_needed)?
                     } else {
                         vec![]
                     };
@@ -668,7 +690,9 @@ impl Engine {
                                 }
                                 v
                             };
-                            self.snapshot.store.get_node_raw(a_node, &all_needed)?
+                            // #521: nullable accessor + drop-absent — see the
+                            // src_props comment in the forward pass above.
+                            read_node_props(&self.snapshot.store, a_node, &all_needed)?
                         } else {
                             vec![]
                         };
@@ -1629,8 +1653,18 @@ impl Engine {
             };
 
             // Batch-read fof properties once per src_slot.
-            let fof_batch: Vec<Vec<u64>> = if !col_ids_fof.is_empty() {
-                self.snapshot.store.batch_read_node_props(
+            //
+            // #521 (broader finding, expanded scope): use the nullable
+            // variant. The old `batch_read_node_props` + `.filter(v != 0)`
+            // combination below was a *different*, worse-direction bug than
+            // #521's null-under-match: it discarded any column whose raw
+            // value was literally 0, misreading a genuinely stored
+            // `Int64(0)` as absent — silent wrong data, not just a null-filter
+            // edge case. `batch_read_node_props_nullable` distinguishes the
+            // two via the null-bitmap sidecar, so absence and stored-zero no
+            // longer collide.
+            let fof_batch: Vec<Vec<Option<u64>>> = if !col_ids_fof.is_empty() {
+                self.snapshot.store.batch_read_node_props_nullable(
                     fof_label_id,
                     &all_fof_slots,
                     &col_ids_fof,
@@ -1667,7 +1701,7 @@ impl Engine {
                                 .iter()
                                 .copied()
                                 .zip(fof_batch[idx].iter().copied())
-                                .filter(|&(_, v)| v != 0)
+                                .filter_map(|(c, opt)| opt.map(|v| (c, v)))
                                 .collect()
                         } else {
                             // Fallback: individual read (delta-only slot not in batch).
