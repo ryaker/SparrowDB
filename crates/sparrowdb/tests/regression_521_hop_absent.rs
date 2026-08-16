@@ -141,10 +141,7 @@ fn undirected_backward_a_role_filter_matches_absent_node() {
         r.rows,
         vec![
             vec![Value::String("Alice".into()), Value::String("Bob".into())],
-            vec![
-                Value::String("Alice".into()),
-                Value::String("Carol".into())
-            ],
+            vec![Value::String("Alice".into()), Value::String("Carol".into())],
         ],
         "undirected backward pass: Alice (absent tag) must surface via both \
          the forward edge to Bob and the backward edge from Carol; Bob and \
@@ -206,7 +203,10 @@ fn undirected_backward_b_role_filter_matches_absent_node() {
 
     assert_eq!(
         r.rows,
-        vec![vec![Value::String("Bob".into()), Value::String("Alice".into())]],
+        vec![vec![
+            Value::String("Bob".into()),
+            Value::String("Alice".into())
+        ]],
         "undirected backward pass: Alice (absent tag) must surface as 'b' \
          via Bob's backward-scanned predecessor edge; Carol (tag present) \
          must never appear as 'b'; got {:?}",
