@@ -334,8 +334,8 @@ pub struct VectorIndexLoadFailure {
     /// not authoritative and not machine-parseable.
     pub reason: String,
     /// `"live_unserviceable"` or `"quarantined_no_live_index"` — see the
-    /// struct doc comment. Check this before deciding whether a vector write
-    /// against this `(label, prop)` would currently succeed or throw.
+    /// interface doc comment. Check this before deciding whether a vector
+    /// write against this `(label, prop)` would currently succeed or throw.
     pub kind: String,
 }
 
@@ -469,7 +469,16 @@ impl SparrowDB {
     /// Open (or create) a SparrowDB database at `path`.
     ///
     /// Throws if the path cannot be created or the database files are corrupt.
-    #[napi(factory)]
+    //
+    // `ts_return_type` below is required, not decorative: napi-derive-backend
+    // derives a factory method's TS return type from the raw Rust struct
+    // ident via `to_case(Case::Pascal)`, which does not consult this struct's
+    // `#[napi(js_name = "SparrowDB")]` and instead treats "DB" as an all-caps
+    // acronym word, re-casing it to "Db". Without the override below, a
+    // regenerated `index.d.ts` reads `static open(...): SparrowDb` — the
+    // exact factory-casing bug fixed by hand in #405. `js_name` alone only
+    // controls the `export declare class SparrowDB` line.
+    #[napi(factory, ts_return_type = "SparrowDB")]
     pub fn open(path: String) -> napi::Result<Self> {
         let db = ::sparrowdb::GraphDb::open(std::path::Path::new(&path)).map_err(to_napi)?;
         Ok(SparrowDB { inner: db })
@@ -622,6 +631,12 @@ impl SparrowDB {
     /// embeddings must be passed as parameters.  The engine surface
     /// (`GraphDb::execute_with_params`) has supported this since SPA-218; this
     /// binding simply exposes it to JS callers.
+    ///
+    /// **HNSW note (as of 0.1.23):** when the target property has a vector
+    /// index, `SET n.prop = $vec` now also writes the vector into the HNSW
+    /// index. Previously the property was stored but the HNSW file was not
+    /// updated — a silent data-loss bug surfaced by KMSmcp channel message
+    /// #202 (#410).
     ///
     /// **`CREATE` support (SPA-480):** standalone `CREATE` and
     /// `MATCH ... CREATE` — including edge properties — now accept `$param`
