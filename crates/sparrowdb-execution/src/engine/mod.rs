@@ -2661,13 +2661,13 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
 /// whatever followed, which only happened to work when the alias equalled
 /// the property name.
 ///
-/// Every call site only reaches `project_row` once `id(var)`, `labels(var)`,
-/// bare `var`, and every other non-aggregate `FnCall` have already been
-/// routed to the eval path (`needs_node_ref_in_return` /
-/// `expr_needs_eval_path`, checked by every caller before choosing between
-/// this fast path and the eval path). So every item here is guaranteed to be
-/// a `PropAccess`; the `_ => Value::Null` arm is a defensive fallback, not a
-/// reachable case.
+/// Every call site checks `needs_node_ref_in_return` first and only reaches
+/// `project_row` when every RETURN item is `expr_projectable_by_row` — which
+/// (#515) is true only for `PropAccess`. So every item here is guaranteed to
+/// be a `PropAccess` on some variable; the `_ => Value::Null` arm exists only
+/// for a `PropAccess` on a variable other than `var_name` (a different,
+/// pre-existing gap tracked separately — this function is only ever invoked
+/// with a single scanned variable in scope), not for any other `Expr` shape.
 fn project_row(
     props: &[(u32, u64)],
     items: &[ReturnItem],
@@ -3094,64 +3094,46 @@ pub(crate) fn has_aggregate_in_return(items: &[ReturnItem]) -> bool {
     items.iter().any(|item| is_aggregate_expr(&item.expr))
 }
 
-/// Returns `true` if any RETURN item requires a `NodeRef` / `EdgeRef` value to
-/// be present in the row map in order to evaluate correctly.
+/// Returns `true` iff `expr` is a shape the fast `project_row` /
+/// `project_hop_row` / `project_three_var_row` column-lookup paths can
+/// actually resolve.
 ///
-/// This covers:
-/// - `id(var)` — a scalar function that receives the whole node reference.
-/// - Bare `var` — projecting a node variable as a property map (SPA-213).
+/// This is deliberately an **allow-list**, not a deny-list (#515). Every one
+/// of those fast paths has exactly one positive case in its match — a
+/// `PropAccess` on the scanned variable, looked up by hashed column id — and
+/// falls through to `_ => Value::Null` for everything else. So a variant is
+/// only safe to route through the fast path when it *is* that one shape;
+/// declaring anything else "safe" requires proving it has an equivalent fast
+/// lookup, which none of the other `Expr` variants do.
 ///
-/// When this returns `true`, the scan must use the eval path (which inserts
-/// `Value::Map` / `Value::NodeRef` under the variable key) instead of the fast
-/// `project_row` path (which only stores individual property columns).
-fn needs_node_ref_in_return(items: &[ReturnItem]) -> bool {
-    items.iter().any(|item| {
-        matches!(&item.expr, Expr::FnCall { name, .. } if name.to_lowercase() == "id")
-            || matches!(&item.expr, Expr::Var(_))
-            || expr_needs_graph(&item.expr)
-            || expr_needs_eval_path(&item.expr)
-    })
+/// Before this, the routing decision (`needs_node_ref_in_return`) was a
+/// deny-list: it OR'd together checks that each recursed looking for one
+/// specific thing it knew `project_row` couldn't handle (a scalar `FnCall`,
+/// a graph-only construct, `id(var)`, a bare `var`) and defaulted `_ =>
+/// false` for anything none of them recognized. A `BinOp`, `Literal`,
+/// `List`, or `InList` built purely from literals and `PropAccess` tripped
+/// none of those checks, so it silently took the fast path and hit
+/// `project_row`'s `_ => Value::Null` fallback — a wrong answer with no
+/// error. An allow-list can't repeat that mistake: a new `Expr` variant is
+/// unprojectable by construction until someone teaches `project_row` to
+/// resolve it and extends this match to match.
+fn expr_projectable_by_row(expr: &Expr) -> bool {
+    matches!(expr, Expr::PropAccess { .. })
 }
 
-/// Returns `true` when the expression contains a scalar `FnCall` that cannot
-/// be resolved by the fast `project_row` column-name lookup.
+/// Returns `true` if any RETURN item cannot be resolved by the fast
+/// `project_row` column-lookup path and must instead go through the eval
+/// path, which builds a full row map (inserting `Value::Map` /
+/// `Value::NodeRef` under the variable key, plus every property under a
+/// hashed-column key) and evaluates each item against it via `eval_expr` /
+/// `eval_expr_graph`.
 ///
-/// `project_row` maps column names like `"n.name"` directly to stored property
-/// values.  Any function call such as `coalesce(n.missing, n.name)`,
-/// `toUpper(n.name)`, or `size(n.name)` produces a column name like
-/// `"coalesce(n.missing, n.name)"` which has no matching stored property.
-/// Those expressions must be evaluated via `eval_expr` on the full row map.
-///
-/// Aggregate functions (`count`, `sum`, etc.) are already handled via the
-/// `use_agg` flag; we exclude them here to avoid double-counting.
-fn expr_needs_eval_path(expr: &Expr) -> bool {
-    match expr {
-        Expr::FnCall { name, args } => {
-            let name_lc = name.to_lowercase();
-            // Aggregates are handled separately by use_agg.
-            if matches!(
-                name_lc.as_str(),
-                "count" | "sum" | "avg" | "min" | "max" | "collect"
-            ) {
-                return false;
-            }
-            // Any other FnCall (coalesce, toUpper, size, labels, type, id, etc.)
-            // needs the eval path.  We include id/labels/type here even though
-            // they are special-cased in eval_expr, because the fast project_row
-            // path cannot handle them at all.
-            let _ = args; // args not needed for this check
-            true
-        }
-        // Recurse into compound expressions that may contain FnCalls.
-        Expr::BinOp { left, right, .. } => {
-            expr_needs_eval_path(left) || expr_needs_eval_path(right)
-        }
-        Expr::And(l, r) | Expr::Or(l, r) => expr_needs_eval_path(l) || expr_needs_eval_path(r),
-        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            expr_needs_eval_path(inner)
-        }
-        _ => false,
-    }
+/// See [`expr_projectable_by_row`] for why this is an allow-list rather than
+/// a list of reasons to bail out.
+fn needs_node_ref_in_return(items: &[ReturnItem]) -> bool {
+    items
+        .iter()
+        .any(|item| !expr_projectable_by_row(&item.expr))
 }
 
 /// Collect the variable names that appear as bare `Expr::Var` in a RETURN clause (SPA-213).
