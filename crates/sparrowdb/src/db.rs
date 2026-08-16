@@ -71,6 +71,12 @@ impl GraphDb {
     ///
     /// # Errors
     ///
+    /// Returns [`Error::DatabaseLocked`] if another process already has this
+    /// root open — SparrowDB allows only one open handle per database root
+    /// across processes at a time (#524). Retry once the other process
+    /// closes its handle or exits; the lock cannot be stolen or broken, by
+    /// design (see [`process_lock`](crate::process_lock)'s module docs).
+    ///
     /// Besides the usual I/O and WAL-replay failures, this returns
     /// [`Error::Corruption`] when a persisted vector index file exists under
     /// `<path>/vector_indexes/` but cannot be loaded — or when that directory
@@ -163,7 +169,9 @@ impl GraphDb {
     /// fail with [`Error::EncryptionAuthFailed`].
     ///
     /// # Errors
-    /// Returns an error if the directory cannot be created, or
+    /// Returns [`Error::DatabaseLocked`] if another process already has this
+    /// root open — see [`GraphDb::open`]'s identical note (#524). Also
+    /// returns an error if the directory cannot be created, or
     /// [`Error::Corruption`] if a persisted vector index file exists but cannot
     /// be loaded — see [`GraphDb::open`] for why that is fatal.
     pub fn open_encrypted(path: &Path, key: [u8; 32]) -> Result<Self> {

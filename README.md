@@ -18,26 +18,33 @@
 
 ---
 
-> ## ⚠️ Single-process only — concurrent access can permanently destroy your database
+> ## ⚠️ Only one process may hold a database open at a time
 >
-> **Open a SparrowDB database from one process at a time.** Two processes writing concurrently to the
-> same database root can corrupt `catalog.tlv` beyond recovery, after which the database **cannot be
-> opened at all**:
+> **`GraphDb::open` takes an exclusive lock on the database root, process-wide.** A second process that
+> tries to open the same root while another process already has it open gets an immediate, clean error
+> instead of being let in:
 >
 > ```
-> Error: corruption: duplicate label_id 0 in catalog file
+> Error: database locked: another process already has '<path>' open for writing. SparrowDB allows
+> only one open handle per database root at a time — close the other process's connection (or wait
+> for it to exit) and retry.
 > ```
 >
-> Measured on `sparrowdb@0.1.26`: **4 of 5 concurrent runs left the database permanently unopenable.**
-> There is currently **no lock file and no guard at `open()`** — nothing stops a second process from
-> attaching. Sequential access (one process exits, the next opens) is safe.
+> This closes [#524](https://github.com/ryaker/SparrowDB/issues/524): on `sparrowdb@0.1.26` and
+> earlier, there was **no lock file and no guard at `open()`** at all, and two processes writing
+> concurrently to the same root could corrupt `catalog.tlv` beyond recovery — measured at 4 of 5
+> concurrent runs leaving the database permanently unopenable
+> (`Error: corruption: duplicate label_id 0 in catalog file`). If you hit that error on an older
+> version, upgrading does not repair an already-corrupted `catalog.tlv` — it only prevents new
+> corruption from this cause.
 >
-> This is easy to hit by accident: a CLI invoked while a daemon is running, two workers, a cron job
-> overlapping a service, or a health check. The bindings expose only `open()` with **no read-only
-> mode**, so *every* attach is a potential writer.
+> The lock is released automatically when the holding process's handle is dropped or the process
+> exits, including a crash or `SIGKILL` — there is nothing to clean up by hand. Sequential access (one
+> process exits, the next opens) has always been safe and still is.
 >
-> Tracked as [#524](https://github.com/ryaker/SparrowDB/issues/524). Until it is fixed, ensure exactly
-> one process holds a given database root.
+> The bindings still expose only `open()` with **no read-only mode**, so this remains a single-writer
+> constraint rather than true multi-reader support: a second process must wait for the first to close
+> its handle (or exit) before it can attach at all, even just to read.
 
 ---
 

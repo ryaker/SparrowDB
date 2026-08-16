@@ -143,14 +143,24 @@ fn concurrent_open_one_wins_one_gets_a_clean_error() {
     // module doc against the unfixed code, so it reliably exercises the
     // race without extra synchronisation machinery.
     let mut alpha = std::process::Command::new(&exe)
-        .args(["child_524_race_writer", "--exact", "--ignored", "--nocapture"])
+        .args([
+            "child_524_race_writer",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
         .env(RACE_DB_ENV, &db_path)
         .env(RACE_LABEL_ENV, "Alpha")
         .env(RACE_RESULT_ENV, &result_alpha)
         .spawn()
         .expect("spawn child alpha");
     let mut beta = std::process::Command::new(&exe)
-        .args(["child_524_race_writer", "--exact", "--ignored", "--nocapture"])
+        .args([
+            "child_524_race_writer",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
         .env(RACE_DB_ENV, &db_path)
         .env(RACE_LABEL_ENV, "Beta")
         .env(RACE_RESULT_ENV, &result_beta)
@@ -159,8 +169,14 @@ fn concurrent_open_one_wins_one_gets_a_clean_error() {
 
     let status_alpha = alpha.wait().expect("alpha must exit");
     let status_beta = beta.wait().expect("beta must exit");
-    assert!(status_alpha.success(), "alpha child process itself must not crash");
-    assert!(status_beta.success(), "beta child process itself must not crash");
+    assert!(
+        status_alpha.success(),
+        "alpha child process itself must not crash"
+    );
+    assert!(
+        status_beta.success(),
+        "beta child process itself must not crash"
+    );
 
     let outcome_alpha = std::fs::read_to_string(&result_alpha).expect("read alpha result");
     let outcome_beta = std::fs::read_to_string(&result_beta).expect("read beta result");
@@ -172,7 +188,11 @@ fn concurrent_open_one_wins_one_gets_a_clean_error() {
         "exactly one racer must win the lock and write; got alpha={outcome_alpha:?} beta={outcome_beta:?}"
     );
 
-    let loser_outcome = if alpha_won { &outcome_beta } else { &outcome_alpha };
+    let loser_outcome = if alpha_won {
+        &outcome_beta
+    } else {
+        &outcome_alpha
+    };
     assert!(
         loser_outcome.starts_with("OPEN_FAILED:"),
         "the loser must fail at open(), not at the write, got: {loser_outcome}"
@@ -196,7 +216,9 @@ fn concurrent_open_one_wins_one_gets_a_clean_error() {
     );
     assert_eq!(
         result.rows[0],
-        vec![sparrowdb_execution::types::Value::String(winner_label.to_string())],
+        vec![sparrowdb_execution::types::Value::String(
+            winner_label.to_string()
+        )],
         "the surviving node must be the winner's, not the loser's or a corrupted mix"
     );
 }
@@ -263,7 +285,12 @@ fn lock_is_released_when_holder_is_sigkilled() {
     let exe = std::env::current_exe().expect("current_exe");
     let mut holder = KillOnDrop(
         std::process::Command::new(&exe)
-            .args(["child_524_lock_holder", "--exact", "--ignored", "--nocapture"])
+            .args([
+                "child_524_lock_holder",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
             .env(HOLD_DB_ENV, &db_path)
             .env(HOLD_READY_FLAG_ENV, &ready_flag)
             // Not inherited: see `KillOnDrop`'s doc comment for the hang
@@ -326,7 +353,9 @@ fn sequential_open_write_close_reopen_still_works() {
         .expect("query after reopen");
     assert_eq!(
         result.rows,
-        vec![vec![sparrowdb_execution::types::Value::String("x".to_string())]],
+        vec![vec![sparrowdb_execution::types::Value::String(
+            "x".to_string()
+        )]],
         "sequential open/write/close/reopen must see the earlier write, unaffected by the lock"
     );
 }
