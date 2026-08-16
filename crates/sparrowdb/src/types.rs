@@ -325,6 +325,17 @@ pub(crate) struct DbInner {
     /// scope for #451, which is about a single handle's `open()` being
     /// stale, not about multiple handles disagreeing.
     pub quarantined_vector_writes: RwLock<HashMap<(String, String), Vec<PathBuf>>>,
+    /// Exclusive cross-process lock on the database root, acquired in
+    /// `GraphDb::open`/`open_encrypted` (#524).
+    ///
+    /// Never read after `open()` — held purely for its `Drop` impl, which
+    /// releases the underlying `flock` when the last `GraphDb` clone sharing
+    /// this `DbInner` goes away (or, independent of Rust-level `Drop`, when
+    /// the process exits or is killed — the OS closes the descriptor either
+    /// way). See `process_lock` module docs for why this is exclusive rather
+    /// than scoped to catalog mutation.
+    #[allow(dead_code)]
+    pub(crate) _db_lock: crate::process_lock::ProcessLock,
 }
 
 /// Run GC on the version store every this many commits.

@@ -35,6 +35,7 @@
 mod batch;
 mod db;
 mod helpers;
+mod process_lock;
 mod read_tx;
 mod types;
 mod wal_codec;

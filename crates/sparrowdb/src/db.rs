@@ -86,6 +86,9 @@ impl GraphDb {
     /// unaffected — absent is not the same as damaged.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
+        // Must be first: refuses a second concurrent handle to this root
+        // before anything below touches the catalog or WAL (#524).
+        let db_lock = crate::process_lock::ProcessLock::acquire(path)?;
         let wal_dir = path.join("wal");
         let wal_writer = WalWriter::open(&wal_dir)?;
         // Replay any WAL records that were fsync'd but not yet written to disk
@@ -147,6 +150,7 @@ impl GraphDb {
                 commits_since_gc: AtomicU64::new(0),
                 vector_indexes,
                 quarantined_vector_writes,
+                _db_lock: db_lock,
             }),
         })
     }
@@ -164,6 +168,8 @@ impl GraphDb {
     /// be loaded — see [`GraphDb::open`] for why that is fatal.
     pub fn open_encrypted(path: &Path, key: [u8; 32]) -> Result<Self> {
         std::fs::create_dir_all(path)?;
+        // Must be first — see the identical comment in `GraphDb::open` (#524).
+        let db_lock = crate::process_lock::ProcessLock::acquire(path)?;
         let wal_dir = path.join("wal");
         let wal_writer = WalWriter::open_encrypted(&wal_dir, key)?;
         // Replay any WAL records that were fsync'd but not yet written to disk.
@@ -215,6 +221,7 @@ impl GraphDb {
                 commits_since_gc: AtomicU64::new(0),
                 vector_indexes,
                 quarantined_vector_writes,
+                _db_lock: db_lock,
             }),
         })
     }
@@ -791,6 +798,9 @@ impl GraphDb {
         // with an active WriteTx that also holds an open Catalog handle.
         // Both paths derive next_label_id from their own in-memory counter, so
         // concurrent catalog writes without this guard can assign duplicate IDs.
+        // This guard is in-process only; the equivalent cross-process race —
+        // two separate `GraphDb::open` calls on the same root — is closed at
+        // `open()` by `ProcessLock` instead (#524).
         let _guard = WriteGuard::try_acquire(&self.inner).ok_or(Error::WriterBusy)?;
         let mut catalog = sparrowdb_catalog::catalog::Catalog::open(&self.inner.path)?;
         let label_id: u32 = match catalog.get_label(label)? {
