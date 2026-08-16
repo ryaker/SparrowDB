@@ -1233,7 +1233,22 @@ impl GraphDb {
         // branches, list comprehensions, subqueries, ...) and is left as a
         // separate, larger change.
         for key in params.keys() {
-            if let Some(bare) = key.strip_prefix('$') {
+            if key.starts_with('$') {
+                // `trim_start_matches`, not `strip_prefix`: a key can carry
+                // more than one leading sigil (`"$$t"`), and suggesting the
+                // single-strip result (`"$t"`) would hand back a value this
+                // same check rejects on the very next call — an error whose
+                // own advice fails.
+                let bare = key.trim_start_matches('$');
+                if bare.is_empty() {
+                    // The key was only sigils (`"$"`, `"$$"`) — there is no
+                    // bare name left to suggest.
+                    return Err(Error::InvalidArgument(format!(
+                        "parameter key {key:?} has no name left once its \
+                         leading '$' is removed; the params map must be \
+                         keyed by a real parameter name, not the sigil alone"
+                    )));
+                }
                 return Err(Error::InvalidArgument(format!(
                     "parameter key {key:?} must not include the leading '$' \
                      sigil; use {bare:?} instead — the params map is keyed by \

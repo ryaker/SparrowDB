@@ -96,6 +96,77 @@ fn sigil_prefixed_key_errors_instead_of_silently_empty() {
     );
 }
 
+// ── 2b. A key with *multiple* leading sigils must suggest a valid bare
+// name, not one that the same check would reject on the caller's next try ──
+//
+// `strip_prefix('$')` on `"$$t"` removes exactly one `$`, leaving `"$t"` —
+// suggesting that would send a caller who follows the error's own advice
+// straight back into this same rejection. `trim_start_matches('$')` removes
+// all of them, so the suggested name (`"t"`) must actually be accepted.
+
+#[test]
+fn double_sigil_key_suggests_a_name_that_is_itself_valid() {
+    let (db, _dir) = open_db();
+    db.execute("CREATE (n:Item {name: 'a', tag: 'x'})").unwrap();
+
+    let r = db.execute_with_params(
+        "MATCH (n:Item {tag: $t}) RETURN n.name",
+        params(vec![("$$t", Value::String("x".into()))]),
+    );
+
+    let err = r.expect_err("a double-sigil key must also be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("\"t\""),
+        "the suggested bare name must be \"t\" (all sigils stripped), not \
+         \"$t\" (only one stripped); got: {msg}"
+    );
+
+    // Prove the suggestion actually works: retry with the suggested key.
+    let retried = db
+        .execute_with_params(
+            "MATCH (n:Item {tag: $t}) RETURN n.name",
+            params(vec![("t", Value::String("x".into()))]),
+        )
+        .expect("the name the error message suggested must itself be accepted");
+    assert_eq!(
+        retried.rows,
+        vec![vec![Value::String("a".into())]],
+        "got {:?}",
+        retried.rows
+    );
+}
+
+// ── 2c. A key that is only sigils has no bare name to suggest — its own
+// distinct error, not a suggestion of the empty string ──────────────────
+//
+// `"$"` and `"$$"` both trim down to `""`. Recommending `""` as a parameter
+// name would be nonsense (no Cypher `$name` token can be empty — the lexer
+// itself rejects `$` with nothing after it, see
+// `sparrowdb_cypher::lexer.rs`'s "empty parameter name after $" error), so
+// this must be its own error, not the generic "use {bare} instead" message.
+
+#[test]
+fn sigil_only_key_gets_its_own_error_not_an_empty_suggestion() {
+    let (db, _dir) = open_db();
+    db.execute("CREATE (n:Item {name: 'a', tag: 'x'})").unwrap();
+
+    for bad_key in ["$", "$$"] {
+        let r = db.execute_with_params(
+            "MATCH (n:Item {tag: $t}) RETURN n.name",
+            params(vec![(bad_key, Value::String("x".into()))]),
+        );
+
+        let err = r.expect_err(&format!("key {bad_key:?} (sigils only) must be rejected"));
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("use \"\""),
+            "{bad_key:?}: must not suggest the empty string as the bare \
+             name; got: {msg}"
+        );
+    }
+}
+
 // ── 3. Control: a typo'd key is explicitly out of scope — still empty ───
 //
 // Hand-derived: no node has `tag` matching an unresolvable filter value, so
