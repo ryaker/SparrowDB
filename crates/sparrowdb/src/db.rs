@@ -1210,6 +1210,39 @@ impl GraphDb {
         cypher: &str,
         params: HashMap<String, sparrowdb_execution::Value>,
     ) -> Result<QueryResult> {
+        // SPA-523: the params map is keyed by the bare parameter name — the
+        // lexer strips the `$` sigil when tokenizing `$name` inside Cypher
+        // source (see `sparrowdb_cypher::lexer`), so `Expr`/`Literal::Param`
+        // and the engine's lookup (`params.get(name)`, `EngineBuilder::
+        // with_params`) never see a leading `$`. A caller who mirrors the
+        // query text and keys the map `"$t"` instead of `"t"` was previously
+        // silently mis-keyed: the lookup missed, the filter fell back to an
+        // unresolvable value, and (post-#467) that now fails *closed* —
+        // zero rows, no error. That is indistinguishable from a query that
+        // legitimately matched nothing. Reject the sigil form outright: it
+        // is unambiguously a caller mistake (no legitimate parameter name
+        // can contain `$`, since the lexer would never let one reach the
+        // caller's params map to begin with) and the error can name the
+        // exact fix.
+        //
+        // Unknown-but-unreferenced keys (a key present in the map that no
+        // `$name` in the query text refers to) are deliberately NOT rejected
+        // here — see issue #523 discussion. A typo'd key (`tt` for `t`) still
+        // returns silent-empty rather than erroring; catching that requires
+        // walking the full bound AST for every `$param` reference (CASE
+        // branches, list comprehensions, subqueries, ...) and is left as a
+        // separate, larger change.
+        for key in params.keys() {
+            if let Some(bare) = key.strip_prefix('$') {
+                return Err(Error::InvalidArgument(format!(
+                    "parameter key {key:?} must not include the leading '$' \
+                     sigil; use {bare:?} instead — the params map is keyed by \
+                     the bare name (e.g. `{{{bare:?}: ...}}`), and `$` is only \
+                     written in the Cypher query text itself (e.g. `${bare}`)"
+                )));
+            }
+        }
+
         use sparrowdb_cypher::{bind, parse};
 
         let stmt = parse(cypher)?;
