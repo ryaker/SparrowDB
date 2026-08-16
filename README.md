@@ -18,6 +18,29 @@
 
 ---
 
+> ## ⚠️ Single-process only — concurrent access can permanently destroy your database
+>
+> **Open a SparrowDB database from one process at a time.** Two processes writing concurrently to the
+> same database root can corrupt `catalog.tlv` beyond recovery, after which the database **cannot be
+> opened at all**:
+>
+> ```
+> Error: corruption: duplicate label_id 0 in catalog file
+> ```
+>
+> Measured on `sparrowdb@0.1.26`: **4 of 5 concurrent runs left the database permanently unopenable.**
+> There is currently **no lock file and no guard at `open()`** — nothing stops a second process from
+> attaching. Sequential access (one process exits, the next opens) is safe.
+>
+> This is easy to hit by accident: a CLI invoked while a daemon is running, two workers, a cron job
+> overlapping a service, or a health check. The bindings expose only `open()` with **no read-only
+> mode**, so *every* attach is a potential writer.
+>
+> Tracked as [#524](https://github.com/ryaker/SparrowDB/issues/524). Until it is fixed, ensure exactly
+> one process holds a given database root.
+
+---
+
 **SparrowDB is an embedded graph database.** It links directly into your process — Rust, Python, Node.js, or Ruby — and gives you a real Cypher query interface backed by a WAL-durable store on disk. No server. No JVM. No cloud subscription. No daemon to babysit.
 
 If your data is fundamentally relational — recommendations, social graphs, dependency trees, fraud rings, knowledge graphs — and you want to query it with multi-hop traversals instead of JOIN chains, SparrowDB is the drop-in answer.
