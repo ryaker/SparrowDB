@@ -179,22 +179,42 @@ mod tests {
         let _b = ProcessLock::acquire(dir.path()).expect("re-acquire after drop");
     }
 
+    /// Deliberately does not inspect `reg.len()` or count entries across the
+    /// whole map: `registry()` is one process-wide static, and `cargo test`
+    /// runs every `#[test]` in this binary in parallel by default — other,
+    /// unrelated tests elsewhere in this crate call `GraphDb::open` (hence
+    /// `ProcessLock::acquire`) on their own tempdirs concurrently with this
+    /// one. A whole-map assertion is an assertion about every other test that
+    /// happens to be mid-`open()` at this exact instant, not about this
+    /// test's own behaviour — exactly the flake an earlier version of this
+    /// test had (caught by a full `cargo test -p sparrowdb` run: a sibling
+    /// unit test's still-live entry made `live == 0` false).
+    ///
+    /// So this only ever inspects entries keyed by paths *this test itself*
+    /// created — `tempfile::tempdir()` paths are unique per call, so no
+    /// concurrently-running test can plausibly collide with `key_a`.
     #[test]
-    fn registry_does_not_grow_across_unrelated_roots() {
-        for _ in 0..8 {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let lock = ProcessLock::acquire(dir.path()).expect("acquire");
-            drop(lock);
-        }
+    fn dead_entry_for_a_specific_root_is_swept_by_the_next_acquire_anywhere() {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let key_a = dir_a
+            .path()
+            .canonicalize()
+            .expect("canonicalize dir_a (it exists — tempdir created it)");
+
+        let lock_a = ProcessLock::acquire(dir_a.path()).expect("acquire a");
+        drop(lock_a);
+        // `key_a`'s entry is now a dead Weak, still physically present until
+        // some call to `acquire` (for any root, not necessarily this one)
+        // sweeps it.
+
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let _lock_b = ProcessLock::acquire(dir_b.path()).expect("acquire b — triggers the sweep");
+
         let reg = registry().lock().expect("registry lock");
-        let live: usize = reg.values().filter(|w| w.strong_count() > 0).count();
-        assert_eq!(live, 0, "no handle should still be held");
-        // The sweep in `acquire` only runs on the next call, so a bounded
-        // number of dead entries may linger — but not one per iteration.
         assert!(
-            reg.len() <= 1,
-            "dead entries must not accumulate unboundedly, got {}",
-            reg.len()
+            !reg.contains_key(&key_a),
+            "a dead entry for a specific, no-longer-referenced root must be swept by the next \
+             acquire() call anywhere, not linger indefinitely"
         );
     }
 }
