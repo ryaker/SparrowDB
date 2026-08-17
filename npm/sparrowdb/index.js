@@ -2,17 +2,7 @@
 
 const { existsSync } = require('fs')
 const { join } = require('path')
-
-// There are no separate `@sparrowdb/<platform>` packages — the prebuilt
-// binaries for every platform this package supports are bundled directly
-// in this tarball (see .github/workflows/release.yml). Map platform+arch
-// to the bundled filename so we only ever try to load a binary that was
-// actually built for the running platform. See README for the supported
-// platform list and why musl/Alpine isn't one of them.
-const PLATFORM_BINARIES = {
-  'linux-x64': 'sparrowdb.linux-x64-gnu.node',
-  'darwin-arm64': 'sparrowdb.darwin-arm64.node',
-}
+const { PLATFORM_BINARIES } = require('./platforms')
 
 // A file existing under an expected name is not proof it's a valid,
 // loadable binary for this platform — issue #481 shipped for a year because
@@ -99,13 +89,3 @@ module.exports = native
 module.exports.SparrowDB = native.SparrowDB
 module.exports.ReadTx = native.ReadTx
 module.exports.WriteTx = native.WriteTx
-
-// Exposed so test/platform-resolution.test.js can look up the bundled
-// filename for the running platform+arch instead of re-deriving the naming
-// convention itself — a test that keeps its own copy of this rule is a
-// second place for it to drift from index.js (see issue #481, where a test
-// doing exactly that passed on darwin-arm64 by coincidence and failed on
-// linux-x64 because it reconstructed "sparrowdb.linux-x64.node" instead of
-// the real "sparrowdb.linux-x64-gnu.node"). Not part of the documented
-// public API.
-module.exports.PLATFORM_BINARIES = PLATFORM_BINARIES

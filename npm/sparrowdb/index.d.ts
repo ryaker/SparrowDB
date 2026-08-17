@@ -122,8 +122,8 @@ export interface VectorIndexLoadFailure {
   reason: string
   /**
    * `"live_unserviceable"` or `"quarantined_no_live_index"` — see the
-   * interface doc comment. Check this before deciding whether a vector write
-   * against this `(label, prop)` would currently succeed or throw.
+   * interface doc comment. Check this before deciding whether a vector
+   * write against this `(label, prop)` would currently succeed or throw.
    */
   kind: string
 }
@@ -140,36 +140,40 @@ export interface VectorIndexLoadFailure {
  * }
  * ```
  *
- * Not to be confused with the instance method `db.vectorIndexHealth(label,
+ * Not to be confused with the **instance** method `db.vectorIndexHealth(label,
  * prop)`, which returns per-index vector reachability counts. This type is
- * about which index FILES are in service; that one is about how many vectors
+ * about which index *files* are in service; that one is about how many vectors
  * inside one healthy file a search can reach.
  *
- * Three fields, because a report has three things to say (#456). Before #456
- * this was a bare `VectorIndexLoadFailure[]`, and `[]` meant all three at once:
+ * # Three fields, because a report has three things to say (#456)
  *
- * - `unscannable` — `[]` also meant "I could not read the directory". A
+ * Before #456 this was a bare `VectorIndexLoadFailure[]`, and `[]` meant three
+ * different things at once. Each collapse cost something:
+ *
+ * - **`unscannable`** — `[]` also meant "I could not read the directory". A
  *   `chmod 000` on `vector_indexes/`, a bad mount during a poll, or a
  *   misconfigured service account produced output byte-identical to a healthy
- *   store, so a monitor could not tell green from blind. When this is non-null,
- *   `active` and `historical` are empty FOR LACK OF OBSERVATION, not lack of
- *   damage. Check it before concluding anything.
- * - `historical` — a quarantine artifact whose `(label, prop)` is served again
- *   by a working index. It used to stay in the one array forever, because #442
- *   never cleans artifacts up, so a repaired store could go green to red and
- *   never back. An alert that will not clear after the problem is fixed gets
- *   muted, and a muted alert is worse than none. Reported rather than
- *   suppressed because #442 records no reason at quarantine time and writes no
- *   sidecar: the artifact file is the only surviving evidence of the incident.
- * - `healthy` — computed natively as `!unscannable && active.length === 0`, so
- *   a caller cannot get the composition wrong. An unscannable report is NOT
- *   healthy: not knowing is not the same as being fine.
+ *   store. A monitor could not tell green from blind. When this is non-null,
+ *   `active` and `historical` are empty *for lack of observation, not lack of
+ *   damage* — check it before concluding anything.
+ * - **`historical`** — a quarantine artifact whose `(label, prop)` is served
+ *   again by a working index. It used to stay in the one array forever,
+ *   because #442 never cleans artifacts up, so a store that had been repaired
+ *   could go green → red and never back. An alert that will not clear after
+ *   the problem is fixed gets muted, and a muted alert is worse than none.
+ *   These are reported rather than suppressed because #442 records no reason
+ *   at quarantine time and writes no sidecar: the artifact file is the only
+ *   surviving evidence the incident happened.
+ * - **`healthy`** — computed in Rust as `unscannable.is_none() &&
+ *   active.is_empty()`, so a JS caller cannot get the composition wrong. Note
+ *   that an unscannable report is **not** healthy: not knowing is not the same
+ *   as being fine.
  */
 export interface VectorIndexDamageReport {
   /**
-   * Present when `vector_indexes/` could not be listed; the string says why.
-   * ABSENT (not null) when the scan succeeded — the native layer omits the
-   * property rather than setting it, so test it for truthiness.
+   * Set when `vector_indexes/` could not be listed; the string says why.
+   * `None` becomes an **absent** JS property rather than `null`, so JS
+   * callers should test it for truthiness.
    *
    * While set, `active` and `historical` are empty because nothing was
    * observed — not because nothing is wrong.
@@ -185,7 +189,10 @@ export interface VectorIndexDamageReport {
    * Forensics for an operator; a monitor ignores this.
    */
   historical: Array<VectorIndexLoadFailure>
-  /** `!unscannable && active.length === 0`. Computed natively. */
+  /**
+   * `!unscannable && active.length === 0`. Computed in Rust so a JS
+   * caller cannot get the composition wrong.
+   */
   healthy: boolean
 }
 /**
@@ -210,8 +217,8 @@ export declare class SparrowDB {
    */
   static open(path: string): SparrowDB
   /**
-   * Deep damage report for the vector indexes at `path`: reads and validates
-   * every live index file.
+   * Deep damage report for the vector indexes at `path`: reads and
+   * validates every live index file.
    *
    * **Static**, and deliberately so: the database this diagnoses is usually
    * one that will not open. `open` fails with a `Corruption` error when a
@@ -223,11 +230,11 @@ export declare class SparrowDB {
    * the diagnostic itself into a second failure to diagnose. A directory it
    * cannot list is reported in `unscannable` rather than raised.
    *
-   * **Not for a poll loop.** This deserialises every HEALTHY index it finds —
-   * for an 8 MB `Knowledge.embedding` index polled hourly, 8 MB of I/O and a
-   * complete HNSW graph rebuild an hour, spent confirming that nothing is
-   * wrong. Use `SparrowDB.vectorIndexDamageScan` for monitoring and this for
-   * "why will my database not open?".
+   * **Not for a poll loop.** This deserialises every *healthy* index it
+   * finds — for an 8 MB `Knowledge.embedding` index polled hourly, 8 MB of
+   * I/O and a complete HNSW graph rebuild an hour, spent confirming that
+   * nothing is wrong. Use `SparrowDB.vectorIndexDamageScan` for monitoring
+   * and this for "why will my database not open?".
    *
    * Damage is reported in both places it can live:
    *
@@ -254,8 +261,8 @@ export declare class SparrowDB {
    *
    * **Read-only since #456.** It used to quarantine the live entries it
    * probed, so a second call answered differently from the first and the
-   * `path` it reported had already been renamed away by the time you read it.
-   * Both are fixed: run it as often as you like, and `path` resolves.
+   * `path` it reported had already been renamed away by the time you read
+   * it. Both are fixed: run it as often as you like, and `path` resolves.
    *
    * ```typescript
    * const report = SparrowDB.vectorIndexLoadFailures('/path/to/my.db')
@@ -269,25 +276,25 @@ export declare class SparrowDB {
    * Cheap damage report for the vector indexes at `path`: directory metadata
    * only, no index file contents read.
    *
-   * **This is the call for a monitor.** Its cost is one directory listing plus
-   * one `stat` per live index, independent of index size, so it is safe at any
-   * poll frequency. `SparrowDB.vectorIndexLoadFailures` is the deep
+   * **This is the call for a monitor.** Its cost is one directory listing
+   * plus one `stat` per live index, independent of index size, so it is safe
+   * at any poll frequency. `SparrowDB.vectorIndexLoadFailures` is the deep
    * counterpart and deserialises every healthy index on every call.
    *
    * **Static** and **never throws**, for the same reasons.
    *
    * What it sees: quarantine artifacts, split into `active` and `historical`
-   * by whether a live index now serves the pair, and live entries that do not
-   * resolve. What it does not: whether a live index still DECODES.
+   * by whether a live index now serves the pair, and live entries that do
+   * not resolve. What it does not: whether a live index still *decodes*.
    *
-   * That is sound for a RUNNING store, and the reason is structural rather
-   * than convenient: `open` loads and validates every live index and refuses
-   * to start when one fails, so a store that is up has had every live file
-   * verified already. The question a monitor is left asking is "did we
-   * quarantine something and lose vectors?", which is exactly what this
-   * answers without reading a payload byte.
+   * That is sound for a **running** store, and the reason is structural
+   * rather than convenient: `open` loads and validates every live index and
+   * refuses to start when one fails, so a store that is up has had every
+   * live file verified already. The question a monitor is left asking is
+   * "did we quarantine something and lose vectors?", which is exactly what
+   * this answers without reading a payload byte.
    *
-   * It cannot tell you why a database refuses to OPEN. Use
+   * It cannot tell you why a database refuses to *open*. Use
    * `SparrowDB.vectorIndexLoadFailures` for that.
    *
    * Not to be confused with the instance method `db.vectorIndexHealth(label,
@@ -331,21 +338,17 @@ export declare class SparrowDB {
    * (`GraphDb::execute_with_params`) has supported this since SPA-218; this
    * binding simply exposes it to JS callers.
    *
-   * **HNSW note (as of 0.1.23):** When the target property has a vector index,
-   * `SET n.prop = $vec` now ALSO writes the vector into the HNSW index.
-   * Previously the property was stored but the HNSW file was not updated —
-   * a silent data-loss bug surfaced by KMSmcp channel message #202.
+   * **HNSW note (as of 0.1.23):** when the target property has a vector
+   * index, `SET n.prop = $vec` now also writes the vector into the HNSW
+   * index. Previously the property was stored but the HNSW file was not
+   * updated — a silent data-loss bug surfaced by KMSmcp channel message
+   * #202 (#410).
    *
-   * **`CREATE` support (SPA-480):** standalone `CREATE (:Label {prop: $p})`
-   * and `MATCH ... CREATE` (including edge properties, e.g.
-   * `CREATE (a)-[:R {weight: $w}]->(b)`) now accept `$param` values. This
-   * closes the last gap in the parameterized-query story: building a
-   * `CREATE` from untrusted input via `executeWithParams` no longer
-   * requires string interpolation, so a value like `'", role: "admin'` is
-   * stored as a literal property value instead of being able to inject
-   * Cypher syntax. Previously these statements threw
-   * `"parameterized MATCH...CREATE and standalone CREATE are not yet
-   * supported"`.
+   * **`CREATE` support (SPA-480):** standalone `CREATE` and
+   * `MATCH ... CREATE` — including edge properties — now accept `$param`
+   * values, closing the last gap in the parameterized-query story: a
+   * `CREATE` built from untrusted input no longer needs string
+   * interpolation to bind a runtime value.
    *
    * ```typescript
    * const emb = Array.from(new Float32Array(768))  // your model output
@@ -391,7 +394,8 @@ export declare class SparrowDB {
    */
   createVectorIndex(label: string, property: string, dimensions: number, similarity?: string | undefined | null): void
   /**
-   * Directly insert a vector into the HNSW index for an existing node.
+   * Directly insert (or replace) a vector in the HNSW index for an existing
+   * node.
    *
    * This is the explicit backfill API requested by KMSmcp (ch #202).  It is
    * useful when nodes were created without an inline embedding and you want to
@@ -402,6 +406,30 @@ export declare class SparrowDB {
    * - `node_id`  — the **user-facing** `id` property value (string), not the
    *                internal u64 slot number.
    * - `vector`   — Float32Array of `dimensions` elements.
+   *
+   * Calling it twice for the same node now *replaces* the stored vector
+   * (issue #441).  Before that fix the second call was a silent no-op, so a
+   * re-embedding pass could report success while changing nothing.
+   *
+   * # The node property is written too
+   *
+   * Before issue #441 this method wrote only the HNSW file, making that file
+   * the sole copy of every embedding it stored: not rebuildable from the
+   * column store, not covered by the WAL, not recoverable to a point in
+   * time.  A backfill of 1721 vectors was lost that way.
+   *
+   * It now also writes `n.<property>` as
+   * `sparrowdb:vec32:<little-endian f32 hex>` inside the same write
+   * transaction as the index update, so the embedding survives in the
+   * checkpointed column store and the index can be rebuilt from it.  The
+   * storage layer has no vector type yet — its `Value` is `Int64` / `Bytes`
+   * / `Float` — so the value reads back as that text form rather than as an
+   * array.  (For comparison, the Cypher path `SET n.embedding = $vec` still
+   * stores an `Int64(0)` placeholder; that is tracked separately.)
+   *
+   * Vectors above ~8189 dimensions cannot be encoded within the overflow
+   * heap's 65535-byte value limit; the call is refused rather than leaving
+   * an unrecoverable index entry.
    *
    * Throws `RangeError` if no vector index exists for `(label, property)`.
    * Throws `TypeError`  if `vector.length` does not match the index dimensions.
@@ -528,8 +556,12 @@ export declare class SparrowDB {
    * Hybrid vector + full-text search using Reciprocal Rank Fusion (RRF).
    *
    * Runs HNSW vector search and BM25 full-text search independently, then
-   * fuses the ranked lists.  Missing indexes are treated as empty — so if
-   * only a vector index exists the call degrades gracefully to vector-only.
+   * fuses the ranked lists.  A genuinely *unconfigured* index is treated as
+   * empty — so if only a vector index exists the call degrades gracefully
+   * to vector-only.  A *present but damaged* FTS index instead rejects the
+   * call (issue #462): the two are distinguishable (an absent file opens
+   * fine as an empty index; only a broken one errs), and collapsing them
+   * would silently mask index corruption as a normal vector-only result.
    *
    * `label`           — node label (e.g. `"Memory"`)
    * `text_property`   — property holding the text content (for BM25)

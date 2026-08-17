@@ -29,14 +29,18 @@ const { spawnSync } = require('node:child_process')
 
 const PACKAGE_DIR = path.join(__dirname, '..')
 const INDEX_JS = path.join(PACKAGE_DIR, 'index.js')
+const PLATFORMS_JS = path.join(PACKAGE_DIR, 'platforms.js')
 
-// Read the real filename convention from index.js rather than reconstructing
-// it here. A hand-copied convention is a second place for it to drift from
-// the loader — which is exactly how #481 shipped: index.js looks for
-// "sparrowdb.linux-x64-gnu.node" (the `-gnu` suffix matters), and an earlier
-// version of this file built "sparrowdb.linux-x64.node" by concatenation,
-// so it passed on darwin-arm64 by coincidence and failed on Linux CI.
-const { PLATFORM_BINARIES } = require(INDEX_JS)
+// Read the real filename convention from platforms.js rather than
+// reconstructing it here. A hand-copied convention is a second place for it
+// to drift from the loader — which is exactly how #481 shipped: index.js
+// looks for "sparrowdb.linux-x64-gnu.node" (the `-gnu` suffix matters), and
+// an earlier version of this file built "sparrowdb.linux-x64.node" by
+// concatenation, so it passed on darwin-arm64 by coincidence and failed on
+// Linux CI. (platforms.js was split out of index.js in #518 so this map
+// isn't part of the package's public API — see makeIsolatedPackageDir
+// below, which now needs to copy it alongside index.js.)
+const { PLATFORM_BINARIES } = require(PLATFORMS_JS)
 
 // Locate a real, loadable compiled binary for the machine running this
 // suite — the same places index.js's own dev fallback (steps 2/3) looks,
@@ -66,6 +70,9 @@ function findRealBinary() {
 function makeIsolatedPackageDir() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sparrowdb-pkgtest-'))
   fs.copyFileSync(INDEX_JS, path.join(dir, 'index.js'))
+  // index.js requires('./platforms') — the isolated copy needs it too,
+  // same as npm publish bundles it alongside index.js in the real tarball.
+  fs.copyFileSync(PLATFORMS_JS, path.join(dir, 'platforms.js'))
   return dir
 }
 
