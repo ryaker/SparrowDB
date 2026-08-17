@@ -1,6 +1,6 @@
 {
   "name": "sparrowdb",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "description": "Native Node.js/TypeScript bindings for SparrowDB — embedded graph database with Cypher query support",
   "main": "index.js",
   "types": "index.d.ts",

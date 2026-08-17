@@ -1,6 +1,6 @@
 [package]
 name = "sparrowdb-ruby"
-version = "0.1.26"
+version = "0.1.27"
 edition = "2021"
 # Ships as a Ruby gem (extconf.rb + Gemfile + lib/), not as a crate. It has never
 # been published to crates.io and cannot be: its path dependencies carry no version
