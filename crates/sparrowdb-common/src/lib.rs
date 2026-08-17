@@ -70,6 +70,19 @@ pub enum Error {
     /// grows beyond the limit set via `EngineBuilder::with_memory_limit`.
     /// Use a larger limit or restructure the query to reduce fan-out.
     QueryMemoryExceeded,
+    /// `GraphDb::open`/`open_encrypted` could not acquire the exclusive
+    /// cross-process lock on the database root because another process
+    /// already holds it open (#524).
+    ///
+    /// Two processes each deriving `next_label_id` (and other catalog
+    /// counters) from their own in-memory state, with no coordination
+    /// between them, can both allocate the same id and permanently corrupt
+    /// `catalog.tlv` — `GraphDb::open` refuses to hand out a second handle
+    /// to the same root instead of risking that. The lock is released
+    /// automatically when the other process's handle is dropped or the
+    /// process exits (including on crash/kill), so retrying after the
+    /// holder closes its handle succeeds.
+    DatabaseLocked(String),
 }
 
 impl std::fmt::Display for Error {
@@ -107,6 +120,12 @@ impl std::fmt::Display for Error {
             Error::QueryMemoryExceeded => write!(
                 f,
                 "query memory exceeded: BFS frontier exceeded the configured memory limit"
+            ),
+            Error::DatabaseLocked(path) => write!(
+                f,
+                "database locked: another process already has '{path}' open for writing. \
+                 SparrowDB allows only one open handle per database root at a time — close \
+                 the other process's connection (or wait for it to exit) and retry."
             ),
         }
     }
