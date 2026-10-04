@@ -845,6 +845,13 @@ impl Engine {
         if return_requires_row_engine(&m.return_clause.items) {
             return false;
         }
+        // #530: the chunked path projects only the middle node `x`. A RETURN
+        // item that reads `a` or `b` is still a `PropAccess`, so the check
+        // above lets it through, and `project_row` would answer `Null`.
+        // Decline so the row engine, which binds all three, evaluates it.
+        if !return_projects_only_var(&m.return_clause.items, pat.nodes[1].var.as_str()) {
+            return false;
+        }
         // Rel table must exist.
         let label = pat.nodes[0].labels[0].clone();
         let rel_type = &pat.rels[0].rel_type;
