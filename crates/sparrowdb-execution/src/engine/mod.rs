@@ -3136,6 +3136,19 @@ fn needs_node_ref_in_return(items: &[ReturnItem]) -> bool {
         .any(|item| !expr_projectable_by_row(&item.expr))
 }
 
+/// Returns `true` when every RETURN item is a `PropAccess` on `var`.
+///
+/// `expr_projectable_by_row` keys on the `Expr` variant alone, so a
+/// `PropAccess` on a *different* variable passes it and then reaches
+/// `project_row`, whose `var == var_name` guard fails and yields `Null`
+/// (#530). Paths that scan a single variable but whose pattern binds more
+/// must check this too and fall back to the row engine when it is `false`.
+pub(crate) fn return_projects_only_var(items: &[ReturnItem], var: &str) -> bool {
+    items
+        .iter()
+        .all(|item| matches!(&item.expr, Expr::PropAccess { var: v, .. } if v.as_str() == var))
+}
+
 /// Collect the variable names that appear as bare `Expr::Var` in a RETURN clause (SPA-213).
 ///
 /// These variables must be projected as a `Value::Map` containing all node properties
