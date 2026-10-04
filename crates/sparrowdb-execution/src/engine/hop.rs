@@ -2157,6 +2157,7 @@ impl Engine {
                                 use_reachability,
                                 usize::MAX,
                                 hop_rel_ids,
+                                None,
                             );
                             reached
                                 .into_iter()

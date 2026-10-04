@@ -1153,6 +1153,7 @@ impl Engine {
                     &delta_idx,
                     &mut neighbors,
                     rel_ids,
+                    None,
                 );
 
                 for &(nb_slot, nb_label) in neighbors.iter() {
