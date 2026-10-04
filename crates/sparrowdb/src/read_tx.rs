@@ -9,8 +9,19 @@ use tracing::info_span;
 
 /// A read-only snapshot transaction.
 ///
-/// Pinned at the `txn_id` current when this handle was opened; immune to
-/// subsequent writer commits for the lifetime of this handle.
+/// Pinned at the `txn_id` current when this handle was opened.
+///
+/// # Isolation guarantees differ by method
+///
+/// - [`get_node`](Self::get_node) is a true snapshot read: property values
+///   come from the version chain at `snapshot_txn_id`, so later writer commits
+///   do not change what it returns.
+/// - [`query`](Self::query) is **not** snapshot-isolated. It opens the node
+///   store fresh and never consults `snapshot_txn_id`, so rows created by
+///   committed writes after this handle was opened (including `CREATE` through
+///   the same database) are visible to it. Do not rely on a `ReadTx` to get a
+///   consistent view across several `query` calls; that needs a per-node
+///   visibility mechanism that is not implemented yet (see #533).
 pub struct ReadTx {
     /// The committed `txn_id` this reader is pinned to.
     pub snapshot_txn_id: u64,
@@ -59,6 +70,12 @@ impl ReadTx {
     /// Multiple `ReadTx` handles may run `query` concurrently.  No write lock
     /// is acquired; only the shared read-paths of the catalog, CSR, and
     /// property-index caches are accessed.
+    ///
+    /// ## Isolation
+    ///
+    /// This method does **not** honour `snapshot_txn_id`: it reads the live
+    /// on-disk state, so newly committed nodes and edges can appear between
+    /// two `query` calls on the same `ReadTx`. See the type-level docs.
     ///
     /// ## Mutation statements rejected
     ///
