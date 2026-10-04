@@ -478,7 +478,7 @@ impl EdgeStore {
         }
         // Collect last-written value for each col_id (later writes win).
         let mut result: Vec<(u32, u64)> = Vec::new();
-        for chunk in bytes.chunks_exact(28) {
+        for chunk in bytes.as_chunks::<28>().0 {
             let s = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
             let d = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
             if s != src_slot || d != dst_slot {
@@ -515,7 +515,7 @@ impl EdgeStore {
             )));
         }
         let mut result = Vec::with_capacity(bytes.len() / 28);
-        for chunk in bytes.chunks_exact(28) {
+        for chunk in bytes.as_chunks::<28>().0 {
             let src_slot = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
             let dst_slot = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
             let col_id = u32::from_le_bytes(chunk[16..20].try_into().unwrap());

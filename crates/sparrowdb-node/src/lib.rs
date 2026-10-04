@@ -114,9 +114,9 @@ fn decode_vector_property(s: &str) -> Option<Vec<f32>> {
     }
     let mut out = Vec::with_capacity(hex.len() / 8);
     let bytes = hex.as_bytes();
-    for chunk in bytes.chunks_exact(8) {
+    for chunk in bytes.as_chunks::<8>().0 {
         let mut raw = [0u8; 4];
-        for (i, pair) in chunk.chunks_exact(2).enumerate() {
+        for (i, pair) in chunk.as_chunks::<2>().0.iter().enumerate() {
             let hi = (pair[0] as char).to_digit(16)?;
             let lo = (pair[1] as char).to_digit(16)?;
             raw[i] = ((hi << 4) | lo) as u8;
