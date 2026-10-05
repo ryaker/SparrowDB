@@ -2602,6 +2602,15 @@ impl Engine {
 
         for (label_id, label_name) in &all_labels {
             let label_id_u32 = *label_id as u32;
+            // #497: skip labels with no live nodes WITHOUT touching the
+            // filesystem.  `label_row_counts` holds the live (tombstone-aware,
+            // #485) count and omits zero-count labels, so a miss means every
+            // slot of this label is empty or tombstoned and the slot loop
+            // below would yield nothing.  Without this, `hwm_for_label` paid
+            // an `exists()` + `read()` per catalog label per query.
+            if !self.snapshot.label_row_counts.contains_key(label_id) {
+                continue;
+            }
             let hwm = self.snapshot.store.hwm_for_label(label_id_u32)?;
             tracing::debug!(label = %label_name, hwm = hwm, "label-less scan: label slot");
 

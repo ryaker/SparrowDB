@@ -33,6 +33,21 @@ use std::path::{Path, PathBuf};
 
 use sparrowdb_common::{Error, NodeId, Result};
 
+thread_local! {
+    /// Number of `load_hwm` calls (each one touches the filesystem) made by
+    /// the current thread.  Diagnostic counter for #497 regression tests.
+    static HWM_DISK_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of per-label high-water-mark disk loads performed so far on the
+/// calling thread.  Each load is `exists()` + `read()` (plus a tmp-file and
+/// directory probe for labels with no `hwm.bin`), so this is a deterministic
+/// proxy for filesystem work in label-iterating scans.  Diagnostic only.
+#[doc(hidden)]
+pub fn hwm_disk_load_count() -> u64 {
+    HWM_DISK_LOADS.with(|c| c.get())
+}
+
 // ── Value type ────────────────────────────────────────────────────────────────
 
 /// A typed property value.
@@ -445,6 +460,7 @@ impl NodeStore {
     /// `hwm.bin.tmp` exists (leftover from a previous crashed write), we
     /// promote the tmp file to `hwm.bin` and use its value.
     fn load_hwm(&self, label_id: u32) -> Result<u64> {
+        HWM_DISK_LOADS.with(|c| c.set(c.get() + 1));
         let path = self.hwm_path(label_id);
         let tmp_path = self.hwm_tmp_path(label_id);
 
