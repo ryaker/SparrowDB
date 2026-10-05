@@ -1140,6 +1140,8 @@ impl EngineBuilder {
 // ── Submodules (split from the original monolithic engine.rs) ─────────────────
 mod aggregate;
 mod expr;
+#[cfg(test)]
+mod filter_resolvable_tests;
 mod hop;
 mod mutation;
 mod path;
@@ -1150,7 +1152,7 @@ mod subquery;
 
 // ── Free-standing prop-filter helper (usable without &self) ───────────────────
 
-/// Returns `true` when `expr` can be fully resolved against `params` — i.e.
+/// Returns `Some(value)` when `expr` can be fully resolved against `params` — i.e.
 /// every leaf is a literal, or a `$param` that is actually present in the
 /// params map.
 ///
@@ -1168,26 +1170,36 @@ mod subquery;
 /// A missing `$param` is unresolvable for the same reason: it means the
 /// query referenced a parameter the caller never supplied, not that the
 /// caller deliberately bound it to null.
-fn is_filter_expr_resolvable(expr: &Expr, params: &HashMap<String, Value>) -> bool {
-    is_filter_expr_resolvable_scoped(expr, params, &[])
+///
+/// The returned value is exactly `eval_expr(expr, params)`, computed in the
+/// same single bottom-up pass that decides resolvability, so a caller never
+/// has to evaluate the expression a second time. Each node is visited — and
+/// each function call dispatched — once, so the work is linear in the size of
+/// the expression (issue #482; it used to be quadratic in call-nesting depth
+/// because every `FnCall` re-evaluated its whole argument subtree).
+fn resolve_filter_expr(expr: &Expr, params: &HashMap<String, Value>) -> Option<Value> {
+    resolve_filter_expr_scoped(expr, params, &[])
 }
 
-/// As [`is_filter_expr_resolvable`], but with a set of locally-bound variable
+/// As [`resolve_filter_expr`], but with a set of locally-bound variable
 /// names — the loop variable of a list predicate (`ANY(x IN … WHERE …)`) is
 /// bound by the comprehension itself, not by the params map, so a bare
 /// `Expr::Var("x")` inside the predicate is legitimately resolvable.
-fn is_filter_expr_resolvable_scoped(
+///
+/// `Some(v)` means resolvable with `v == eval_expr(expr, params)`; `None`
+/// means unresolvable.
+fn resolve_filter_expr_scoped(
     expr: &Expr,
     params: &HashMap<String, Value>,
     locals: &[&str],
-) -> bool {
-    let rec = |e: &Expr| is_filter_expr_resolvable_scoped(e, params, locals);
+) -> Option<Value> {
+    let rec = |e: &Expr| resolve_filter_expr_scoped(e, params, locals);
     match expr {
         // A literal `$name` — resolvable only if the caller actually supplied it.
-        Expr::Literal(Literal::Param(p)) => params.contains_key(&format!("${p}")),
+        Expr::Literal(Literal::Param(p)) => params.get(&format!("${p}")).cloned(),
         // Constant literals (including an explicit `null` written in the query)
         // are always resolvable.
-        Expr::Literal(_) => true,
+        Expr::Literal(_) => Some(eval_expr(expr, params)),
         // Function calls / arithmetic are resolvable iff every argument is.
         // A function call is resolvable iff every argument is AND the dispatcher
         // actually accepts the call. Checking the arguments alone is not enough:
@@ -1201,17 +1213,57 @@ fn is_filter_expr_resolvable_scoped(
         // The dispatcher itself is the source of truth here rather than a
         // duplicated list of known names, which would silently drift as
         // functions are added.
+        //
+        // The argument values come from the recursion itself (each child's
+        // resolved value IS `eval_expr(child, params)`), so nothing below this
+        // node is evaluated twice.
         Expr::FnCall { name, args } => {
-            args.iter().all(&rec) && {
-                let evaluated: Vec<Value> = args.iter().map(|a| eval_expr(a, params)).collect();
-                crate::functions::dispatch_function(name, evaluated).is_ok()
+            let evaluated: Vec<Value> = args.iter().map(&rec).collect::<Option<_>>()?;
+            let result = crate::functions::dispatch_function(name, evaluated).ok()?;
+            // `eval_expr` short-circuits `type(v)` / `labels(v)` / `id(v)` on a
+            // bare variable into a row-map lookup instead of the dispatcher's
+            // result. The dispatcher above has already accepted the call (that
+            // is what resolvability asks); the *value* must still be what
+            // `eval_expr` returns, and that lookup involves no dispatch.
+            if is_row_metadata_call(name, args) {
+                Some(eval_expr(expr, params))
+            } else {
+                Some(result)
             }
         }
-        Expr::BinOp { left, right, .. } => rec(left) && rec(right),
-        Expr::List(items) => items.iter().all(&rec),
-        Expr::InList { expr, list, .. } => rec(expr) && list.iter().all(&rec),
-        Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => rec(e),
-        Expr::And(a, b) | Expr::Or(a, b) => rec(a) && rec(b),
+        Expr::BinOp { left, op, right } => {
+            let (l, r) = (rec(left)?, rec(right)?);
+            Some(eval_binop_values(op, &l, &r))
+        }
+        Expr::List(items) => items
+            .iter()
+            .map(&rec)
+            .collect::<Option<Vec<_>>>()
+            .map(Value::List),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let lv = rec(expr)?;
+            let items: Vec<Value> = list.iter().map(&rec).collect::<Option<_>>()?;
+            let matched = items.iter().any(|item| values_equal(&lv, item));
+            Some(Value::Bool(if *negated { !matched } else { matched }))
+        }
+        Expr::Not(e) => Some(match rec(e)? {
+            Value::Bool(b) => Value::Bool(!b),
+            _ => Value::Null,
+        }),
+        Expr::IsNull(e) => Some(Value::Bool(matches!(rec(e)?, Value::Null))),
+        Expr::IsNotNull(e) => Some(Value::Bool(!matches!(rec(e)?, Value::Null))),
+        Expr::And(a, b) => Some(match (rec(a)?, rec(b)?) {
+            (Value::Bool(x), Value::Bool(y)) => Value::Bool(x && y),
+            _ => Value::Null,
+        }),
+        Expr::Or(a, b) => Some(match (rec(a)?, rec(b)?) {
+            (Value::Bool(x), Value::Bool(y)) => Value::Bool(x || y),
+            _ => Value::Null,
+        }),
         // `CASE WHEN <cond> THEN <val> … [ELSE <val>]` is resolvable iff every
         // condition, every branch value, and the ELSE are.  This one is NOT
         // merely conservative: `MATCH (n:Item {id: CASE WHEN true THEN 1 ELSE 2 END})`
@@ -1221,8 +1273,23 @@ fn is_filter_expr_resolvable_scoped(
             branches,
             else_expr,
         } => {
-            branches.iter().all(|(cond, val)| rec(cond) && rec(val))
-                && else_expr.as_ref().is_none_or(|e| rec(e))
+            // Every branch is checked (an untaken branch containing an
+            // undispatchable call still makes the expression unresolvable), then
+            // the value follows `eval_expr`'s first-true-condition rule.
+            let mut branch_vals = Vec::with_capacity(branches.len());
+            for (cond, val) in branches {
+                branch_vals.push((rec(cond)?, rec(val)?));
+            }
+            let else_val = match else_expr {
+                Some(e) => rec(e)?,
+                None => Value::Null,
+            };
+            Some(
+                branch_vals
+                    .into_iter()
+                    .find(|(cond, _)| matches!(cond, Value::Bool(true)))
+                    .map_or(else_val, |(_, val)| val),
+            )
         }
         // `ANY/ALL/NONE/SINGLE (x IN <list> WHERE <pred>)` binds `x` itself, so
         // the predicate is resolvable even though it names a variable absent
@@ -1237,10 +1304,16 @@ fn is_filter_expr_resolvable_scoped(
         } => {
             let mut inner: Vec<&str> = locals.to_vec();
             inner.push(variable.as_str());
-            rec(list_expr) && is_filter_expr_resolvable_scoped(predicate, params, &inner)
+            rec(list_expr)?;
+            resolve_filter_expr_scoped(predicate, params, &inner)?;
+            // The predicate runs once per list item with the loop variable
+            // bound, so its value cannot be reused from this pass; evaluate
+            // the whole predicate node the ordinary way. (Only expressions
+            // nested *inside* a list predicate are visited twice.)
+            Some(eval_expr(expr, params))
         }
         // A comprehension-bound loop variable is resolvable inside its own body.
-        Expr::Var(v) if locals.contains(&v.as_str()) => true,
+        Expr::Var(v) if locals.contains(&v.as_str()) => Some(eval_expr(expr, params)),
         // A bare variable or property access can never be resolved from a
         // params-only map — see the doc comment above.  Everything else
         // (EXISTS, shortestPath, CountStar, list predicates, …) is not
@@ -1265,8 +1338,16 @@ fn is_filter_expr_resolvable_scoped(
         //   • NotExists / ExistsSubquery / ShortestPath need graph traversal and
         //     CountStar needs aggregation; none has a static form.
         // Check that property when adding variant 19.
-        _ => false,
+        _ => None,
     }
+}
+
+/// Whether `eval_expr` answers this call from the row map (`type(r)`,
+/// `labels(n)`, `id(n)` on a bare variable) rather than via the dispatcher.
+/// Must stay in sync with the early-return arms of `eval_expr`'s `FnCall`.
+fn is_row_metadata_call(name: &str, args: &[Expr]) -> bool {
+    matches!(args.first(), Some(Expr::Var(_)))
+        && matches!(name.to_lowercase().as_str(), "type" | "labels" | "id")
 }
 
 fn matches_prop_filter_static(
@@ -1280,16 +1361,16 @@ fn matches_prop_filter_static(
         // `$param` the caller never supplied, property access on a var not in
         // scope, …) must never widen a pattern-property filter into "match
         // every node of the label" (issue #467). Bail out before evaluating.
-        if !is_filter_expr_resolvable(&f.value, params) {
+        let Some(filter_val) = resolve_filter_expr(&f.value, params) else {
             return false;
-        }
+        };
 
         let col_id = prop_name_to_col_id(&f.key);
         let stored_val = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
 
-        // Evaluate the filter expression (supports literals, function calls, and
-        // runtime parameters via `$name` — params are keyed as `"$name"` in the map).
-        let filter_val = eval_expr(&f.value, params);
+        // `filter_val` is the value of the filter expression (literals, function
+        // calls, runtime parameters via `$name` — params are keyed as `"$name"`
+        // in the map), computed once by the resolvability pass above (#482).
         let matches = match filter_val {
             Value::Int64(n) => {
                 // Int64 values are stored with TAG_INT64 (0x00) in the top byte.
@@ -2391,6 +2472,126 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
     }
 }
 
+/// Apply a binary operator to two already-evaluated operands.
+///
+/// Shared by [`eval_expr`] and [`resolve_filter_expr`] so both agree exactly.
+fn eval_binop_values(op: &BinOpKind, lv: &Value, rv: &Value) -> Value {
+    match op {
+        // SPA-264: use values_equal for cross-type Bool↔Int64 coercion.
+        BinOpKind::Eq => Value::Bool(values_equal(lv, rv)),
+        BinOpKind::Neq => Value::Bool(!values_equal(lv, rv)),
+        BinOpKind::Lt => match (lv, rv) {
+            (Value::Int64(a), Value::Int64(b)) => Value::Bool(a < b),
+            (Value::Float64(a), Value::Float64(b)) => Value::Bool(a < b),
+            (Value::Int64(a), Value::Float64(b)) => {
+                cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_lt()))
+            }
+            (Value::Float64(a), Value::Int64(b)) => {
+                cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_gt()))
+            }
+            _ => Value::Null,
+        },
+        BinOpKind::Le => match (lv, rv) {
+            (Value::Int64(a), Value::Int64(b)) => Value::Bool(a <= b),
+            (Value::Float64(a), Value::Float64(b)) => Value::Bool(a <= b),
+            (Value::Int64(a), Value::Float64(b)) => {
+                cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_le()))
+            }
+            (Value::Float64(a), Value::Int64(b)) => {
+                cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_ge()))
+            }
+            _ => Value::Null,
+        },
+        BinOpKind::Gt => match (lv, rv) {
+            (Value::Int64(a), Value::Int64(b)) => Value::Bool(a > b),
+            (Value::Float64(a), Value::Float64(b)) => Value::Bool(a > b),
+            (Value::Int64(a), Value::Float64(b)) => {
+                cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_gt()))
+            }
+            (Value::Float64(a), Value::Int64(b)) => {
+                cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_lt()))
+            }
+            _ => Value::Null,
+        },
+        BinOpKind::Ge => match (lv, rv) {
+            (Value::Int64(a), Value::Int64(b)) => Value::Bool(a >= b),
+            (Value::Float64(a), Value::Float64(b)) => Value::Bool(a >= b),
+            (Value::Int64(a), Value::Float64(b)) => {
+                cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_ge()))
+            }
+            (Value::Float64(a), Value::Int64(b)) => {
+                cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_le()))
+            }
+            _ => Value::Null,
+        },
+        BinOpKind::Contains => match (lv, rv) {
+            (Value::String(l), Value::String(r)) => Value::Bool(l.contains(r.as_str())),
+            _ => Value::Null,
+        },
+        BinOpKind::StartsWith => match (lv, rv) {
+            (Value::String(l), Value::String(r)) => Value::Bool(l.starts_with(r.as_str())),
+            _ => Value::Null,
+        },
+        BinOpKind::EndsWith => match (lv, rv) {
+            (Value::String(l), Value::String(r)) => Value::Bool(l.ends_with(r.as_str())),
+            _ => Value::Null,
+        },
+        BinOpKind::And => match (lv, rv) {
+            (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
+            _ => Value::Null,
+        },
+        BinOpKind::Or => match (lv, rv) {
+            (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
+            _ => Value::Null,
+        },
+        BinOpKind::Add => match (lv, rv) {
+            (Value::Int64(a), Value::Int64(b)) => Value::Int64(a + b),
+            (Value::Float64(a), Value::Float64(b)) => Value::Float64(a + b),
+            (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 + b),
+            (Value::Float64(a), Value::Int64(b)) => Value::Float64(a + *b as f64),
+            (Value::String(a), Value::String(b)) => Value::String(format!("{a}{b}")),
+            _ => Value::Null,
+        },
+        BinOpKind::Sub => match (lv, rv) {
+            (Value::Int64(a), Value::Int64(b)) => Value::Int64(a - b),
+            (Value::Float64(a), Value::Float64(b)) => Value::Float64(a - b),
+            (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 - b),
+            (Value::Float64(a), Value::Int64(b)) => Value::Float64(a - *b as f64),
+            _ => Value::Null,
+        },
+        BinOpKind::Mul => match (lv, rv) {
+            (Value::Int64(a), Value::Int64(b)) => Value::Int64(a * b),
+            (Value::Float64(a), Value::Float64(b)) => Value::Float64(a * b),
+            (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 * b),
+            (Value::Float64(a), Value::Int64(b)) => Value::Float64(a * *b as f64),
+            _ => Value::Null,
+        },
+        BinOpKind::Div => match (lv, rv) {
+            (Value::Int64(a), Value::Int64(b)) => {
+                if *b == 0 {
+                    Value::Null
+                } else {
+                    Value::Int64(a / b)
+                }
+            }
+            (Value::Float64(a), Value::Float64(b)) => Value::Float64(a / b),
+            (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 / b),
+            (Value::Float64(a), Value::Int64(b)) => Value::Float64(a / *b as f64),
+            _ => Value::Null,
+        },
+        BinOpKind::Mod => match (lv, rv) {
+            (Value::Int64(a), Value::Int64(b)) => {
+                if *b == 0 {
+                    Value::Null
+                } else {
+                    Value::Int64(a % b)
+                }
+            }
+            _ => Value::Null,
+        },
+    }
+}
+
 fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
     match expr {
         Expr::PropAccess { var, prop } => {
@@ -2460,120 +2661,7 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             // Evaluate binary operations for use in RETURN expressions.
             let lv = eval_expr(left, vals);
             let rv = eval_expr(right, vals);
-            match op {
-                // SPA-264: use values_equal for cross-type Bool↔Int64 coercion.
-                BinOpKind::Eq => Value::Bool(values_equal(&lv, &rv)),
-                BinOpKind::Neq => Value::Bool(!values_equal(&lv, &rv)),
-                BinOpKind::Lt => match (&lv, &rv) {
-                    (Value::Int64(a), Value::Int64(b)) => Value::Bool(a < b),
-                    (Value::Float64(a), Value::Float64(b)) => Value::Bool(a < b),
-                    (Value::Int64(a), Value::Float64(b)) => {
-                        cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_lt()))
-                    }
-                    (Value::Float64(a), Value::Int64(b)) => {
-                        cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_gt()))
-                    }
-                    _ => Value::Null,
-                },
-                BinOpKind::Le => match (&lv, &rv) {
-                    (Value::Int64(a), Value::Int64(b)) => Value::Bool(a <= b),
-                    (Value::Float64(a), Value::Float64(b)) => Value::Bool(a <= b),
-                    (Value::Int64(a), Value::Float64(b)) => {
-                        cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_le()))
-                    }
-                    (Value::Float64(a), Value::Int64(b)) => {
-                        cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_ge()))
-                    }
-                    _ => Value::Null,
-                },
-                BinOpKind::Gt => match (&lv, &rv) {
-                    (Value::Int64(a), Value::Int64(b)) => Value::Bool(a > b),
-                    (Value::Float64(a), Value::Float64(b)) => Value::Bool(a > b),
-                    (Value::Int64(a), Value::Float64(b)) => {
-                        cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_gt()))
-                    }
-                    (Value::Float64(a), Value::Int64(b)) => {
-                        cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_lt()))
-                    }
-                    _ => Value::Null,
-                },
-                BinOpKind::Ge => match (&lv, &rv) {
-                    (Value::Int64(a), Value::Int64(b)) => Value::Bool(a >= b),
-                    (Value::Float64(a), Value::Float64(b)) => Value::Bool(a >= b),
-                    (Value::Int64(a), Value::Float64(b)) => {
-                        cmp_i64_f64(*a, *b).map_or(Value::Null, |o| Value::Bool(o.is_ge()))
-                    }
-                    (Value::Float64(a), Value::Int64(b)) => {
-                        cmp_i64_f64(*b, *a).map_or(Value::Null, |o| Value::Bool(o.is_le()))
-                    }
-                    _ => Value::Null,
-                },
-                BinOpKind::Contains => match (&lv, &rv) {
-                    (Value::String(l), Value::String(r)) => Value::Bool(l.contains(r.as_str())),
-                    _ => Value::Null,
-                },
-                BinOpKind::StartsWith => match (&lv, &rv) {
-                    (Value::String(l), Value::String(r)) => Value::Bool(l.starts_with(r.as_str())),
-                    _ => Value::Null,
-                },
-                BinOpKind::EndsWith => match (&lv, &rv) {
-                    (Value::String(l), Value::String(r)) => Value::Bool(l.ends_with(r.as_str())),
-                    _ => Value::Null,
-                },
-                BinOpKind::And => match (&lv, &rv) {
-                    (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
-                    _ => Value::Null,
-                },
-                BinOpKind::Or => match (&lv, &rv) {
-                    (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
-                    _ => Value::Null,
-                },
-                BinOpKind::Add => match (&lv, &rv) {
-                    (Value::Int64(a), Value::Int64(b)) => Value::Int64(a + b),
-                    (Value::Float64(a), Value::Float64(b)) => Value::Float64(a + b),
-                    (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 + b),
-                    (Value::Float64(a), Value::Int64(b)) => Value::Float64(a + *b as f64),
-                    (Value::String(a), Value::String(b)) => Value::String(format!("{a}{b}")),
-                    _ => Value::Null,
-                },
-                BinOpKind::Sub => match (&lv, &rv) {
-                    (Value::Int64(a), Value::Int64(b)) => Value::Int64(a - b),
-                    (Value::Float64(a), Value::Float64(b)) => Value::Float64(a - b),
-                    (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 - b),
-                    (Value::Float64(a), Value::Int64(b)) => Value::Float64(a - *b as f64),
-                    _ => Value::Null,
-                },
-                BinOpKind::Mul => match (&lv, &rv) {
-                    (Value::Int64(a), Value::Int64(b)) => Value::Int64(a * b),
-                    (Value::Float64(a), Value::Float64(b)) => Value::Float64(a * b),
-                    (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 * b),
-                    (Value::Float64(a), Value::Int64(b)) => Value::Float64(a * *b as f64),
-                    _ => Value::Null,
-                },
-                BinOpKind::Div => match (&lv, &rv) {
-                    (Value::Int64(a), Value::Int64(b)) => {
-                        if *b == 0 {
-                            Value::Null
-                        } else {
-                            Value::Int64(a / b)
-                        }
-                    }
-                    (Value::Float64(a), Value::Float64(b)) => Value::Float64(a / b),
-                    (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 / b),
-                    (Value::Float64(a), Value::Int64(b)) => Value::Float64(a / *b as f64),
-                    _ => Value::Null,
-                },
-                BinOpKind::Mod => match (&lv, &rv) {
-                    (Value::Int64(a), Value::Int64(b)) => {
-                        if *b == 0 {
-                            Value::Null
-                        } else {
-                            Value::Int64(a % b)
-                        }
-                    }
-                    _ => Value::Null,
-                },
-            }
+            eval_binop_values(op, &lv, &rv)
         }
         Expr::Not(inner) => match eval_expr(inner, vals) {
             Value::Bool(b) => Value::Bool(!b),

@@ -10,6 +10,13 @@ use sparrowdb_common::{Error, Result};
 
 use crate::types::Value;
 
+// Test-only per-thread count of `dispatch_function` invocations, used to
+// assert how much work a filter-resolvability check does (issue #482).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DISPATCH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // ── Public dispatcher ─────────────────────────────────────────────────────────
 
 /// Dispatch a built-in function call by name.
@@ -17,6 +24,8 @@ use crate::types::Value;
 /// `name` is compared case-insensitively.
 /// Returns `Err(InvalidArgument)` for unknown function names or arity errors.
 pub fn dispatch_function(name: &str, args: Vec<Value>) -> Result<Value> {
+    #[cfg(test)]
+    DISPATCH_CALLS.with(|c| c.set(c.get() + 1));
     match name.to_lowercase().as_str() {
         // ── SPA-140: String functions ─────────────────────────────────────────
         "toupper" => fn_to_upper(args),
