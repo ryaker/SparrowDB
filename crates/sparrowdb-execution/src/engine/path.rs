@@ -32,8 +32,19 @@ impl Engine {
         delta_idx: &DeltaIndex,
         out: &mut std::collections::HashSet<(u64, u32)>,
         rel_ids: &[u32],
+        rev: Option<&ReverseIndex>,
     ) {
         out.clear();
+
+        // #495: inbound traversal.  `rev` maps a node to the nodes that have a
+        // physical edge *into* it, already restricted to the requested rel types
+        // and carrying both endpoints' labels, so no CSR/delta probing is needed.
+        if let Some(rev) = rev {
+            if let Some(preds) = rev.get(&(src_label_id, src_slot)) {
+                out.extend(preds.iter().copied());
+            }
+            return;
+        }
 
         // ── CSR neighbours: label from the catalog ────────────────────────────
         // SPA-284: `rel_ids` restricts the lookup to the requested types.
@@ -51,6 +62,55 @@ impl Engine {
                 out.insert((dst_slot, dst_label));
             }
         }
+    }
+
+    /// Invert every edge of the requested types into a [`ReverseIndex`]:
+    /// `(dst_label, dst_slot) -> [(src_slot, src_label)]`.
+    ///
+    /// Both endpoint labels are known for both edge sources — the catalog's
+    /// `(src_label_id, dst_label_id)` for a checkpointed CSR table, the stored
+    /// `NodeId`s for a delta record — so nothing is guessed (cf. #429/#431).
+    /// `rel_ids` empty means "any type".  Legacy CSRs with no catalog entry
+    /// carry no label metadata and are not indexed (the forward path guesses
+    /// their labels; an inbound walk has nothing to key them by).
+    pub(crate) fn build_reverse_index(
+        &self,
+        delta_idx: &DeltaIndex,
+        rel_ids: &[u32],
+    ) -> ReverseIndex {
+        let mut rev: ReverseIndex = std::collections::HashMap::new();
+        let topo = self.snapshot.csr_topology();
+        for &(rid, tbl_src_lid, tbl_dst_lid) in &topo.tables {
+            if !rel_ids.is_empty() && !rel_ids.contains(&rid) {
+                continue;
+            }
+            if let Some(csr) = self.snapshot.csrs.get(&rid) {
+                for src in 0..csr.n_nodes() {
+                    for &dst in csr.neighbors(src) {
+                        rev.entry((tbl_dst_lid, dst))
+                            .or_default()
+                            .push((src, tbl_src_lid));
+                    }
+                }
+            }
+        }
+        for recs in delta_idx.values() {
+            for r in recs {
+                if !rel_ids.is_empty() && !rel_ids.contains(&r.rel_id.0) {
+                    continue;
+                }
+                let (src_label, src_slot) = node_id_parts(r.src.0);
+                let (dst_label, dst_slot) = node_id_parts(r.dst.0);
+                rev.entry((dst_label, dst_slot))
+                    .or_default()
+                    .push((src_slot, src_label));
+            }
+        }
+        for v in rev.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        rev
     }
 
     /// DFS traversal for variable-length path patterns `(src)-[:R*min..max]->(dst)`.
@@ -85,6 +145,7 @@ impl Engine {
         use_reachability: bool,
         result_limit: usize,
         rel_ids: &[u32],
+        rev: Option<&ReverseIndex>,
     ) -> Vec<(u64, u32)> {
         const SAFETY_CAP: u32 = 10;
         let max_hops = max_hops.min(SAFETY_CAP);
@@ -128,6 +189,7 @@ impl Engine {
                     delta_idx,
                     neighbors_buf,
                     rel_ids,
+                    rev,
                 );
                 for (nb_slot, nb_label) in neighbors_buf.iter().copied().collect::<Vec<_>>() {
                     if global_visited.insert((nb_slot, nb_label)) {
@@ -174,6 +236,7 @@ impl Engine {
                 delta_idx,
                 neighbors_buf,
                 rel_ids,
+                rev,
             );
             let src_nbrs: Vec<(u64, u32)> = neighbors_buf.iter().copied().collect();
 
@@ -223,6 +286,7 @@ impl Engine {
                                 delta_idx,
                                 neighbors_buf,
                                 rel_ids,
+                                rev,
                             );
                             let next_nbrs: Vec<(u64, u32)> =
                                 neighbors_buf.iter().copied().collect();
@@ -253,9 +317,13 @@ impl Engine {
         let dst_node_pat = &pat.nodes[1];
         let rel_pat = &pat.rels[0];
 
-        if rel_pat.dir != sparrowdb_cypher::ast::EdgeDir::Outgoing {
-            return Err(sparrowdb_common::Error::Unimplemented);
-        }
+        // #495: `Incoming` walks the same expansion over a reverse index; only
+        // an undirected quantifier (`-[:R*]-`) remains unimplemented.
+        let incoming = match rel_pat.dir {
+            sparrowdb_cypher::ast::EdgeDir::Outgoing => false,
+            sparrowdb_cypher::ast::EdgeDir::Incoming => true,
+            _ => return Err(sparrowdb_common::Error::Unimplemented),
+        };
 
         let min_hops = rel_pat.min_hops.unwrap_or(1);
         let max_hops = rel_pat.max_hops.unwrap_or(10); // unbounded → cap at 10
@@ -369,6 +437,13 @@ impl Engine {
             });
         }
 
+        // #495: for an inbound quantifier, invert the edge set once per query.
+        let reverse_index: Option<ReverseIndex> = if incoming {
+            Some(self.build_reverse_index(&delta_idx, &rel_ids))
+        } else {
+            None
+        };
+
         // Reusable neighbors buffer: allocated once, cleared between frontier nodes.
         let mut neighbors_buf: std::collections::HashSet<(u64, u32)> =
             std::collections::HashSet::new();
@@ -463,6 +538,7 @@ impl Engine {
                     use_reachability,
                     remaining,
                     &rel_ids,
+                    reverse_index.as_ref(),
                 );
 
                 // ── SPA-285: batch-read dst properties ────────────────────────
