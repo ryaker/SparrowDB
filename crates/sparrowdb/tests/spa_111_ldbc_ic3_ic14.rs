@@ -3,8 +3,7 @@
 //! Uses the mini LDBC fixture data loaded via the sparrowdb-bench loader.
 //!
 //! Most tests assert non-empty results on the synthetic dataset, but non-empty
-//! is not the goal — correctness is. IC6 asserts *empty*, because empty is the
-//! right answer there and asserting otherwise is what let #422 hide.
+//! is not the goal — correctness is. IC6 asserts exact positive rows (see #428).
 
 use sparrowdb::GraphDb;
 use sparrowdb_bench::ic_queries;
@@ -101,8 +100,8 @@ fn ic4_top_tags_of_friend_posts() {
     let (_dir, db) = load_mini_db();
 
     // Alice (1) knows Bob (2) and Carol (3).
-    // Bob created post 2 tagged with Rust.
-    // Carol created post 3 tagged with SocialNetworks.
+    // Bob created post 2 {Rust, Databases, SocialNetworks}.
+    // Carol created post 3 {SocialNetworks, GraphTheory, Rust}.
     let results = ic_queries::ic4_top_tags(&db, 1, "2010-01-01", 365).unwrap();
 
     assert!(
@@ -140,47 +139,74 @@ fn ic6_tag_co_occurrence() {
     let (_dir, db) = load_mini_db();
 
     // IC6 asks which OTHER tags appear on the posts that carry the given tag and
-    // were created by the person's friends. It is not "every friend tag except
-    // this one" — that was #422, and this test used to assert it: it expected a
-    // non-empty result for "Rust" under the comment "should find other tags on
-    // friend posts", which is the bug written down as the expectation.
+    // were created by the person's friends (#422: not "every friend tag").
     //
-    // Alice (1) knows Bob (2), Carol (3) and Frank (6).
-    // Bob created post 2, tagged {Rust}. Carol created post 3, tagged
-    // {SocialNetworks}. Frank created nothing.
+    // Hand derivation: Alice's friends are {2 Bob, 3 Carol, 6 Frank}; Frank has
+    // no posts. Friend posts: 2 = {Rust, Databases, SocialNetworks},
+    // 3 = {SocialNetworks, GraphTheory, Rust}. Alice's own posts 1, 4 and Dave's
+    // post 5 do not count.
     //
-    // So post 2 is the only friend post carrying Rust, and it carries no other
-    // tag — nothing co-occurs. SocialNetworks is on post 3, which is not tagged
-    // Rust, so it must not appear.
-    let results = ic_queries::ic6_tag_co_occurrence(&db, 1, "Rust").unwrap();
-    assert!(
-        results.is_empty(),
-        "IC6: post 2 is the only friend post tagged Rust and carries no other tag; got {results:?}"
+    // ic6(1, Rust): both posts carry Rust. Others: SocialNetworks 2 (posts 2, 3),
+    // Databases 1 (post 2), GraphTheory 1 (post 3). `cnt DESC, name ASC` →
+    // [(SocialNetworks,2), (Databases,1), (GraphTheory,1)].
+    // Sorted here because the engine ignores ORDER BY on grouped COUNT(*) (#543);
+    // `ic6_tag_co_occurrence_order_by` below asserts the engine's own order.
+    let sorted = |mut r: Vec<(String, i64)>| {
+        r.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        r
+    };
+    let results = sorted(ic_queries::ic6_tag_co_occurrence(&db, 1, "Rust").unwrap());
+    assert_eq!(
+        results,
+        vec![
+            ("SocialNetworks".to_string(), 2),
+            ("Databases".to_string(), 1),
+            ("GraphTheory".to_string(), 1)
+        ],
+        "IC6(1, Rust) mismatch; got {results:?}"
     );
 
-    // A tag no post carries must yield nothing. Before #422 this returned every
-    // friend tag, because the tag was only ever excluded from the output and
-    // never used to select posts.
+    // ic6(1, Databases): only friend post 2 carries it; Alice's own post 1
+    // (which also has GraphTheory) must not contribute. Others on post 2:
+    // Rust 1, SocialNetworks 1 → tie → name ASC.
+    let db_tag = sorted(ic_queries::ic6_tag_co_occurrence(&db, 1, "Databases").unwrap());
+    assert_eq!(
+        db_tag,
+        vec![("Rust".to_string(), 1), ("SocialNetworks".to_string(), 1)],
+        "IC6(1, Databases) mismatch; got {db_tag:?}"
+    );
+
+    // #422 headline: Bob (2) knows {4, 5}; the only friend post is Dave's post 5
+    // {GraphTheory}, which does not carry Databases → empty.
+    let none_for_bob = ic_queries::ic6_tag_co_occurrence(&db, 2, "Databases").unwrap();
+    assert!(
+        none_for_bob.is_empty(),
+        "IC6(2, Databases): no friend post carries it; got {none_for_bob:?}"
+    );
+
+    // A tag absent from the graph must return empty.
     let unknown = ic_queries::ic6_tag_co_occurrence(&db, 1, "ZZZ_nonexistent").unwrap();
     assert!(
         unknown.is_empty(),
         "IC6: a tag absent from the graph must return empty; got {unknown:?}"
     );
+}
 
-    // Liveness guard. Every IC6 expectation this fixture can express is empty:
-    // the only multi-tag post is 1 ({Databases, GraphTheory}), it belongs to
-    // Alice, and nobody `knows` Alice (person 1 is never a knows target), so
-    // post 1 is never anyone's friend post. That makes both assertions above
-    // satisfiable by an ic6 that always returns empty. IC4 walks the same
-    // friend→post→tag pipeline without the tag restriction, so its non-emptiness
-    // proves the empties are the restriction at work, not a dead query.
-    // Tracked in #428 — a friend-owned multi-tag post would let IC6 be asserted
-    // positively and retire this guard.
-    let ic4 = ic_queries::ic4_top_tags(&db, 1, "2010-01-01", 365).unwrap();
-    assert!(
-        !ic4.is_empty(),
-        "IC6 liveness: IC4 shares IC6's friend→post→tag pipeline and must be non-empty, \
-         otherwise IC6's empty results prove nothing; got {ic4:?}"
+#[test]
+#[ignore = "bug #543: ORDER BY ignored with grouped COUNT(*)"]
+fn ic6_tag_co_occurrence_order_by() {
+    let (_dir, db) = load_mini_db();
+    // Friend posts 2 {Rust,Databases,SocialNetworks} and 3 {SocialNetworks,
+    // GraphTheory,Rust}: others of Rust are SocialNetworks 2, Databases 1,
+    // GraphTheory 1 in `cnt DESC, name ASC` order.
+    let r = ic_queries::ic6_tag_co_occurrence(&db, 1, "Rust").unwrap();
+    assert_eq!(
+        r,
+        vec![
+            ("SocialNetworks".to_string(), 2),
+            ("Databases".to_string(), 1),
+            ("GraphTheory".to_string(), 1)
+        ]
     );
 }
 
