@@ -10,7 +10,10 @@ pub struct PageId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TxnId(pub u64);
 
-/// Node identifier: upper 16 bits = label_id, lower 48 bits = slot_id.
+/// Node identifier: upper 32 bits = label_id, lower 32 bits = slot_id.
+///
+/// Every production site packs it as `(label_id << 32) | slot_id` and unpacks
+/// with `>> 32` / `& 0xFFFF_FFFF`; the label is a `u32` and the slot a `u32`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -193,13 +196,15 @@ mod tests {
     #[test]
     fn node_id_packing_roundtrip() {
         let label_id: u64 = 3;
-        let slot_id: u64 = 0x0000_BEEF_CAFE;
-        let packed = (label_id << 48) | (slot_id & 0x0000_FFFF_FFFF_FFFF);
+        let slot_id: u64 = 0xBEEF_CAFE;
+        let packed = (label_id << 32) | (slot_id & 0xFFFF_FFFF);
         let node = NodeId(packed);
-        let recovered_label = node.0 >> 48;
-        let recovered_slot = node.0 & 0x0000_FFFF_FFFF_FFFF;
+        let recovered_label = node.0 >> 32;
+        let recovered_slot = node.0 & 0xFFFF_FFFF;
         assert_eq!(recovered_label, label_id);
         assert_eq!(recovered_slot, slot_id);
+        // Layout is 32/32: a label of 3 lands at bit 32, not bit 48.
+        assert_eq!(packed, 0x0000_0003_BEEF_CAFE);
     }
 
     #[test]
