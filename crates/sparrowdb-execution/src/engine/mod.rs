@@ -45,6 +45,10 @@ use crate::types::{QueryResult, Value};
 /// traversal code for O(1) neighbor lookups.
 pub(crate) type DeltaIndex = HashMap<(u32, u64), Vec<DeltaRecord>>;
 
+/// Inbound adjacency for variable-length traversal (#495):
+/// `(dst_label_id, dst_slot) -> [(src_slot, src_label_id)]`.
+pub(crate) type ReverseIndex = HashMap<(u32, u64), Vec<(u64, u32)>>;
+
 /// Decompose a raw `NodeId` value into `(label_id, slot)`.
 ///
 /// The encoding is: high 32 bits = label_id, low 32 bits = slot.
