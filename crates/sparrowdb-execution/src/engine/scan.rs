@@ -717,9 +717,10 @@ impl Engine {
         // node" #467 fixed, but still wrong (issue #472).
         let locals: Vec<&str> = binding.keys().map(|s| s.as_str()).collect();
         for f in filters {
-            if !super::is_filter_expr_resolvable_scoped(&f.value, params, &locals) {
+            let Some(resolved_val) = super::resolve_filter_expr_scoped(&f.value, params, &locals)
+            else {
                 return false;
-            }
+            };
 
             let col_id = prop_name_to_col_id(&f.key);
             let stored_raw = props.iter().find(|(c, _)| *c == col_id).map(|(_, v)| *v);
@@ -731,7 +732,8 @@ impl Engine {
                     // present in `binding`.
                     binding.get(v).cloned().unwrap_or(Value::Null)
                 }
-                other => eval_expr(other, params),
+                // Already evaluated by the resolvability pass (#482).
+                _ => resolved_val,
             };
 
             let stored_val = stored_raw.map(|raw| decode_raw_val(raw, &self.snapshot.store));
