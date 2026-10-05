@@ -2990,24 +2990,40 @@ fn sort_spill_threshold() -> usize {
         .unwrap_or(crate::sort_spill::DEFAULT_ROW_THRESHOLD)
 }
 
+/// Resolve an ORDER BY expression to the index of the RETURN column it sorts on.
+///
+/// Matches, in order: a column named by alias or by `var.prop`; then any RETURN
+/// item whose expression is structurally identical (so `ORDER BY COUNT(*)` finds
+/// the `COUNT(*) AS cnt` column).  `None` means the key is not a RETURN column.
+fn order_by_col_index(expr: &Expr, items: &[ReturnItem], column_names: &[String]) -> Option<usize> {
+    let by_name = match expr {
+        Expr::PropAccess { var, prop } => {
+            let key = format!("{var}.{prop}");
+            column_names.iter().position(|c| c == &key)
+        }
+        Expr::Var(v) => column_names.iter().position(|c| c == v.as_str()),
+        _ => None,
+    };
+    by_name.or_else(|| {
+        items
+            .iter()
+            .position(|item| &item.expr == expr)
+            .filter(|&i| i < column_names.len())
+    })
+}
+
 /// Build a sort key from a single row and the ORDER BY spec.
 fn make_sort_key(
     row: &[Value],
     order_by: &[(Expr, SortDir)],
+    items: &[ReturnItem],
     column_names: &[String],
 ) -> Vec<crate::sort_spill::SortKeyVal> {
     use crate::sort_spill::{OrdValue, SortKeyVal};
     order_by
         .iter()
         .map(|(expr, dir)| {
-            let col_idx = match expr {
-                Expr::PropAccess { var, prop } => {
-                    let key = format!("{var}.{prop}");
-                    column_names.iter().position(|c| c == &key)
-                }
-                Expr::Var(v) => column_names.iter().position(|c| c == v.as_str()),
-                _ => None,
-            };
+            let col_idx = order_by_col_index(expr, items, column_names);
             let val = col_idx
                 .and_then(|i| row.get(i))
                 .map(OrdValue::from_value)
@@ -3030,14 +3046,7 @@ fn apply_order_by(rows: &mut Vec<Vec<Value>>, m: &MatchStatement, column_names: 
     if rows.len() <= threshold {
         rows.sort_by(|a, b| {
             for (expr, dir) in &m.order_by {
-                let col_idx = match expr {
-                    Expr::PropAccess { var, prop } => {
-                        let key = format!("{var}.{prop}");
-                        column_names.iter().position(|c| c == &key)
-                    }
-                    Expr::Var(v) => column_names.iter().position(|c| c == v.as_str()),
-                    _ => None,
-                };
+                let col_idx = order_by_col_index(expr, &m.return_clause.items, column_names);
                 if let Some(idx) = col_idx {
                     if idx < a.len() && idx < b.len() {
                         let cmp = compare_values(&a[idx], &b[idx]);
@@ -3058,7 +3067,7 @@ fn apply_order_by(rows: &mut Vec<Vec<Value>>, m: &MatchStatement, column_names: 
         use crate::sort_spill::{SortableRow, SpillingSorter};
         let mut sorter: SpillingSorter<SortableRow> = SpillingSorter::new();
         for row in rows.drain(..) {
-            let key = make_sort_key(&row, &m.order_by, column_names);
+            let key = make_sort_key(&row, &m.order_by, &m.return_clause.items, column_names);
             if sorter.push(SortableRow { key, data: row }).is_err() {
                 return;
             }
