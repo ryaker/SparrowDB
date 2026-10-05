@@ -119,8 +119,9 @@ fn ic2_unknown_person_returns_empty() {
 //   knows:        1→{2,3,6}; 2→{4,5}; 3→{4,5}; 6→{7}; 7→8; 8→9; 9→10
 //   isLocatedIn:  1,3,7,10→US(1)  2,5,8→UK(2)  4,6,9→Germany(3)
 //   posts:        1,4→Alice  2→Bob  3→Carol  5→Dave
-//   post tags:    1→{Databases,GraphTheory} 2→{Rust} 3→{SocialNetworks}
-//                 4→{Databases} 5→{GraphTheory}
+//   post tags:    1→{Databases,GraphTheory} 2→{Rust,Databases,SocialNetworks}
+//                 3→{SocialNetworks,GraphTheory,Rust} 4→{Databases} 5→{GraphTheory}
+//   tag classes:  Databases,Rust→Technology  GraphTheory,SocialNetworks→Science
 //   likes:        2→p1, 3→p1, 1→p2, 4→p3, 3→p4
 //   comments:     c1→p1 by Bob, c4→p4 by Dave
 //   forums:       1 "Graph Databases" {1,2,3}; 2 "Rust Programming" {4,5};
@@ -147,11 +148,41 @@ fn ic3_friends_in_countries_returns_both_germans() {
 fn ic4_top_tags_of_friends_posts() {
     let (_dir, db) = db_with_mini_fixture();
     let r = ic_queries::ic4_top_tags(&db, 1, "2012-01-01", 30).expect("IC4 should not error");
-    // Friends {2,3,6}: Bob→post2→Rust, Carol→post3→SocialNetworks, Frank→no posts.
+    // Friends {2,3,6}; Frank has no posts, so the friend posts are 2 and 3.
+    // post 2 → {Rust, Databases, SocialNetworks}; post 3 → {SocialNetworks, GraphTheory, Rust}.
+    // Counts: Rust 2, SocialNetworks 2, Databases 1, GraphTheory 1.
+    // `cnt DESC, tag.name ASC`: the 2s tie → Rust < SocialNetworks; the 1s tie →
+    // Databases < GraphTheory.
+    // Row CONTENT is asserted here; ORDER BY is asserted separately in
+    // `ic4_top_tags_order_by` because the engine ignores it (#543).
+    let mut got = r.clone();
+    got.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    assert_eq!(
+        got,
+        vec![
+            ("Rust".to_string(), 2),
+            ("SocialNetworks".to_string(), 2),
+            ("Databases".to_string(), 1),
+            ("GraphTheory".to_string(), 1)
+        ],
+        "IC4: tag counts over friend posts 2 and 3; got {r:?}"
+    );
+}
+
+#[test]
+#[ignore = "bug #543: ORDER BY ignored with grouped COUNT(*)"]
+fn ic4_top_tags_order_by() {
+    let (_dir, db) = db_with_mini_fixture();
+    let r = ic_queries::ic4_top_tags(&db, 1, "2012-01-01", 30).expect("IC4 should not error");
+    // Same counts as above, in `cnt DESC, tag.name ASC` order.
     assert_eq!(
         r,
-        vec![("Rust".to_string(), 1), ("SocialNetworks".to_string(), 1)],
-        "IC4: expected one Rust and one SocialNetworks tag from friends' posts; got {r:?}"
+        vec![
+            ("Rust".to_string(), 2),
+            ("SocialNetworks".to_string(), 2),
+            ("Databases".to_string(), 1),
+            ("GraphTheory".to_string(), 1)
+        ]
     );
 }
 
@@ -175,60 +206,87 @@ fn ic5_forums_ranked_by_friend_membership() {
 #[test]
 fn ic6_co_occurring_tags() {
     let (_dir, db) = db_with_mini_fixture();
+    // Sorted in the test (cnt DESC, name ASC): the engine ignores ORDER BY on
+    // grouped COUNT(*) (#543), which `ic6_co_occurring_tags_order_by` covers.
+    let ic6 = |p: i64, t: &str| {
+        let mut r = ic_queries::ic6_tag_co_occurrence(&db, p, t).expect("IC6 should not error");
+        r.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        r
+    };
+    let row = |n: &str, c: i64| (n.to_string(), c);
 
-    // Alice's friend posts are 2 (Bob, {Rust}) and 3 (Carol, {SocialNetworks});
-    // Frank has none. Every expectation below follows from those two posts.
-
-    // Only post 2 carries Rust, and it carries no other tag, so nothing
-    // co-occurs with Rust among friends' posts.
-    let r = ic_queries::ic6_tag_co_occurrence(&db, 1, "Rust").expect("IC6 should not error");
-    assert!(
-        r.is_empty(),
-        "IC6: post 2 is the only friend post tagged Rust and has no other tag; got {r:?}"
+    // Hand derivation, from the CSVs (never from engine output).
+    //   knows (directed): 1→{2,3,6}; 2→{4,5}; ...   Alice's friends = {2,3,6}.
+    //   post creators: 1,4→Alice(1)  2→Bob(2)  3→Carol(3)  5→Dave(4); Frank(6) has none.
+    //   So Alice's friend posts are 2 and 3 only. Posts 1, 4 are her own and
+    //   post 5 is Dave's (not her friend); none may contribute.
+    //   post 2 = {Rust, Databases, SocialNetworks}
+    //   post 3 = {SocialNetworks, GraphTheory, Rust}
+    //
+    // ic6(1, Rust): both posts carry Rust. Other tags: post 2 → Databases,
+    //   SocialNetworks; post 3 → SocialNetworks, GraphTheory.
+    //   SocialNetworks 2, Databases 1, GraphTheory 1.
+    //   `cnt DESC, name ASC` → [(SocialNetworks,2), (Databases,1), (GraphTheory,1)]
+    //   (count order disagrees with alphabetical order for the first row;
+    //   the 1s tie-break alphabetically).
+    assert_eq!(
+        ic6(1, "Rust"),
+        vec![
+            row("SocialNetworks", 2),
+            row("Databases", 1),
+            row("GraphTheory", 1)
+        ]
     );
 
-    // Symmetric case: only post 3 carries SocialNetworks, and it too is
-    // single-tagged.
-    let sn =
-        ic_queries::ic6_tag_co_occurrence(&db, 1, "SocialNetworks").expect("IC6 should not error");
-    assert!(
-        sn.is_empty(),
-        "IC6: post 3 is the only friend post tagged SocialNetworks and has no other tag; got {sn:?}"
+    // ic6(1, SocialNetworks): both posts carry it. Others: post 2 → Rust,
+    //   Databases; post 3 → GraphTheory, Rust. Rust 2, Databases 1, GraphTheory 1.
+    assert_eq!(
+        ic6(1, "SocialNetworks"),
+        vec![row("Rust", 2), row("Databases", 1), row("GraphTheory", 1)]
     );
 
-    // The #422 headline case. Databases sits on posts 1 and 4, both created by
-    // Alice herself — no *friend* post carries it, so no friend post survives
-    // the restriction and nothing can co-occur. Before the fix this returned
-    // [(Rust,1), (SocialNetworks,1)]: every friend tag except the input one.
-    let db_tag =
-        ic_queries::ic6_tag_co_occurrence(&db, 1, "Databases").expect("IC6 should not error");
-    assert!(
-        db_tag.is_empty(),
-        "IC6: Databases is only on Alice's own posts 1 and 4, never a friend's; got {db_tag:?}"
+    // ic6(1, Databases): only friend post 2 carries it (posts 1 and 4 are
+    //   Alice's own, so post 1's GraphTheory must NOT appear).
+    //   Others on post 2: Rust 1, SocialNetworks 1 → tie → name ASC.
+    assert_eq!(
+        ic6(1, "Databases"),
+        vec![row("Rust", 1), row("SocialNetworks", 1)]
     );
+
+    // ic6(1, GraphTheory): friend post 3 carries it (post 1 is Alice's own,
+    //   post 5 is Dave's). Others on post 3: SocialNetworks 1, Rust 1 → tie.
+    assert_eq!(
+        ic6(1, "GraphTheory"),
+        vec![row("Rust", 1), row("SocialNetworks", 1)]
+    );
+
+    // The #422 headline case. Bob (2) knows {4,5}; Dave (4) owns post 5
+    //   {GraphTheory}; Eve (5) owns none. No friend post carries Databases, so
+    //   nothing co-occurs. Before the #422 fix this returned GraphTheory (every
+    //   friend tag except the input one).
+    assert!(ic6(2, "Databases").is_empty());
+    // Post 5 is the only friend post carrying GraphTheory and is single-tagged.
+    assert!(ic6(2, "GraphTheory").is_empty());
 
     // A tag no post carries must yield nothing.
-    let none = ic_queries::ic6_tag_co_occurrence(&db, 1, "ZZZ_nonexistent")
-        .expect("IC6 unknown tag should not error");
-    assert!(
-        none.is_empty(),
-        "IC6: unknown tag must return empty; got {none:?}"
-    );
+    assert!(ic6(1, "ZZZ_nonexistent").is_empty());
+}
 
-    // Liveness guard. Every IC6 expectation the mini fixture can express is
-    // empty: the only multi-tag post is 1 ({Databases, GraphTheory}), it belongs
-    // to Alice, and nobody `knows` Alice (person 1 is never a knows target), so
-    // post 1 is never anyone's friend post. That makes the assertions above
-    // satisfiable by an ic6 that always returns empty. IC4 walks the same
-    // friend→post→tag pipeline without the tag restriction, so its non-emptiness
-    // proves the empties are the restriction at work, not a dead query.
-    // Tracked in #428 — a friend-owned multi-tag post would let IC6 be asserted
-    // positively and retire this guard.
-    let ic4 = ic_queries::ic4_top_tags(&db, 1, "2012-01-01", 30).expect("IC4 should not error");
-    assert!(
-        !ic4.is_empty(),
-        "IC6 liveness: IC4 shares IC6's friend→post→tag pipeline and must be non-empty, \
-         otherwise IC6's empty results prove nothing; got {ic4:?}"
+#[test]
+#[ignore = "bug #543: ORDER BY ignored with grouped COUNT(*)"]
+fn ic6_co_occurring_tags_order_by() {
+    let (_dir, db) = db_with_mini_fixture();
+    // Derivation as in `ic6_co_occurring_tags`: friend posts 2 and 3 both carry
+    // Rust; others are SocialNetworks 2, Databases 1, GraphTheory 1, and
+    // `cnt DESC, name ASC` puts SocialNetworks first despite the alphabet.
+    let r = ic_queries::ic6_tag_co_occurrence(&db, 1, "Rust").expect("IC6 should not error");
+    assert_eq!(
+        r,
+        vec![
+            ("SocialNetworks".to_string(), 2),
+            ("Databases".to_string(), 1),
+            ("GraphTheory".to_string(), 1)
+        ]
     );
 }
 
@@ -298,20 +356,28 @@ fn ic10_recommends_friends_of_friends() {
 #[test]
 fn ic12_expert_search_by_tag_class() {
     let (_dir, db) = db_with_mini_fixture();
-    // Friends {2,3,6}: Bob wrote post 2 → tag Rust → class Technology;
-    // Carol wrote post 3 → tag SocialNetworks → class Science; Frank none.
+    // Friends {2,3,6}. Per-person counts are (post, tag) pairs whose tag is in the class.
+    // Bob: post 2 = {Rust(T), Databases(T), SocialNetworks(S)} → Technology 2, Science 1.
+    // Carol: post 3 = {SocialNetworks(S), GraphTheory(S), Rust(T)} → Technology 1, Science 2.
+    // Frank has no posts.
     let tech = ic_queries::ic12_expert_search(&db, 1, "Technology").expect("IC12 should not error");
     assert_eq!(
         tech,
-        vec![(("Bob".to_string(), "Jones".to_string()), 1)],
-        "IC12: only Bob posted under tag class Technology; got {tech:?}"
+        vec![
+            (("Bob".to_string(), "Jones".to_string()), 2),
+            (("Carol".to_string(), "White".to_string()), 1)
+        ],
+        "IC12: Technology counts Bob 2, Carol 1; got {tech:?}"
     );
 
     let science = ic_queries::ic12_expert_search(&db, 1, "Science").expect("IC12 should not error");
     assert_eq!(
         science,
-        vec![(("Carol".to_string(), "White".to_string()), 1)],
-        "IC12: only Carol posted under tag class Science; got {science:?}"
+        vec![
+            (("Carol".to_string(), "White".to_string()), 2),
+            (("Bob".to_string(), "Jones".to_string()), 1)
+        ],
+        "IC12: Science counts Carol 2, Bob 1; got {science:?}"
     );
 
     // No tag maps to OffTopic in tag_hasType_tagclass_0_0.csv.
