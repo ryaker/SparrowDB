@@ -1389,33 +1389,31 @@ impl SparrowDB {
         let fetch_k = (k_usize * 2).max(20);
 
         // ── 1. Vector search ─────────────────────────────────────────────────
-        let vec_results: Vec<(u64, f32)> = match self
-            .inner
-            .get_vector_index(&label, &vector_property)
-        {
-            Some(arc) => {
-                let idx = arc
-                    .read()
-                    .map_err(|e| to_napi(format!("lock poisoned: {e}")))?;
-                // `HnswIndex::search` asserts on a dimension mismatch; a panic
-                // unwinding through the NAPI boundary aborts the whole Node
-                // process, so reject here with the same TypeError that
-                // `vector_search` raises.
-                if query_vector.len() != idx.dimensions {
-                    return Err(napi::Error::new(
-                        napi::Status::InvalidArg,
-                        format!(
+        let vec_results: Vec<(u64, f32)> =
+            match self.inner.get_vector_index(&label, &vector_property) {
+                Some(arc) => {
+                    let idx = arc
+                        .read()
+                        .map_err(|e| to_napi(format!("lock poisoned: {e}")))?;
+                    // `HnswIndex::search` asserts on a dimension mismatch; a panic
+                    // unwinding through the NAPI boundary aborts the whole Node
+                    // process, so reject here with the same TypeError that
+                    // `vector_search` raises.
+                    if query_vector.len() != idx.dimensions {
+                        return Err(napi::Error::new(
+                            napi::Status::InvalidArg,
+                            format!(
                             "TypeError: query vector has {} dimensions but the index expects {}",
                             query_vector.len(),
                             idx.dimensions
                         ),
-                    ));
+                        ));
+                    }
+                    let ef = (fetch_k * 4).max(50);
+                    idx.search(query_vector.as_ref(), fetch_k, ef)
                 }
-                let ef = (fetch_k * 4).max(50);
-                idx.search(query_vector.as_ref(), fetch_k, ef)
-            }
-            None => vec![],
-        };
+                None => vec![],
+            };
 
         // ── 2. Full-text (BM25) search ───────────────────────────────────────
         //
