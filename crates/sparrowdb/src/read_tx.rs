@@ -36,15 +36,18 @@ impl ReadTx {
     /// committed at or before `snapshot_txn_id` it shadows the on-disk value.
     pub fn get_node(&self, node_id: NodeId, col_ids: &[u32]) -> crate::Result<Vec<(u32, Value)>> {
         let versions = self.inner.versions.read().expect("version lock poisoned");
-        let raw = self.store.get_node_raw(node_id, col_ids)?;
+        // #560: nullable read.  A column the node never stored is omitted
+        // (unless the version chain holds a value committed at or before this
+        // snapshot), never reported as a fabricated `Int64(0)`.
+        let raw = self.store.get_node_raw_nullable(node_id, col_ids)?;
         let result = raw
             .into_iter()
-            .map(|(col_id, raw_val)| {
+            .filter_map(|(col_id, raw_val)| {
                 // Check version chain first.
                 if let Some(v) = versions.get_at(node_id, col_id, self.snapshot_txn_id) {
-                    (col_id, v)
+                    Some((col_id, v))
                 } else {
-                    (col_id, self.store.decode_raw_value(raw_val))
+                    raw_val.map(|r| (col_id, self.store.decode_raw_value(r)))
                 }
             })
             .collect();

@@ -333,7 +333,9 @@ impl OrdValue {
 
     fn discriminant(&self) -> u8 {
         match self {
-            OrdValue::Null => 0,
+            // NULL sorts after every value ascending (openCypher), matching
+            // `compare_values` on the in-memory path.
+            OrdValue::Null => 6,
             OrdValue::Bool(_) => 1,
             OrdValue::Int64(_) => 2,
             OrdValue::Float64(_) => 3,

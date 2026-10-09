@@ -2359,6 +2359,16 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// `true` when either operand is `Null`.  In openCypher `NULL = x`, `NULL <> x`
+/// and `NULL = NULL` are all NULL (never true), so an absent property can
+/// neither equal nor differ from anything, including another absent property
+/// (#560).  This governs WHERE/RETURN comparison expressions only; the
+/// pattern-property filter (`{p: $null}`, #479) has its own rule in
+/// `matches_prop_filter_static` and is not affected.
+fn any_null(a: &Value, b: &Value) -> bool {
+    matches!(a, Value::Null) || matches!(b, Value::Null)
+}
+
 /// Compare an i64 and an f64 numerically, returning `None` when the i64 cannot
 /// be represented exactly as f64 (i.e. `|i| > 2^53`).  Callers that receive
 /// `None` should treat the values as incomparable.
@@ -2376,8 +2386,8 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
             let lv = eval_expr(left, vals);
             let rv = eval_expr(right, vals);
             match op {
-                BinOpKind::Eq => values_equal(&lv, &rv),
-                BinOpKind::Neq => !values_equal(&lv, &rv),
+                BinOpKind::Eq => !any_null(&lv, &rv) && values_equal(&lv, &rv),
+                BinOpKind::Neq => !any_null(&lv, &rv) && !values_equal(&lv, &rv),
                 BinOpKind::Contains => lv.contains(&rv),
                 BinOpKind::StartsWith => {
                     matches!((&lv, &rv), (Value::String(l), Value::String(r)) if l.starts_with(r.as_str()))
@@ -2434,7 +2444,15 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
         }
         Expr::And(l, r) => eval_where(l, vals) && eval_where(r, vals),
         Expr::Or(l, r) => eval_where(l, vals) || eval_where(r, vals),
-        Expr::Not(inner) => !eval_where(inner, vals),
+        // NOT of a comparison with a NULL operand is NULL, not true (#560).
+        Expr::Not(inner) => match inner.as_ref() {
+            Expr::BinOp {
+                left,
+                op: BinOpKind::Eq | BinOpKind::Neq,
+                right,
+            } if any_null(&eval_expr(left, vals), &eval_expr(right, vals)) => false,
+            _ => !eval_where(inner, vals),
+        },
         Expr::Literal(Literal::Bool(b)) => *b,
         Expr::Literal(_) => false,
         Expr::InList {
@@ -2478,6 +2496,7 @@ fn eval_where(expr: &Expr, vals: &HashMap<String, Value>) -> bool {
 fn eval_binop_values(op: &BinOpKind, lv: &Value, rv: &Value) -> Value {
     match op {
         // SPA-264: use values_equal for cross-type Bool↔Int64 coercion.
+        BinOpKind::Eq | BinOpKind::Neq if any_null(lv, rv) => Value::Null,
         BinOpKind::Eq => Value::Bool(values_equal(lv, rv)),
         BinOpKind::Neq => Value::Bool(!values_equal(lv, rv)),
         BinOpKind::Lt => match (lv, rv) {
@@ -3151,6 +3170,13 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
             x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
         }
         (Value::String(x), Value::String(y)) => x.cmp(y),
+        // openCypher orders NULL after every value ascending (so before every
+        // value descending).  Without this a NULL compared Equal to everything,
+        // which is not a total order and left absent-property rows wherever the
+        // sort happened to put them (#560).
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Greater,
+        (_, Value::Null) => std::cmp::Ordering::Less,
         _ => std::cmp::Ordering::Equal,
     }
 }

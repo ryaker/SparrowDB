@@ -1892,9 +1892,19 @@ impl Engine {
                 }
                 if filter_col_ids.is_empty() {
                     candidates.push(node_id);
-                } else if let Ok(raw_props) =
-                    self.snapshot.store.get_node_raw(node_id, &filter_col_ids)
+                } else if let Ok(raw_props) = self
+                    .snapshot
+                    .store
+                    .get_node_raw_nullable(node_id, &filter_col_ids)
                 {
+                    // #560: nullable accessor + drop absent columns, as every
+                    // other read-path prop-filter site does.  `get_node_raw`
+                    // zero-sentinels an absent column to 0, so `{u:0}` matched
+                    // nodes that never stored `u`.
+                    let raw_props: Vec<(u32, u64)> = raw_props
+                        .into_iter()
+                        .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+                        .collect();
                     if matches_prop_filter_static(
                         &raw_props,
                         &node.props,
@@ -1905,9 +1915,10 @@ impl Engine {
                     }
                 }
             }
-            if candidates.is_empty() {
-                return Ok(QueryResult::empty(column_names.to_vec()));
-            }
+            // No early return on an empty candidate set (#560): the cross
+            // product below is then empty, WHERE/aggregation still run, and a
+            // global `COUNT(*)` correctly yields one row holding 0 instead of
+            // no rows at all.
             per_var.push((node.var.clone(), label_id, candidates));
         }
 
