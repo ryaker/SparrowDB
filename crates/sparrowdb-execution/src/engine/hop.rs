@@ -826,28 +826,12 @@ impl Engine {
             }
         }
 
+        // #543: aggregation replaces the row set, but DISTINCT / ORDER BY / SKIP /
+        // LIMIT must still run afterwards on the projected (aggregated) rows.
         if use_raw_rows_path {
             rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
-        } else {
-            // DISTINCT
-            if m.distinct {
-                deduplicate_rows(&mut rows);
-            }
-
-            // ORDER BY
-            apply_order_by(&mut rows, m, column_names);
-
-            // SKIP
-            if let Some(skip) = m.skip {
-                let skip = (skip as usize).min(rows.len());
-                rows.drain(0..skip);
-            }
-
-            // LIMIT
-            if let Some(lim) = m.limit {
-                rows.truncate(lim as usize);
-            }
         }
+        apply_post_processing(&mut rows, m, column_names);
 
         tracing::debug!(rows = rows.len(), "one-hop traversal complete");
         Ok(QueryResult {
@@ -1824,29 +1808,12 @@ impl Engine {
             }
         }
 
-        // SPA-263: apply aggregation using pre-built raw_rows (with node refs).
+        // #543: aggregation replaces the row set, but DISTINCT / ORDER BY / SKIP /
+        // LIMIT must still run afterwards on the projected (aggregated) rows.
         if use_agg {
             rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
-        } else {
-            // DISTINCT
-            if m.distinct {
-                deduplicate_rows(&mut rows);
-            }
-
-            // ORDER BY
-            apply_order_by(&mut rows, m, column_names);
-
-            // SKIP
-            if let Some(skip) = m.skip {
-                let skip = (skip as usize).min(rows.len());
-                rows.drain(0..skip);
-            }
-
-            // LIMIT
-            if let Some(lim) = m.limit {
-                rows.truncate(lim as usize);
-            }
         }
+        apply_post_processing(&mut rows, m, column_names);
 
         tracing::debug!(rows = rows.len(), "two-hop traversal complete");
         Ok(QueryResult {

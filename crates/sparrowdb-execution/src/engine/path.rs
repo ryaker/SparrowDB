@@ -375,10 +375,22 @@ impl Engine {
             )
         };
 
-        let col_ids_src =
+        // #543: aggregate RETURN items (COUNT/SUM/...) used to fall through to
+        // `project_hop_row`, which yields Null for them.  Collect raw rows and
+        // aggregate them after the traversal instead, like the 1-/2-hop paths.
+        let use_agg = has_aggregate_in_return(&m.return_clause.items);
+        let mut raw_rows: Vec<HashMap<String, Value>> = Vec::new();
+
+        let mut col_ids_src =
             collect_col_ids_for_var_from_items(&src_node_pat.var, &m.return_clause.items);
-        let col_ids_dst =
+        let mut col_ids_dst =
             collect_col_ids_for_var_from_items(&dst_node_pat.var, &m.return_clause.items);
+        if use_agg {
+            for item in &m.return_clause.items {
+                collect_col_ids_from_expr(&item.expr, &mut col_ids_src);
+                collect_col_ids_from_expr(&item.expr, &mut col_ids_dst);
+            }
+        }
 
         // Build dst read set: projection columns + dst inline-prop filter columns +
         // WHERE-clause columns on the dst variable.  Mirrors the 1-hop code (SPA-224).
@@ -453,7 +465,9 @@ impl Engine {
         // With ORDER BY or SKIP we must collect all rows before sorting/skipping.
         let has_order_by = !m.order_by.is_empty();
         let has_skip = m.skip.is_some();
-        let row_limit: usize = if has_order_by || has_skip {
+        // An aggregate needs every matching row before it can group, so LIMIT
+        // cannot cut the traversal short either.
+        let row_limit: usize = if has_order_by || has_skip || use_agg {
             usize::MAX
         } else {
             m.limit.map(|l| l as usize).unwrap_or(usize::MAX)
@@ -672,6 +686,30 @@ impl Engine {
                         }
                     }
 
+                    if use_agg {
+                        let mut row_vals = build_row_vals(
+                            &src_props,
+                            &src_node_pat.var,
+                            &col_ids_src,
+                            &self.snapshot.store,
+                        );
+                        row_vals.extend(build_row_vals(
+                            &dst_props,
+                            &dst_node_pat.var,
+                            &col_ids_dst,
+                            &self.snapshot.store,
+                        ));
+                        if !src_node_pat.var.is_empty() {
+                            row_vals.insert(src_node_pat.var.clone(), Value::NodeRef(src_node));
+                        }
+                        if !dst_node_pat.var.is_empty() {
+                            let dst_nid = NodeId(((resolved_dst_label_id as u64) << 32) | dst_slot);
+                            row_vals.insert(dst_node_pat.var.clone(), Value::NodeRef(dst_nid));
+                        }
+                        raw_rows.push(row_vals);
+                        continue;
+                    }
+
                     let rel_var_type = if !rel_pat.var.is_empty() {
                         Some((rel_pat.var.as_str(), rel_pat.rel_type.as_str()))
                     } else {
@@ -704,6 +742,10 @@ impl Engine {
                 } // end for (dst_slot, actual_label_id) in dst_nodes
             } // end for src_slot in src_iter
         } // end 'src_labels: for (src_label_id, hwm_src) in src_label_ids
+
+        if use_agg {
+            rows = self.aggregate_rows_graph(&raw_rows, &m.return_clause.items);
+        }
 
         // DISTINCT
         if m.distinct {
