@@ -171,6 +171,15 @@ fn json_to_exec_value(v: &serde_json::Value) -> std::result::Result<ExecValue, S
             Ok(ExecValue::List(out))
         }
         J::Object(map) => {
+            // A typed array (`Float32Array`, `Float64Array`, ...) reaches us as
+            // an object keyed "0".."n-1" -- napi's serde bridge has no typed
+            // array case.  Left alone it becomes a `Value::Map`, which can be
+            // neither written as a property nor passed to `vector_similarity`
+            // (issue #400: `SET n.emb = $vec` with a `Float32Array` failed with
+            // "property value is a map").  Recover the list.
+            if let Some(list) = indexed_object_to_list(map)? {
+                return Ok(list);
+            }
             let mut entries = Vec::with_capacity(map.len());
             for (k, v) in map {
                 entries.push((k.clone(), json_to_exec_value(v)?));
@@ -178,6 +187,34 @@ fn json_to_exec_value(v: &serde_json::Value) -> std::result::Result<ExecValue, S
             Ok(ExecValue::Map(entries))
         }
     }
+}
+
+/// If `map`'s keys are exactly the decimal indices `0..n` (n >= 1), return the
+/// values in index order as a `Value::List`; otherwise `None`.  This is how a
+/// JS typed array arrives after serde conversion.  An ordinary user map that
+/// happens to use keys "0".."n-1" is indistinguishable and is treated the same.
+fn indexed_object_to_list(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<Option<ExecValue>, String> {
+    if map.is_empty() {
+        return Ok(None);
+    }
+    let mut slots: Vec<Option<&serde_json::Value>> = vec![None; map.len()];
+    for (k, v) in map {
+        // Reject non-canonical spellings ("01", "+1") so only real indices match.
+        let Ok(i) = k.parse::<usize>() else {
+            return Ok(None);
+        };
+        if i.to_string() != *k || i >= slots.len() || slots[i].is_some() {
+            return Ok(None);
+        }
+        slots[i] = Some(v);
+    }
+    let mut out = Vec::with_capacity(slots.len());
+    for v in slots.into_iter().flatten() {
+        out.push(json_to_exec_value(v)?);
+    }
+    Ok(Some(ExecValue::List(out)))
 }
 
 /// Convert a top-level JS object (received as a JSON object) into the
@@ -1358,6 +1395,20 @@ impl SparrowDB {
                     let idx = arc
                         .read()
                         .map_err(|e| to_napi(format!("lock poisoned: {e}")))?;
+                    // `HnswIndex::search` asserts on a dimension mismatch; a panic
+                    // unwinding through the NAPI boundary aborts the whole Node
+                    // process, so reject here with the same TypeError that
+                    // `vector_search` raises.
+                    if query_vector.len() != idx.dimensions {
+                        return Err(napi::Error::new(
+                            napi::Status::InvalidArg,
+                            format!(
+                            "TypeError: query vector has {} dimensions but the index expects {}",
+                            query_vector.len(),
+                            idx.dimensions
+                        ),
+                        ));
+                    }
                     let ef = (fetch_k * 4).max(50);
                     idx.search(query_vector.as_ref(), fetch_k, ef)
                 }
@@ -1690,6 +1741,64 @@ mod tests {
 
     // ── json_object_to_params ─────────────────────────────────────────────────
 
+    /// A `Float32Array` arrives as `{"0":..,"1":..}`; it must become a list
+    /// (hand-built from the expected [0.5, -2, 8]), never a Map.
+    #[test]
+    fn json_to_exec_value_typed_array_object_becomes_list() {
+        let v = serde_json::json!({"0": 0.5, "1": -2.0, "2": 8.0});
+        match json_to_exec_value(&v).unwrap() {
+            ExecValue::List(items) => {
+                assert_eq!(items.len(), 3);
+                assert!(matches!(items[0], ExecValue::Float64(x) if x == 0.5));
+                assert!(matches!(items[1], ExecValue::Float64(x) if x == -2.0));
+                assert!(matches!(items[2], ExecValue::Float64(x) if x == 8.0));
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    /// Index order is numeric, not lexicographic: with 11 entries "10" sorts
+    /// before "2" as a string key.  Value at index i is i, so the list must be
+    /// 0..=10 in order.
+    #[test]
+    fn json_to_exec_value_typed_array_orders_numerically() {
+        let mut m = serde_json::Map::new();
+        for i in 0..11 {
+            m.insert(i.to_string(), serde_json::json!(i));
+        }
+        match json_to_exec_value(&serde_json::Value::Object(m)).unwrap() {
+            ExecValue::List(items) => {
+                let got: Vec<i64> = items
+                    .iter()
+                    .map(|x| match x {
+                        ExecValue::Int64(n) => *n,
+                        o => panic!("unexpected {o:?}"),
+                    })
+                    .collect();
+                assert_eq!(got, (0..=10).collect::<Vec<i64>>());
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    /// Objects whose keys are not exactly 0..n stay Maps (gap, non-canonical
+    /// spelling, non-numeric key, empty).
+    #[test]
+    fn json_to_exec_value_non_index_objects_stay_maps() {
+        for v in [
+            serde_json::json!({"0": 1, "2": 3}),
+            serde_json::json!({"1": 1}),
+            serde_json::json!({"00": 1}),
+            serde_json::json!({"a": 1}),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                matches!(json_to_exec_value(&v).unwrap(), ExecValue::Map(_)),
+                "{v} must remain a Map"
+            );
+        }
+    }
+
     #[test]
     fn json_object_to_params_extracts_keys() {
         let obj = serde_json::json!({ "id": "abc", "n": 5, "emb": [0.1, 0.2] });
@@ -1887,46 +1996,6 @@ mod tests {
                 window[0] >= window[1],
                 "results must be sorted by descending score; got {scores:?}"
             );
-        }
-    }
-
-    // ── Hybrid stub returns descriptive error ─────────────────────────────────
-    //
-    // The hybrid_search() stub always returns Err with a message mentioning
-    // "#396".  We verify this by calling it directly (no NAPI types needed).
-
-    #[test]
-    fn hybrid_search_stub_returns_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = open_db(dir.path());
-
-        // Construct the error message by calling the stub via execute(), which
-        // hits the same path as the NAPI binding — or verify directly that the
-        // reason string is what we expect.
-        //
-        // We call hybrid_search_cypher_stub, which lives in the engine and
-        // always returns an Err.  Since we can't easily call the NAPI function
-        // without a Node.js env, we verify the invariant at the engine level:
-        // the Cypher hybrid_search() function must return an error until #396.
-        let result = db.execute(
-            "RETURN hybrid_search('Memory', 'embedding', 'content', \
-             [0.1, 0.2, 0.3], 'query', 5) AS r",
-        );
-        // Either the function is not yet registered (InvalidArgument) or it
-        // returns an error — either way, `result` must be Err.
-        // If it somehow succeeds, we still need it to signal "not implemented".
-        match result {
-            Err(e) => {
-                // Expected: hybrid_search not yet wired in Cypher (or errors).
-                let _ = e; // accepted
-            }
-            Ok(res) => {
-                // If the function does exist and returns a value, it should
-                // communicate the stub status via the NAPI binding's Err path,
-                // not via Cypher.  The binding test in JS covers this; here we
-                // just confirm the DB doesn't panic.
-                let _ = res;
-            }
         }
     }
 
