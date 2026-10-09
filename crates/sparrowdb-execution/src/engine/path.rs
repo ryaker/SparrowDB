@@ -582,7 +582,11 @@ impl Engine {
                             // Deduplicate slots within each label group.
                             slots.sort_unstable();
                             slots.dedup();
-                            let batch = self.snapshot.store.batch_read_node_props(
+                            // #556: nullable batch read + drop-absent.  The bare
+                            // `batch_read_node_props` zero-sentinels an absent
+                            // column to 0, so an absent property reached the
+                            // aggregate as Int64(0) instead of NULL.
+                            let batch = self.snapshot.store.batch_read_node_props_nullable(
                                 label_id,
                                 &slots,
                                 &dst_all_col_ids,
@@ -592,6 +596,7 @@ impl Engine {
                                     .iter()
                                     .copied()
                                     .zip(batch[i].iter().copied())
+                                    .filter_map(|(c, opt)| opt.map(|v| (c, v)))
                                     .collect();
                                 map.insert((*slot as u64, label_id), props);
                             }
