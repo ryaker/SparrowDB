@@ -86,3 +86,42 @@ fn project_selects_columns() {
         }
     }
 }
+
+/// #560 audit: `LabelScan` reads each column with `get_node_raw`, whose
+/// zero-sentinel turns a property the node never stored into `Int64(0)`, and
+/// `TypedVector::Int64` has no null channel to say otherwise. Fixture (col 1):
+/// node1 = 0 (stored), node2 = 4, node3 = absent. `col_1 == 0` must match
+/// node1 only; the hand-derived expectation is 1 row, the engine returns 2.
+#[test]
+#[ignore = "bug #562: LabelScan has no null channel; absent col reads as Int64(0)"]
+fn label_scan_filter_zero_does_not_match_absent_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = NodeStore::open(dir.path()).expect("node store");
+    let mut cat = Catalog::open(dir.path()).expect("catalog");
+    let label_id = cat.create_label("W").expect("W") as u32;
+    store
+        .create_node(
+            label_id,
+            &[(0, StoreValue::Int64(1)), (1, StoreValue::Int64(0))],
+        )
+        .unwrap();
+    store
+        .create_node(
+            label_id,
+            &[(0, StoreValue::Int64(2)), (1, StoreValue::Int64(4))],
+        )
+        .unwrap();
+    store
+        .create_node(label_id, &[(0, StoreValue::Int64(3))])
+        .unwrap();
+
+    let mut scan = LabelScan::new(&store, label_id, &[0, 1]);
+    let mut filter = Filter::new(&mut scan, "col_1", Value::Int64(0));
+    let mut matched = 0usize;
+    while let Some(chunk) = filter.next_chunk().expect("filter ok") {
+        for group in &chunk.groups {
+            matched += group.len();
+        }
+    }
+    assert_eq!(matched, 1, "only node1 stores col_1 = 0");
+}

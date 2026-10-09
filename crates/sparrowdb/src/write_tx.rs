@@ -174,12 +174,16 @@ impl WriteTx {
             None
         } else {
             // Read the current on-disk value as the before-image.
+            // #560: nullable read, so a column the node never stored has NO
+            // before-image rather than a fabricated `Int64(0)` one (a snapshot
+            // reader pinned before this SET must still see the property absent).
             let disk_val = self
                 .store
-                .get_node_raw(node_id, &[col_id])
+                .get_node_raw_nullable(node_id, &[col_id])
                 .ok()
                 .and_then(|mut v| v.pop())
-                .map(|(_, raw)| self.store.decode_raw_value(raw));
+                .and_then(|(_, raw)| raw)
+                .map(|raw| self.store.decode_raw_value(raw));
             disk_val.map(|v| (prev_txn_id, v))
         };
 
@@ -300,7 +304,13 @@ impl WriteTx {
         let disk_hwm = self.store.disk_hwm_for_label(label_id)?;
         for slot in 0..disk_hwm {
             let candidate = NodeId((label_id as u64) << 32 | slot);
-            if let Ok(stored) = self.store.get_node_raw(candidate, &col_ids) {
+            // #560: nullable read + drop absent columns, so `MERGE (n {p:0})`
+            // cannot match a node that never stored `p`.
+            if let Ok(stored) = self.store.get_node_raw_nullable(candidate, &col_ids) {
+                let stored: Vec<(u32, u64)> = stored
+                    .into_iter()
+                    .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+                    .collect();
                 let matches = col_kv.iter().all(|(_, col_id, want_val)| {
                     stored
                         .iter()
@@ -404,7 +414,12 @@ impl WriteTx {
         let disk_hwm = self.store.disk_hwm_for_label(label_id)?;
         for slot in 0..disk_hwm {
             let candidate = NodeId((label_id as u64) << 32 | slot);
-            if let Ok(stored) = self.store.get_node_raw(candidate, &match_col_ids) {
+            // #560: nullable read + drop absent columns (see above).
+            if let Ok(stored) = self.store.get_node_raw_nullable(candidate, &match_col_ids) {
+                let stored: Vec<(u32, u64)> = stored
+                    .into_iter()
+                    .filter_map(|(c, opt)| opt.map(|v| (c, v)))
+                    .collect();
                 let matches = stored
                     .iter()
                     .find(|&&(c, _)| c == match_col_id)

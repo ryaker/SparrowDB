@@ -750,6 +750,7 @@ impl Engine {
                 let lv = self.eval_expr_graph(left, vals);
                 let rv = self.eval_expr_graph(right, vals);
                 match op {
+                    BinOpKind::Eq | BinOpKind::Neq if any_null(&lv, &rv) => Value::Null,
                     BinOpKind::Eq => Value::Bool(values_equal(&lv, &rv)),
                     BinOpKind::Neq => Value::Bool(!values_equal(&lv, &rv)),
                     BinOpKind::Lt => match (&lv, &rv) {

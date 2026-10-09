@@ -1376,13 +1376,18 @@ impl NodeStore {
 
     /// Retrieve the typed property values for a node.
     ///
-    /// Convenience wrapper over [`get_node_raw`] that decodes every raw `u64`
-    /// back to a `Value`, reading the overflow string heap when needed (SPA-212).
+    /// Convenience wrapper over [`get_node_raw_nullable`] that decodes every
+    /// present raw `u64` back to a `Value`, reading the overflow string heap
+    /// when needed (SPA-212).
+    ///
+    /// A column the node never stored is **omitted** from the result (#560),
+    /// not returned as `Int64(0)`: the zero-sentinel of [`get_node_raw`] is
+    /// indistinguishable from a stored `0`.  A stored `0` is still returned.
     pub fn get_node(&self, node_id: NodeId, col_ids: &[u32]) -> Result<Vec<(u32, Value)>> {
-        let raw = self.get_node_raw(node_id, col_ids)?;
+        let raw = self.get_node_raw_nullable(node_id, col_ids)?;
         Ok(raw
             .into_iter()
-            .map(|(col_id, v)| (col_id, self.decode_raw_value(v)))
+            .filter_map(|(col_id, v)| v.map(|v| (col_id, self.decode_raw_value(v))))
             .collect())
     }
 

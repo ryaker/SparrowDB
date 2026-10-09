@@ -258,7 +258,6 @@ fn degree_fastpath_count_matches_plain_count() {
 }
 
 #[test]
-#[ignore = "bug #560"]
 fn multi_pattern_inline_zero_filter_does_not_match_absent() {
     let (_d, db) = fixture();
     // Only W1 stores u = 0; W3 lacks u.  One A, so 1 * 1 = 1.

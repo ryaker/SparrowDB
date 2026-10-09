@@ -934,12 +934,26 @@ impl GraphDb {
                             // Propagate I/O errors — silencing them would disable
                             // the constraint check on read failure.
                             let existing_raws = check_store.read_col_all(label_id, col_id)?;
-                            let conflict_on_disk = existing_raws.iter().any(|&raw| {
-                                if raw == 0 || raw == u64::MAX {
-                                    return false;
-                                }
-                                check_store.decode_raw_value(raw) == *val
-                            });
+                            // #560: presence comes from the null-bitmap sidecar,
+                            // not from `raw == 0`.  A slot that never stored this
+                            // property reads as raw 0, but so does a stored
+                            // Int64(0); the sentinel made UNIQUE blind to a
+                            // stored 0.  Legacy data without a sidecar keeps
+                            // the old `raw != 0` rule.
+                            let null_bitmap = check_store
+                                .read_null_bitmap_all(label_id, col_id)
+                                .unwrap_or(None);
+                            let conflict_on_disk =
+                                existing_raws.iter().enumerate().any(|(slot, &raw)| {
+                                    let present = match &null_bitmap {
+                                        Some(bits) => bits.get(slot).copied().unwrap_or(false),
+                                        None => raw != 0,
+                                    };
+                                    if !present || raw == u64::MAX {
+                                        return false;
+                                    }
+                                    check_store.decode_raw_value(raw) == *val
+                                });
                             // Check nodes buffered earlier in this same statement.
                             let conflict_in_tx = tx.pending_ops.iter().any(|op| match op {
                                 PendingOp::NodeCreate {
