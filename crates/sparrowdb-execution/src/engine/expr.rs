@@ -706,8 +706,16 @@ impl Engine {
                     .or_else(|| vals.get(&format!("{var}.__node_id__")))
                 {
                     let col_id = prop_name_to_col_id(prop);
-                    if let Ok(props) = self.snapshot.store.get_node_raw(*node_id, &[col_id]) {
-                        if let Some(&(_, raw)) = props.iter().find(|(c, _)| *c == col_id) {
+                    // #556: nullable accessor.  `get_node_raw` zero-sentinels an
+                    // absent column to 0, which is indistinguishable from a
+                    // stored Int64(0) and fed a fabricated 0 into
+                    // COUNT/SUM/AVG/MIN/MAX/collect.  An absent property is NULL.
+                    if let Ok(props) = self
+                        .snapshot
+                        .store
+                        .get_node_raw_nullable(*node_id, &[col_id])
+                    {
+                        if let Some(&(_, Some(raw))) = props.iter().find(|(c, _)| *c == col_id) {
                             return decode_raw_val(raw, &self.snapshot.store);
                         }
                     }
