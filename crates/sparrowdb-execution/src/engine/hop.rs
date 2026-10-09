@@ -14,6 +14,31 @@ struct NhopRelBinding {
 type NhopNeighbor = (u64, u32, Option<NhopRelBinding>);
 
 impl Engine {
+    /// Resolve a node-pattern label to its catalog id, or fail with a message
+    /// naming the clause, the node position and the label (#493).
+    ///
+    /// Callers use this only where the existing behaviour is already an error
+    /// (formerly a bare `not found`); it does not change which queries error.
+    pub(crate) fn label_id_or_diagnostic(
+        &self,
+        label: &str,
+        clause: &str,
+        role: &str,
+    ) -> Result<u32> {
+        if label.is_empty() {
+            return Err(sparrowdb_common::Error::InvalidArgument(format!(
+                "{clause}: the {role} requires a label (unlabeled nodes are not supported \
+                 in this position); use e.g. (n:Label)"
+            )));
+        }
+        match self.snapshot.catalog.get_label(label)? {
+            Some(id) => Ok(id as u32),
+            None => Err(sparrowdb_common::Error::InvalidArgument(format!(
+                "{clause}: unknown label '{label}' on the {role}; no such label exists"
+            ))),
+        }
+    }
+
     // ── 1-hop traversal: (a)-[:R]->(f) ───────────────────────────────────────
 
     pub(crate) fn execute_one_hop(
@@ -864,16 +889,10 @@ impl Engine {
 
         let src_label = src_node_pat.labels.first().cloned().unwrap_or_default();
         let fof_label = fof_node_pat.labels.first().cloned().unwrap_or_default();
-        let src_label_id = self
-            .snapshot
-            .catalog
-            .get_label(&src_label)?
-            .ok_or(sparrowdb_common::Error::NotFound)? as u32;
-        let fof_label_id = self
-            .snapshot
-            .catalog
-            .get_label(&fof_label)?
-            .ok_or(sparrowdb_common::Error::NotFound)? as u32;
+        let src_label_id =
+            self.label_id_or_diagnostic(&src_label, "MATCH 2-hop pattern", "first node")?;
+        let fof_label_id =
+            self.label_id_or_diagnostic(&fof_label, "MATCH 2-hop pattern", "last node")?;
 
         let hwm_src = self.snapshot.store.hwm_for_label(src_label_id)?;
         tracing::debug!(src_label = %src_label, fof_label = %fof_label, hwm_src = hwm_src, "two-hop traversal start");
