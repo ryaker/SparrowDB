@@ -134,39 +134,50 @@ impl Engine {
         // Step 3: project RETURN from the WITH-projected rows.
         let column_names = extract_return_column_names(&m.return_clause.items);
 
-        // Apply ORDER BY on the projected rows (which still have all WITH aliases)
-        // before projecting down to RETURN columns — this allows ORDER BY on columns
-        // that are not in the RETURN clause (e.g. ORDER BY age when only name is returned).
+        // WITH-level ORDER BY / SKIP / LIMIT shape the WITH output, so they run
+        // before RETURN sees the rows (and before a RETURN aggregate groups them).
+        // Evaluated graph-aware (#477) so `ORDER BY bm25_score(n.text, 'q')`
+        // resolves even when the score was not also WITH-aliased.
         let mut ordered_projected = projected;
-        if !m.order_by.is_empty() {
-            ordered_projected.sort_by(|a, b| {
-                for (expr, dir) in &m.order_by {
-                    // #477: graph-aware so `ORDER BY bm25_score(n.text, 'q')`
-                    // resolves even when the score was not also WITH-aliased.
-                    let val_a = self.eval_expr_graph(expr, a);
-                    let val_b = self.eval_expr_graph(expr, b);
-                    let cmp = compare_values(&val_a, &val_b);
-                    let cmp = if *dir == SortDir::Desc {
-                        cmp.reverse()
-                    } else {
-                        cmp
-                    };
-                    if cmp != std::cmp::Ordering::Equal {
-                        return cmp;
-                    }
-                }
-                std::cmp::Ordering::Equal
+        self.order_skip_limit_projected(
+            &mut ordered_projected,
+            &m.with_order_by,
+            m.with_skip,
+            m.with_limit,
+        );
+
+        // #558: an aggregate in the RETURN after a non-aggregating WITH must
+        // aggregate the WITH output (one group per distinct key), not be
+        // evaluated per row. RETURN-level ORDER BY / SKIP / LIMIT then apply to
+        // the aggregated rows, exactly as on a plain `MATCH … RETURN agg`.
+        if has_aggregate_in_return(&m.return_clause.items) {
+            let mut rows = super::aggregate_rows(self, &ordered_projected, &m.return_clause.items);
+            if m.distinct {
+                deduplicate_rows(&mut rows);
+            }
+            super::sort_rows_by(
+                &mut rows,
+                &m.order_by,
+                &m.return_clause.items,
+                &column_names,
+            );
+            if let Some(skip) = m.skip {
+                rows.drain(0..(skip as usize).min(rows.len()));
+            }
+            if let Some(lim) = m.limit {
+                rows.truncate(lim as usize);
+            }
+            return Ok(QueryResult {
+                columns: column_names,
+                rows,
             });
         }
 
-        // Apply SKIP / LIMIT before final projection.
-        if let Some(skip) = m.skip {
-            let skip = (skip as usize).min(ordered_projected.len());
-            ordered_projected.drain(0..skip);
-        }
-        if let Some(lim) = m.limit {
-            ordered_projected.truncate(lim as usize);
-        }
+        // Non-aggregate RETURN: ORDER BY runs on the projected rows (which still
+        // have all WITH aliases) before projecting down to RETURN columns — this
+        // allows ORDER BY on columns that are not in the RETURN clause (e.g.
+        // ORDER BY age when only name is returned).
+        self.order_skip_limit_projected(&mut ordered_projected, &m.order_by, m.skip, m.limit);
 
         let mut rows: Vec<Vec<Value>> = ordered_projected
             .iter()
@@ -189,6 +200,41 @@ impl Engine {
         })
     }
 
+    /// Sort `rows` by `order_by` (graph-aware), then apply SKIP and LIMIT.
+    fn order_skip_limit_projected(
+        &self,
+        rows: &mut Vec<HashMap<String, Value>>,
+        order_by: &[(Expr, SortDir)],
+        skip: Option<u64>,
+        limit: Option<u64>,
+    ) {
+        if !order_by.is_empty() {
+            rows.sort_by(|a, b| {
+                for (expr, dir) in order_by {
+                    let cmp = compare_values(
+                        &self.eval_expr_graph(expr, a),
+                        &self.eval_expr_graph(expr, b),
+                    );
+                    let cmp = if *dir == SortDir::Desc {
+                        cmp.reverse()
+                    } else {
+                        cmp
+                    };
+                    if cmp != std::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        if let Some(skip) = skip {
+            rows.drain(0..(skip as usize).min(rows.len()));
+        }
+        if let Some(lim) = limit {
+            rows.truncate(lim as usize);
+        }
+    }
+
     /// Aggregate a set of raw scan rows through a list of WITH items that
     /// include aggregate expressions (COUNT(*), collect(), etc.).
     ///
@@ -198,162 +244,26 @@ impl Engine {
         rows: &[HashMap<String, Value>],
         items: &[sparrowdb_cypher::ast::WithItem],
     ) -> Vec<HashMap<String, Value>> {
-        // Classify each WITH item as key or aggregate.
-        let key_indices: Vec<usize> = items
+        // A WITH that aggregates groups exactly like a RETURN that aggregates:
+        // one implementation (`aggregate_rows`) owns grouping, NULL-skipping,
+        // DISTINCT, and the per-function finalisation (SUM int/float, AVG,
+        // MIN/MAX, empty-input defaults). Reusing it keeps the two in lockstep.
+        let return_items: Vec<ReturnItem> = items
             .iter()
-            .enumerate()
-            .filter(|(_, item)| !is_aggregate_expr(&item.expr))
-            .map(|(i, _)| i)
+            .map(|item| ReturnItem {
+                expr: item.expr.clone(),
+                alias: Some(item.alias.clone()),
+            })
             .collect();
-        let agg_indices: Vec<usize> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| is_aggregate_expr(&item.expr))
-            .map(|(i, _)| i)
-            .collect();
-
-        // Build groups.
-        let mut group_keys: Vec<Vec<Value>> = Vec::new();
-        let mut group_accum: Vec<Vec<Vec<Value>>> = Vec::new(); // [group][agg_pos] → values
-
-        for row_vals in rows {
-            let key: Vec<Value> = key_indices
-                .iter()
-                .map(|&i| self.eval_expr_graph(&items[i].expr, row_vals))
-                .collect();
-            let group_idx = if let Some(pos) = group_keys.iter().position(|k| k == &key) {
-                pos
-            } else {
-                group_keys.push(key);
-                group_accum.push(vec![vec![]; agg_indices.len()]);
-                group_keys.len() - 1
-            };
-            for (ai, &ri) in agg_indices.iter().enumerate() {
-                match &items[ri].expr {
-                    sparrowdb_cypher::ast::Expr::CountStar => {
-                        group_accum[group_idx][ai].push(Value::Int64(1));
-                    }
-                    sparrowdb_cypher::ast::Expr::FnCall { name, args, .. }
-                        if name.to_lowercase() == "collect" =>
-                    {
-                        // #477: use the graph-aware evaluator so an aggregate
-                        // argument like `collect(bm25_score(n.text, 'q'))` can
-                        // resolve — the plain `eval_expr` does not know
-                        // full_text_search/bm25_score/hybrid_search and would
-                        // silently score every row `Null`.
-                        let val = if !args.is_empty() {
-                            self.eval_expr_graph(&args[0], row_vals)
-                        } else {
-                            Value::Null
-                        };
-                        if !matches!(val, Value::Null) {
-                            group_accum[group_idx][ai].push(val);
-                        }
-                    }
-                    sparrowdb_cypher::ast::Expr::FnCall { name, args, .. }
-                        if matches!(
-                            name.to_lowercase().as_str(),
-                            "count" | "sum" | "avg" | "min" | "max"
-                        ) =>
-                    {
-                        let val = if !args.is_empty() {
-                            self.eval_expr_graph(&args[0], row_vals)
-                        } else {
-                            Value::Null
-                        };
-                        if !matches!(val, Value::Null) {
-                            group_accum[group_idx][ai].push(val);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // If no rows were seen, still produce one output row for global aggregates
-        // (e.g. COUNT(*) over an empty scan returns 0).
-        if rows.is_empty() && key_indices.is_empty() {
-            let mut out_row: HashMap<String, Value> = HashMap::new();
-            for &ri in &agg_indices {
-                let val = match &items[ri].expr {
-                    sparrowdb_cypher::ast::Expr::CountStar => Value::Int64(0),
-                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
-                        if name.to_lowercase() == "collect" =>
-                    {
-                        Value::List(vec![])
-                    }
-                    _ => Value::Int64(0),
-                };
-                out_row.insert(items[ri].alias.clone(), val);
-            }
-            return vec![out_row];
-        }
-
-        // Finalize each group.
-        let mut result: Vec<HashMap<String, Value>> = Vec::new();
-        for (gi, key_vals) in group_keys.iter().enumerate() {
-            let mut out_row: HashMap<String, Value> = HashMap::new();
-            // Insert key values.
-            for (ki, &ri) in key_indices.iter().enumerate() {
-                out_row.insert(items[ri].alias.clone(), key_vals[ki].clone());
-            }
-            // Finalize aggregates.
-            for (ai, &ri) in agg_indices.iter().enumerate() {
-                if super::agg_is_distinct(&items[ri].expr) {
-                    super::dedup_agg_values(&mut group_accum[gi][ai]);
-                }
-                let accum = &group_accum[gi][ai];
-                let val = match &items[ri].expr {
-                    sparrowdb_cypher::ast::Expr::CountStar => Value::Int64(accum.len() as i64),
-                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
-                        if name.to_lowercase() == "collect" =>
-                    {
-                        Value::List(accum.clone())
-                    }
-                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
-                        if name.to_lowercase() == "count" =>
-                    {
-                        Value::Int64(accum.len() as i64)
-                    }
-                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
-                        if name.to_lowercase() == "sum" =>
-                    {
-                        let sum: i64 = accum
-                            .iter()
-                            .filter_map(|v| {
-                                if let Value::Int64(n) = v {
-                                    Some(*n)
-                                } else {
-                                    None
-                                }
-                            })
-                            .sum();
-                        Value::Int64(sum)
-                    }
-                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
-                        if name.to_lowercase() == "min" =>
-                    {
-                        accum
-                            .iter()
-                            .min_by(|a, b| compare_values(a, b))
-                            .cloned()
-                            .unwrap_or(Value::Null)
-                    }
-                    sparrowdb_cypher::ast::Expr::FnCall { name, .. }
-                        if name.to_lowercase() == "max" =>
-                    {
-                        accum
-                            .iter()
-                            .max_by(|a, b| compare_values(a, b))
-                            .cloned()
-                            .unwrap_or(Value::Null)
-                    }
-                    _ => Value::Null,
-                };
-                out_row.insert(items[ri].alias.clone(), val);
-            }
-            result.push(out_row);
-        }
-        result
+        super::aggregate_rows(self, rows, &return_items)
+            .into_iter()
+            .map(|vals| {
+                items
+                    .iter()
+                    .map(|item| item.alias.clone())
+                    .zip(vals)
+                    .collect()
+            })
+            .collect()
     }
 }
