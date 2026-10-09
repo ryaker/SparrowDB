@@ -1,6 +1,55 @@
 //! Auto-generated submodule — see engine/mod.rs for context.
 use super::*;
 
+/// One row of the leading MATCH of `MATCH ... OPTIONAL MATCH ...`: the values
+/// its variables expose to RETURN, and the node each variable is bound to (the
+/// key the optional pattern is joined on).
+#[derive(Clone, Default)]
+struct LeadRow {
+    vals: HashMap<String, Value>,
+    bound: HashMap<String, (u32, u64)>,
+    /// First node bound, for an optional path that shares no variable.
+    first: Option<(u32, u64)>,
+}
+
+/// Edge lookups for walking OPTIONAL MATCH paths, built once per query.
+pub(crate) struct OptionalAdjacency {
+    /// Un-checkpointed edges keyed by `(src_label, src_slot)`.
+    fwd: DeltaIndex,
+    /// Relationship-table ids per rel type name (empty name = any type).
+    rel_ids: HashMap<String, Vec<u32>>,
+    /// Inverted edges per rel type, built the first time a hop is walked
+    /// against its direction.
+    rev: HashMap<String, std::cell::OnceCell<ReverseIndex>>,
+}
+
+impl OptionalAdjacency {
+    fn build(engine: &Engine, patterns: &[PathPattern]) -> Self {
+        let fwd = build_delta_index(&engine.read_delta_all());
+        let mut rel_ids = HashMap::new();
+        let mut rev = HashMap::new();
+        for rel in patterns.iter().flat_map(|p| p.rels.iter()) {
+            rel_ids
+                .entry(rel.rel_type.clone())
+                .or_insert_with(|| engine.resolve_rel_ids_for_type(&rel.rel_type));
+            rev.entry(rel.rel_type.clone())
+                .or_insert_with(std::cell::OnceCell::new);
+        }
+        Self { fwd, rel_ids, rev }
+    }
+
+    fn reverse(&self, engine: &Engine, rel_type: &str) -> &ReverseIndex {
+        static EMPTY: std::sync::OnceLock<ReverseIndex> = std::sync::OnceLock::new();
+        match self.rev.get(rel_type) {
+            Some(cell) => cell.get_or_init(|| {
+                let ids = self.rel_ids.get(rel_type).cloned().unwrap_or_default();
+                engine.build_reverse_index(&self.fwd, &ids)
+            }),
+            None => EMPTY.get_or_init(HashMap::new),
+        }
+    }
+}
+
 impl Engine {
     /// Execute a multi-clause Cypher pipeline (SPA-134).
     ///
@@ -1481,18 +1530,26 @@ impl Engine {
                 rows: vec![null_row],
             });
         }
-        let lead_node_pat = &mom.match_patterns[0].nodes[0];
-        let lead_label = lead_node_pat.labels.first().cloned().unwrap_or_default();
-        let lead_label_id = match self.snapshot.catalog.get_label(&lead_label)? {
-            Some(id) => id as u32,
-            None => {
-                // The leading MATCH is non-optional: unknown label → 0 rows (not null).
-                return Ok(QueryResult {
-                    columns: column_names,
-                    rows: vec![],
-                });
+
+        // Every leading pattern contributes its first node; `MATCH (p:P),(t:T)`
+        // binds both and the rows are their cross product.
+        let mut lead_nodes: Vec<(&sparrowdb_cypher::ast::NodePattern, u32)> = Vec::new();
+        for pat in &mom.match_patterns {
+            let Some(node_pat) = pat.nodes.first() else {
+                continue;
+            };
+            let label = node_pat.labels.first().cloned().unwrap_or_default();
+            match self.snapshot.catalog.get_label(&label)? {
+                Some(id) => lead_nodes.push((node_pat, id as u32)),
+                None => {
+                    // The leading MATCH is non-optional: unknown label → 0 rows (not null).
+                    return Ok(QueryResult {
+                        columns: column_names,
+                        rows: vec![],
+                    });
+                }
             }
-        };
+        }
 
         // Aggregates (`COUNT(p)`, `MAX(p.id)`, `ORDER BY` over them) read their
         // arguments from the combined row, so every column any RETURN item
@@ -1516,45 +1573,71 @@ impl Engine {
             if let Some(ref wexpr) = mom.match_where {
                 collect_col_ids_from_expr(wexpr, &mut ids);
             }
-            for p in &lead_node_pat.props {
-                let col_id = prop_name_to_col_id(&p.key);
-                if !ids.contains(&col_id) {
-                    ids.push(col_id);
+            for (node_pat, _) in &lead_nodes {
+                for p in &node_pat.props {
+                    let col_id = prop_name_to_col_id(&p.key);
+                    if !ids.contains(&col_id) {
+                        ids.push(col_id);
+                    }
                 }
             }
             ids
         };
 
-        let lead_hwm = self.snapshot.store.hwm_for_label(lead_label_id)?;
-        let lead_var = lead_node_pat.var.as_str();
-
-        // Collect lead rows as (slot, props) pairs.
-        let mut lead_rows: Vec<(u64, Vec<(u32, u64)>)> = Vec::new();
-        for slot in 0..lead_hwm {
-            let node_id = NodeId(((lead_label_id as u64) << 32) | slot);
-            // SPA-216: use is_node_tombstoned() to avoid spurious NotFound
-            // when tombstone_node() wrote col_0 only for the deleted slot.
-            if self.is_node_tombstoned(node_id) {
-                continue;
-            }
-            let props = read_node_props(&self.snapshot.store, node_id, &lead_all_col_ids)?;
-            if !self.matches_prop_filter(&props, &lead_node_pat.props) {
-                continue;
-            }
-            if let Some(ref wexpr) = mom.match_where {
-                let mut row_vals =
-                    build_row_vals(&props, lead_var, &lead_all_col_ids, &self.snapshot.store);
-                row_vals.extend(self.dollar_params());
-                if !self.eval_where_graph(wexpr, &row_vals) {
+        // Collect lead rows: the cross product of every leading pattern's
+        // candidates, each carrying its variable bindings.
+        let mut lead_rows: Vec<LeadRow> = vec![LeadRow::default()];
+        for (node_pat, label_id) in &lead_nodes {
+            let var = node_pat.var.as_str();
+            let hwm = self.snapshot.store.hwm_for_label(*label_id)?;
+            let mut candidates: Vec<(u64, Vec<(u32, u64)>)> = Vec::new();
+            for slot in 0..hwm {
+                let node_id = NodeId(((*label_id as u64) << 32) | slot);
+                // SPA-216: use is_node_tombstoned() to avoid spurious NotFound
+                // when tombstone_node() wrote col_0 only for the deleted slot.
+                if self.is_node_tombstoned(node_id) {
                     continue;
                 }
+                let props = read_node_props(&self.snapshot.store, node_id, &lead_all_col_ids)?;
+                if self.matches_prop_filter(&props, &node_pat.props) {
+                    candidates.push((slot, props));
+                }
             }
-            lead_rows.push((slot, props));
+            let mut next: Vec<LeadRow> = Vec::with_capacity(lead_rows.len() * candidates.len());
+            for base in &lead_rows {
+                for (slot, props) in &candidates {
+                    let mut row = base.clone();
+                    row.vals.extend(build_row_vals(
+                        props,
+                        var,
+                        &lead_all_col_ids,
+                        &self.snapshot.store,
+                    ));
+                    if !var.is_empty() {
+                        row.bound.insert(var.to_string(), (*label_id, *slot));
+                        if use_agg {
+                            row.vals.insert(
+                                var.to_string(),
+                                Value::NodeRef(NodeId(((*label_id as u64) << 32) | *slot)),
+                            );
+                        }
+                    }
+                    row.first.get_or_insert((*label_id, *slot));
+                    next.push(row);
+                }
+            }
+            lead_rows = next;
+        }
+        if let Some(ref wexpr) = mom.match_where {
+            lead_rows.retain(|row| {
+                let mut row_vals = row.vals.clone();
+                row_vals.extend(self.dollar_params());
+                self.eval_where_graph(wexpr, &row_vals)
+            });
         }
 
         // ── Step 2: for each lead row, run the optional sub-pattern ──────────
 
-        // Determine optional-side node variable and label.
         let opt_patterns = &mom.optional_patterns;
 
         // Determine optional-side variables from return clause.
@@ -1568,71 +1651,64 @@ impl Engine {
         // Row maps for the aggregate path (variables bound as `NodeRef`).
         let mut agg_rows: Vec<HashMap<String, Value>> = Vec::new();
 
-        // An incoming optional hop `(lead)<-[:R]-(opt)` needs the reversed edge
-        // set; build it once per query rather than per lead row.
-        let optional_incoming = opt_patterns.len() == 1
-            && opt_patterns[0].rels.len() == 1
-            && opt_patterns[0].rels[0].dir != sparrowdb_cypher::ast::EdgeDir::Outgoing;
-        let reverse_index: Option<ReverseIndex> = if optional_incoming {
-            let rel_ids = self.resolve_rel_ids_for_type(&opt_patterns[0].rels[0].rel_type);
-            let delta_idx = build_delta_index(&self.read_delta_all());
-            Some(self.build_reverse_index(&delta_idx, &rel_ids))
-        } else {
-            None
-        };
+        // Columns the optional-side nodes must expose: anything RETURN, ORDER BY
+        // or the OPTIONAL MATCH's own WHERE reads.
+        let mut opt_col_ids: Vec<u32> = Vec::new();
+        for item in &mom.return_clause.items {
+            collect_col_ids_from_expr(&item.expr, &mut opt_col_ids);
+        }
+        for (expr, _) in &mom.order_by {
+            collect_col_ids_from_expr(expr, &mut opt_col_ids);
+        }
+        if let Some(ref wexpr) = mom.optional_where {
+            collect_col_ids_from_expr(wexpr, &mut opt_col_ids);
+        }
 
-        for (lead_slot, lead_props) in &lead_rows {
-            let mut lead_row_vals = build_row_vals(
-                lead_props,
-                lead_var,
-                &lead_all_col_ids,
-                &self.snapshot.store,
-            );
-            if use_agg && !lead_var.is_empty() {
-                lead_row_vals.insert(
-                    lead_var.to_string(),
-                    Value::NodeRef(NodeId(((lead_label_id as u64) << 32) | *lead_slot)),
-                );
+        // Adjacency, built once per query rather than per lead row.
+        let adjacency = OptionalAdjacency::build(self, opt_patterns);
+
+        for lead in &lead_rows {
+            let lead_row_vals = lead.vals.clone();
+
+            // Left-join the optional paths on the variables the leading MATCH
+            // bound.  Several optional paths are joined left to right.
+            let mut opt_sub_rows: Vec<HashMap<String, Value>> = vec![HashMap::new()];
+            for opt_pat in opt_patterns {
+                let mut joined: Vec<HashMap<String, Value>> = Vec::new();
+                for partial in &opt_sub_rows {
+                    let mut bound = lead.bound.clone();
+                    for (var, v) in partial {
+                        if let Value::NodeRef(n) = v {
+                            bound.insert(var.clone(), node_id_parts(n.0));
+                        }
+                    }
+                    for row in self.optional_path_rows(
+                        opt_pat,
+                        &bound,
+                        lead.first,
+                        &opt_col_ids,
+                        &adjacency,
+                    )? {
+                        let mut merged = partial.clone();
+                        merged.extend(row);
+                        joined.push(merged);
+                    }
+                }
+                opt_sub_rows = joined;
             }
-
-            // Attempt the optional sub-pattern.
-            // We only support the common case:
-            //   (lead_var)-[:REL_TYPE]->(opt_var:Label)
-            // where opt_patterns has exactly one path with one rel hop.
-            let opt_sub_rows: Vec<HashMap<String, Value>> = if opt_patterns.len() == 1
-                && opt_patterns[0].rels.len() == 1
-                && opt_patterns[0].nodes.len() == 2
-            {
-                let opt_pat = &opt_patterns[0];
-                let opt_src_pat = &opt_pat.nodes[0];
-                let opt_dst_pat = &opt_pat.nodes[1];
-                let opt_rel_pat = &opt_pat.rels[0];
-
-                // Destination label — if not found, treat as 0 (no matches).
-                let opt_dst_label = opt_dst_pat.labels.first().cloned().unwrap_or_default();
-                let opt_dst_label_id: Option<u32> =
-                    match self.snapshot.catalog.get_label(&opt_dst_label) {
-                        Ok(Some(id)) => Some(id as u32),
-                        _ => None,
-                    };
-
-                self.optional_one_hop_sub_rows(
-                    *lead_slot,
-                    lead_label_id,
-                    opt_dst_label_id,
-                    opt_src_pat,
-                    opt_dst_pat,
-                    opt_rel_pat,
-                    &opt_vars,
-                    &column_names,
-                    &agg_col_ids,
-                    reverse_index.as_ref(),
-                )
-                .unwrap_or_default()
-            } else {
-                // Unsupported optional pattern → treat as no matches.
-                vec![]
-            };
+            if opt_patterns.is_empty() {
+                opt_sub_rows.clear();
+            }
+            // The OPTIONAL MATCH's own WHERE filters its matches; a lead row
+            // whose matches are all filtered out still survives, with NULLs.
+            if let Some(ref wexpr) = mom.optional_where {
+                opt_sub_rows.retain(|opt_row| {
+                    let mut combined = lead_row_vals.clone();
+                    combined.extend(opt_row.clone());
+                    combined.extend(self.dollar_params());
+                    self.eval_where_graph(wexpr, &combined)
+                });
+            }
 
             if use_agg {
                 // Left outer join: a lead row with no match still contributes
@@ -1719,133 +1795,220 @@ impl Engine {
         })
     }
 
-    /// Scan neighbors of `src_slot` via delta log + CSR for the optional 1-hop,
-    /// returning one `HashMap<String,Value>` per matching destination node.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn optional_one_hop_sub_rows(
+    /// Match one OPTIONAL MATCH path against the graph, anchored on a node the
+    /// leading MATCH already bound.
+    ///
+    /// The anchor may sit anywhere in the path: `(lead)-[:R]->(x)`,
+    /// `(x)-[:R]->(lead)` and `(x)-[:R]->(lead)-[:S]->(y)` all join on `lead`.
+    /// The path is expanded outward from the anchor in both directions, and
+    /// every other node whose variable is already bound (`MATCH (a),(b)
+    /// OPTIONAL MATCH (a)-->(b)`) must land on that exact node.  Returns one
+    /// row per distinct match holding only the variables this path introduces;
+    /// an empty result means "no match" and the caller emits the NULL row.
+    ///
+    /// Variable-length hops are not expanded here and yield no match.
+    pub(crate) fn optional_path_rows(
         &self,
-        src_slot: u64,
-        src_label_id: u32,
-        dst_label_id: Option<u32>,
-        _src_pat: &sparrowdb_cypher::ast::NodePattern,
-        dst_node_pat: &sparrowdb_cypher::ast::NodePattern,
-        rel_pat: &sparrowdb_cypher::ast::RelPattern,
-        opt_vars: &[String],
-        column_names: &[String],
-        extra_col_ids: &[u32],
-        reverse_index: Option<&ReverseIndex>,
+        pat: &sparrowdb_cypher::ast::PathPattern,
+        bound: &HashMap<String, (u32, u64)>,
+        legacy_anchor: Option<(u32, u64)>,
+        col_ids: &[u32],
+        adj: &OptionalAdjacency,
     ) -> Result<Vec<HashMap<String, Value>>> {
-        let dst_label_id = match dst_label_id {
-            Some(id) => id,
-            None => return Ok(vec![]),
-        };
-
-        let dst_var = dst_node_pat.var.as_str();
-        let mut col_ids_dst = collect_col_ids_for_var(dst_var, column_names, dst_label_id);
-        for c in extra_col_ids {
-            if !col_ids_dst.contains(c) {
-                col_ids_dst.push(*c);
-            }
-        }
-        let _ = opt_vars;
-
-        // `(lead)<-[:R]-(opt)` (and the reverse half of `(lead)-[:R]-(opt)`):
-        // the neighbours are the edge's physical sources.
-        let incoming_slots: Vec<u64> = match (reverse_index, &rel_pat.dir) {
-            (Some(rev), sparrowdb_cypher::ast::EdgeDir::Incoming)
-            | (Some(rev), sparrowdb_cypher::ast::EdgeDir::Both) => rev
-                .get(&(src_label_id, src_slot))
-                .map(|v| {
-                    v.iter()
-                        .filter(|(_, label)| *label == dst_label_id)
-                        .map(|(slot, _)| *slot)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            _ => vec![],
-        };
-        if rel_pat.dir == sparrowdb_cypher::ast::EdgeDir::Incoming {
-            return self.optional_sub_rows_for_slots(
-                incoming_slots,
-                dst_label_id,
-                dst_node_pat,
-                &col_ids_dst,
-            );
-        }
-
-        // SPA-185: resolve rel-type lookup once; use for both delta and CSR reads.
-        let rel_lookup = self.resolve_rel_table_id(src_label_id, dst_label_id, &rel_pat.rel_type);
-
-        // If the rel type was specified but not registered, no edges can exist.
-        if matches!(rel_lookup, RelTableLookup::NotFound) {
+        let n = pat.nodes.len();
+        if n == 0 || pat.rels.len() + 1 != n || pat.rels.iter().any(|r| r.min_hops.is_some()) {
             return Ok(vec![]);
         }
 
-        let delta_neighbors: Vec<u64> = {
-            let records: Vec<DeltaRecord> = match rel_lookup {
-                RelTableLookup::Found(rtid) => self.read_delta_for(rtid),
-                _ => self.read_delta_all(),
-            };
-            records
-                .into_iter()
-                .filter(|r| {
-                    let r_src_label = (r.src.0 >> 32) as u32;
-                    let r_src_slot = r.src.0 & 0xFFFF_FFFF;
-                    let r_dst_label = (r.dst.0 >> 32) as u32;
-                    // Slots are label-relative: an edge landing on another label
-                    // must not be read as a `dst_label_id` node.
-                    r_src_label == src_label_id
-                        && r_src_slot == src_slot
-                        && r_dst_label == dst_label_id
-                })
-                .map(|r| r.dst.0 & 0xFFFF_FFFF)
-                .collect()
-        };
-
-        let csr_neighbors = match rel_lookup {
-            RelTableLookup::Found(rtid) => self.csr_neighbors(rtid, src_slot),
-            _ => self.csr_neighbor_slots_to_label(src_slot, src_label_id, Some(dst_label_id), &[]),
-        };
-        let all_neighbors: Vec<u64> = csr_neighbors
-            .into_iter()
-            .chain(delta_neighbors)
-            .chain(incoming_slots)
-            .collect();
-        self.optional_sub_rows_for_slots(all_neighbors, dst_label_id, dst_node_pat, &col_ids_dst)
-    }
-
-    /// Materialise the optional-side node rows for a set of neighbour slots
-    /// (deduplicated), applying the optional node's inline property filter and
-    /// binding the variable as a non-null `NodeRef` so `COUNT(opt)` counts it.
-    fn optional_sub_rows_for_slots(
-        &self,
-        slots: Vec<u64>,
-        dst_label_id: u32,
-        dst_node_pat: &sparrowdb_cypher::ast::NodePattern,
-        col_ids_dst: &[u32],
-    ) -> Result<Vec<HashMap<String, Value>>> {
-        let dst_var = dst_node_pat.var.as_str();
-        let mut seen: HashSet<u64> = HashSet::new();
-        let mut sub_rows: Vec<HashMap<String, Value>> = Vec::new();
-
-        for dst_slot in slots {
-            if !seen.insert(dst_slot) {
-                continue;
+        // Resolve each node's label once.  `None` = any label.
+        let mut labels: Vec<Option<u32>> = Vec::with_capacity(n);
+        for node in &pat.nodes {
+            match node.labels.first() {
+                None => labels.push(None),
+                Some(l) => match self.snapshot.catalog.get_label(l) {
+                    Ok(Some(id)) => labels.push(Some(id as u32)),
+                    // Unknown label: nothing can match.
+                    _ => return Ok(vec![]),
+                },
             }
-            let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
-            let dst_props = read_node_props(&self.snapshot.store, dst_node, col_ids_dst)?;
-            if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
-                continue;
-            }
-            let mut row_vals =
-                build_row_vals(&dst_props, dst_var, col_ids_dst, &self.snapshot.store);
-            if !dst_var.is_empty() {
-                row_vals.insert(dst_var.to_string(), Value::NodeRef(dst_node));
-            }
-            sub_rows.push(row_vals);
         }
 
-        Ok(sub_rows)
+        // Anchor: the first node whose variable the leading MATCH bound.  A path
+        // sharing no variable with it keeps the historical reading that its
+        // first node is the leading MATCH's first node.
+        let (anchor, anchor_slot) = match pat
+            .nodes
+            .iter()
+            .position(|nd| !nd.var.is_empty() && bound.contains_key(&nd.var))
+        {
+            Some(i) => (i, bound[&pat.nodes[i].var]),
+            None => match legacy_anchor {
+                Some(s) => (0, s),
+                None => return Ok(vec![]),
+            },
+        };
+
+        struct Partial {
+            slots: Vec<Option<(u32, u64)>>,
+            props: Vec<Vec<(u32, u64)>>,
+        }
+
+        // Admit `slot` as pattern node `j` given the nodes assigned so far.
+        let admit =
+            |j: usize, slot: (u32, u64), partial: &Partial| -> Result<Option<Vec<(u32, u64)>>> {
+                let node = &pat.nodes[j];
+                if labels[j].is_some_and(|l| l != slot.0) {
+                    return Ok(None);
+                }
+                let node_id = NodeId(((slot.0 as u64) << 32) | slot.1);
+                if self.is_node_tombstoned(node_id) {
+                    return Ok(None);
+                }
+                if !node.var.is_empty() {
+                    if bound.get(&node.var).is_some_and(|b| *b != slot) {
+                        return Ok(None);
+                    }
+                    // A variable repeated within the path must repeat its node.
+                    for (k, other) in pat.nodes.iter().enumerate() {
+                        if k != j && other.var == node.var {
+                            if let Some(Some(s)) = partial.slots.get(k) {
+                                if *s != slot {
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut ids: Vec<u32> = col_ids.to_vec();
+                for p in &node.props {
+                    let c = prop_name_to_col_id(&p.key);
+                    if !ids.contains(&c) {
+                        ids.push(c);
+                    }
+                }
+                let props = read_node_props(&self.snapshot.store, node_id, &ids)?;
+                if !self.matches_prop_filter(&props, &node.props) {
+                    return Ok(None);
+                }
+                Ok(Some(props))
+            };
+
+        let seed = Partial {
+            slots: vec![None; n],
+            props: vec![Vec::new(); n],
+        };
+        let Some(anchor_props) = admit(anchor, anchor_slot, &seed)? else {
+            return Ok(vec![]);
+        };
+        let mut start = seed;
+        start.slots[anchor] = Some(anchor_slot);
+        start.props[anchor] = anchor_props;
+        let mut partials = vec![start];
+
+        // Expand rightwards (node j -> j+1), then leftwards (node j+1 -> j).
+        let steps = (anchor..n - 1)
+            .map(|j| (j, j + 1, j, false))
+            .chain((0..anchor).rev().map(|j| (j + 1, j, j, true)));
+        for (from, to, rel_idx, reversed) in steps {
+            let mut next: Vec<Partial> = Vec::new();
+            for p in &partials {
+                let Some(from_slot) = p.slots[from] else {
+                    continue;
+                };
+                for nb in self.optional_neighbors(from_slot, &pat.rels[rel_idx], reversed, adj) {
+                    if let Some(props) = admit(to, nb, p)? {
+                        let mut np = Partial {
+                            slots: p.slots.clone(),
+                            props: p.props.clone(),
+                        };
+                        np.slots[to] = Some(nb);
+                        np.props[to] = props;
+                        next.push(np);
+                    }
+                }
+            }
+            partials = next;
+            if partials.is_empty() {
+                return Ok(vec![]);
+            }
+        }
+
+        let mut seen: HashSet<Vec<(u32, u64)>> = HashSet::new();
+        let mut rows: Vec<HashMap<String, Value>> = Vec::new();
+        for p in partials {
+            let key: Vec<(u32, u64)> = p.slots.iter().map(|s| s.unwrap_or((0, 0))).collect();
+            if !seen.insert(key) {
+                continue;
+            }
+            let mut row: HashMap<String, Value> = HashMap::new();
+            for (j, node) in pat.nodes.iter().enumerate() {
+                if node.var.is_empty() || bound.contains_key(&node.var) {
+                    continue;
+                }
+                let Some((label, slot)) = p.slots[j] else {
+                    continue;
+                };
+                row.extend(build_row_vals(
+                    &p.props[j],
+                    &node.var,
+                    col_ids,
+                    &self.snapshot.store,
+                ));
+                row.insert(
+                    node.var.clone(),
+                    Value::NodeRef(NodeId(((label as u64) << 32) | slot)),
+                );
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// Neighbours of `from` across one relationship hop, as `(label, slot)`.
+    ///
+    /// `reversed` is true when the path is walked against its written order
+    /// (from the right-hand node of the hop to the left-hand one), which flips
+    /// the pattern's arrow.  Edges come from the CSR plus the un-checkpointed
+    /// delta log; both endpoint labels are known for both, nothing is guessed.
+    fn optional_neighbors(
+        &self,
+        from: (u32, u64),
+        rel: &sparrowdb_cypher::ast::RelPattern,
+        reversed: bool,
+        adj: &OptionalAdjacency,
+    ) -> Vec<(u32, u64)> {
+        use sparrowdb_cypher::ast::EdgeDir;
+        let rel_ids = adj.rel_ids.get(&rel.rel_type).cloned().unwrap_or_default();
+        // A named type that matches no relationship table has no edges.
+        if !rel.rel_type.is_empty() && rel_ids.is_empty() {
+            return vec![];
+        }
+        let (out, inn) = match (&rel.dir, reversed) {
+            (EdgeDir::Outgoing, false) | (EdgeDir::Incoming, true) => (true, false),
+            (EdgeDir::Incoming, false) | (EdgeDir::Outgoing, true) => (false, true),
+            _ => (true, true),
+        };
+        let mut found: Vec<(u32, u64)> = Vec::new();
+        if out {
+            found.extend(
+                self.csr_neighbors_labeled(from.1, from.0, &rel_ids)
+                    .into_iter()
+                    .map(|(slot, label)| (label, slot)),
+            );
+            if let Some(recs) = adj.fwd.get(&from) {
+                found.extend(
+                    recs.iter()
+                        .filter(|r| rel_ids.is_empty() || rel_ids.contains(&r.rel_id.0))
+                        .map(|r| node_id_parts(r.dst.0)),
+                );
+            }
+        }
+        if inn {
+            if let Some(srcs) = adj.reverse(self, &rel.rel_type).get(&from) {
+                found.extend(srcs.iter().map(|&(slot, label)| (label, slot)));
+            }
+        }
+        found
     }
 
     // ── Node-only scan (no relationships) ─────────────────────────────────────

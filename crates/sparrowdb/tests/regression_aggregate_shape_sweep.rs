@@ -731,9 +731,8 @@ fn varlen_relationship_variable() {
     ]);
 }
 
-/// Known bug #552: engine returns the wrong answer; expectations are hand-derived.
+/// #552 (fixed): expectations are hand-derived.
 #[test]
-#[ignore = "bug #552"]
 fn optional_match_multi_hop() {
     check(vec![
         c(
