@@ -771,12 +771,8 @@ impl Engine {
             let node = &pat.nodes[0];
             let var_name = node.var.as_str();
             let label = node.labels.first().cloned().unwrap_or_default();
-            let label_id = self
-                .snapshot
-                .catalog
-                .get_label(&label)?
-                .ok_or(sparrowdb_common::Error::NotFound)?;
-            let label_id_u32 = label_id as u32;
+            let label_id_u32 =
+                self.label_id_or_diagnostic(&label, "MATCH ... WITH", "node pattern")?;
             let hwm = self.snapshot.store.hwm_for_label(label_id_u32)?;
 
             // Collect col_ids needed by WHERE + WITH projections + inline prop filters.

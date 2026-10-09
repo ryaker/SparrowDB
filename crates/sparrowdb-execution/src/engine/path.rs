@@ -367,12 +367,11 @@ impl Engine {
         let dst_label_id: Option<u32> = if dst_label.is_empty() {
             None
         } else {
-            Some(
-                self.snapshot
-                    .catalog
-                    .get_label(&dst_label)?
-                    .ok_or(sparrowdb_common::Error::NotFound)? as u32,
-            )
+            Some(self.label_id_or_diagnostic(
+                &dst_label,
+                "MATCH variable-length path",
+                "destination node",
+            )?)
         };
 
         // #543: aggregate RETURN items (COUNT/SUM/...) used to fall through to
