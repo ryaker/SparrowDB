@@ -13,6 +13,7 @@ fn call(name: &str, args: Vec<Expr>) -> Expr {
     Expr::FnCall {
         name: name.to_string(),
         args,
+        distinct: false,
     }
 }
 /// `abs(abs(... abs(-1) ...))` with `depth` calls.

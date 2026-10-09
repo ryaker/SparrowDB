@@ -115,8 +115,17 @@ pub enum Expr {
     Var(String),
     /// `COUNT(*)`
     CountStar,
-    /// Function call (for aggregate stubs).
-    FnCall { name: String, args: Vec<Expr> },
+    /// Function call (also the representation of non-star aggregates).
+    ///
+    /// `distinct` is `true` only for `agg(DISTINCT expr)` (`count`, `sum`,
+    /// `avg`, `min`, `max`, `collect`): the aggregate then folds the
+    /// de-duplicated non-null argument values of each group (#549). The
+    /// parser never sets it for any other function.
+    FnCall {
+        name: String,
+        args: Vec<Expr>,
+        distinct: bool,
+    },
     /// A list literal: `[expr, expr, ...]`.
     List(Vec<Expr>),
     /// `expr IN [val, val, ...]` — membership test.

@@ -1122,7 +1122,11 @@ impl GraphDb {
                     item.alias.clone().unwrap_or_else(|| match &item.expr {
                         Expr::PropAccess { var, prop } => format!("{var}.{prop}"),
                         Expr::Var(v) => v.clone(),
-                        Expr::FnCall { name, args } => {
+                        Expr::FnCall {
+                            name,
+                            args,
+                            distinct,
+                        } => {
                             let arg_str = args
                                 .first()
                                 .map(|a| match a {
@@ -1130,7 +1134,8 @@ impl GraphDb {
                                     _ => "*".to_string(),
                                 })
                                 .unwrap_or_else(|| "*".to_string());
-                            format!("{}({})", name.to_lowercase(), arg_str)
+                            let distinct_kw = if *distinct { "DISTINCT " } else { "" };
+                            format!("{}({}{})", name.to_lowercase(), distinct_kw, arg_str)
                         }
                         _ => "?".to_string(),
                     })
@@ -1178,7 +1183,7 @@ impl GraphDb {
                             ExecValue::Null
                         }
                     }
-                    Expr::FnCall { name, args } if name.eq_ignore_ascii_case("id") => {
+                    Expr::FnCall { name, args, .. } if name.eq_ignore_ascii_case("id") => {
                         if let Some(Expr::Var(v)) = args.first() {
                             if let Some(&node_id) = var_to_node.get(v.as_str()) {
                                 ExecValue::Int64(node_id.0 as i64)

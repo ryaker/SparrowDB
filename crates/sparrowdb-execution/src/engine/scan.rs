@@ -993,8 +993,14 @@ impl Engine {
         let item = &m.return_clause.items[0];
         let is_count = match &item.expr {
             Expr::CountStar => true,
-            Expr::FnCall { name, args } => {
-                name == "count"
+            Expr::FnCall {
+                name,
+                args,
+                distinct,
+            } => {
+                // `count(DISTINCT n)` is not the plain node count (#549).
+                !*distinct
+                    && name == "count"
                     && args.len() == 1
                     && matches!(&args[0], Expr::Var(v) if v == &node.var)
             }
@@ -1072,7 +1078,7 @@ impl Engine {
             return Ok(None);
         }
         let order_var = match sort_expr {
-            Expr::FnCall { name, args } => {
+            Expr::FnCall { name, args, .. } => {
                 let name_lc = name.to_lowercase();
                 if name_lc != "out_degree" && name_lc != "degree" {
                     return Ok(None);
@@ -1153,7 +1159,7 @@ impl Engine {
                 .iter()
                 .map(|item| match &item.expr {
                     // Resolve out_degree(var) / degree(var) → degree value.
-                    Expr::FnCall { name, args } => {
+                    Expr::FnCall { name, args, .. } => {
                         let name_lc = name.to_lowercase();
                         let arg_matches =
                             matches!(args.first(), Some(Expr::Var(v)) if v == node_var);
@@ -1256,8 +1262,14 @@ impl Engine {
 
             for item in items {
                 match &item.expr {
-                    Expr::FnCall { name, args }
-                        if name.to_lowercase() == "count" && args.len() == 1 =>
+                    // `COUNT(DISTINCT f)` is not the edge-degree count the
+                    // degree cache answers (parallel edges) — fall through to
+                    // the general path (#549).
+                    Expr::FnCall {
+                        name,
+                        args,
+                        distinct: false,
+                    } if name.to_lowercase() == "count" && args.len() == 1 =>
                     {
                         // COUNT(f) — arg must be the destination variable.
                         if let Some(Expr::Var(v)) = args.first() {

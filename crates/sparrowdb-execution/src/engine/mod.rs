@@ -1217,7 +1217,7 @@ fn resolve_filter_expr_scoped(
         // The argument values come from the recursion itself (each child's
         // resolved value IS `eval_expr(child, params)`), so nothing below this
         // node is evaluated twice.
-        Expr::FnCall { name, args } => {
+        Expr::FnCall { name, args, .. } => {
             let evaluated: Vec<Value> = args.iter().map(&rec).collect::<Option<_>>()?;
             let result = crate::functions::dispatch_function(name, evaluated).ok()?;
             // `eval_expr` short-circuits `type(v)` / `labels(v)` / `id(v)` on a
@@ -1443,7 +1443,7 @@ fn eval_list_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Vec<Va
                 }
             }
         }
-        Expr::FnCall { name, args } => {
+        Expr::FnCall { name, args, .. } => {
             // Expand function calls that produce lists.
             // Currently only `range(start, end[, step])` is supported here.
             let name_lc = name.to_lowercase();
@@ -1532,7 +1532,7 @@ fn extract_return_column_names(items: &[ReturnItem]) -> Vec<String> {
                 Expr::PropAccess { var, prop } => format!("{var}.{prop}"),
                 Expr::Var(v) => v.clone(),
                 Expr::CountStar => "count(*)".to_string(),
-                Expr::FnCall { name, args } => {
+                Expr::FnCall { name, args, .. } => {
                     let arg_str = args
                         .first()
                         .map(|a| match a {
@@ -2620,7 +2620,7 @@ fn eval_expr(expr: &Expr, vals: &HashMap<String, Value>) -> Value {
             }
             Literal::Null => Value::Null,
         },
-        Expr::FnCall { name, args } => {
+        Expr::FnCall { name, args, .. } => {
             // Special-case metadata functions that need direct row-map access.
             // type(r) and labels(n) look up pre-inserted metadata keys rather
             // than dispatching through the function library with evaluated args.
@@ -2807,7 +2807,7 @@ fn project_hop_row(
             // Dispatch on the AST expression, not on the (possibly aliased) column name.
             // This fixes #369: `RETURN n.name AS from` must resolve `n.name`, not `"from"`.
             match &item.expr {
-                Expr::FnCall { name, args } => {
+                Expr::FnCall { name, args, .. } => {
                     let name_lc = name.to_lowercase();
                     let arg_var = args.first().and_then(|a| {
                         if let Expr::Var(v) = a {
@@ -3169,6 +3169,35 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
         Expr::ListPredicate { list_expr, .. } => expr_has_collect(list_expr),
         _ => false,
     }
+}
+
+/// Returns `true` if `expr` is an aggregate written with `DISTINCT`
+/// (`count(DISTINCT x)`, `collect(DISTINCT x)`, ... or a list predicate over
+/// `collect(DISTINCT x)`).
+pub(crate) fn agg_is_distinct(expr: &Expr) -> bool {
+    match expr {
+        Expr::FnCall { distinct, .. } => *distinct,
+        Expr::ListPredicate { list_expr, .. } => agg_is_distinct(list_expr),
+        _ => false,
+    }
+}
+
+/// Drop repeated values from one group's accumulated aggregate arguments,
+/// keeping the first occurrence of each (#549).
+///
+/// Equality is exactly the one `RETURN DISTINCT` uses (`deduplicate_rows`):
+/// type-tagged value identity, so `Int64(1)` and `Float64(1.0)` are different
+/// values, and, as there, a `NaN` is never equal to anything (all are kept).
+/// Nulls never reach here — every aggregate drops them before accumulating.
+pub(crate) fn dedup_agg_values(vals: &mut Vec<Value>) {
+    let mut seen: std::collections::HashSet<Vec<u8>> =
+        std::collections::HashSet::with_capacity(vals.len());
+    vals.retain(|v| {
+        if matches!(v, Value::Float64(f) if f.is_nan()) {
+            return true;
+        }
+        seen.insert(bincode::serialize(v).expect("Value must be bincode-serializable"))
+    });
 }
 
 /// Returns `true` if the expression contains a `collect()` call (directly or nested).
@@ -3533,6 +3562,9 @@ fn aggregate_rows(
                 output_row.push(key_vals[ki].clone());
                 ki += 1;
             } else {
+                if agg_is_distinct(&return_items[col_idx].expr) {
+                    dedup_agg_values(&mut group_accum[gi][ai]);
+                }
                 let accumulated = Value::List(group_accum[gi][ai].clone());
                 let result = if kinds[col_idx] == AggKind::Collect {
                     evaluate_aggregate_expr(&return_items[col_idx].expr, &accumulated, &outer_vals)
