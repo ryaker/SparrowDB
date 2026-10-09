@@ -387,8 +387,18 @@ pub struct MatchWithStatement {
     pub match_where: Option<Expr>,
     pub with_clause: WithClause,
     pub return_clause: ReturnClause,
+    /// ORDER BY written after the WITH clause (`WITH … ORDER BY … RETURN …`).
+    /// Applies to the WITH output, i.e. before a RETURN aggregate sees the rows.
+    pub with_order_by: Vec<(Expr, SortDir)>,
+    /// SKIP written after the WITH clause.
+    pub with_skip: Option<u64>,
+    /// LIMIT written after the WITH clause.
+    pub with_limit: Option<u64>,
+    /// ORDER BY written after the RETURN clause only.
     pub order_by: Vec<(Expr, SortDir)>,
+    /// SKIP written after the RETURN clause only.
     pub skip: Option<u64>,
+    /// LIMIT written after the RETURN clause only.
     pub limit: Option<u64>,
     pub distinct: bool,
 }

@@ -930,7 +930,7 @@ impl Parser {
                     self.expect_tok(&Token::By)?;
                     self.parse_order_by_items()?
                 } else {
-                    with_order_by
+                    vec![]
                 };
 
                 let skip = if matches!(self.peek(), Token::Skip) {
@@ -952,7 +952,7 @@ impl Parser {
                         }
                     }
                 } else {
-                    with_skip
+                    None
                 };
 
                 let limit = if matches!(self.peek(), Token::Limit) {
@@ -974,7 +974,7 @@ impl Parser {
                         }
                     }
                 } else {
-                    with_limit
+                    None
                 };
 
                 Ok(Statement::MatchWith(MatchWithStatement {
@@ -982,6 +982,9 @@ impl Parser {
                     match_where,
                     with_clause,
                     return_clause,
+                    with_order_by,
+                    with_skip,
+                    with_limit,
                     order_by,
                     skip,
                     limit,
