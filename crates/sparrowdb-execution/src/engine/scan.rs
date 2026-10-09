@@ -1331,6 +1331,33 @@ impl Engine {
             }
         };
 
+        // The DegreeCache tallies out-degree per source *slot* across every
+        // relationship table, so it only equals `COUNT(dst)` for this pattern
+        // when every table in the catalog is a `src_label -[rel_type]-> dst_label`
+        // table.  Otherwise edges of other types, destination labels, or source
+        // labels sharing the slot are over-counted (#559): fall through to the
+        // general path.
+        let dst_label_id: Option<u32> = match dst_node.labels.first() {
+            Some(l) if !l.is_empty() => match self.snapshot.catalog.get_label(l)? {
+                Some(id) => Some(id as u32),
+                None => return Ok(None),
+            },
+            _ => None,
+        };
+        let cache_matches_pattern =
+            self.snapshot
+                .catalog
+                .list_rel_tables_with_ids()
+                .iter()
+                .all(|(_, sid, did, rt)| {
+                    *sid as u32 == label_id
+                        && dst_label_id.is_none_or(|d| d == *did as u32)
+                        && (rel.rel_type.is_empty() || *rt == rel.rel_type)
+                });
+        if !cache_matches_pattern {
+            return Ok(None);
+        }
+
         tracing::debug!(
             label = %src_label,
             k = k,
