@@ -154,7 +154,7 @@ fn ic4_top_tags_of_friends_posts() {
     // `cnt DESC, tag.name ASC`: the 2s tie → Rust < SocialNetworks; the 1s tie →
     // Databases < GraphTheory.
     // Row CONTENT is asserted here; ORDER BY is asserted separately in
-    // `ic4_top_tags_order_by` because the engine ignores it (#543).
+    // `ic4_top_tags_order_by` (the engine ignored it before #543/#546).
     let mut got = r.clone();
     got.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     assert_eq!(
@@ -170,7 +170,6 @@ fn ic4_top_tags_of_friends_posts() {
 }
 
 #[test]
-#[ignore = "bug #543: ORDER BY ignored with grouped COUNT(*)"]
 fn ic4_top_tags_order_by() {
     let (_dir, db) = db_with_mini_fixture();
     let r = ic_queries::ic4_top_tags(&db, 1, "2012-01-01", 30).expect("IC4 should not error");
@@ -206,8 +205,8 @@ fn ic5_forums_ranked_by_friend_membership() {
 #[test]
 fn ic6_co_occurring_tags() {
     let (_dir, db) = db_with_mini_fixture();
-    // Sorted in the test (cnt DESC, name ASC): the engine ignores ORDER BY on
-    // grouped COUNT(*) (#543), which `ic6_co_occurring_tags_order_by` covers.
+    // Sorted in the test (cnt DESC, name ASC) so this checks row content only;
+    // `ic6_co_occurring_tags_order_by` covers the engine's own ORDER BY.
     let ic6 = |p: i64, t: &str| {
         let mut r = ic_queries::ic6_tag_co_occurrence(&db, p, t).expect("IC6 should not error");
         r.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -273,7 +272,6 @@ fn ic6_co_occurring_tags() {
 }
 
 #[test]
-#[ignore = "bug #543: ORDER BY ignored with grouped COUNT(*)"]
 fn ic6_co_occurring_tags_order_by() {
     let (_dir, db) = db_with_mini_fixture();
     // Derivation as in `ic6_co_occurring_tags`: friend posts 2 and 3 both carry

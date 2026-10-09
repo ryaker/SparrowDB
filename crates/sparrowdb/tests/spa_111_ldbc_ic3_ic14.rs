@@ -149,8 +149,9 @@ fn ic6_tag_co_occurrence() {
     // ic6(1, Rust): both posts carry Rust. Others: SocialNetworks 2 (posts 2, 3),
     // Databases 1 (post 2), GraphTheory 1 (post 3). `cnt DESC, name ASC` →
     // [(SocialNetworks,2), (Databases,1), (GraphTheory,1)].
-    // Sorted here because the engine ignores ORDER BY on grouped COUNT(*) (#543);
-    // `ic6_tag_co_occurrence_order_by` below asserts the engine's own order.
+    // Row CONTENT is checked order-independently here (sorted in the test);
+    // `ic6_tag_co_occurrence_order_by` below asserts the engine's own order
+    // (ORDER BY on grouped COUNT(*) was fixed in #543/#546).
     let sorted = |mut r: Vec<(String, i64)>| {
         r.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         r
@@ -193,7 +194,6 @@ fn ic6_tag_co_occurrence() {
 }
 
 #[test]
-#[ignore = "bug #543: ORDER BY ignored with grouped COUNT(*)"]
 fn ic6_tag_co_occurrence_order_by() {
     let (_dir, db) = load_mini_db();
     // Friend posts 2 {Rust,Databases,SocialNetworks} and 3 {SocialNetworks,
