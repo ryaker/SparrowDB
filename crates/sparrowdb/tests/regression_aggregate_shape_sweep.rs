@@ -665,9 +665,8 @@ fn varlen_and_incoming_varlen_aggregates() {
     ]);
 }
 
-/// Known bug #549: engine returns the wrong answer; expectations are hand-derived.
+/// `COUNT(DISTINCT x)` across the shapes (#549); expectations are hand-derived.
 #[test]
-#[ignore = "bug #549"]
 fn count_distinct_unsupported() {
     check(vec![
         c(

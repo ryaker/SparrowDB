@@ -415,6 +415,30 @@ fn order_by_distinct_aggregate_and_limit() {
 }
 
 #[test]
+fn distinct_aggregate_in_optional_match() {
+    let (_d, db) = fixture();
+    // Grouped by p.g: x = P1 {A,B,C} = 3; y = P2 {A,B} + P3 {B,C} -> {A,B,C}
+    // = 3 distinct (4 plain).
+    assert_eq!(
+        rows(
+            &db,
+            "MATCH (p:P) OPTIONAL MATCH (p)-[:HAS]->(t:T) \
+             RETURN p.g, COUNT(DISTINCT t.name) AS c ORDER BY p.g"
+        ),
+        vec![vec![s("x"), i(3)], vec![s("y"), i(3)]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "MATCH (p:P) OPTIONAL MATCH (p)-[:HAS]->(t:T) \
+             RETURN p.g, COUNT(t.name) AS c ORDER BY p.g"
+        ),
+        vec![vec![s("x"), i(3)], vec![s("y"), i(4)]],
+        "control: plain count"
+    );
+}
+
+#[test]
 fn distinct_aggregate_in_with_clause() {
     let (_d, db) = w_fixture();
     // WITH-aggregation (`aggregate_with_items`).  Group v=1 has 2 nodes but
