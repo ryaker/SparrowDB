@@ -2441,6 +2441,26 @@ impl Parser {
         Ok(items)
     }
 
+    /// Consume an optional `DISTINCT` right after a call's `(` (#549).
+    ///
+    /// Only the aggregate functions accept it; `DISTINCT` inside any other
+    /// call is a parse error rather than being silently dropped.
+    fn parse_agg_distinct(&mut self, fn_name: &str) -> Result<bool> {
+        if !matches!(self.peek(), Token::Distinct) {
+            return Ok(false);
+        }
+        if !matches!(
+            fn_name.to_lowercase().as_str(),
+            "count" | "sum" | "avg" | "min" | "max" | "collect"
+        ) {
+            return Err(Error::InvalidArgument(format!(
+                "DISTINCT is only valid inside an aggregate function, not {fn_name}()"
+            )));
+        }
+        self.advance();
+        Ok(true)
+    }
+
     fn parse_atom(&mut self) -> Result<Expr> {
         match self.peek().clone() {
             Token::Ident(var) => {
@@ -2463,6 +2483,7 @@ impl Parser {
                     // Function call: name(arg, arg, ...)
                     self.advance(); // consume function name
                     self.advance(); // consume '('
+                    let distinct = self.parse_agg_distinct(&var)?;
                     let mut args = Vec::new();
                     if !matches!(self.peek(), Token::RParen) {
                         loop {
@@ -2475,7 +2496,11 @@ impl Parser {
                         }
                     }
                     self.expect_tok(&Token::RParen)?;
-                    Ok(Expr::FnCall { name: var, args })
+                    Ok(Expr::FnCall {
+                        name: var,
+                        args,
+                        distinct,
+                    })
                 } else {
                     self.advance();
                     Ok(Expr::Var(var))
@@ -2490,12 +2515,14 @@ impl Parser {
                     self.expect_tok(&Token::RParen)?;
                     Ok(Expr::CountStar)
                 } else {
-                    // COUNT(expr) — treat as a named aggregate FnCall.
+                    // COUNT([DISTINCT] expr) — treat as a named aggregate FnCall.
+                    let distinct = self.parse_agg_distinct("count")?;
                     let arg = self.parse_expr()?;
                     self.expect_tok(&Token::RParen)?;
                     Ok(Expr::FnCall {
                         name: "count".to_string(),
                         args: vec![arg],
+                        distinct,
                     })
                 }
             }
@@ -2621,6 +2648,7 @@ impl Parser {
                     other => Ok(Expr::FnCall {
                         name: "_neg".into(),
                         args: vec![other],
+                        distinct: false,
                     }),
                 }
             }

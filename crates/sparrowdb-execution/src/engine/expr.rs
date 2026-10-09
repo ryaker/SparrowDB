@@ -718,7 +718,7 @@ impl Engine {
             // than a hand-written match, so this call site and
             // `is_graph_only_fn` can never disagree about which names route
             // here.
-            Expr::FnCall { name, args } => {
+            Expr::FnCall { name, args, .. } => {
                 let name_lc = name.to_ascii_lowercase();
                 match GRAPH_ONLY_FNS.iter().find(|(n, _)| *n == name_lc) {
                     Some((_, f)) => f(self, args, vals),
@@ -1215,6 +1215,7 @@ mod tests {
             let expr = Expr::FnCall {
                 name: (*name).to_string(),
                 args: vec![],
+                distinct: false,
             };
             assert!(
                 expr_needs_graph(&expr),
@@ -1239,6 +1240,7 @@ mod tests {
         let expr = Expr::FnCall {
             name: "toUpper".to_string(),
             args: vec![],
+            distinct: false,
         };
         assert!(!expr_needs_graph(&expr));
         assert!(!is_graph_only_fn("toUpper"));
@@ -1251,6 +1253,7 @@ mod tests {
         let expr = Expr::FnCall {
             name: "HYBRID_SEARCH".to_string(),
             args: vec![],
+            distinct: false,
         };
         assert!(expr_needs_graph(&expr));
     }

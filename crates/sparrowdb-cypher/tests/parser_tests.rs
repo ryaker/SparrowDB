@@ -238,3 +238,50 @@ fn parse_empty_input_rejected() {
 fn parse_unknown_keyword_rejected() {
     assert!(parse("FROBNICATE (n:Person) RETURN n").is_err());
 }
+
+// ── DISTINCT inside aggregates (#549) ────────────────────────────────────────
+
+fn first_return_expr(q: &str) -> sparrowdb_cypher::ast::Expr {
+    match parse(q).expect("must parse") {
+        Statement::Match(m) => m.return_clause.items[0].expr.clone(),
+        other => panic!("expected Match, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_aggregate_distinct_sets_flag_for_every_aggregate() {
+    use sparrowdb_cypher::ast::Expr;
+    for f in ["count", "COUNT", "sum", "avg", "min", "max", "collect"] {
+        let q = format!("MATCH (n:N) RETURN {f}(DISTINCT n.x)");
+        match first_return_expr(&q) {
+            Expr::FnCall {
+                name,
+                args,
+                distinct,
+            } => {
+                assert!(distinct, "{q}: distinct flag must be set");
+                assert!(name.eq_ignore_ascii_case(f));
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("{q}: expected FnCall, got {other:?}"),
+        }
+        let q = format!("MATCH (n:N) RETURN {f}(n.x)");
+        assert!(
+            matches!(
+                first_return_expr(&q),
+                Expr::FnCall {
+                    distinct: false,
+                    ..
+                }
+            ),
+            "{q}: plain call must not be distinct"
+        );
+    }
+}
+
+#[test]
+fn parse_distinct_rejected_outside_aggregates_and_for_star() {
+    assert!(parse("MATCH (n:N) RETURN count(DISTINCT *)").is_err());
+    assert!(parse("MATCH (n:N) RETURN toUpper(DISTINCT n.x)").is_err());
+    assert!(parse("MATCH (n:N) RETURN count(DISTINCT)").is_err());
+}

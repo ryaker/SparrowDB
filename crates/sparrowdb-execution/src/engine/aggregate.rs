@@ -233,7 +233,7 @@ impl Engine {
                     sparrowdb_cypher::ast::Expr::CountStar => {
                         group_accum[group_idx][ai].push(Value::Int64(1));
                     }
-                    sparrowdb_cypher::ast::Expr::FnCall { name, args }
+                    sparrowdb_cypher::ast::Expr::FnCall { name, args, .. }
                         if name.to_lowercase() == "collect" =>
                     {
                         // #477: use the graph-aware evaluator so an aggregate
@@ -250,7 +250,7 @@ impl Engine {
                             group_accum[group_idx][ai].push(val);
                         }
                     }
-                    sparrowdb_cypher::ast::Expr::FnCall { name, args }
+                    sparrowdb_cypher::ast::Expr::FnCall { name, args, .. }
                         if matches!(
                             name.to_lowercase().as_str(),
                             "count" | "sum" | "avg" | "min" | "max"
@@ -299,6 +299,9 @@ impl Engine {
             }
             // Finalize aggregates.
             for (ai, &ri) in agg_indices.iter().enumerate() {
+                if super::agg_is_distinct(&items[ri].expr) {
+                    super::dedup_agg_values(&mut group_accum[gi][ai]);
+                }
                 let accum = &group_accum[gi][ai];
                 let val = match &items[ri].expr {
                     sparrowdb_cypher::ast::Expr::CountStar => Value::Int64(accum.len() as i64),

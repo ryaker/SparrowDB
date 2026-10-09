@@ -2189,7 +2189,7 @@ impl<C: PipelineOperator> PipelineOperator for DstSlotProjector<C> {
 /// Return `true` if `expr` is `id(var_name)`.
 fn is_id_call(expr: &Expr, var_name: &str) -> bool {
     match expr {
-        Expr::FnCall { name, args } => {
+        Expr::FnCall { name, args, .. } => {
             name.eq_ignore_ascii_case("id")
                 && args.len() == 1
                 && matches!(&args[0], Expr::Var(v) if v.as_str() == var_name)
