@@ -571,8 +571,27 @@ impl Engine {
         // Now scan each rel table in reverse (dst→src) to find backward edges
         // (b→a) that were not already emitted in the forward pass.
         if *dir == EdgeDir::Both {
+            // The backward pass reads each table against the opposite
+            // orientation: the pattern's source node is the table's
+            // *destination* label.  Filtering with the forward list would drop
+            // every table whose stored direction is dst->src of the pattern
+            // (`(t:T)-[:HAS]-(p:P)` over `(:P)-[:HAS]->(:T)` matched nothing)
+            // and, for the forward-matching tables, scan the wrong label.
+            let rel_tables_bwd: Vec<(u64, u32, u32, String)> = self
+                .snapshot
+                .catalog
+                .list_rel_tables_with_ids()
+                .into_iter()
+                .filter(|(_, sid, did, rt)| {
+                    let type_ok = rel_pat.rel_type.is_empty() || rt == &rel_pat.rel_type;
+                    let src_ok = src_label_id_opt.map(|id| id == *did as u32).unwrap_or(true);
+                    let dst_ok = dst_label_id_opt.map(|id| id == *sid as u32).unwrap_or(true);
+                    type_ok && src_ok && dst_ok
+                })
+                .map(|(catalog_id, sid, did, rt)| (catalog_id, sid as u32, did as u32, rt))
+                .collect();
             for (catalog_rel_id, tbl_src_label_id, tbl_dst_label_id, tbl_rel_type) in
-                &rel_tables_to_scan
+                &rel_tables_bwd
             {
                 let storage_rel_id = RelTableId(*catalog_rel_id as u32);
                 // In the backward pass, scan "dst" label nodes (b-side) as src.
@@ -1428,6 +1447,15 @@ impl Engine {
                                     row_vals
                                         .insert(fof_node_pat.var.clone(), Value::NodeRef(b_node));
                                 }
+                                bind_two_hop_rel_vars(
+                                    &mut row_vals,
+                                    pat,
+                                    [
+                                        hop1_rel_ids.first().copied().unwrap_or(0),
+                                        hop2_rel_ids.first().copied().unwrap_or(0),
+                                    ],
+                                    [src_node, mid_node, b_node],
+                                );
                                 raw_rows.push(row_vals);
                             } else {
                                 let row = project_three_var_row(
@@ -1589,6 +1617,15 @@ impl Engine {
                             if !fof_node_pat.var.is_empty() {
                                 row_vals.insert(fof_node_pat.var.clone(), Value::NodeRef(b_node));
                             }
+                            bind_two_hop_rel_vars(
+                                &mut row_vals,
+                                pat,
+                                [
+                                    hop1_rel_ids.first().copied().unwrap_or(0),
+                                    hop2_rel_ids.first().copied().unwrap_or(0),
+                                ],
+                                [src_node, mid_node, b_node],
+                            );
                             raw_rows.push(row_vals);
                         } else {
                             // Project a row: src (a) + mid (m) + fof (b) columns.
@@ -1808,6 +1845,15 @@ impl Engine {
                         if !fof_node_pat.var.is_empty() {
                             row_vals.insert(fof_node_pat.var.clone(), Value::NodeRef(fof_node));
                         }
+                        bind_two_hop_rel_vars(
+                            &mut row_vals,
+                            pat,
+                            [
+                                hop1_rel_ids.first().copied().unwrap_or(0),
+                                hop2_rel_ids.first().copied().unwrap_or(0),
+                            ],
+                            [src_node, mid_node, fof_node],
+                        );
                         raw_rows.push(row_vals);
                     } else {
                         // SPA-241: use three-var projection so mid variable columns
@@ -2454,5 +2500,31 @@ impl Engine {
             columns: column_names.to_vec(),
             rows,
         })
+    }
+}
+
+/// Bind the relationship variables of a 2-hop pattern as non-null `EdgeRef`s
+/// in an aggregate row, so `COUNT(r)` over `(a)-[r1]->(m)-[r2]->(b)` counts
+/// matched edges instead of seeing a missing (null) variable.
+///
+/// Identity follows the 1-hop convention: rel-table id in the high 32 bits,
+/// `src_slot ^ dst_slot` in the low 32.
+fn bind_two_hop_rel_vars(
+    row_vals: &mut HashMap<String, Value>,
+    pat: &sparrowdb_cypher::ast::PathPattern,
+    rel_ids: [u64; 2],
+    nodes: [NodeId; 3],
+) {
+    for (hop, (rel_id, ends)) in rel_ids
+        .iter()
+        .zip([(nodes[0], nodes[1]), (nodes[1], nodes[2])])
+        .enumerate()
+    {
+        let var = &pat.rels[hop].var;
+        if !var.is_empty() {
+            let slot = |n: NodeId| n.0 & 0xFFFF_FFFF;
+            let id = (*rel_id << 32) | (slot(ends.0) ^ slot(ends.1)) & 0xFFFF_FFFF;
+            row_vals.insert(var.clone(), Value::EdgeRef(sparrowdb_common::EdgeId(id)));
+        }
     }
 }

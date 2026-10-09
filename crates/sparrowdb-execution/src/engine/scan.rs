@@ -1482,9 +1482,25 @@ impl Engine {
             }
         };
 
+        // Aggregates (`COUNT(p)`, `MAX(p.id)`, `ORDER BY` over them) read their
+        // arguments from the combined row, so every column any RETURN item
+        // mentions must be fetched, not only the plain lead-variable items.
+        let use_agg = has_aggregate_in_return(&mom.return_clause.items);
+        let mut agg_col_ids: Vec<u32> = Vec::new();
+        if use_agg {
+            for item in &mom.return_clause.items {
+                collect_col_ids_from_expr(&item.expr, &mut agg_col_ids);
+            }
+        }
+
         // Collect all col_ids needed for lead scan.
         let lead_all_col_ids: Vec<u32> = {
             let mut ids = collect_col_ids_from_return_items(&lead_return_items);
+            for c in &agg_col_ids {
+                if !ids.contains(c) {
+                    ids.push(*c);
+                }
+            }
             if let Some(ref wexpr) = mom.match_where {
                 collect_col_ids_from_expr(wexpr, &mut ids);
             }
@@ -1537,14 +1553,35 @@ impl Engine {
             .collect();
 
         let mut result_rows: Vec<Vec<Value>> = Vec::new();
+        // Row maps for the aggregate path (variables bound as `NodeRef`).
+        let mut agg_rows: Vec<HashMap<String, Value>> = Vec::new();
+
+        // An incoming optional hop `(lead)<-[:R]-(opt)` needs the reversed edge
+        // set; build it once per query rather than per lead row.
+        let optional_incoming = opt_patterns.len() == 1
+            && opt_patterns[0].rels.len() == 1
+            && opt_patterns[0].rels[0].dir != sparrowdb_cypher::ast::EdgeDir::Outgoing;
+        let reverse_index: Option<ReverseIndex> = if optional_incoming {
+            let rel_ids = self.resolve_rel_ids_for_type(&opt_patterns[0].rels[0].rel_type);
+            let delta_idx = build_delta_index(&self.read_delta_all());
+            Some(self.build_reverse_index(&delta_idx, &rel_ids))
+        } else {
+            None
+        };
 
         for (lead_slot, lead_props) in &lead_rows {
-            let lead_row_vals = build_row_vals(
+            let mut lead_row_vals = build_row_vals(
                 lead_props,
                 lead_var,
                 &lead_all_col_ids,
                 &self.snapshot.store,
             );
+            if use_agg && !lead_var.is_empty() {
+                lead_row_vals.insert(
+                    lead_var.to_string(),
+                    Value::NodeRef(NodeId(((lead_label_id as u64) << 32) | *lead_slot)),
+                );
+            }
 
             // Attempt the optional sub-pattern.
             // We only support the common case:
@@ -1576,12 +1613,29 @@ impl Engine {
                     opt_rel_pat,
                     &opt_vars,
                     &column_names,
+                    &agg_col_ids,
+                    reverse_index.as_ref(),
                 )
                 .unwrap_or_default()
             } else {
                 // Unsupported optional pattern → treat as no matches.
                 vec![]
             };
+
+            if use_agg {
+                // Left outer join: a lead row with no match still contributes
+                // exactly one row (optional variables unbound, i.e. null).
+                if opt_sub_rows.is_empty() {
+                    agg_rows.push(lead_row_vals);
+                } else {
+                    for opt_row_vals in opt_sub_rows {
+                        let mut combined = lead_row_vals.clone();
+                        combined.extend(opt_row_vals);
+                        agg_rows.push(combined);
+                    }
+                }
+                continue;
+            }
 
             if opt_sub_rows.is_empty() {
                 // No matches: emit lead row with NULLs for optional vars.
@@ -1626,9 +1680,19 @@ impl Engine {
             }
         }
 
+        if use_agg {
+            result_rows = self.aggregate_rows_graph(&agg_rows, &mom.return_clause.items);
+        }
         if mom.distinct {
             deduplicate_rows(&mut result_rows);
         }
+        // ORDER BY ran nowhere on this path before: rows came back in scan order.
+        sort_rows_by(
+            &mut result_rows,
+            &mom.order_by,
+            &mom.return_clause.items,
+            &column_names,
+        );
         if let Some(skip) = mom.skip {
             let skip = (skip as usize).min(result_rows.len());
             result_rows.drain(0..skip);
@@ -1656,6 +1720,8 @@ impl Engine {
         rel_pat: &sparrowdb_cypher::ast::RelPattern,
         opt_vars: &[String],
         column_names: &[String],
+        extra_col_ids: &[u32],
+        reverse_index: Option<&ReverseIndex>,
     ) -> Result<Vec<HashMap<String, Value>>> {
         let dst_label_id = match dst_label_id {
             Some(id) => id,
@@ -1663,8 +1729,37 @@ impl Engine {
         };
 
         let dst_var = dst_node_pat.var.as_str();
-        let col_ids_dst = collect_col_ids_for_var(dst_var, column_names, dst_label_id);
+        let mut col_ids_dst = collect_col_ids_for_var(dst_var, column_names, dst_label_id);
+        for c in extra_col_ids {
+            if !col_ids_dst.contains(c) {
+                col_ids_dst.push(*c);
+            }
+        }
         let _ = opt_vars;
+
+        // `(lead)<-[:R]-(opt)` (and the reverse half of `(lead)-[:R]-(opt)`):
+        // the neighbours are the edge's physical sources.
+        let incoming_slots: Vec<u64> = match (reverse_index, &rel_pat.dir) {
+            (Some(rev), sparrowdb_cypher::ast::EdgeDir::Incoming)
+            | (Some(rev), sparrowdb_cypher::ast::EdgeDir::Both) => rev
+                .get(&(src_label_id, src_slot))
+                .map(|v| {
+                    v.iter()
+                        .filter(|(_, label)| *label == dst_label_id)
+                        .map(|(slot, _)| *slot)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => vec![],
+        };
+        if rel_pat.dir == sparrowdb_cypher::ast::EdgeDir::Incoming {
+            return self.optional_sub_rows_for_slots(
+                incoming_slots,
+                dst_label_id,
+                dst_node_pat,
+                &col_ids_dst,
+            );
+        }
 
         // SPA-185: resolve rel-type lookup once; use for both delta and CSR reads.
         let rel_lookup = self.resolve_rel_table_id(src_label_id, dst_label_id, &rel_pat.rel_type);
@@ -1699,21 +1794,42 @@ impl Engine {
             RelTableLookup::Found(rtid) => self.csr_neighbors(rtid, src_slot),
             _ => self.csr_neighbor_slots_to_label(src_slot, src_label_id, Some(dst_label_id), &[]),
         };
-        let all_neighbors: Vec<u64> = csr_neighbors.into_iter().chain(delta_neighbors).collect();
+        let all_neighbors: Vec<u64> = csr_neighbors
+            .into_iter()
+            .chain(delta_neighbors)
+            .chain(incoming_slots)
+            .collect();
+        self.optional_sub_rows_for_slots(all_neighbors, dst_label_id, dst_node_pat, &col_ids_dst)
+    }
 
+    /// Materialise the optional-side node rows for a set of neighbour slots
+    /// (deduplicated), applying the optional node's inline property filter and
+    /// binding the variable as a non-null `NodeRef` so `COUNT(opt)` counts it.
+    fn optional_sub_rows_for_slots(
+        &self,
+        slots: Vec<u64>,
+        dst_label_id: u32,
+        dst_node_pat: &sparrowdb_cypher::ast::NodePattern,
+        col_ids_dst: &[u32],
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        let dst_var = dst_node_pat.var.as_str();
         let mut seen: HashSet<u64> = HashSet::new();
         let mut sub_rows: Vec<HashMap<String, Value>> = Vec::new();
 
-        for dst_slot in all_neighbors {
+        for dst_slot in slots {
             if !seen.insert(dst_slot) {
                 continue;
             }
             let dst_node = NodeId(((dst_label_id as u64) << 32) | dst_slot);
-            let dst_props = read_node_props(&self.snapshot.store, dst_node, &col_ids_dst)?;
+            let dst_props = read_node_props(&self.snapshot.store, dst_node, col_ids_dst)?;
             if !self.matches_prop_filter(&dst_props, &dst_node_pat.props) {
                 continue;
             }
-            let row_vals = build_row_vals(&dst_props, dst_var, &col_ids_dst, &self.snapshot.store);
+            let mut row_vals =
+                build_row_vals(&dst_props, dst_var, col_ids_dst, &self.snapshot.store);
+            if !dst_var.is_empty() {
+                row_vals.insert(dst_var.to_string(), Value::NodeRef(dst_node));
+            }
             sub_rows.push(row_vals);
         }
 

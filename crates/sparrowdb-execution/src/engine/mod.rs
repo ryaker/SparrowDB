@@ -3012,6 +3012,36 @@ fn order_by_col_index(expr: &Expr, items: &[ReturnItem], column_names: &[String]
     })
 }
 
+/// Value an ORDER BY key takes on one projected row.
+///
+/// A key naming a RETURN column (by alias, `var.prop`, or the identical
+/// expression) reads that column.  Any other key is evaluated as an expression
+/// over the row's columns, each bound by alias and as `var.prop`, so
+/// `ORDER BY cnt * -1` and `ORDER BY p.id + 1` sort correctly.  A key that
+/// needs something the RETURN did not project (`ORDER BY id(p)` with only
+/// `p.id` returned) still evaluates to null: that remains unsupported.
+fn order_key_value(
+    expr: &Expr,
+    row: &[Value],
+    items: &[ReturnItem],
+    column_names: &[String],
+) -> Value {
+    if let Some(i) = order_by_col_index(expr, items, column_names) {
+        return row.get(i).cloned().unwrap_or(Value::Null);
+    }
+    let mut scope: HashMap<String, Value> = HashMap::new();
+    for (name, val) in column_names.iter().zip(row.iter()) {
+        if let Some((var, prop)) = name.split_once('.') {
+            scope.insert(
+                format!("{var}.col_{}", prop_name_to_col_id(prop)),
+                val.clone(),
+            );
+        }
+        scope.insert(name.clone(), val.clone());
+    }
+    eval_expr(expr, &scope)
+}
+
 /// Build a sort key from a single row and the ORDER BY spec.
 fn make_sort_key(
     row: &[Value],
@@ -3023,11 +3053,7 @@ fn make_sort_key(
     order_by
         .iter()
         .map(|(expr, dir)| {
-            let col_idx = order_by_col_index(expr, items, column_names);
-            let val = col_idx
-                .and_then(|i| row.get(i))
-                .map(OrdValue::from_value)
-                .unwrap_or(OrdValue::Null);
+            let val = OrdValue::from_value(&order_key_value(expr, row, items, column_names));
             match dir {
                 SortDir::Asc => SortKeyVal::Asc(val),
                 SortDir::Desc => SortKeyVal::Desc(std::cmp::Reverse(val)),
@@ -3037,37 +3063,57 @@ fn make_sort_key(
 }
 
 fn apply_order_by(rows: &mut Vec<Vec<Value>>, m: &MatchStatement, column_names: &[String]) {
-    if m.order_by.is_empty() {
+    sort_rows_by(rows, &m.order_by, &m.return_clause.items, column_names);
+}
+
+/// Sort projected rows by an ORDER BY spec.  Statement-agnostic so every
+/// statement form that carries `order_by` + RETURN items (MATCH, MATCH …
+/// OPTIONAL MATCH) can share the one implementation.
+fn sort_rows_by(
+    rows: &mut Vec<Vec<Value>>,
+    order_by: &[(Expr, SortDir)],
+    items: &[ReturnItem],
+    column_names: &[String],
+) {
+    if order_by.is_empty() {
         return;
     }
 
     let threshold = sort_spill_threshold();
 
     if rows.len() <= threshold {
-        rows.sort_by(|a, b| {
-            for (expr, dir) in &m.order_by {
-                let col_idx = order_by_col_index(expr, &m.return_clause.items, column_names);
-                if let Some(idx) = col_idx {
-                    if idx < a.len() && idx < b.len() {
-                        let cmp = compare_values(&a[idx], &b[idx]);
-                        let cmp = if *dir == SortDir::Desc {
-                            cmp.reverse()
-                        } else {
-                            cmp
-                        };
-                        if cmp != std::cmp::Ordering::Equal {
-                            return cmp;
-                        }
-                    }
+        // Decorate-sort-undecorate: each key is resolved once per row, not once
+        // per comparison (an expression key evaluates a scope per row).
+        let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = rows
+            .drain(..)
+            .map(|row| {
+                let keys = order_by
+                    .iter()
+                    .map(|(expr, _)| order_key_value(expr, &row, items, column_names))
+                    .collect();
+                (keys, row)
+            })
+            .collect();
+        keyed.sort_by(|(ka, _), (kb, _)| {
+            for (i, (_, dir)) in order_by.iter().enumerate() {
+                let cmp = compare_values(&ka[i], &kb[i]);
+                let cmp = if *dir == SortDir::Desc {
+                    cmp.reverse()
+                } else {
+                    cmp
+                };
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
                 }
             }
             std::cmp::Ordering::Equal
         });
+        rows.extend(keyed.into_iter().map(|(_, row)| row));
     } else {
         use crate::sort_spill::{SortableRow, SpillingSorter};
         let mut sorter: SpillingSorter<SortableRow> = SpillingSorter::new();
         for row in rows.drain(..) {
-            let key = make_sort_key(&row, &m.order_by, &m.return_clause.items, column_names);
+            let key = make_sort_key(&row, order_by, items, column_names);
             if sorter.push(SortableRow { key, data: row }).is_err() {
                 return;
             }
